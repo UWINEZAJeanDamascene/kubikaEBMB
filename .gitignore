@@ -1,55 +1,38 @@
-# Node
+
+# Dependencies
 node_modules/
+.pnp/
+.pnp.js
+
+# Build
 dist/
 build/
 
-# Environment
+# Environment files
 .env
 .env.*
-.env.local
-.env.production
+!.env.example
+
+env.development
+env.production
+env.staging
 
 # OS / editor
 .DS_Store
 .vscode/
 
 # Logs
-logs
+logs/
 *.log
-# Dependencies
-node_modules/
-.pnp/
-.pnp.js
-node_modules/
-# Build
-dist/
-build/
-# scripts/
-
-# Testing
-coverage/
-
-# Misc
-.DS_Store
-*.log
-
-# Debug
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Local env files
-.env
-.env.local
-.env.*.local
-.env.development
-.env.staging
-.env.production
-# Keep .env.example tracked!
-!.env.example
+# Testing
+coverage/
 
 # Credentials
 config/google-credentials.json
 
-# Local performance baseline snapshots (measurement artifacts, not source)
+# Local performance baseline snapshots
 performance-baselines/snapshots/
