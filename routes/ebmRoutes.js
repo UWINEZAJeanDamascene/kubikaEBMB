@@ -1,5 +1,5 @@
 const express = require('express');
-const { body } = require('express-validator');
+const { body, param, query } = require('express-validator');
 const router = express.Router();
 const ebmController = require('../controllers/ebmController');
 const { protect } = require('../middleware/auth');
@@ -12,11 +12,83 @@ const { cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware')
 const invalidateWarehouses = cacheInvalidationMiddleware({ type: 'warehouse', invalidateAll: true });
 
 router.use(protect);
+
+function requirePlatformAdmin(req, res, next) {
+  if (req.user?.role !== 'platform_admin') {
+    return res.status(403).json({
+      success: false,
+      code: 'EBM_PLATFORM_ADMIN_REQUIRED',
+      message: 'Only a platform administrator can manage platform-wide EBM settings.',
+    });
+  }
+  return next();
+}
+
+function validateRraBranchIdBody() {
+  return [
+    body('branchId').optional({ nullable: true }).isString().trim().matches(/^\d{1,2}$/),
+    body('bhfId').optional({ nullable: true }).isString().trim().matches(/^\d{1,2}$/),
+    body().custom((_, { req }) => {
+      const branchId = req.body.branchId;
+      const bhfId = req.body.bhfId;
+      const isValid = (value) => typeof value === 'string' && /^\d{1,2}$/.test(value.trim());
+      if (branchId !== undefined && branchId !== null && !isValid(branchId)) {
+        throw new Error('branchId must contain one or two digits');
+      }
+      if (bhfId !== undefined && bhfId !== null && !isValid(bhfId)) {
+        throw new Error('bhfId must contain one or two digits');
+      }
+      if (!branchId && !bhfId) throw new Error('A one- or two-digit branchId is required');
+      if (branchId && bhfId && branchId.trim().padStart(2, '0') !== bhfId.trim().padStart(2, '0')) {
+        throw new Error('branchId and bhfId must identify the same RRA branch');
+      }
+      return true;
+    }),
+  ];
+}
+
+router.get('/platform/company/:companyId/setting',
+  requirePlatformAdmin,
+  param('companyId').isMongoId().withMessage('Invalid company ID'),
+  validateRequest,
+  ebmController.getCompanyEbmSetting,
+);
+router.patch('/platform/company/:companyId/setting',
+  requirePlatformAdmin,
+  param('companyId').isMongoId().withMessage('Invalid company ID'),
+  body('enabled').isBoolean().withMessage('enabled is required and must be a boolean'),
+  body('reason').optional({ nullable: true }).isString().trim().isLength({ min: 1, max: 500 }).withMessage('reason must be 1-500 chars when supplied'),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.updateCompanyEbmSetting,
+);
+router.get('/platform/company/:companyId/rra-approval',
+  requirePlatformAdmin,
+  param('companyId').isMongoId().withMessage('Invalid company ID'),
+  validateRequest,
+  ebmController.getCompanyRraApproval,
+);
+router.patch('/platform/company/:companyId/rra-approval',
+  requirePlatformAdmin,
+  param('companyId').isMongoId().withMessage('Invalid company ID'),
+  body('approved').isBoolean().withMessage('approved is required and must be a boolean'),
+  body('reference')
+    .if((value, { req }) => req.body.approved === true)
+    .isString().trim().isLength({ min: 1, max: 200 })
+    .withMessage('reference is required when recording approval and must be at most 200 characters'),
+  body('reason').isString().trim().isLength({ min: 1, max: 500 }).withMessage('reason is required and must be at most 500 characters'),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.updateCompanyRraApproval,
+);
+
 router.use(attachCompanyId);
 
+router.get('/operations', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getOperationCatalog);
 router.get('/devices', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getDeviceStatus);
 router.get('/readiness', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getReadiness);
 router.get('/codes/status', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getCodeSyncStatus);
+router.get('/branches/reconciliation', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getBranchReconciliation);
 router.get('/codes', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getCodes);
 router.get('/codes/item-classes', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getItemClasses);
 router.get('/codes/tins', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.searchTINs);
@@ -34,7 +106,14 @@ router.post(
 );
 router.get('/notices', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getNotices);
 router.get('/imports', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.listImportedItems);
-router.get('/purchases/unmatched', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.listUnmatchedPurchases);
+router.get(
+  '/purchases/unmatched',
+  requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']),
+  query('status').optional().isIn(['unmatched', 'linked', 'rejected', 'ambiguous']),
+  query('limit').optional().isInt({ min: 1, max: 500 }).toInt(),
+  validateRequest,
+  ebmController.listUnmatchedPurchases,
+);
 router.get('/queue', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.listSubmissionQueue);
 router.get('/alerts', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.listAlerts);
 
@@ -44,6 +123,7 @@ router.post(
   body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   body('full').optional().isBoolean(),
+  body('prcOrdCd').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 5 }),
   validateRequest,
   stripUnvalidatedBody,
   ebmController.syncCodes,
@@ -65,12 +145,26 @@ router.post(
 router.post(
   '/branches/register',
   requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']),
-  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
-  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  ...validateRraBranchIdBody(),
   validateRequest,
   stripUnvalidatedBody,
   invalidateWarehouses,
   ebmController.registerBranch,
+);
+
+router.post(
+  '/branches/insurance/submit',
+  requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']),
+  ...validateRraBranchIdBody(),
+  validateRequest,
+  stripUnvalidatedBody,
+  invalidateWarehouses,
+  ebmController.submitBranchInsurance,
+);
+router.get(
+  '/branches/insurance/status',
+  requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']),
+  ebmController.getBranchInsuranceStatus,
 );
 
 router.post(
@@ -101,7 +195,6 @@ router.post(
   body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   body('full').optional().isBoolean(),
-  body('prcOrdCd').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ max: 5 }),
   validateRequest,
   stripUnvalidatedBody,
   ebmController.syncSalesSummaries,
@@ -116,6 +209,17 @@ router.post(
   validateRequest,
   stripUnvalidatedBody,
   ebmController.syncRegisteredItems,
+);
+
+router.post(
+  '/imports/:id/mapping',
+  requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']),
+  body('productId').notEmpty().withMessage('productId is required').isMongoId(),
+  body('warehouseId').notEmpty().withMessage('warehouseId is required').isMongoId(),
+  body('supplierId').notEmpty().withMessage('supplierId is required').isMongoId(),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.mapImportedItem,
 );
 
 router.post(
@@ -154,8 +258,7 @@ router.post(
 router.post(
   '/stock/reconcile',
   requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']),
-  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
-  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().matches(/^\d{2}$/),
   body('lastReqDt').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 14, max: 14 }),
   validateRequest,
   stripUnvalidatedBody,
@@ -165,8 +268,7 @@ router.post(
 router.post(
   '/stock/reconcile/resubmit',
   requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']),
-  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
-  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().matches(/^\d{2}$/),
   body('itemCd').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ max: 20 }),
   body('itemCode').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ max: 20 }),
   body('productId').optional({ nullable: true, checkFalsy: true }).isMongoId(),

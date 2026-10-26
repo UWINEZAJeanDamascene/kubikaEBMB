@@ -1,3 +1,4 @@
+const { randomUUID } = require('crypto');
 const EBMDevice = require('../models/EBMDevice');
 const Company = require('../models/Company');
 const Warehouse = require('../models/Warehouse');
@@ -5,24 +6,19 @@ const ebmService = require('./ebmService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
 const { EBM_MODES, EBMServiceError, extractInitInfo } = require('./ebmService');
 const EBMFiscalSequenceService = require('./ebmFiscalSequenceService');
+const { buildInitInfoRequest } = require('../utils/vsdcPayloadSanitizer');
+const { assertInitEncryptionConfigured, protectInitResult } = require('../utils/ebmInitResultProtection');
 
 function normalizeBranchId(value) {
   if (value === undefined || value === null || value === '') return null;
-  const digits = String(value).trim();
-  return digits.padStart(2, '0').slice(-2);
+  const text = String(value).trim();
+  if (!/^\d{1,2}$/.test(text)) return null;
+  return text.padStart(2, '0');
 }
 
 function extractTin(company) {
-  return String(
-    company?.tax_identification_number ||
-    company?.registration_number ||
-    company?.tin ||
-    '',
-  ).trim();
-}
-
-function buildDeviceSerialNo({ tin, branchId }) {
-  return `dvc${tin}${branchId}`;
+  const tin = String(company?.tax_identification_number || '').trim();
+  return /^\d{9}$/.test(tin) ? tin : '';
 }
 
 function toPublicDevice(device) {
@@ -33,12 +29,17 @@ function toPublicDevice(device) {
     company: raw.company,
     tin: raw.tin,
     branchId: raw.branchId,
+    environment: raw.environment || raw.initializedMode || raw.lastAttemptMode || null,
     branchName: raw.branchName,
     branchRef: raw.branchRef,
     deviceSerialNo: raw.deviceSerialNo,
     status: raw.status,
     initializedAt: raw.initializedAt,
     lastAttemptAt: raw.lastAttemptAt,
+    lastRequestId: raw.lastRequestId || null,
+    sequenceSeedStatus: raw.sequenceSeedStatus || null,
+    lastSuccessfulContactAt: raw.lastSuccessfulContactAt || null,
+    lastSuccessfulFiscalAt: raw.lastSuccessfulFiscalAt || null,
     lastErrorMessage: raw.lastErrorMessage,
     initializedMode: raw.initializedMode,
     lastAttemptMode: raw.lastAttemptMode,
@@ -65,20 +66,12 @@ class EBMDeviceService {
       .sort({ isDefault: -1, createdAt: 1, name: 1 })
       .lean();
 
-    if (!warehouses.length) {
-      return [{
-        branchId: '00',
-        branchName: 'Headquarter',
-        branchRef: null,
-      }];
-    }
-
     return warehouses.map((warehouse) => ({
-      branchId: warehouse.rraBranchId || (warehouse.isDefault ? '00' : null),
-      branchName: warehouse.name || warehouse.code || `Branch ${warehouse.rraBranchId || '00'}`,
+      branchId: normalizeBranchId(warehouse.rraBranchId),
+      branchName: warehouse.name || warehouse.code || `Branch ${warehouse.rraBranchId || ''}`,
       branchRef: warehouse._id,
       rraBranchId: warehouse.rraBranchId || null,
-    })).filter((branch) => branch.branchId);
+    })).filter((branch) => branch.branchId && branch.branchRef);
   }
 
   static async getInitializationStatus(companyId) {
@@ -90,24 +83,50 @@ class EBMDeviceService {
 
     const tin = extractTin(company);
     const currentMode = ebmService.getConfig().mode;
-    const deviceByBranch = new Map(devices.map((device) => [device.branchId, device]));
+    const devicesByBranch = new Map();
+    devices
+      .filter((device) => (device.environment || device.initializedMode || device.lastAttemptMode || 'mock') === currentMode)
+      .forEach((device) => {
+        const rows = devicesByBranch.get(device.branchId) || [];
+        rows.push(device);
+        devicesByBranch.set(device.branchId, rows);
+      });
 
     return {
       mode: currentMode,
       tin,
       branches: branches.map((branch) => {
-        const device = deviceByBranch.get(branch.branchId);
+        const branchDevices = devicesByBranch.get(branch.branchId) || [];
+        const device = branchDevices.length === 1 ? branchDevices[0] : null;
+        const duplicateBranchMapping = branches.filter((candidate) => candidate.branchId === branch.branchId).length > 1;
+        const initializationBlocked = ['initializing', 'outcome_unknown'].includes(device?.status);
         return {
           ...branch,
           tin,
-          deviceSerialNo: device?.deviceSerialNo || (tin ? buildDeviceSerialNo({ tin, branchId: branch.branchId }) : null),
-          status: device?.status || EBM_DEVICE_STATUSES.NOT_INITIALIZED,
+          deviceSerialNo: device?.deviceSerialNo || null,
+          configurationError: duplicateBranchMapping || branchDevices.length > 1,
+          initializationBlocked,
+          status: duplicateBranchMapping || branchDevices.length > 1
+            ? EBM_DEVICE_STATUSES.FAILED
+            : device?.status || EBM_DEVICE_STATUSES.NOT_INITIALIZED,
           initializedAt: device?.initializedAt || null,
           lastAttemptAt: device?.lastAttemptAt || null,
-          lastErrorMessage: device?.lastErrorMessage || null,
+          lastRequestId: device?.lastRequestId || null,
+          sequenceSeedStatus: device?.sequenceSeedStatus || null,
+          lastErrorMessage: duplicateBranchMapping
+            ? `RRA branch ${branch.branchId} is assigned to multiple active warehouses.`
+            : branchDevices.length > 1
+              ? `Multiple device records exist for RRA branch ${branch.branchId} in ${currentMode}.`
+              : initializationBlocked
+                ? 'An initialization attempt may have reached RRA but has no confirmed outcome. Reconcile it by request ID before trying again.'
+              : device?.lastErrorMessage || null,
           initializedMode: device?.initializedMode || null,
           lastAttemptMode: device?.lastAttemptMode || null,
-          modeMatches: device?.status === EBM_DEVICE_STATUSES.INITIALIZED && device?.initializedMode === currentMode,
+          modeMatches: !duplicateBranchMapping && branchDevices.length === 1
+            && device?.status === EBM_DEVICE_STATUSES.INITIALIZED
+            && !['pending', 'failed'].includes(device?.sequenceSeedStatus)
+            && (device?.environment || device?.initializedMode || device?.lastAttemptMode) === currentMode
+            && device?.initializedMode === currentMode,
           recordId: device?._id || null,
         };
       }),
@@ -134,6 +153,7 @@ class EBMDeviceService {
     const device = await EBMDevice.findOne({
       company: companyId,
       branchId: normalizedBranchId,
+      environment: mode,
       status: EBM_DEVICE_STATUSES.INITIALIZED,
       initializedMode: mode,
     }).lean();
@@ -149,89 +169,223 @@ class EBMDeviceService {
       );
     }
 
+    if (device.sequenceSeedStatus === 'pending' || device.sequenceSeedStatus === 'failed') {
+      throw new EBMServiceError(
+        'RRA initialized this device, but local fiscal sequence setup is incomplete. Reconcile sequence setup before submitting fiscal operations. Do not initialize the device again.',
+        { code: 'EBM_LOCAL_SEQUENCE_NOT_READY', mode, retryable: false, requestId: device.lastRequestId },
+      );
+    }
+
     return device;
   }
 
   static async initializeDevice(companyId, data = {}, userId = null) {
     const company = await this.getCompany(companyId);
-    const tin = String(data.tin || extractTin(company)).trim();
-    const branchId = normalizeBranchId(data.branchId || data.bhfId || '00');
-
+    const tin = extractTin(company);
+    const suppliedTin = data.tin == null ? null : String(data.tin).trim();
     if (!tin) {
-      const error = new Error('Company TIN is required before EBM device initialization.');
+      const error = new Error('Set the company tax identification number to a valid 9-digit TIN before EBM device initialization.');
       error.statusCode = 422;
+      error.code = 'EBM_COMPANY_TIN_REQUIRED';
+      throw error;
+    }
+    if (suppliedTin && suppliedTin !== tin) {
+      const error = new Error('The supplied TIN does not match the authenticated company tax identification number.');
+      error.statusCode = 422;
+      error.code = 'EBM_COMPANY_TIN_MISMATCH';
+      throw error;
+    }
+
+    if (data.branchId != null && data.bhfId != null
+      && normalizeBranchId(data.branchId) !== normalizeBranchId(data.bhfId)) {
+      const error = new Error('branchId and bhfId identify different branches. Send only one branch identifier or make them match.');
+      error.statusCode = 422;
+      error.code = 'EBM_BRANCH_ID_MISMATCH';
+      throw error;
+    }
+    const requestedBranchId = data.branchId ?? data.bhfId;
+    const branchId = normalizeBranchId(requestedBranchId);
+    if (!branchId) {
+      const error = new Error('Select a valid RRA branch ID containing one or two digits.');
+      error.statusCode = 422;
+      error.code = 'EBM_BRANCH_ID_INVALID';
       throw error;
     }
 
     const branches = await this.getBranchRows(companyId);
-    const branch = branches.find((candidate) => candidate.branchId === branchId) || {
-      branchId,
-      branchName: branchId === '00' ? 'Headquarter' : `Branch ${branchId}`,
-      branchRef: null,
-    };
+    const matchingBranches = branches.filter((candidate) => candidate.branchId === branchId);
+    if (matchingBranches.length === 0) {
+      const error = new Error(`RRA branch ${branchId} is not configured on an active warehouse belonging to this company.`);
+      error.statusCode = 404;
+      error.code = 'EBM_BRANCH_NOT_MAPPED';
+      throw error;
+    }
+    if (matchingBranches.length > 1) {
+      const error = new Error(`RRA branch ${branchId} is assigned to multiple active warehouses. Resolve the duplicate branch mapping before initialization.`);
+      error.statusCode = 409;
+      error.code = 'EBM_BRANCH_MAPPING_AMBIGUOUS';
+      throw error;
+    }
+    const [branch] = matchingBranches;
 
-    let device = await EBMDevice.findOne({ company: companyId, branchId });
-    const requestedSerialNo = String(data.deviceSerialNo || data.dvcSrlNo || device?.deviceSerialNo || buildDeviceSerialNo({ tin, branchId })).trim();
-
-    if (device && device.deviceSerialNo !== requestedSerialNo) {
-      const error = new Error('Device serial number is immutable once set for an EBM branch device.');
+    const mode = ebmService.getConfig().mode;
+    const internalSerial = data.deviceSerialNo == null ? null : String(data.deviceSerialNo).trim();
+    const wireSerial = data.dvcSrlNo == null ? null : String(data.dvcSrlNo).trim();
+    if (internalSerial && wireSerial && internalSerial !== wireSerial) {
+      const error = new Error('deviceSerialNo and dvcSrlNo contain different values. Send one device serial value.');
+      error.statusCode = 422;
+      error.code = 'EBM_DEVICE_SERIAL_MISMATCH';
+      throw error;
+    }
+    const requestedSerial = internalSerial ?? wireSerial;
+    const requestedSerialNo = requestedSerial == null ? '' : String(requestedSerial).trim();
+    const deviceRecords = await EBMDevice.find({ company: companyId, branchId, environment: mode }).lean();
+    if (deviceRecords.length > 1) {
+      const error = new Error(`Multiple device records exist for RRA branch ${branchId} in ${mode}. Resolve the device registry before initializing.`);
+      error.statusCode = 409;
+      error.code = 'EBM_DEVICE_IDENTITY_AMBIGUOUS';
+      throw error;
+    }
+    const device = deviceRecords[0] || null;
+    const registeredSerialNo = String(device?.deviceSerialNo || '').trim();
+    if (device?.tin && device.tin !== tin) {
+      const error = new Error('The stored device TIN no longer matches the authenticated company TIN. Reconcile the company tax identity before continuing.');
+      error.statusCode = 409;
+      error.code = 'EBM_DEVICE_TIN_MISMATCH';
+      throw error;
+    }
+    if (device?.branchRef && String(device.branchRef) !== String(branch.branchRef)) {
+      const error = new Error('The stored device belongs to a different warehouse mapping. Resolve the device-to-branch mapping before continuing.');
+      error.statusCode = 409;
+      error.code = 'EBM_DEVICE_BRANCH_MISMATCH';
+      throw error;
+    }
+    if (registeredSerialNo && requestedSerialNo && registeredSerialNo !== requestedSerialNo) {
+      const error = new Error('Device serial number is immutable once registered for this company, branch, and environment.');
+      error.statusCode = 409;
+      error.code = 'EBM_DEVICE_SERIAL_MISMATCH';
+      throw error;
+    }
+    const serialNo = registeredSerialNo || requestedSerialNo;
+    // Validate the resolved application values before creating or mutating a device record.
+    buildInitInfoRequest({ tin, bhfId: branchId, dvcSrlNo: serialNo });
+    if (mode !== EBM_MODES.MOCK) {
+      await require('./ebmApprovalService').assertApproved(companyId);
+      assertInitEncryptionConfigured();
+    }
+    if (['initializing', 'outcome_unknown'].includes(device?.status)) {
+      const error = new EBMServiceError(
+        'A previous initialization attempt has no confirmed outcome. Reconcile it by request ID before trying again; do not send another initialization request.',
+        { code: 'EBM_INIT_ATTEMPT_NEEDS_RECONCILIATION', mode, retryable: false, requestId: device.lastRequestId },
+      );
+      error.code = 'EBM_INIT_ATTEMPT_NEEDS_RECONCILIATION';
+      error.retryable = false;
+      error.requestId = device.lastRequestId || null;
       error.statusCode = 409;
       throw error;
     }
-
-    if (!device) {
-      device = await EBMDevice.create({
+    if (device?.status === EBM_DEVICE_STATUSES.INITIALIZED && device.initializedMode === mode) {
+      return {
+        success: true,
+        alreadyInitialized: true,
+        device: toPublicDevice(device),
+        response: null,
+      };
+    }
+    let attemptDevice = device;
+    if (!attemptDevice) {
+      attemptDevice = await EBMDevice.create({
         company: companyId,
         tin,
         branchId,
+        environment: mode,
         branchName: branch.branchName,
         branchRef: branch.branchRef,
-        deviceSerialNo: requestedSerialNo,
+        deviceSerialNo: serialNo,
         status: EBM_DEVICE_STATUSES.NOT_INITIALIZED,
         createdBy: userId,
         updatedBy: userId,
       });
     }
 
-    device.tin = tin;
-    device.branchName = branch.branchName;
-    device.branchRef = branch.branchRef;
-    device.lastAttemptAt = new Date();
-    device.lastAttemptMode = ebmService.getConfig().mode;
-    device.updatedBy = userId;
+    const previousStatus = attemptDevice.status || EBM_DEVICE_STATUSES.NOT_INITIALIZED;
+    attemptDevice.tin = tin;
+    attemptDevice.branchName = branch.branchName;
+    attemptDevice.branchRef = branch.branchRef;
+    attemptDevice.lastAttemptAt = new Date();
+    attemptDevice.status = EBM_DEVICE_STATUSES.INITIALIZING;
+    const requestId = randomUUID();
+    attemptDevice.lastRequestId = requestId;
+    attemptDevice.lastAttemptMode = mode;
+    attemptDevice.updatedBy = userId;
+    await attemptDevice.save();
 
+    let response;
     try {
-      const response = await ebmService.initializeDevice({
+      response = await ebmService.initializeDevice({
         companyId,
         tin,
         bhfId: branchId,
-        dvcSrlNo: device.deviceSerialNo,
-      });
+        dvcSrlNo: serialNo,
+        requestId,
+      }, { approvalVerified: mode !== EBM_MODES.MOCK });
+    } catch (error) {
+      if (error.dispatched === true) {
+        attemptDevice.status = ['EBM_INIT_OUTCOME_UNKNOWN', 'EBM_INIT_RESPONSE_MALFORMED'].includes(error.code)
+          ? EBM_DEVICE_STATUSES.OUTCOME_UNKNOWN
+          : EBM_DEVICE_STATUSES.FAILED;
+        attemptDevice.lastErrorMessage = error.message || 'EBM initialization failed';
+        attemptDevice.initResult = error.response || null;
+      } else attemptDevice.status = previousStatus;
+      await attemptDevice.save();
+      throw error;
+    }
 
-      device.status = EBM_DEVICE_STATUSES.INITIALIZED;
-      device.initializedAt = new Date();
-      device.initializedMode = ebmService.getConfig().mode;
-      device.lastErrorMessage = null;
-      device.initResult = response.raw;
-      await device.save();
+    // Persist the confirmed remote success before the idempotent local sequence seeding.
+    attemptDevice.status = EBM_DEVICE_STATUSES.INITIALIZED;
+    attemptDevice.initializedAt = new Date();
+    attemptDevice.initializedMode = mode;
+    attemptDevice.sequenceSeedStatus = 'pending';
+    attemptDevice.lastErrorMessage = null;
+    attemptDevice.initResult = protectInitResult(response.raw);
+    attemptDevice.lastSuccessfulContactAt = new Date();
+    await attemptDevice.save();
+
+    try {
       await EBMFiscalSequenceService.seedFromInitInfo(
         companyId,
         branchId,
         extractInitInfo(response.data || response.raw?.data || {}),
       );
-
-      return {
-        success: true,
-        device: toPublicDevice(device),
-        response,
-      };
     } catch (error) {
-      device.status = EBM_DEVICE_STATUSES.FAILED;
-      device.lastErrorMessage = error.message || 'EBM initialization failed';
-      device.initResult = error.response || null;
-      await device.save();
-      throw error;
+      attemptDevice.sequenceSeedStatus = 'failed';
+      attemptDevice.lastErrorMessage = 'RRA initialization succeeded, but local fiscal sequence setup failed. Do not initialize again; reconcile local sequences using the request ID.';
+      await attemptDevice.save();
+      const localError = new EBMServiceError(
+        `${attemptDevice.lastErrorMessage} Request ID ${requestId}.`,
+        {
+          code: 'EBM_INIT_LOCAL_SEQUENCE_SEED_FAILED',
+          mode,
+          requestId,
+          retryable: false,
+          cause: error,
+        },
+      );
+      localError.code = 'EBM_INIT_LOCAL_SEQUENCE_SEED_FAILED';
+      localError.retryable = false;
+      localError.statusCode = 503;
+      localError.remoteInitialized = true;
+      throw localError;
     }
+
+    attemptDevice.sequenceSeedStatus = 'complete';
+    attemptDevice.lastErrorMessage = null;
+    await attemptDevice.save();
+    return {
+      success: true,
+      device: toPublicDevice(attemptDevice),
+      response,
+    };
   }
 }
 

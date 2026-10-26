@@ -703,6 +703,7 @@ exports.approveCreditNote = async (req, res, next) => {
         responseNote = await EBMSalesService.submitCreditNote(note._id, {
           companyId,
           refundRsnCd,
+          modifierUserId: req.user.id || req.user._id,
         });
       } catch (ebmError) {
         console.error("EBM refund submission failed after credit note confirmation:", ebmError.message);
@@ -1782,6 +1783,7 @@ exports.confirmCreditNote = async (req, res, next) => {
         responseNote = await EBMSalesService.submitCreditNote(creditNote._id, {
           companyId,
           refundRsnCd,
+          modifierUserId: req.user.id || req.user._id,
         });
         await responseNote.populate(
           "lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry",
@@ -1859,6 +1861,7 @@ exports.submitCreditNoteEbm = async (req, res, next) => {
       responseNote = await EBMSalesService.submitCreditNote(note._id, {
         companyId,
         refundRsnCd,
+        modifierUserId: req.user.id || req.user._id,
       });
     } catch (ebmError) {
       console.error("EBM credit note submission failed:", ebmError.message);

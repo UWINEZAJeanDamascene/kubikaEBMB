@@ -17,6 +17,8 @@ const FIELD_MAP = {
   currency: { target: 'currency' },
   exchangeRate: { target: 'exchangeRate' },
   purchaseDate: { target: 'purchaseDate' },
+  supplierInvoiceNumber: { target: 'supplierInvoiceNumber' },
+  totalAmount: { target: 'totalAmount' },
 };
 
 module.exports = buildDocumentModel({

@@ -4,8 +4,35 @@
  * optional Prisma interactive transactions.
  */
 const { prisma } = require('../lib/prisma');
+const { MAX_VSDC_NUMBER, MAX_VSDC_NUMBER_BIGINT } = require('../constants/ebmFiscalNumber');
 
-const MAX_VSDC_NUMBER = 9999999999;
+// RRA declares these counters as NUMBER(38); keep the ceiling as text so it
+// never passes through JavaScript's imprecise Number representation.
+function parseExactInteger(value, { allowZero = false } = {}) {
+  let parsed;
+  try {
+    if (typeof value === 'bigint') parsed = value;
+    else if (typeof value === 'number' && Number.isSafeInteger(value)) parsed = BigInt(value);
+    else if (typeof value === 'string' && /^\d+$/.test(value.trim())) parsed = BigInt(value.trim());
+  } catch {
+    parsed = undefined;
+  }
+  const minimum = allowZero ? 0n : 1n;
+  if (parsed === undefined || parsed < minimum || parsed > MAX_VSDC_NUMBER_BIGINT) {
+    const error = new Error(`EBM fiscal sequence values must be whole numbers between ${minimum} and ${MAX_VSDC_NUMBER}.`);
+    error.code = 'EBM_FISCAL_SEQUENCE_INVALID';
+    error.retryable = false;
+    throw error;
+  }
+  return parsed;
+}
+
+function safeFiscalValue(value) {
+  const text = value && typeof value.toFixed === 'function'
+    ? value.toFixed(0)
+    : value.toString();
+  return BigInt(text) <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(text) : text;
+}
 
 /**
  * Sequence counters deliberately do NOT join the caller's ambient transaction
@@ -111,8 +138,8 @@ async function ensureMinSequence(companyId, name, year, minValue, tx = null) {
  * @param {string} companyId
  * @param {string} branchId  two-char branch code
  * @param {string} sequenceType  EbmSequenceType enum value
- * @param {{ seed?: number, seededFrom?: string|null, tx?: object }} [options]
- * @returns {Promise<number>}
+ * @param {{ seed?: number|string|bigint, seededFrom?: string|null, tx?: object }} [options]
+ * @returns {Promise<number|string>} Safe values remain numbers; larger fiscal numbers remain exact decimal strings.
  */
 async function allocateEbmSequence(companyId, branchId, sequenceType, options = {}) {
   const { seed = 0, seededFrom = null, tx = null } = options;
@@ -121,7 +148,8 @@ async function allocateEbmSequence(companyId, branchId, sequenceType, options = 
   const branch = String(branchId).padStart(2, '0').slice(-2);
   const type = String(sequenceType);
 
-  if (seed > 0) {
+  const seedValue = seed == null ? 0n : parseExactInteger(seed, { allowZero: true });
+  if (seedValue > 0n) {
     await c.$queryRawUnsafe(
       `INSERT INTO ebm_sequences
          (company_id, branch_id, sequence_type, last_number, seeded_from, seeded_at, created_at, updated_at)
@@ -130,7 +158,7 @@ async function allocateEbmSequence(companyId, branchId, sequenceType, options = 
       company,
       branch,
       type,
-      Number(seed),
+      seedValue.toString(),
       seededFrom,
     );
   }
@@ -141,30 +169,28 @@ async function allocateEbmSequence(companyId, branchId, sequenceType, options = 
      VALUES ($1, $2, $3::"EbmSequenceType", 1, NOW(), NOW())
      ON CONFLICT (company_id, branch_id, sequence_type)
      DO UPDATE SET last_number = ebm_sequences.last_number + 1, updated_at = NOW()
+     WHERE ebm_sequences.last_number < $4::numeric
      RETURNING last_number`,
     company,
     branch,
     type,
+    MAX_VSDC_NUMBER,
   );
-
-  const lastNumber = Number(rows[0].last_number);
-  if (lastNumber > MAX_VSDC_NUMBER) {
-    const error = new Error(
-      `EBM ${sequenceType} fiscal sequence exceeded VSDC NUMBER(10) capacity for branch ${branch}.`,
-    );
+  if (!rows.length) {
+    const error = new Error(`EBM ${sequenceType} fiscal sequence reached the VSDC NUMBER(38) limit for branch ${branch}.`);
     error.code = 'EBM_FISCAL_SEQUENCE_EXHAUSTED';
     error.retryable = false;
     throw error;
   }
-  return lastNumber;
+  return safeFiscalValue(rows[0].last_number);
 }
 
 /**
  * Seed EBM counters from VSDC init info ($max semantics).
  */
 async function seedEbmSequence(companyId, branchId, sequenceType, minValue, seededFrom = 'vsdc_init', tx = null) {
-  const min = Math.max(0, Number(minValue) || 0);
-  if (min <= 0) return min;
+  const min = minValue == null ? 0n : parseExactInteger(minValue, { allowZero: true });
+  if (min <= 0n) return min;
 
   const rows = await client(tx).$queryRawUnsafe(
     `INSERT INTO ebm_sequences
@@ -180,10 +206,10 @@ async function seedEbmSequence(companyId, branchId, sequenceType, minValue, seed
     String(companyId),
     String(branchId).padStart(2, '0').slice(-2),
     String(sequenceType),
-    min,
+    min.toString(),
     seededFrom,
   );
-  return Number(rows[0].last_number);
+  return safeFiscalValue(rows[0].last_number);
 }
 
 module.exports = {

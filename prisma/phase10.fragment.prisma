@@ -25,6 +25,7 @@
 // projects                   Project[]
 // ebmDevices                 EbmDevice[]
 // ebmCodes                   EbmCode[]
+// ebmCodeClasses             EbmCodeClass[]
 // ebmItemClasses             EbmItemClass[]
 // ebmNotices                 EbmNotice[]
 // ebmImportedItems           EbmImportedItem[]
@@ -909,12 +910,17 @@ model EbmDevice {
   companyId        String    @map("company_id") @db.Char(24)
   tin              String
   branchId         String    @map("branch_id") @db.VarChar(2)
+  environment      String    @default("mock") @db.VarChar(20)
   branchName       String?   @map("branch_name")
   branchRefId      String?   @map("branch_ref_id") @db.Char(24)
   deviceSerialNo   String    @map("device_serial_no")
   status           String    @default("not_initialized")
   initializedAt    DateTime? @map("initialized_at") @db.Timestamptz(3)
   lastAttemptAt    DateTime? @map("last_attempt_at") @db.Timestamptz(3)
+  lastRequestId    String?   @map("last_request_id") @db.VarChar(64)
+  sequenceSeedStatus String? @map("sequence_seed_status") @db.VarChar(20)
+  lastSuccessfulContactAt DateTime? @map("last_successful_contact_at") @db.Timestamptz(3)
+  lastSuccessfulFiscalAt  DateTime? @map("last_successful_fiscal_at") @db.Timestamptz(3)
   lastErrorMessage String?   @map("last_error_message")
   initializedMode  String?   @map("initialized_mode")
   lastAttemptMode  String?   @map("last_attempt_mode")
@@ -926,32 +932,64 @@ model EbmDevice {
 
   company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
-  @@unique([companyId, branchId, deviceSerialNo])
+  @@unique([companyId, branchId, deviceSerialNo, environment])
   @@index([companyId, branchId])
   @@index([companyId, status])
   @@map("ebm_devices")
 }
 
 model EbmCode {
-  id            String   @id @db.Char(24)
-  companyId     String   @map("company_id") @db.Char(24)
-  codeClass     String   @map("code_class")
-  codeClassName String?  @map("code_class_name")
-  code          String
-  name          String?
-  description   String?
-  sortOrder     Int      @default(0) @map("sort_order")
-  active        Boolean  @default(true)
-  source        Json     @default("{}")
-  lastSyncedAt  DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id                    String   @id @db.Char(24)
+  companyId             String   @map("company_id") @db.Char(24)
+  codeClass             String   @map("code_class")
+  codeClassName         String?  @map("code_class_name")
+  codeClassDescription  String?  @map("code_class_description")
+  classUserDefinedName1 String?  @map("class_user_defined_name_1")
+  classUserDefinedName2 String?  @map("class_user_defined_name_2")
+  classUserDefinedName3 String?  @map("class_user_defined_name_3")
+  codeClassUseYn        String?  @map("code_class_use_yn")
+  codeClassSource       Json     @default("{}") @map("code_class_source")
+  code                  String
+  name                  String?
+  description           String?
+  sortOrder             Int      @default(0) @map("sort_order")
+  userDefinedCode1      String?  @map("user_defined_code_1")
+  userDefinedCode2      String?  @map("user_defined_code_2")
+  userDefinedCode3      String?  @map("user_defined_code_3")
+  useYn                 String?  @map("use_yn")
+  active                Boolean  @default(true)
+  source                Json     @default("{}")
+  lastSyncedAt          DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
   @@unique([companyId, codeClass, code])
   @@index([companyId, codeClass, active])
   @@map("ebm_codes")
+}
+
+model EbmCodeClass {
+  id                    String   @id @db.Char(24)
+  companyId             String   @map("company_id") @db.Char(24)
+  codeClass             String   @map("code_class")
+  name                  String
+  description           String?
+  userDefinedName1      String?  @map("user_defined_name_1")
+  userDefinedName2      String?  @map("user_defined_name_2")
+  userDefinedName3      String?  @map("user_defined_name_3")
+  useYn                 String?  @map("use_yn")
+  active                Boolean  @default(true)
+  source                Json     @default("{}")
+  lastSyncedAt          DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company               Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, codeClass])
+  @@index([companyId, active])
+  @@map("ebm_code_classes")
 }
 
 model EbmItemClass {
@@ -963,6 +1001,8 @@ model EbmItemClass {
   parentCode     String?  @map("parent_code")
   taxTypeCode    String?  @map("tax_type_code")
   majorTarget    Boolean  @default(false) @map("major_target")
+  majorTargetYn  String?  @map("major_target_yn")
+  useYn          String?  @map("use_yn")
   active         Boolean  @default(true)
   source         Json     @default("{}")
   lastSyncedAt   DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
@@ -977,22 +1017,28 @@ model EbmItemClass {
   @@map("ebm_item_classes")
 }
 
-// Global RRA taxpayer registry — no companyId
+// Tenant and branch scoped RRA customer-TIN lookup cache.
 model EbmTin {
-  id           String   @id @db.Char(24)
-  tin          String   @unique
-  taxpayerName String   @map("taxpayer_name")
-  statusCode   String?  @map("status_code")
-  provinceName String?  @map("province_name")
-  districtName String?  @map("district_name")
-  active       Boolean  @default(true)
-  source       Json     @default("{}")
-  lastSyncedAt DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id                  String    @id @db.Char(24)
+  companyId           String?   @map("company_id") @db.Char(24)
+  branchId            String?   @map("branch_id") @db.VarChar(2)
+  tin                 String
+  taxpayerName        String    @map("taxpayer_name")
+  statusCode          String?   @map("status_code")
+  provinceName        String?   @map("province_name")
+  districtName        String?   @map("district_name")
+  sectorName          String?   @map("sector_name")
+  verificationMode    String?   @map("verification_mode")
+  active              Boolean   @default(true)
+  source              Json      @default("{}")
+  lastSyncedAt        DateTime  @default(now()) @map("last_synced_at") @db.Timestamptz(3)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company             Company?  @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
-  @@index([tin, taxpayerName])
-  @@index([active])
+  @@unique([companyId, branchId, tin])
+  @@index([companyId, branchId, tin, taxpayerName])
+  @@index([companyId, branchId, active])
   @@map("ebm_tins")
 }
 
@@ -1002,6 +1048,8 @@ model EbmNotice {
   noticeNumber String   @map("notice_number")
   title        String?
   content      String?
+  detailUrl    String?  @map("detail_url")
+  registrantName String? @map("registrant_name")
   noticeDate   String?  @map("notice_date")
   active       Boolean  @default(true)
   source       Json     @default("{}")

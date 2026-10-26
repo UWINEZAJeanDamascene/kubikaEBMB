@@ -14,7 +14,14 @@ const FIELD_MAP = {
   companyId: { target: 'companyId', isId: true },
   itemClassCode: { target: 'itemClassCode' },
   itemClassName: { target: 'itemClassName' },
+  itemClassLevel: { target: 'itemClassLevel' },
+  parentCode: { target: 'parentCode' },
+  taxTypeCode: { target: 'taxTypeCode' },
+  majorTarget: { target: 'majorTarget' },
+  majorTargetYn: { target: 'majorTargetYn' },
+  useYn: { target: 'useYn' },
   active: { target: 'active' },
+  source: { target: 'source' },
   lastSyncedAt: { target: 'lastSyncedAt' },
 };
 

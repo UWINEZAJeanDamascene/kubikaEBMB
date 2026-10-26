@@ -153,7 +153,11 @@ function invoiceLineToApi(row) {
       _id: row.product.id,
       name: row.product.name,
       sku: row.product.sku,
+      barcode: row.product.barcode ?? null,
       unit: row.product.unit,
+      ebm: row.product.ebm ?? {},
+      ...(row.product.taxCode != null ? { taxCode: row.product.taxCode } : {}),
+      ...(row.product.taxRate != null ? { taxRate: qtyNum(row.product.taxRate) } : {}),
       ...(row.product.trackingType != null ? { trackingType: row.product.trackingType } : {}),
       ...(row.product.isStockable != null ? { isStockable: row.product.isStockable } : {}),
     };
@@ -1729,6 +1733,7 @@ const GRN_HEADER = {
   confirmedBy: 'confirmedById',
   confirmedAt: 'confirmedAt',
   freight: 'freight',
+  ebmImportReference: 'ebmImportReference',
 };
 
 function grnTranslateCreate(data) {

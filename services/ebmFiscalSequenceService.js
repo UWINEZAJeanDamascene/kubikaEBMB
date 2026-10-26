@@ -3,11 +3,16 @@ const {
   allocateEbmSequence,
   seedEbmSequence,
 } = require('./postgresSequenceStore');
+const { prisma } = require('../lib/prisma');
 
 const EBM_SEQUENCE_TYPES = Object.freeze({
   SALES_INVOICE: 'sales_invoice',
+  PURCHASE_INVOICE: 'purchase_invoice',
   RECEIPT: 'receipt',
   REPORT: 'report',
+  TRAINING_INVOICE: 'training_invoice',
+  PROFORMA_INVOICE: 'proforma_invoice',
+  COPY_INVOICE: 'copy_invoice',
   STOCK_SAR: 'stock_sar',
 });
 
@@ -17,9 +22,47 @@ function normalizeBranchId(value) {
 }
 
 function toPositiveInteger(value, fallback = null) {
-  const parsed = parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
-  return Math.min(parsed, MAX_VSDC_NUMBER);
+  if (value === null || value === undefined || value === '') return fallback;
+  const parsed = typeof value === 'bigint'
+    ? value
+    : typeof value === 'number' && Number.isSafeInteger(value)
+      ? BigInt(value)
+      : typeof value === 'string' && /^\d+$/.test(value.trim())
+        ? BigInt(value.trim())
+        : null;
+  if (parsed === null || parsed < 1n) return fallback;
+  if (parsed > BigInt(MAX_VSDC_NUMBER)) {
+    const error = new Error('The VSDC initialization counter exceeds the sequence range supported by this application.');
+    error.code = 'EBM_INIT_SEQUENCE_UNSUPPORTED';
+    error.retryable = false;
+    throw error;
+  }
+  return parsed <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(parsed) : parsed.toString();
+}
+
+function parseInitCounter(value, field) {
+  if (value === null || value === undefined || value === '') return 0n;
+  let parsed;
+  try {
+    if (typeof value === 'bigint') parsed = value;
+    else if (typeof value === 'number' && Number.isSafeInteger(value)) parsed = BigInt(value);
+    else if (typeof value === 'string' && /^\d+$/.test(value.trim())) parsed = BigInt(value.trim());
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed === undefined || parsed === null || parsed < 0n) {
+    const error = new Error(`VSDC initialization returned an invalid ${field} counter.`);
+    error.code = 'EBM_INIT_SEQUENCE_INVALID';
+    error.retryable = false;
+    throw error;
+  }
+  if (parsed > BigInt(MAX_VSDC_NUMBER)) {
+    const error = new Error(`VSDC initialization ${field} exceeds the fiscal sequence range supported by this application.`);
+    error.code = 'EBM_INIT_SEQUENCE_UNSUPPORTED';
+    error.retryable = false;
+    throw error;
+  }
+  return parsed;
 }
 
 async function allocate(companyId, branchId, sequenceType, options = {}) {
@@ -33,23 +76,28 @@ async function allocate(companyId, branchId, sequenceType, options = {}) {
 
 async function seedFromInitInfo(companyId, branchId, initInfo = {}) {
   const normalizedBranchId = normalizeBranchId(branchId);
-  const salesInvoiceSeed = Math.max(
-    toPositiveInteger(initInfo.lastSaleInvcNo, 0) || 0,
-    toPositiveInteger(initInfo.lastInvcNo, 0) || 0,
-  );
-  const receiptSeed = toPositiveInteger(initInfo.lastSaleRcptNo, 0) || 0;
+  const salesInvoiceSeed = [
+    parseInitCounter(initInfo.lastSaleInvcNo, 'lastSaleInvcNo'),
+    parseInitCounter(initInfo.lastInvcNo, 'lastInvcNo'),
+  ].reduce((max, value) => (value > max ? value : max), 0n);
+  const receiptSeed = parseInitCounter(initInfo.lastSaleRcptNo, 'lastSaleRcptNo');
 
   const seeds = [
     [EBM_SEQUENCE_TYPES.SALES_INVOICE, salesInvoiceSeed],
+    [EBM_SEQUENCE_TYPES.PURCHASE_INVOICE, parseInitCounter(initInfo.lastPchsInvcNo, 'lastPchsInvcNo')],
     [EBM_SEQUENCE_TYPES.RECEIPT, receiptSeed],
     [EBM_SEQUENCE_TYPES.REPORT, receiptSeed],
-  ].filter(([, seed]) => seed > 0);
+    [EBM_SEQUENCE_TYPES.TRAINING_INVOICE, parseInitCounter(initInfo.lastTrainInvcNo, 'lastTrainInvcNo')],
+    [EBM_SEQUENCE_TYPES.PROFORMA_INVOICE, parseInitCounter(initInfo.lastProfrmInvcNo, 'lastProfrmInvcNo')],
+    [EBM_SEQUENCE_TYPES.COPY_INVOICE, parseInitCounter(initInfo.lastCopyInvcNo, 'lastCopyInvcNo')],
+  ].filter(([, seed]) => seed > 0n);
 
-  await Promise.all(
+  if (!seeds.length) return;
+  await prisma.$transaction((tx) => Promise.all(
     seeds.map(([sequenceType, seed]) =>
-      seedEbmSequence(companyId, normalizedBranchId, sequenceType, seed, 'vsdc_init'),
+      seedEbmSequence(companyId, normalizedBranchId, sequenceType, seed, 'vsdc_init', tx),
     ),
-  );
+  ));
 }
 
 function getFiscalField(doc, field) {

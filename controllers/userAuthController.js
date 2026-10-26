@@ -11,6 +11,10 @@ const passwordUtils = require('../utils/passwordUtils');
 const sessionService = require('../services/sessionService');
 const env = require('../src/config/environment');
 const config = env.getConfig();
+const Warehouse = require('../models/Warehouse');
+const EBMBranchService = require('../services/ebmBranchService');
+const { toIdString } = require('../utils/objectId');
+const { userToApi } = require('../utils/authMappers');
 
 // Generate JWT Token
 const generateToken = (id, companyId, role) => {
@@ -190,6 +194,16 @@ exports.inviteUser = async (req, res, next) => {
       });
     }
 
+    const assignedBranch = Object.prototype.hasOwnProperty.call(req.body, 'branch')
+      ? req.body.branch
+      : req.body.defaultWarehouse;
+    const branch = assignedBranch
+      ? await Warehouse.findOne({ _id: assignedBranch, company: companyId })
+      : null;
+    if (assignedBranch && !branch) {
+      return res.status(400).json({ success: false, code: 'INVALID_BRANCH', message: 'Select a branch in this company' });
+    }
+
     const result = await UserService.inviteUserToCompany(req.user.id, {
       email,
       companyId,
@@ -198,12 +212,29 @@ exports.inviteUser = async (req, res, next) => {
       departmentId,
     });
 
+    if (assignedBranch) {
+      await prisma.user.update({
+        where: { id: result.user._id, companyId: toIdString(companyId) },
+        data: { branchId: toIdString(assignedBranch) },
+      });
+      result.user.branch = toIdString(assignedBranch);
+      if (branch.rraBranchId) {
+        result.branchUserSubmission = await EBMBranchService.submitBranchUsers(companyId, branch.rraBranchId, req.user);
+        result.user = await prisma.user.findFirst({
+          where: { id: result.user._id, companyId: toIdString(companyId) },
+          include: { roles: { include: { role: true } } },
+        });
+        result.user = userToApi(result.user);
+      }
+    }
+
     res.status(201).json({
       success: true,
       data: result.user,
       isNewUser: result.isNewUser,
       invitationEmailSent: result.invitationEmailSent,
       message: result.message,
+      ...(result.branchUserSubmission ? { branchUserSubmission: result.branchUserSubmission } : {}),
     });
   } catch (error) {
     if (error.code === 'P2002') {

@@ -316,7 +316,7 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
 
   if (!submitEbm) return invoice;
   try {
-    return await EBMSalesService.submitInvoice(invoice._id, { companyId });
+    return await EBMSalesService.submitInvoice(invoice._id, { companyId, modifierUserId: userId });
   } catch (error) {
     console.error('EBM sales submission failed after invoice confirmation:', error.message);
     return error.invoice || Invoice.findOne({ _id: invoice._id, company: companyId })

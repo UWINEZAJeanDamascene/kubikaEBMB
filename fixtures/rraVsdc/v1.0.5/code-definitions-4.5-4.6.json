@@ -1,0 +1,694 @@
+{
+  "source": {
+    "documentId": "RRA_VSDC_DOC_v1.0.5",
+    "version": "1.0.5",
+    "sha256": "25DF854736B60E7E4EB128BF99904813C5D96ACF99464B7B48F23C7FAB3DF9C1",
+    "printedPages": {
+      "4.5": "64",
+      "4.6": "65"
+    },
+    "physicalPdfPages": {
+      "4.5": "68",
+      "4.6": "69"
+    }
+  },
+  "classifications": [
+    {
+      "codeClass": "17",
+      "codeClassName": "Packaging Unit",
+      "details": [
+        {
+          "code": "AM",
+          "sortOrder": 1,
+          "name": "Ampoule",
+          "description": "Ampoule",
+          "remark": ""
+        },
+        {
+          "code": "BA",
+          "sortOrder": 2,
+          "name": "Barrel",
+          "description": "Barrel",
+          "remark": ""
+        },
+        {
+          "code": "BC",
+          "sortOrder": 3,
+          "name": "Bottlecrate",
+          "description": "Bottlecrate",
+          "remark": ""
+        },
+        {
+          "code": "BE",
+          "sortOrder": 4,
+          "name": "Bundle",
+          "description": "Bundle",
+          "remark": ""
+        },
+        {
+          "code": "BF",
+          "sortOrder": 5,
+          "name": "Balloon, non-protected",
+          "description": "Balloon, non-protected",
+          "remark": ""
+        },
+        {
+          "code": "BG",
+          "sortOrder": 6,
+          "name": "Bag",
+          "description": "Bag",
+          "remark": ""
+        },
+        {
+          "code": "BJ",
+          "sortOrder": 7,
+          "name": "Bucket",
+          "description": "Bucket",
+          "remark": ""
+        },
+        {
+          "code": "BK",
+          "sortOrder": 8,
+          "name": "Basket",
+          "description": "Basket",
+          "remark": ""
+        },
+        {
+          "code": "BL",
+          "sortOrder": 9,
+          "name": "Bale",
+          "description": "Bale",
+          "remark": ""
+        },
+        {
+          "code": "BQ",
+          "sortOrder": 10,
+          "name": "Bottle, protected cylindrical",
+          "description": "Bottle, protected cylindrical",
+          "remark": ""
+        },
+        {
+          "code": "BR",
+          "sortOrder": 11,
+          "name": "Bar",
+          "description": "Bar",
+          "remark": ""
+        },
+        {
+          "code": "BV",
+          "sortOrder": 12,
+          "name": "Bottle, bulbous",
+          "description": "Bottle, bulbous",
+          "remark": ""
+        },
+        {
+          "code": "BZ",
+          "sortOrder": 13,
+          "name": "Bag",
+          "description": "Bag",
+          "remark": ""
+        },
+        {
+          "code": "CA",
+          "sortOrder": 14,
+          "name": "Can",
+          "description": "Can",
+          "remark": ""
+        },
+        {
+          "code": "CH",
+          "sortOrder": 15,
+          "name": "Chest",
+          "description": "Chest",
+          "remark": ""
+        },
+        {
+          "code": "CJ",
+          "sortOrder": 16,
+          "name": "Coffin",
+          "description": "Coffin",
+          "remark": ""
+        },
+        {
+          "code": "CL",
+          "sortOrder": 17,
+          "name": "Coil",
+          "description": "Coil",
+          "remark": ""
+        },
+        {
+          "code": "CR",
+          "sortOrder": 18,
+          "name": "Wooden Box, Wooden Case",
+          "description": "Wooden Box, Wooden Case",
+          "remark": ""
+        },
+        {
+          "code": "CS",
+          "sortOrder": 19,
+          "name": "Cassette",
+          "description": "Cassette",
+          "remark": ""
+        },
+        {
+          "code": "CT",
+          "sortOrder": 20,
+          "name": "Carton",
+          "description": "Carton",
+          "remark": ""
+        },
+        {
+          "code": "CTN",
+          "sortOrder": 21,
+          "name": "Container",
+          "description": "Container",
+          "remark": ""
+        },
+        {
+          "code": "CY",
+          "sortOrder": 22,
+          "name": "Cylinder",
+          "description": "Cylinder",
+          "remark": ""
+        },
+        {
+          "code": "DR",
+          "sortOrder": 23,
+          "name": "Drum",
+          "description": "Drum",
+          "remark": ""
+        },
+        {
+          "code": "GT",
+          "sortOrder": 24,
+          "name": "Extra Countable Item",
+          "description": "Extra Countable Item",
+          "remark": ""
+        },
+        {
+          "code": "HH",
+          "sortOrder": 25,
+          "name": "Hand Baggage",
+          "description": "Hand Baggage",
+          "remark": ""
+        },
+        {
+          "code": "IZ",
+          "sortOrder": 26,
+          "name": "Ingots",
+          "description": "Ingots",
+          "remark": ""
+        },
+        {
+          "code": "JR",
+          "sortOrder": 27,
+          "name": "Jar",
+          "description": "Jar",
+          "remark": ""
+        },
+        {
+          "code": "JU",
+          "sortOrder": 28,
+          "name": "Jug",
+          "description": "Jug",
+          "remark": ""
+        },
+        {
+          "code": "JY",
+          "sortOrder": 29,
+          "name": "Jerry CAN Cylindrical",
+          "description": "Jerry CAN Cylindrical",
+          "remark": ""
+        },
+        {
+          "code": "KZ",
+          "sortOrder": 30,
+          "name": "Canester",
+          "description": "Canester",
+          "remark": ""
+        },
+        {
+          "code": "LZ",
+          "sortOrder": 31,
+          "name": "Logs, in bundle/bunch/truss",
+          "description": "Logs, in bundle/bunch/truss",
+          "remark": ""
+        },
+        {
+          "code": "NT",
+          "sortOrder": 32,
+          "name": "Net",
+          "description": "Net",
+          "remark": ""
+        },
+        {
+          "code": "OU",
+          "sortOrder": 33,
+          "name": "Non-Exterior Packaging Unit",
+          "description": "Non-Exterior Packaging Unit",
+          "remark": ""
+        },
+        {
+          "code": "PD",
+          "sortOrder": 34,
+          "name": "Poddon",
+          "description": "Poddon",
+          "remark": ""
+        },
+        {
+          "code": "PG",
+          "sortOrder": 35,
+          "name": "Plate",
+          "description": "Plate",
+          "remark": ""
+        },
+        {
+          "code": "PI",
+          "sortOrder": 36,
+          "name": "Pipe",
+          "description": "Pipe",
+          "remark": ""
+        },
+        {
+          "code": "PO",
+          "sortOrder": 37,
+          "name": "Pilot",
+          "description": "Pilot",
+          "remark": ""
+        },
+        {
+          "code": "PU",
+          "sortOrder": 38,
+          "name": "Traypack",
+          "description": "Traypack",
+          "remark": ""
+        },
+        {
+          "code": "RL",
+          "sortOrder": 39,
+          "name": "Reel",
+          "description": "Reel",
+          "remark": ""
+        },
+        {
+          "code": "RO",
+          "sortOrder": 40,
+          "name": "Roll",
+          "description": "Roll",
+          "remark": ""
+        },
+        {
+          "code": "RZ",
+          "sortOrder": 41,
+          "name": "Rods, in bundle/bunch/truss",
+          "description": "Rods, in bundle/bunch/truss",
+          "remark": ""
+        },
+        {
+          "code": "SK",
+          "sortOrder": 42,
+          "name": "Skeletoncase",
+          "description": "Skeletoncase",
+          "remark": ""
+        },
+        {
+          "code": "TY",
+          "sortOrder": 43,
+          "name": "Tank, cylindrical",
+          "description": "Tank, cylindrical",
+          "remark": ""
+        },
+        {
+          "code": "VG",
+          "sortOrder": 44,
+          "name": "Bulk,gas(at 1031 mbar 15 oC)",
+          "description": "Bulk,gas(at 1031 mbar 15 oC)",
+          "remark": ""
+        },
+        {
+          "code": "VL",
+          "sortOrder": 45,
+          "name": "Bulk,liquid(at normal temperature/pressure)",
+          "description": "Bulk,liquid(at normal temperature/pressure)",
+          "remark": ""
+        },
+        {
+          "code": "VO",
+          "sortOrder": 46,
+          "name": "Bulk, solid, large particles(nodules)",
+          "description": "Bulk, solid, large particles(\"nodules\")",
+          "remark": ""
+        },
+        {
+          "code": "VQ",
+          "sortOrder": 47,
+          "name": "Bulk, gas (liquefied at abnormal temperature/pressure)",
+          "description": "Bulk, gas(liquefied at abnormal temperature/pressure)",
+          "remark": ""
+        },
+        {
+          "code": "VR",
+          "sortOrder": 48,
+          "name": "Bulk, solid, granular particles(grains)",
+          "description": "Bulk, solid, granular particles(\"grains\")",
+          "remark": ""
+        },
+        {
+          "code": "VT",
+          "sortOrder": 49,
+          "name": "Extra Bulk Item",
+          "description": "Extra Bulk Item",
+          "remark": ""
+        },
+        {
+          "code": "VY",
+          "sortOrder": 50,
+          "name": "Bulk, fine particles(powder)",
+          "description": "Bulk, fine particles(\"powder\")",
+          "remark": ""
+        },
+        {
+          "code": "ML",
+          "sortOrder": 51,
+          "name": "Mills cigarette",
+          "description": "Mills",
+          "remark": ""
+        },
+        {
+          "code": "TN",
+          "sortOrder": 52,
+          "name": "TAN",
+          "description": "1TAN REFER TO 20BAGS",
+          "remark": ""
+        }
+      ]
+    },
+    {
+      "codeClass": "10",
+      "codeClassName": "Unit of Quantity",
+      "details": [
+        {
+          "code": "4B",
+          "sortOrder": 1,
+          "name": "Pair",
+          "description": "Pair",
+          "remark": ""
+        },
+        {
+          "code": "AV",
+          "sortOrder": 2,
+          "name": "Cap",
+          "description": "Cap",
+          "remark": ""
+        },
+        {
+          "code": "BA",
+          "sortOrder": 3,
+          "name": "Barrel",
+          "description": "Barrel",
+          "remark": ""
+        },
+        {
+          "code": "BE",
+          "sortOrder": 4,
+          "name": "bundle",
+          "description": "bundle",
+          "remark": ""
+        },
+        {
+          "code": "BG",
+          "sortOrder": 5,
+          "name": "bag",
+          "description": "bag",
+          "remark": ""
+        },
+        {
+          "code": "BL",
+          "sortOrder": 6,
+          "name": "block",
+          "description": "block",
+          "remark": ""
+        },
+        {
+          "code": "BLL",
+          "sortOrder": 7,
+          "name": "BLL Barrel",
+          "description": "BLL Barrel (petroleum) (158,987 dm3)",
+          "remark": ""
+        },
+        {
+          "code": "BX",
+          "sortOrder": 8,
+          "name": "box",
+          "description": "box",
+          "remark": ""
+        },
+        {
+          "code": "CA",
+          "sortOrder": 9,
+          "name": "Can",
+          "description": "Can",
+          "remark": ""
+        },
+        {
+          "code": "CEL",
+          "sortOrder": 10,
+          "name": "Cell",
+          "description": "Cell",
+          "remark": ""
+        },
+        {
+          "code": "CMT",
+          "sortOrder": 11,
+          "name": "centimetre",
+          "description": "centimetre",
+          "remark": ""
+        },
+        {
+          "code": "CR",
+          "sortOrder": 12,
+          "name": "CARAT",
+          "description": "CARAT",
+          "remark": ""
+        },
+        {
+          "code": "DR",
+          "sortOrder": 13,
+          "name": "Drum",
+          "description": "Drum",
+          "remark": ""
+        },
+        {
+          "code": "DZ",
+          "sortOrder": 14,
+          "name": "Dozen",
+          "description": "Dozen",
+          "remark": ""
+        },
+        {
+          "code": "GLL",
+          "sortOrder": 15,
+          "name": "Gallon",
+          "description": "Gallon",
+          "remark": ""
+        },
+        {
+          "code": "GRM",
+          "sortOrder": 16,
+          "name": "Gram",
+          "description": "Gram",
+          "remark": ""
+        },
+        {
+          "code": "GRO",
+          "sortOrder": 17,
+          "name": "Gross",
+          "description": "Gross",
+          "remark": ""
+        },
+        {
+          "code": "KG",
+          "sortOrder": 18,
+          "name": "Kilo-Gramme",
+          "description": "Kilo-Gramme",
+          "remark": ""
+        },
+        {
+          "code": "KTM",
+          "sortOrder": 19,
+          "name": "kilometre",
+          "description": "kilometre",
+          "remark": ""
+        },
+        {
+          "code": "KWT",
+          "sortOrder": 20,
+          "name": "kilowatt",
+          "description": "kilowatt",
+          "remark": ""
+        },
+        {
+          "code": "L",
+          "sortOrder": 21,
+          "name": "Litre",
+          "description": "Litre",
+          "remark": ""
+        },
+        {
+          "code": "LBR",
+          "sortOrder": 22,
+          "name": "pound",
+          "description": "pound",
+          "remark": ""
+        },
+        {
+          "code": "LK",
+          "sortOrder": 23,
+          "name": "link",
+          "description": "link",
+          "remark": ""
+        },
+        {
+          "code": "LTR",
+          "sortOrder": 24,
+          "name": "Litre",
+          "description": "Litre",
+          "remark": ""
+        },
+        {
+          "code": "M",
+          "sortOrder": 25,
+          "name": "Metre",
+          "description": "Metre",
+          "remark": ""
+        },
+        {
+          "code": "M2",
+          "sortOrder": 26,
+          "name": "Square Metre",
+          "description": "Square Metre",
+          "remark": ""
+        },
+        {
+          "code": "M3",
+          "sortOrder": 27,
+          "name": "Cubic Metre",
+          "description": "Cubic Metre",
+          "remark": ""
+        },
+        {
+          "code": "MGM",
+          "sortOrder": 28,
+          "name": "milligram",
+          "description": "milligram",
+          "remark": ""
+        },
+        {
+          "code": "MTR",
+          "sortOrder": 29,
+          "name": "metre",
+          "description": "metre",
+          "remark": ""
+        },
+        {
+          "code": "MWT",
+          "sortOrder": 30,
+          "name": "megawatt hour (1000 kW.h)",
+          "description": "megawatt hour (1000 kW.h)",
+          "remark": ""
+        },
+        {
+          "code": "NO",
+          "sortOrder": 31,
+          "name": "Number",
+          "description": "Number",
+          "remark": ""
+        },
+        {
+          "code": "NX",
+          "sortOrder": 32,
+          "name": "part per thousand",
+          "description": "part per thousand",
+          "remark": ""
+        },
+        {
+          "code": "PA",
+          "sortOrder": 33,
+          "name": "packet",
+          "description": "packet",
+          "remark": ""
+        },
+        {
+          "code": "PG",
+          "sortOrder": 34,
+          "name": "plate",
+          "description": "plate",
+          "remark": ""
+        },
+        {
+          "code": "PR",
+          "sortOrder": 35,
+          "name": "pair",
+          "description": "pair",
+          "remark": ""
+        },
+        {
+          "code": "RL",
+          "sortOrder": 36,
+          "name": "reel",
+          "description": "reel",
+          "remark": ""
+        },
+        {
+          "code": "RO",
+          "sortOrder": 37,
+          "name": "roll",
+          "description": "roll",
+          "remark": ""
+        },
+        {
+          "code": "SET",
+          "sortOrder": 38,
+          "name": "set",
+          "description": "set",
+          "remark": ""
+        },
+        {
+          "code": "ST",
+          "sortOrder": 39,
+          "name": "sheet",
+          "description": "sheet",
+          "remark": ""
+        },
+        {
+          "code": "TNE",
+          "sortOrder": 40,
+          "name": "tonne (metric ton)",
+          "description": "tonne (metric ton)",
+          "remark": ""
+        },
+        {
+          "code": "TU",
+          "sortOrder": 41,
+          "name": "tube",
+          "description": "tube",
+          "remark": ""
+        },
+        {
+          "code": "U",
+          "sortOrder": 42,
+          "name": "Pieces/item [Number]",
+          "description": "Pieces/item [Number]",
+          "remark": ""
+        },
+        {
+          "code": "YRD",
+          "sortOrder": 43,
+          "name": "yard",
+          "description": "yard",
+          "remark": ""
+        }
+      ]
+    }
+  ]
+}

@@ -14,7 +14,7 @@ const STANDARD_DOC_FIELD_MAP = {
   updatedAt: { target: 'updatedAt' },
 };
 
-const DEFAULT_PRODUCT_SELECT = { id: true, name: true, sku: true, unit: true, isStockable: true, trackingType: true, taxCode: true, taxRate: true };
+const DEFAULT_PRODUCT_SELECT = { id: true, name: true, sku: true, barcode: true, unit: true, isStockable: true, trackingType: true, taxCode: true, taxRate: true, ebm: true };
 
 const CLIENT_SELECT_FIELDS = new Set([
   'name', 'code', 'type', 'contact', 'taxId', 'paymentTerms', 'isActive',
@@ -29,7 +29,7 @@ const WAREHOUSE_SELECT_FIELDS = new Set([
   'name', 'code', 'location', 'isActive', 'address', 'rraBranchId',
 ]);
 const PRODUCT_SELECT_FIELDS = new Set([
-  'name', 'sku', 'unit', 'taxRate', 'taxCode', 'trackingType', 'isStockable',
+  'name', 'sku', 'barcode', 'unit', 'taxRate', 'taxCode', 'trackingType', 'isStockable', 'ebm',
   'isActive', 'currentStock', 'sellingPrice', 'costPrice',
 ]);
 

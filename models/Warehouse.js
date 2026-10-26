@@ -22,12 +22,14 @@ const FIELD_MAP = {
   customFields: { target: 'customFields' },
   rraBranchId: { target: 'rraBranchId' },
   ebmRegistrationStatus: { target: 'ebmRegistrationStatus' },
+  ebmRegistrationMode: { target: 'ebmRegistrationMode' },
   ebmRegisteredAt: { target: 'ebmRegisteredAt' },
   ebmLastAttemptAt: { target: 'ebmLastAttemptAt' },
   ebmRegistrationError: { target: 'ebmRegistrationError' },
   ebmUsersSubmitted: { target: 'ebmUsersSubmitted' },
   ebmInsurances: { target: 'ebmInsurances' },
   ebmInsuranceSubmitted: { target: 'ebmInsuranceSubmitted' },
+  ebmInsuranceSubmissions: { target: 'ebmInsuranceSubmissions' },
 };
 
 module.exports = buildTenantModel({

@@ -5,6 +5,10 @@ const {
   extractInitInfo,
   mapVsdcErrorCode,
 } = require('../utils/vsdcPayloadSanitizer');
+const VSDC_1_0_5_CODE_DEFINITION_4_1_TO_4_3 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.1-4.3.json');
+const VSDC_1_0_5_CODE_DEFINITION_4_4 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.4.json');
+const VSDC_1_0_5_CODE_DEFINITION_4_7_TO_4_10 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.7-4.10.json');
+const { preserveImportDecimalPrecision } = require('../utils/ebmImportResponseParser');
 
 const EBM_MODES = Object.freeze({
   MOCK: 'mock',
@@ -312,7 +316,11 @@ class EBMService {
 
     const wirePayload = sanitizeForEndpoint(endpoint, payload);
     try {
-      const { data } = await this.http.post(endpoint, wirePayload);
+      const isImportSelection = endpoint === VSDC_ENDPOINTS.SELECT_IMPORT_ITEMS;
+      const requestConfig = isImportSelection
+        ? { responseType: 'text', transformResponse: [preserveImportDecimalPrecision] }
+        : undefined;
+      const { data } = await this.http.post(endpoint, wirePayload, requestConfig);
       return normalizeVsdcResponse(data, this.mode, endpoint, payload);
     } catch (error) {
       if (error instanceof EBMServiceError) throw error;
@@ -372,18 +380,47 @@ class EBMService {
       }
 
       case VSDC_ENDPOINTS.SELECT_CODES:
+        const codeDefinitionClasses = VSDC_1_0_5_CODE_DEFINITION_4_1_TO_4_3.classifications.map((classification) => ({
+          cdCls: classification.codeClass,
+          cdClsNm: classification.codeClassName,
+          dtlList: classification.details.map((detail) => ({
+            cd: detail.code,
+            cdNm: detail.name,
+            cdDesc: detail.description,
+            useYn: 'Y',
+            srtOrd: detail.sortOrder,
+          })),
+        }));
+        const nationClass = VSDC_1_0_5_CODE_DEFINITION_4_4.classifications.map((classification) => ({
+          cdCls: classification.codeClass,
+          cdClsNm: classification.codeClassName,
+          cdClsDesc: 'Nation',
+          useYn: 'Y',
+          dtlList: classification.details.map((detail) => ({
+            cd: detail.code,
+            cdNm: detail.name,
+            cdDesc: detail.description,
+            useYn: 'Y',
+            srtOrd: detail.sortOrder,
+          })),
+        }));
+        const fiscalCodeClasses = VSDC_1_0_5_CODE_DEFINITION_4_7_TO_4_10.classifications.map((classification) => ({
+          cdCls: classification.codeClass,
+          cdClsNm: classification.codeClassName,
+          useYn: 'Y',
+          dtlList: classification.details.map((detail) => ({
+            cd: detail.code,
+            cdNm: detail.name,
+            cdDesc: detail.description,
+            useYn: 'Y',
+            srtOrd: detail.sortOrder,
+          })),
+        }));
         return makeSuccessResponse({
           clsList: [
-            {
-              cdCls: '04',
-              cdClsNm: 'Tax Type',
-              dtlList: [
-                { cd: 'A', cdNm: 'A-EX', cdDesc: 'A-EX', useYn: 'Y' },
-                { cd: 'B', cdNm: 'B-18.00%', cdDesc: 'B-18.00%', useYn: 'Y' },
-                { cd: 'C', cdNm: 'C', cdDesc: 'C', useYn: 'Y' },
-                { cd: 'D', cdNm: 'D', cdDesc: 'D', useYn: 'Y' },
-              ],
-            },
+            ...codeDefinitionClasses,
+            ...nationClass,
+            ...fiscalCodeClasses,
             {
               cdCls: '17',
               cdClsNm: 'Packaging Unit',
@@ -400,29 +437,6 @@ class EBMService {
                 { cd: 'KGM', cdNm: 'Kilogram', cdDesc: 'Kilogram', useYn: 'Y' },
               ],
             },
-            {
-              cdCls: '33',
-              cdClsNm: 'Currency',
-              dtlList: [
-                { cd: 'RWF', cdNm: 'Rwandan franc', cdDesc: 'Rwandan franc', useYn: 'Y' },
-              ],
-            },
-            { cdCls: '05', cdClsNm: 'Transaction Type', dtlList: [
-              { cd: 'N', cdNm: 'Normal', cdDesc: 'Normal sale', useYn: 'Y' },
-              { cd: 'C', cdNm: 'Copy', cdDesc: 'Copy invoice', useYn: 'Y' },
-              { cd: 'D', cdNm: 'Debit Note', cdDesc: 'Debit note', useYn: 'Y' },
-            ] },
-            { cdCls: '06', cdClsNm: 'Receipt Type', dtlList: [
-              { cd: 'S', cdNm: 'Sale', cdDesc: 'Sale receipt', useYn: 'Y' },
-              { cd: 'R', cdNm: 'Refund', cdDesc: 'Refund receipt', useYn: 'Y' },
-              { cd: 'P', cdNm: 'Proforma', cdDesc: 'Proforma invoice', useYn: 'Y' },
-              { cd: 'C', cdNm: 'Copy', cdDesc: 'Copy invoice', useYn: 'Y' },
-            ] },
-            { cdCls: '07', cdClsNm: 'Payment Method', dtlList: [
-              { cd: '01', cdNm: 'Cash', cdDesc: 'Cash', useYn: 'Y' },
-              { cd: '02', cdNm: 'Credit', cdDesc: 'Credit', useYn: 'Y' },
-              { cd: '05', cdNm: 'Mobile Money', cdDesc: 'Mobile money', useYn: 'Y' },
-            ] },
             { cdCls: '09', cdClsNm: 'Refund Reason', dtlList: [
               { cd: '01', cdNm: 'Customer cancellation', cdDesc: 'Customer cancellation', useYn: 'Y' },
               { cd: '02', cdNm: 'Wrong item', cdDesc: 'Wrong item', useYn: 'Y' },
@@ -436,18 +450,6 @@ class EBMService {
               { cd: '01', cdNm: 'Sale', cdDesc: 'Sale issue', useYn: 'Y' },
               { cd: '04', cdNm: 'Adjustment', cdDesc: 'Stock adjustment out', useYn: 'Y' },
             ] },
-            { cdCls: '13', cdClsNm: 'Country', dtlList: [
-              { cd: 'RW', cdNm: 'Rwanda', cdDesc: 'Rwanda', useYn: 'Y' },
-              { cd: 'KE', cdNm: 'Kenya', cdDesc: 'Kenya', useYn: 'Y' },
-            ] },
-            { cdCls: '14', cdClsNm: 'Taxpayer Status', dtlList: [
-              { cd: 'A', cdNm: 'Active', cdDesc: 'Active taxpayer', useYn: 'Y' },
-              { cd: 'D', cdNm: 'Dormant', cdDesc: 'Dormant taxpayer', useYn: 'Y' },
-            ] },
-            { cdCls: '15', cdClsNm: 'Product Type', dtlList: [
-              { cd: '1', cdNm: 'Raw Material', cdDesc: 'Raw material', useYn: 'Y' },
-              { cd: '2', cdNm: 'Finished Product', cdDesc: 'Finished product', useYn: 'Y' },
-            ] },
             { cdCls: '16', cdClsNm: 'Registration Type', dtlList: [
               { cd: 'A', cdNm: 'Automatic', cdDesc: 'Automatic registration', useYn: 'Y' },
               { cd: 'M', cdNm: 'Manual', cdDesc: 'Manual registration', useYn: 'Y' },
@@ -456,7 +458,14 @@ class EBMService {
               { cd: 'P', cdNm: 'Purchase', cdDesc: 'Purchase receipt', useYn: 'Y' },
               { cd: 'C', cdNm: 'Credit Note', cdDesc: 'Purchase credit note', useYn: 'Y' },
             ] },
-          ],
+          ].map((codeClass) => ({
+            ...codeClass,
+            useYn: codeClass.useYn || 'Y',
+            dtlList: codeClass.dtlList.map((detail, index) => ({
+              ...detail,
+              srtOrd: detail.srtOrd ?? index + 1,
+            })),
+          })),
         }, now);
 
       case VSDC_ENDPOINTS.SELECT_ITEM_CLASSES:
@@ -592,9 +601,9 @@ class EBMService {
               netWt: 22,
               spplrNm: 'KIGALI WHOLESALE LTD',
               agntNm: 'Mock Customs Agent',
-              invcFcurAmt: 12000,
+              invcFcurAmt: '12000.00',
               invcFcurCd: 'USD',
-              invcFcurExcrt: 1300,
+              invcFcurExcrt: '1300.00',
               dclRefNum: `REF-${formatVsdcDate()}-001`,
             },
             {
@@ -615,9 +624,9 @@ class EBMService {
               netWt: 48,
               spplrNm: 'RWANDA RETAIL GROUP',
               agntNm: 'Mock Customs Agent',
-              invcFcurAmt: 3000,
+              invcFcurAmt: '3000.00',
               invcFcurCd: 'USD',
-              invcFcurExcrt: 1300,
+              invcFcurExcrt: '1300.00',
               dclRefNum: `REF-${formatVsdcDate()}-002`,
             },
           ],
@@ -918,6 +927,7 @@ module.exports.VSDC_ENDPOINTS = VSDC_ENDPOINTS;
 module.exports.extractInitInfo = extractInitInfo;
 module.exports.formatVsdcDate = formatVsdcDate;
 module.exports.formatVsdcDateTime = formatVsdcDateTime;
+module.exports.preserveImportDecimalPrecision = preserveImportDecimalPrecision;
 
 
 

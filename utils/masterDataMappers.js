@@ -108,12 +108,23 @@ function warehouseToApi(row) {
     customFields: row.customFields ?? {},
     rraBranchId: row.rraBranchId ?? null,
     ebmRegistrationStatus: row.ebmRegistrationStatus ?? 'not_registered',
+    ebmRegistrationMode: row.ebmRegistrationMode ?? null,
     ebmRegisteredAt: row.ebmRegisteredAt ?? null,
     ebmLastAttemptAt: row.ebmLastAttemptAt ?? null,
     ebmRegistrationError: row.ebmRegistrationError ?? null,
     ebmUsersSubmitted: Boolean(row.ebmUsersSubmitted),
     ebmInsurances: Array.isArray(row.ebmInsurances) ? row.ebmInsurances : [],
     ebmInsuranceSubmitted: Boolean(row.ebmInsuranceSubmitted),
+    ebmInsuranceSubmissions: Array.isArray(row.ebmInsuranceSubmissions)
+      ? row.ebmInsuranceSubmissions.map((submission) => ({
+          branchId: submission.branchId ?? row.rraBranchId ?? null,
+          isrccCd: submission.isrccCd,
+          status: submission.status,
+          code: submission.code ?? null,
+          mode: submission.mode ?? null,
+          lastAttemptAt: submission.lastAttemptAt ?? null,
+        }))
+      : [],
     ...mapTimestamps(row),
   };
 }
@@ -131,12 +142,14 @@ const WAREHOUSE_INPUT_MAP = {
   customFields: 'customFields',
   rraBranchId: 'rraBranchId',
   ebmRegistrationStatus: 'ebmRegistrationStatus',
+  ebmRegistrationMode: 'ebmRegistrationMode',
   ebmRegisteredAt: 'ebmRegisteredAt',
   ebmLastAttemptAt: 'ebmLastAttemptAt',
   ebmRegistrationError: 'ebmRegistrationError',
   ebmUsersSubmitted: 'ebmUsersSubmitted',
   ebmInsurances: 'ebmInsurances',
   ebmInsuranceSubmitted: 'ebmInsuranceSubmitted',
+  ebmInsuranceSubmissions: 'ebmInsuranceSubmissions',
 };
 
 function warehouseInputToPrisma(data = {}) {
@@ -189,7 +202,15 @@ function clientToApi(row) {
     isActive: Boolean(row.isActive),
     createdBy: row.createdById ?? null,
     customFields: row.customFields ?? {},
-    ebmBranchCustomers: Array.isArray(row.ebmBranchCustomers) ? row.ebmBranchCustomers : [],
+    ebmBranchCustomers: Array.isArray(row.ebmBranchCustomers)
+      ? row.ebmBranchCustomers.map((submission) => ({
+          branchId: submission.branchId,
+          status: submission.status,
+          mode: submission.mode ?? null,
+          submittedAt: submission.submittedAt ?? null,
+          lastAttemptAt: submission.lastAttemptAt ?? null,
+        }))
+      : [],
     ...mapTimestamps(row),
   };
 }

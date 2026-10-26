@@ -11,8 +11,10 @@ const {
 
 const EBM_DEVICE_STATUSES = Object.freeze({
   NOT_INITIALIZED: 'not_initialized',
+  INITIALIZING: 'initializing',
   INITIALIZED: 'initialized',
   FAILED: 'failed',
+  OUTCOME_UNKNOWN: 'outcome_unknown',
 });
 
 const EBM_DEVICE_MODES = Object.freeze({
@@ -26,11 +28,17 @@ const FIELD_MAP = {
   companyId: { target: 'companyId', isId: true },
   tin: { target: 'tin' },
   branchId: { target: 'branchId' },
+  environment: { target: 'environment' },
   branchName: { target: 'branchName' },
   deviceSerialNo: { target: 'deviceSerialNo' },
   status: { target: 'status' },
   initializedAt: { target: 'initializedAt' },
   lastAttemptAt: { target: 'lastAttemptAt' },
+  lastRequestId: { target: 'lastRequestId' },
+  sequenceSeedStatus: { target: 'sequenceSeedStatus' },
+  initResult: { target: 'initResult' },
+  lastSuccessfulContactAt: { target: 'lastSuccessfulContactAt' },
+  lastSuccessfulFiscalAt: { target: 'lastSuccessfulFiscalAt' },
   initializedMode: { target: 'initializedMode' },
   lastAttemptMode: { target: 'lastAttemptMode' },
   branchRef: { target: 'branchRefId', isId: true },

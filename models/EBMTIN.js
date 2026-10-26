@@ -1,5 +1,5 @@
 /**
- * EBMTIN — PostgreSQL (Prisma) backed (global RRA registry, no company).
+ * Tenant and branch scoped cache of RRA customer TIN lookups.
  */
 
 const { buildGlobalModel } = require('../utils/masterDataCommon');
@@ -10,9 +10,19 @@ const {
 } = require('../utils/phase10Mappers');
 
 const FIELD_MAP = {
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  branchId: { target: 'branchId' },
   tin: { target: 'tin' },
   taxpayerName: { target: 'taxpayerName' },
+  statusCode: { target: 'statusCode' },
+  provinceName: { target: 'provinceName' },
+  districtName: { target: 'districtName' },
+  sectorName: { target: 'sectorName' },
+  verificationMode: { target: 'verificationMode' },
   active: { target: 'active' },
+  source: { target: 'source' },
+  lastSyncedAt: { target: 'lastSyncedAt' },
 };
 
 module.exports = buildGlobalModel({

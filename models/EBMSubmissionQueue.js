@@ -14,13 +14,14 @@ const DOCUMENT_TYPES = Object.freeze([
   'pos',
   'creditNote',
   'purchase',
+  'purchaseOrder',
   'stockMovement',
   'stockMaster',
   'branchTransfer',
   'stockAdjustment',
 ]);
 
-const QUEUE_STATUSES = Object.freeze(['pending', 'failed', 'submitted', 'abandoned']);
+const QUEUE_STATUSES = Object.freeze(['pending', 'submitting', 'failed', 'submitted', 'abandoned']);
 
 const FIELD_MAP = {
   companyId: { target: 'companyId', isId: true },
@@ -28,6 +29,15 @@ const FIELD_MAP = {
   documentType: { target: 'documentType' },
   documentId: { target: 'documentId', isId: true },
   endpoint: { target: 'endpoint' },
+  operationKey: { target: 'operationKey' },
+  correlationId: { target: 'correlationId' },
+  environment: { target: 'environment' },
+  prerequisiteType: { target: 'prerequisiteType' },
+  prerequisiteEndpoint: { target: 'prerequisiteEndpoint' },
+  prerequisiteOperationKey: { target: 'prerequisiteOperationKey' },
+  fiscalResponse: { target: 'fiscalResponse' },
+  sourceAppliedAt: { target: 'sourceAppliedAt' },
+  dependentsDispatchedAt: { target: 'dependentsDispatchedAt' },
   ebmStatus: { target: 'ebmStatus' },
   isRetryable: { target: 'isRetryable' },
 };

@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { body, validationResult } = require('express-validator');
 
 // Warehouse routes
 const {
@@ -223,7 +224,17 @@ router.post('/purchase-orders/:id/payment', requirePermission('ap_payments', 'cr
 
 // ========== GRN ROUTES ==========
 router.get('/grn', canReadGrn, listGRNs);
-router.post('/grn', requirePermission('grn', 'create'), logAction('stock'), createGRN);
+router.post('/grn', requirePermission('grn', 'create'), [
+  body('importedItemId').optional({ nullable: true, checkFalsy: true }).isMongoId(),
+  body('importedUnitCost').optional({ nullable: true }).isFloat({ gt: 0 }),
+  body('importedCurrencyCode').optional({ nullable: true }).isString().trim().isLength({ min: 3, max: 3 }),
+  body('supplierInvoiceNo').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ max: 100 }),
+  (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ success: false, message: errors.array()[0].msg, errors: errors.array() });
+    next();
+  },
+], logAction('stock'), createGRN);
 router.get('/grn/:id', canReadGrn, getGRN);
 router.put('/grn/:id', requirePermission('grn', 'update'), logAction('stock'), updateGRN);
 router.delete('/grn/:id', requirePermission('grn', 'delete'), logAction('stock'), deleteGRN);

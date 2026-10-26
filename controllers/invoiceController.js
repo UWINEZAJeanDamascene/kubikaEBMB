@@ -974,6 +974,7 @@ exports.cancelInvoice = async (req, res, next) => {
       payments: 1,
       stockReserved: 1,
       stockDeducted: 1,
+      ebm: 1,
     });
 
     if (Array.isArray(invoice?.lines)) {
@@ -990,6 +991,14 @@ exports.cancelInvoice = async (req, res, next) => {
       return res.status(404).json({
         success: false,
         message: "Invoice not found",
+      });
+    }
+
+    if (['submitted', 'pending', 'outcome_unknown', 'accepted'].includes(String(invoice.ebm?.ebmStatus || '').toLowerCase())) {
+      return res.status(409).json({
+        success: false,
+        code: 'EBM_FISCAL_CANCELLATION_UNSUPPORTED',
+        message: 'This invoice has a submitted or unresolved fiscal state. Do not cancel it locally; reconcile with RRA and use the confirmed fiscal correction workflow.',
       });
     }
 
@@ -1132,10 +1141,19 @@ exports.cancelInvoice = async (req, res, next) => {
 exports.verifyInvoiceCustomerTin = async (req, res, next) => {
   try {
     const companyId = String(req.user.company._id || req.user.company.id);
+    if (req.body.branchId && req.body.bhfId && String(req.body.branchId) !== String(req.body.bhfId)) {
+      return res.status(422).json({ success: false, code: 'EBM_BRANCH_ID_CONFLICT', message: 'Provide one matching RRA branch ID.' });
+    }
+    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
+      .populate('lines.product')
+      .populate('deliveryNote');
+    if (!invoice) return res.status(404).json({ success: false, code: 'EBM_INVOICE_NOT_FOUND', message: 'Invoice not found for RRA customer TIN verification.' });
+    const requestedBranch = req.body.branchId || req.body.bhfId || null;
+    const branch = await require('../services/ebmSalesService').resolveBranch(invoice, companyId, requestedBranch);
     const result = await require('../services/ebmCustomerTinService').verifyInvoiceCustomerTin(
       companyId,
       req.params.id,
-      { branchId: req.body.branchId || req.body.bhfId || '00' },
+      { branchId: branch.rraBranchId },
     );
     res.json({ success: true, data: result.invoice, verification: result.verification });
   } catch (error) {
@@ -1146,10 +1164,18 @@ exports.verifyInvoiceCustomerTin = async (req, res, next) => {
 // Submit a confirmed invoice to RRA/EBM and return the persisted submission state.
 exports.submitInvoiceEbm = async (req, res, next) => {
   try {
+    if (req.body.variant && req.body.variant !== 'sale') {
+      return res.status(409).json({ success: false, code: 'EBM_SALES_VARIANT_UNSUPPORTED', message: 'Only normal fiscal sales are supported by this endpoint. Proforma and copy submissions require a confirmed RRA contract.' });
+    }
+    if (req.body.branchId && req.body.bhfId && String(req.body.branchId) !== String(req.body.bhfId)) {
+      return res.status(422).json({ success: false, code: 'EBM_BRANCH_ID_CONFLICT', message: 'Provide one matching RRA branch ID.' });
+    }
     const companyId = String(req.user.company._id || req.user.company.id);
     const invoice = await require('../services/ebmSalesService').submitInvoice(req.params.id, {
       companyId,
       branchId: req.body.branchId || req.body.bhfId || null,
+      purchaserAcceptance: req.body.prchrAcptcYn ?? null,
+      modifierUserId: req.user.id || req.user._id,
     });
     res.json({ success: true, message: 'Invoice submitted to EBM.', data: await hydrateInvoiceRelations(invoice, companyId) });
   } catch (error) {

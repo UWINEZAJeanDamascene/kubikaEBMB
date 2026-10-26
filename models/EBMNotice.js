@@ -11,6 +11,12 @@ const {
 
 const FIELD_MAP = {
   noticeNumber: { target: 'noticeNumber' },
+  title: { target: 'title' },
+  content: { target: 'content' },
+  detailUrl: { target: 'detailUrl' },
+  registrantName: { target: 'registrantName' },
+  source: { target: 'source' },
+  lastSyncedAt: { target: 'lastSyncedAt' },
   active: { target: 'active' },
   noticeDate: { target: 'noticeDate' },
 };

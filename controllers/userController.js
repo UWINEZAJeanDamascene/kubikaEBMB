@@ -121,7 +121,14 @@ exports.createUser = async (req, res, next) => {
     if (branchId) {
       await prisma.user.update({ where: { id: result.user._id, companyId }, data: { branchId: toIdString(branchId) } });
       result.user.branch = toIdString(branchId);
-      if (branch.rraBranchId) EBMBranchService.submitBranchUsers(companyId, branch.rraBranchId).catch((err) => console.error('[User] EBM branch user submission failed:', err.message));
+      if (branch.rraBranchId) {
+        result.branchUserSubmission = await EBMBranchService.submitBranchUsers(companyId, branch.rraBranchId, req.user);
+        const updatedUser = await prisma.user.findFirst({
+          where: { id: result.user._id, companyId },
+          include: { roles: { include: { role: true } } },
+        });
+        result.user = userToApi(updatedUser);
+      }
     }
     res.status(201).json({
       success: true,
@@ -129,6 +136,7 @@ exports.createUser = async (req, res, next) => {
       isNewUser: result.isNewUser,
       invitationEmailSent: result.invitationEmailSent,
       message: result.message,
+      ...(result.branchUserSubmission ? { branchUserSubmission: result.branchUserSubmission } : {}),
     });
   } catch (error) {
     if (error.code === 'P2002') return res.status(409).json({ success: false, message: 'An account with this email is already present in the workspace', code: 'USER_ALREADY_MEMBER' });
@@ -198,24 +206,40 @@ exports.updateUser = async (req, res, next) => {
       data.departmentId = null;
     }
 
-    const assignedBranch = req.body.branch || req.body.defaultWarehouse;
+    const branchWasProvided = Object.prototype.hasOwnProperty.call(req.body, 'branch')
+      || Object.prototype.hasOwnProperty.call(req.body, 'defaultWarehouse');
+    const assignedBranch = Object.prototype.hasOwnProperty.call(req.body, 'branch')
+      ? req.body.branch
+      : req.body.defaultWarehouse;
+    let branch = null;
+    if (branchWasProvided && assignedBranch) {
+      branch = await Warehouse.findOne({ _id: assignedBranch, company: companyId });
+      if (!branch) return res.status(400).json({ success: false, code: 'INVALID_BRANCH', message: 'Select a branch in this company' });
+      data.branchId = toIdString(assignedBranch);
+    } else if (branchWasProvided) {
+      data.branchId = null;
+    }
 
-    const user = await prisma.user.update({
+    let user = await prisma.user.update({
       where: { id: existing.id },
       data,
       include: { roles: { include: { role: true } } },
     });
 
+    let branchUserSubmission = null;
+    if (branch?.rraBranchId) {
+      branchUserSubmission = await EBMBranchService.submitBranchUsers(companyId, branch.rraBranchId, req.user);
+      user = await prisma.user.findFirst({
+        where: { id: existing.id, companyId },
+        include: { roles: { include: { role: true } } },
+      });
+    }
+
     res.json({
       success: true,
-      data: userToApi(user)
+      data: userToApi(user),
+      ...(branchUserSubmission ? { branchUserSubmission } : {}),
     });
-
-    if (assignedBranch) {
-      Warehouse.findOne({ _id: assignedBranch, company: companyId }).then((branch) => {
-        if (branch?.rraBranchId) return EBMBranchService.submitBranchUsers(companyId, branch.rraBranchId);
-      }).catch((err) => console.error('[User] EBM branch user update submission failed:', err.message));
-    }
   } catch (error) {
     next(error);
   }

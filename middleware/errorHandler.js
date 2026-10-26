@@ -43,6 +43,11 @@ const errorHandler = (err, req, res, next) => {
     statusCode = 404;
     code = 'NOT_FOUND';
     message = err.message || 'Resource not found';
+  } else if (typeof err.code === 'string' && /^P\d{4}$/.test(err.code)) {
+    // Do not return raw Prisma constraint and database diagnostics to clients.
+    statusCode = 500;
+    code = 'INTERNAL_ERROR';
+    message = 'An unexpected error occurred';
   } else if (err.code === 'AGGREGATE_ROW_LIMIT') {
     // The compatibility pipeline refuses to return a silently truncated
     // aggregate. Existing frontend dashboard/report error states surface this
@@ -90,6 +95,9 @@ const errorHandler = (err, req, res, next) => {
     success: false,
     message,
     code,
+    ...(typeof err.requestId === 'string' && /^[a-f0-9-]{36}$/i.test(err.requestId)
+      ? { requestId: err.requestId }
+      : {}),
   };
 
   if (exposeStack && err.stack) {

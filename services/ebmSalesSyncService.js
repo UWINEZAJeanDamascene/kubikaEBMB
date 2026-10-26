@@ -3,8 +3,8 @@ const EBMSyncState = require('../models/EBMSyncState');
 const Invoice = require('../models/Invoice');
 const ebmService = require('./ebmService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
-const { formatVsdcDateTime } = require('./ebmService');
 const { EBM_SYNC_TYPES } = require('../constants/ebmSyncTypes');
+const { cursorSemanticsConfirmed, assertResultTimestamp, cursorRegressionError } = require('../utils/ebmCursorPolicy');
 
 const FIRST_SYNC_DT = '20000101000000';
 const SYNC_TYPE = EBM_SYNC_TYPES.SALES_SUMMARY;
@@ -67,9 +67,11 @@ class EBMSalesSyncService {
   static async syncSalesSummaries(companyId, options = {}) {
     const branchId = normalizeBranchId(options.branchId || options.bhfId || '00');
     const full = options.full === true;
+    const mode = ebmService.getConfig().mode;
+    const semanticsConfirmed = cursorSemanticsConfirmed(mode, 'EBM_SALES_CURSOR_SEMANTICS_CONFIRMED');
     const device = await getInitializedDevice(companyId, branchId);
     const state = await getSyncState(companyId, branchId);
-    const lastReqDt = full ? FIRST_SYNC_DT : (state.lastReqDt || FIRST_SYNC_DT);
+    const lastReqDt = full || !semanticsConfirmed ? FIRST_SYNC_DT : (state.lastReqDt || FIRST_SYNC_DT);
 
     const response = await ebmService.selectSales({
       companyId,
@@ -78,6 +80,10 @@ class EBMSalesSyncService {
       lastReqDt,
       ...(options.prcOrdCd ? { prcOrdCd: String(options.prcOrdCd).slice(0, 5) } : {}),
     });
+    if (!assertResultTimestamp(response.resultDt)
+      || (semanticsConfirmed && response.resultDt < lastReqDt)) {
+      throw cursorRegressionError('RRA sales-summary lookup');
+    }
 
     const saleList = asArray(response.data?.saleList || response.data?.salesList || response.data?.trnsSalesList);
     const summaries = saleList.map((raw) => normalizeSaleSummary(raw, companyId, branchId));
@@ -100,13 +106,15 @@ class EBMSalesSyncService {
       };
     });
 
-    state.lastReqDt = response.resultDt || formatVsdcDateTime();
+    state.lastReqDt = semanticsConfirmed ? response.resultDt : FIRST_SYNC_DT;
     state.lastSuccessfulSyncAt = new Date();
     state.lastErrorMessage = null;
     state.summary = {
       pulled: summaries.length,
       matched: reconciliation.filter((row) => row.matchStatus === 'matched').length,
       missingLocal: reconciliation.filter((row) => row.matchStatus === 'missing_local').length,
+      cursorAdvanced: semanticsConfirmed,
+      cursorPolicy: semanticsConfirmed ? 'incremental_confirmed' : 'fixed_baseline_replay_unconfirmed',
     };
     await state.save();
 

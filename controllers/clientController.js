@@ -39,6 +39,8 @@ async function trySaveClientBranchCustomer({ companyId, clientId, body, user }) 
         resultCd: result.response?.resultCd,
         resultMsg: result.response?.resultMsg,
         resultDt: result.response?.resultDt,
+        mode: result.response?.mode,
+        requestId: result.response?.requestId,
       },
     };
   } catch (error) {
@@ -235,10 +237,25 @@ exports.saveClientBranchCustomer = async (req, res, next) => {
         resultCd: result.response?.resultCd,
         resultMsg: result.response?.resultMsg,
         resultDt: result.response?.resultDt,
+        mode: result.response?.mode,
+        requestId: result.response?.requestId,
       },
-      payload: result.payload,
-      message: 'Client saved as RRA EBM branch customer',
+      message: result.response?.mode === 'production'
+        ? 'Client accepted by RRA as a branch customer'
+        : result.response?.mode === 'mock'
+          ? 'Mock request succeeded; the client is not registered with RRA'
+          : 'Client accepted by the RRA VSDC environment',
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getClientBranchCustomerStatus = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const data = await EBMBranchService.getBranchCustomerStatus(companyId, req.params.id);
+    res.json({ success: true, data });
   } catch (error) {
     next(error);
   }

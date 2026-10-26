@@ -5,6 +5,8 @@ const StockMovement = require('../models/StockMovement');
 const Quotation = require('../models/Quotation');
 const Invoice = require('../models/Invoice');
 const Supplier = require('../models/Supplier');
+const EBMCode = require('../models/EBMCode');
+const TaxAutomationService = require('../services/taxAutomationService');
 const bwipjs = require('bwip-js');
 const QRCode = require('qrcode');
 const ChartOfAccount = require('../models/ChartOfAccount');
@@ -62,6 +64,75 @@ async function validateProductAccounts(body, companyId) {
   }
 
   return errors;
+}
+
+async function applySyncedEbmTaxRate(body, companyId, existingProduct = null) {
+  const ebm = body.ebm && typeof body.ebm === 'object' && !Array.isArray(body.ebm) ? body.ebm : {};
+  const explicitEbmCode = ebm.taxTyCd || ebm.taxTypeCode;
+  let code = explicitEbmCode;
+  if (!code && Object.prototype.hasOwnProperty.call(body, 'taxCode')) {
+    if (typeof body.taxCode !== 'string' || !['A', 'B', 'C', 'D'].includes(body.taxCode)) {
+      const error = new Error('Tax type must be an exact RRA tax type code from class 04.');
+      error.code = 'EBM_PRODUCT_TAX_CODE_INVALID';
+      error.statusCode = 422;
+      throw error;
+    }
+    code = body.taxCode;
+  }
+  if (!code) code = existingProduct?.ebm?.taxTyCd || existingProduct?.ebm?.taxTypeCode;
+  if (typeof code !== 'string' || code.trim() !== code || !code) {
+    const error = new Error('Select an RRA tax type code before saving this product.');
+    error.code = 'EBM_PRODUCT_TAX_CODE_MISSING';
+    error.statusCode = 422;
+    throw error;
+  }
+
+  if (!['A', 'B', 'C', 'D'].includes(code)) {
+    const error = new Error('Tax type must be an active RRA tax type code.');
+    error.code = 'EBM_PRODUCT_TAX_CODE_INVALID';
+    error.statusCode = 422;
+    throw error;
+  }
+
+  const syncedCode = await EBMCode.findOne({
+    company: companyId,
+    codeClass: '04',
+    code,
+    active: { $ne: false },
+    useYn: { $ne: 'N' },
+  }).lean();
+  if (!syncedCode) {
+    const error = new Error(`RRA tax type ${code} is not present as an active code in this company's synchronized class 04.`);
+    error.code = 'EBM_PRODUCT_TAX_CODE_INVALID';
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const taxRate = await TaxAutomationService.getActiveTaxRate(companyId, {
+    code,
+    date: new Date(),
+  });
+  const rate = taxRate?.ratePct == null ? NaN : Number(taxRate.ratePct);
+  if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
+    const error = new Error(`Configure an active company tax rate for code ${code}; no rate is inferred from the RRA code name or user-defined code fields.`);
+    error.code = 'EBM_PRODUCT_TAX_RATE_UNAVAILABLE';
+    error.statusCode = 409;
+    throw error;
+  }
+
+  body.taxCode = code;
+  body.taxRate = rate;
+  body.ebm = {
+    ...ebm,
+    taxTyCd: code,
+    taxTypeCode: code,
+    taxRateSource: {
+      type: 'company_tax_rate',
+      taxRateId: taxRate._id || taxRate.id,
+      code: taxRate.code,
+      ratePct: rate,
+    },
+  };
 }
 
 const ALLOWED_PRODUCT_SORT_FIELDS = new Set([
@@ -331,6 +402,8 @@ exports.createProduct = async (req, res, next) => {
       req.body.averageCost = req.body.costPrice;
     }
 
+    await applySyncedEbmTaxRate(req.body, companyId);
+
     const product = await Product.create(req.body);
 
     // Link product to supplier if supplier is provided
@@ -408,11 +481,20 @@ exports.updateProduct = async (req, res, next) => {
       return res.status(422).json({ success: false, errors: accountErrors });
     }
 
+    const taxSettingsSubmitted = Object.prototype.hasOwnProperty.call(req.body, 'taxCode')
+      || (req.body.ebm && typeof req.body.ebm === 'object' && !Array.isArray(req.body.ebm)
+        && (Object.prototype.hasOwnProperty.call(req.body.ebm, 'taxTyCd')
+          || Object.prototype.hasOwnProperty.call(req.body.ebm, 'taxTypeCode')));
+
     // Merge the ebm payload so an edit never drops RRA registration state
     // (ebmItemCode, isRegisteredWithEBM, registration timestamps) that the form does not submit.
     if (req.body.ebm && typeof req.body.ebm === 'object' && !Array.isArray(req.body.ebm)) {
       const existingEbm = (product.ebm && typeof product.ebm === 'object') ? product.ebm : {};
       req.body.ebm = { ...existingEbm, ...req.body.ebm };
+    }
+
+    if (taxSettingsSubmitted) {
+      await applySyncedEbmTaxRate(req.body, companyId, product);
     }
 
     // Update product
@@ -1085,7 +1167,7 @@ exports.registerAllProductsWithEBM = async (req, res, next) => {
       return res.json({
       success: true,
       data: result,
-      message: `${result.registered} newly registered; ${result.alreadyRegistered} already registered; ${result.failed} failed.`,
+      message: `${result.registered} newly registered; ${result.alreadyRegistered} already registered; ${result.reconciliationRequired || 0} need RRA branch reconciliation; ${result.failed} failed.`,
     });
   } catch (error) {
     next(error);

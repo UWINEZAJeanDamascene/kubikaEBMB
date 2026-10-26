@@ -1,12 +1,14 @@
 const Warehouse = require('../models/Warehouse');
 const InventoryBatch = require('../models/InventoryBatch');
 const Product = require('../models/Product');
-const EBMBranchService = require('../services/ebmBranchService');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../lib/prisma');
 const { warehouseTranslateCreate, warehouseTranslateUpdate } = require('../utils/masterDataMappers');
+const { validateWarehouseInsuranceConfig } = require('../utils/warehouseInsuranceConfig');
+const { nextWarehouseCode } = require('../utils/warehouseCode');
+const { getDefaultWarehouseInventoryAccount } = require('../services/warehouseAccountService');
 
-const WAREHOUSE_FIELDS = ['name', 'code', 'description', 'location', 'inventoryAccount', 'isActive', 'isDefault', 'customFields', 'rraBranchId'];
+const WAREHOUSE_FIELDS = ['name', 'code', 'description', 'location', 'isActive', 'isDefault', 'customFields', 'rraBranchId', 'ebmInsurances'];
 
 function warehousePayload(body = {}) {
   const payload = {};
@@ -16,6 +18,9 @@ function warehousePayload(body = {}) {
   if (payload.name !== undefined) payload.name = String(payload.name || '').trim();
   if (payload.code !== undefined) payload.code = String(payload.code || '').trim().toUpperCase();
   if (payload.description !== undefined && payload.description !== null) payload.description = String(payload.description).trim();
+  if (payload.ebmInsurances !== undefined) {
+    payload.ebmInsurances = validateWarehouseInsuranceConfig(payload.ebmInsurances);
+  }
   return payload;
 }
 
@@ -159,22 +164,47 @@ exports.createWarehouse = async (req, res, next) => {
     const companyId = req.user.company._id;
 
     const payload = warehousePayload(req.body);
-    if (!payload.name || !payload.code) return res.status(400).json({ success: false, message: 'Warehouse name and code are required' });
+    if (!payload.name) return res.status(400).json({ success: false, message: 'Warehouse name is required' });
     if (payload.isDefault && payload.isActive === false) return res.status(400).json({ success: false, message: 'An inactive warehouse cannot be the default warehouse' });
-    const data = await warehouseTranslateCreate({ ...payload, company: companyId, createdBy: req.user.id });
-    const row = await prisma.$transaction(async (tx) => {
-      const existingDefault = await tx.warehouse.findFirst({ where: { companyId: asId(companyId), isDefault: true } });
-      const shouldBeDefault = data.isActive && (data.isDefault || !existingDefault);
-      if (shouldBeDefault) await tx.warehouse.updateMany({ where: { companyId: asId(companyId), isDefault: true }, data: { isDefault: false } });
-      return tx.warehouse.create({ data: { ...data, isDefault: shouldBeDefault } });
+    const inventoryAccount = await getDefaultWarehouseInventoryAccount(companyId);
+    const baseData = await warehouseTranslateCreate({
+      ...payload,
+      inventoryAccount,
+      company: companyId,
+      createdBy: req.user.id,
     });
-    const warehouse = await Warehouse.findOne({ _id: row.id, company: companyId });
+    const generatedCode = !payload.code;
+    let row;
+    let attempts = 0;
+    const maxAttempts = generatedCode ? 5 : 1;
 
-    if (warehouse.rraBranchId) {
-      EBMBranchService.registerBranch(companyId, warehouse, req.user.id).catch((err) => {
-        console.error('[Warehouse] EBM branch registration failed:', err.message);
-      });
+    while (!row && attempts < maxAttempts) {
+      attempts += 1;
+      try {
+        row = await prisma.$transaction(async (tx) => {
+          let code = payload.code;
+          if (!code) {
+            const existingWarehouses = await tx.warehouse.findMany({
+              where: { companyId: asId(companyId) },
+              select: { code: true },
+            });
+            code = nextWarehouseCode(existingWarehouses.map((warehouse) => warehouse.code));
+          }
+
+          const data = { ...baseData, code };
+          const existingDefault = await tx.warehouse.findFirst({ where: { companyId: asId(companyId), isDefault: true } });
+          const shouldBeDefault = data.isActive && (data.isDefault || !existingDefault);
+          if (shouldBeDefault) await tx.warehouse.updateMany({ where: { companyId: asId(companyId), isDefault: true }, data: { isDefault: false } });
+          return tx.warehouse.create({ data: { ...data, isDefault: shouldBeDefault } });
+        });
+      } catch (error) {
+        if (isUniqueConflict(error) && generatedCode && attempts < maxAttempts) continue;
+        if (isUniqueConflict(error)) return res.status(409).json({ success: false, code: 'WAREHOUSE_CODE_EXISTS', message: 'A warehouse with this code already exists for this company' });
+        throw error;
+      }
     }
+
+    const warehouse = await Warehouse.findOne({ _id: row.id, company: companyId });
 
     res.status(201).json({
       success: true,
@@ -221,6 +251,10 @@ exports.updateWarehouse = async (req, res, next) => {
       return res.status(409).json({ success: false, code: 'DEFAULT_WAREHOUSE', message: 'Choose another active default warehouse before deactivating this one' });
     }
     const update = warehouseTranslateUpdate(payload);
+    if (Object.prototype.hasOwnProperty.call(payload, 'ebmInsurances')) {
+      update.ebmInsuranceSubmitted = false;
+      update.ebmInsuranceSubmissions = [];
+    }
     const id = asId(warehouse._id);
     await prisma.$transaction(async (tx) => {
       if (update.isDefault === false && warehouse.isDefault) {
@@ -231,12 +265,6 @@ exports.updateWarehouse = async (req, res, next) => {
       await tx.warehouse.update({ where: { id }, data: update });
     });
     warehouse = await Warehouse.findOne({ _id: id, company: companyId });
-
-    if (warehouse.rraBranchId) {
-      EBMBranchService.registerBranch(companyId, warehouse, req.user.id).catch((err) => {
-        console.error('[Warehouse] EBM branch update registration failed:', err.message);
-      });
-    }
 
     res.json({
       success: true,

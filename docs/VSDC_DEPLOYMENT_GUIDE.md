@@ -346,23 +346,19 @@ Before the tenant starts using production, confirm every item below.
 
 ## Section 9: Switching from Sandbox to Production
 
-1. Schedule a maintenance window.
+Use the same application build in both environments; do not edit application source code to switch modes. Test and Production must use separate deployment configuration, VSDC WAR/service and database state. Do not point Production at a database containing test invoices or test fiscal counters.
 
-2. Back up MongoDB before changing mode.
+1. Schedule a maintenance window for the Production deployment.
 
-   ```bash
-   mongodump --uri="mongodb://localhost:27017/stock-management" --out=/backups/stock-management-before-ebm-production
-   ```
+2. Back up the current environment using its database's approved backup procedure. Provision and configure the Production database independently rather than promoting test fiscal transactions or fiscal counters.
 
-3. Stop Tomcat.
+3. Stop the Test VSDC service only if it is being replaced in that deployment. Prefer separate Test and Production VSDC hosts/services so Test remains available.
 
-4. Remove the sandbox VSDC WAR and expanded application directory from Tomcat `webapps`.
+4. Deploy the RRA Production VSDC WAR to the Production VSDC service. Do not replace the Test WAR in a shared service while Test clients still depend on it.
 
-5. Deploy the production VSDC WAR provided by RRA. The production WAR is different from the sandbox WAR.
+5. Verify the Production VSDC application starts successfully and can reach the Production RRA endpoint.
 
-6. Start Tomcat and verify the production VSDC application starts successfully.
-
-7. Change the backend environment.
+6. Configure the Production backend environment:
 
    ```env
    EBM_MODE=production
@@ -370,20 +366,20 @@ Before the tenant starts using production, confirm every item below.
    RRA_PRODUCTION_URL=https://api-ebm.rra.gov.rw
    ```
 
-8. Restart the backend server.
+7. Start/restart the backend using the same released application build and the Production environment configuration. Startup validation fails if `EBM_MODE=production` has no valid `VSDC_BASE_URL`.
 
-9. Open Company Settings, then EBM Devices.
+8. Open Company Settings, then EBM Devices.
 
-10. Initialize the device in production mode. Sandbox initialization does not carry over.
+9. Initialize the device in Production mode. Device initialization is stored with its environment; Test initialization does not count as Production initialization.
 
-11. Trigger a full EBM code data sync.
+10. Trigger a full EBM code data sync.
 
-12. Verify branches and products are still correctly registered for the real TIN.
+11. Verify branches and products are correctly registered for the Production taxpayer TIN. Do not treat Test VSDC records as Production registrations.
 
-13. Create one small production test invoice.
+12. Only submit a real, authorized business transaction in Production. Do not create a fabricated “test invoice” against Production.
 
-14. Confirm the invoice and verify `ebmStatus: submitted`.
+13. Confirm the invoice reaches `ebmStatus: submitted` and that the returned fiscal identifiers belong to the Production environment.
 
-15. Download the invoice PDF and confirm the RRA receipt number is visible.
+14. Download the invoice PDF and confirm the real Production RRA receipt information is visible.
 
-16. Confirm the EBM retry queue is empty before ending the maintenance window.
+15. Review the Production EBM retry queue and readiness dashboard before releasing the deployment.

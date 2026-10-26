@@ -24,6 +24,8 @@ const EBMStockService = require("../services/ebmStockService");
 const DEFAULT_ACCOUNTS =
   require("../constants/chartOfAccounts").DEFAULT_ACCOUNTS;
 const StockLevel = require("../models/StockLevel");
+const EBMImportedItem = require("../models/EBMImportedItem");
+const { dbClient } = require("../lib/prisma");
 const { toIdString } = require("../utils/objectId");
 const { parseBoundedPage } = require("../utils/querySafety");
 const { normalizeGRNLinesFromPurchaseOrder } = require("../utils/purchaseReceiptRules");
@@ -226,6 +228,9 @@ exports.createGRN = async (req, res, next) => {
       referenceNo,
       receivedDate,
       freight,
+      importedItemId,
+      importedUnitCost,
+      importedCurrencyCode,
     } = req.body;
 
     const po = await PurchaseOrder.findOne({
@@ -236,6 +241,53 @@ exports.createGRN = async (req, res, next) => {
       return res
         .status(404)
         .json({ success: false, message: "Purchase order not found" });
+
+    let importedItem = null;
+    if (importedItemId) {
+      importedItem = await EBMImportedItem.findOne({ _id: importedItemId, company: companyId }).lean();
+      if (!importedItem) return res.status(404).json({ success: false, message: "Imported item not found" });
+      if (importedItem.confirmationStatus !== "pending") {
+        return res.status(409).json({ success: false, message: "Only pending imported items can be received locally" });
+      }
+      if (importedItem.grn) {
+        const existingReceipt = await GoodsReceivedNote.findOne({ _id: importedItem.grn, company: companyId });
+        if (existingReceipt) return res.status(200).json({ success: true, data: existingReceipt, message: "Receipt already exists for this imported item" });
+        return res.status(409).json({ success: false, message: "Imported item references a missing receipt; contact an administrator" });
+      }
+      const existingLinkedGrn = await GoodsReceivedNote.findOne({ company: companyId, ebmImportReference: String(importedItem._id) });
+      if (existingLinkedGrn) {
+        await EBMImportedItem.findOneAndUpdate(
+          { _id: importedItem._id, company: companyId, grn: null },
+          { $set: { grn: existingLinkedGrn._id, purchaseOrder: existingLinkedGrn.purchaseOrder } },
+          { new: true },
+        );
+        return res.status(200).json({ success: true, data: existingLinkedGrn, message: "Receipt already exists for this imported item" });
+      }
+      if (importedItem.stockUpdated) {
+        return res.status(409).json({ success: false, message: "Stock is already marked received for this imported item, but its GRN link is missing. Do not create another receipt; contact an administrator to reconcile the record." });
+      }
+      if (!importedItem.product || !importedItem.warehouse || !importedItem.supplier) {
+        return res.status(422).json({ success: false, message: "Map the imported item to a product, warehouse, and supplier before receiving it" });
+      }
+      if (String(importedItem.warehouse) !== String(resolveRefId(warehouse))
+        || String(importedItem.supplier) !== String(resolveRefId(po.supplier))) {
+        return res.status(422).json({ success: false, message: "Selected PO supplier and receiving warehouse must match the imported-item mapping" });
+      }
+      if (String(importedCurrencyCode || "").toUpperCase() !== String(po.currencyCode || "RWF").toUpperCase()) {
+        return res.status(422).json({ success: false, message: `Receipt currency must match the approved PO currency (${po.currencyCode || "RWF"})` });
+      }
+      if (!Array.isArray(lines) || lines.length !== 1 || String(resolveLineProductId(lines[0])) !== String(importedItem.product)) {
+        return res.status(422).json({ success: false, message: "Imported-item receipt must contain exactly its mapped product" });
+      }
+      const mappedPoLines = (po.lines || []).filter((line) => String(resolveLineProductId(line)) === String(importedItem.product));
+      if (mappedPoLines.length !== 1) {
+        return res.status(422).json({ success: false, message: "The approved PO must contain exactly one line for the mapped product" });
+      }
+      if (!Number.isFinite(Number(importedUnitCost)) || Number(importedUnitCost) <= 0
+        || Math.abs(Number(importedUnitCost) - Number(mappedPoLines[0].unitCost)) > 0.000001) {
+        return res.status(422).json({ success: false, message: "Enter the approved PO unit cost. Price variances must be resolved through the PO approval workflow" });
+      }
+    }
 
     await syncPoQtyReceivedFromConfirmedGrns(po, companyId);
     try {
@@ -297,19 +349,58 @@ exports.createGRN = async (req, res, next) => {
       };
     }
 
-    const grn = await GoodsReceivedNote.create({
+    const createReceipt = async () => {
+      const grn = await GoodsReceivedNote.create({
       company: companyId,
-      referenceNo,
+      referenceNo: referenceNo || await nextReferenceNo(companyId, 'GRN'),
       purchaseOrder: po._id,
       warehouse: warehouseId,
       supplier: po.supplier,
-      supplierInvoiceNo: supplierInv,
+      supplierInvoiceNo: importedItem ? (req.body.supplierInvoiceNo || undefined) : supplierInv,
       receivedDate: receivedDate ? new Date(receivedDate) : undefined,
       lines: enrichedLines,
       freight: freightPayload,
       totalAmount: computeGrnTotal({ lines: enrichedLines, freight: freightPayload }),
+      ebmImportReference: importedItem ? String(importedItem._id) : undefined,
       createdBy: req.user.id,
-    });
+      });
+      if (importedItem) {
+        const linked = await EBMImportedItem.findOneAndUpdate(
+          { _id: importedItem._id, company: companyId, confirmationStatus: 'pending', stockUpdated: false, grn: null },
+          { $set: { grn: grn._id, purchaseOrder: po._id } },
+          { new: true },
+        );
+        if (!linked) {
+          const conflict = new Error('This imported item already has a receipt or changed while the receipt was being created.');
+          conflict.status = 409;
+          throw conflict;
+        }
+      }
+      return grn;
+    };
+    let grn;
+    try {
+      grn = importedItem
+        ? await transactionService.runInTransaction(createReceipt)
+        : await createReceipt();
+    } catch (createErr) {
+      // A simultaneous retry can lose the conditional import link after the
+      // other request commits. Resolve that race to the one durable GRN.
+      if (importedItem) {
+        const committedReceipt = await GoodsReceivedNote.findOne({
+          company: companyId,
+          ebmImportReference: String(importedItem._id),
+        });
+        if (committedReceipt) {
+          return res.status(200).json({
+            success: true,
+            data: committedReceipt,
+            message: "Receipt already exists for this imported item",
+          });
+        }
+      }
+      throw createErr;
+    }
 
     res.status(201).json({ success: true, data: grn });
   } catch (err) {
@@ -320,6 +411,26 @@ exports.createGRN = async (req, res, next) => {
 // Confirm GRN: transactional stock updates + journal posting
 exports.confirmGRN = async (req, res, next) => {
   const companyId = req.user.company._id;
+
+  // A retry after a lost success response should resolve to the already
+  // committed receipt instead of presenting a false failure or reposting it.
+  let previouslyConfirmed;
+  try {
+    previouslyConfirmed = await GoodsReceivedNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+      status: "confirmed",
+    });
+  } catch (err) {
+    return next(err);
+  }
+  if (previouslyConfirmed) {
+    return res.json({
+      success: true,
+      message: "GRN was already confirmed; no additional stock or accounting entries were created.",
+      data: previouslyConfirmed,
+    });
+  }
 
   const runConfirm = async (sess) => {
     // sess may be null
@@ -335,6 +446,40 @@ exports.confirmGRN = async (req, res, next) => {
     normalizeGrnRefs(grn);
     if (grn.status === "confirmed")
       throw Object.assign(new Error("GRN already confirmed"), { status: 400 });
+
+    let linkedImport = null;
+    if (grn.ebmImportReference) {
+      const claim = await GoodsReceivedNote.updateOne(
+        { _id: grn._id, company: companyId, status: 'draft' },
+        { $set: { status: 'processing' } },
+      );
+      if (claim.matchedCount !== 1) {
+        throw Object.assign(new Error('This imported-item GRN is already being confirmed or is no longer a draft.'), { status: 409 });
+      }
+      grn.status = 'processing';
+      linkedImport = await EBMImportedItem.findOne({
+        _id: grn.ebmImportReference,
+        company: companyId,
+      }).lean();
+      if (!linkedImport || linkedImport.confirmationStatus !== 'pending'
+        || linkedImport.stockUpdated || String(linkedImport.grn) !== String(grn._id)) {
+        throw Object.assign(new Error('This imported item is no longer eligible for local receipt.'), { status: 409 });
+      }
+      if (!Array.isArray(grn.lines) || grn.lines.length !== 1
+        || String(resolveLineProductId(grn.lines[0])) !== String(linkedImport.product)
+        || String(resolveRefId(grn.warehouse)) !== String(linkedImport.warehouse)
+        || String(resolveRefId(grn.supplier)) !== String(linkedImport.supplier)) {
+        throw Object.assign(new Error('Imported-item GRN no longer matches its saved product, supplier, and warehouse mapping.'), { status: 409 });
+      }
+    }
+
+    // Serialize receipts against the same PO before checking remaining
+    // quantities. This prevents two different GRNs from both consuming the
+    // same remaining PO balance concurrently.
+    await dbClient().$queryRaw`
+      SELECT id FROM purchase_orders
+      WHERE id = ${String(grn.purchaseOrder)} AND company_id = ${String(companyId)}
+      FOR UPDATE`;
 
     const po = await PurchaseOrder.findOne(
       { _id: grn.purchaseOrder, company: companyId },
@@ -410,6 +555,16 @@ exports.confirmGRN = async (req, res, next) => {
     // Both passes below walk the same lines, so the products are loaded once
     // here instead of once per line per pass — previously 2N round-trips for an
     // N-line receipt, all of them sequential.
+    // Product rows are locked in deterministic order. Besides protecting the
+    // company-wide stock/WAC read-modify-write below, this serializes receipts
+    // for the same product even when they come from different purchase orders.
+    const productIdsToLock = [...new Set((grn.lines || []).map(resolveLineProductId).filter(Boolean))].sort();
+    for (const productId of productIdsToLock) {
+      await dbClient().$queryRaw`
+        SELECT id FROM products
+        WHERE id = ${String(productId)} AND company_id = ${String(companyId)}
+        FOR UPDATE`;
+    }
     const grnLineProducts = await loadLineProducts(Product, grn.lines, companyId);
 
     // First pass: Validate tracking types and prepare batch/serial data
@@ -649,55 +804,14 @@ exports.confirmGRN = async (req, res, next) => {
 
       await product.save(useSession ? { session: sess } : {});
 
-      // ── Upsert StockLevel (qty + WAC) for this product/warehouse ──────────
+      // ── Atomically upsert StockLevel (qty + WAC) for this product/warehouse ─
       try {
-        const existingLevel = await StockLevel.findOne(
-          {
-            company_id: companyId,
-            product_id: line.product,
-            warehouse_id: grn.warehouse,
-          },
-          null,
-          useSession ? { session: sess } : {},
-        );
-        const prevQtyOnHand = existingLevel
-          ? existingLevel.qty_on_hand || 0
-          : 0;
-        const prevAvgCost = existingLevel ? existingLevel.avg_cost || 0 : 0;
-        const recvQty = Number(line.qtyReceived);
-        const recvCost = Number(line.landedUnitCost);
-        const newQtyOnHand =
-          Math.round((prevQtyOnHand + recvQty) * 10000) / 10000;
-        const newAvgCost =
-          newQtyOnHand > 0
-            ? Math.round(
-                ((prevQtyOnHand * prevAvgCost + recvQty * recvCost) /
-                  newQtyOnHand) *
-                  1000000,
-              ) / 1000000
-            : recvCost;
-        const newTotalValue = Math.round(newQtyOnHand * newAvgCost * 100) / 100;
-
-        await StockLevel.findOneAndUpdate(
-          {
-            company_id: companyId,
-            product_id: line.product,
-            warehouse_id: grn.warehouse,
-          },
-          {
-            $set: {
-              qty_on_hand: newQtyOnHand,
-              avg_cost: newAvgCost,
-              total_value: newTotalValue,
-              last_movement_at: new Date(),
-              last_movement_type: "receipt",
-            },
-            $setOnInsert: {
-              qty_reserved: 0,
-              qty_on_order: 0,
-            },
-          },
-          { upsert: true, ...(useSession ? { session: sess } : {}) },
+        await StockLevel.recalculateWAC(
+          companyId,
+          line.product,
+          grn.warehouse,
+          line.qtyReceived,
+          line.landedUnitCost,
         );
       } catch (slErr) {
         throw Object.assign(
@@ -748,12 +862,9 @@ exports.confirmGRN = async (req, res, next) => {
       );
     }
 
-    const totalOrdered = po.lines.reduce((s, l) => s + (l.qtyOrdered || 0), 0);
-    const totalReceived = po.lines.reduce(
-      (s, l) => s + (l.qtyReceived || 0),
-      0,
+    const wasFullyReceived = (po.lines || []).length > 0 && po.lines.every(
+      (line) => Number(line.qtyReceived || 0) >= Number(line.qtyOrdered || 0),
     );
-    const wasFullyReceived = totalReceived >= totalOrdered;
     po.status = wasFullyReceived ? "fully_received" : "partially_received";
     markPoLinesDirty(po);
     await po.save(useSession ? { session: sess } : {});
@@ -977,6 +1088,22 @@ exports.confirmGRN = async (req, res, next) => {
     grn.paymentStatus = "pending";
 
     await grn.save(useSession ? { session: sess } : {});
+    if (linkedImport) {
+      const receivedImport = await EBMImportedItem.findOneAndUpdate(
+        {
+          _id: grn.ebmImportReference,
+          company: companyId,
+          confirmationStatus: 'pending',
+          grn: grn._id,
+          stockUpdated: false,
+        },
+        { $set: { stockUpdated: true, stockUpdateError: null } },
+        { new: true },
+      );
+      if (!receivedImport) {
+        throw Object.assign(new Error('Imported-item receipt link changed; inventory posting was rolled back.'), { status: 409 });
+      }
+    }
     // GRN confirmation is the AP recognition event. Record it in the same
     // PostgreSQL transaction as the stock and journal posting so retries cannot
     // leave the subledger behind the confirmed document.
@@ -996,21 +1123,24 @@ exports.confirmGRN = async (req, res, next) => {
     }
 
     try {
-      const poForEbm = await PurchaseOrder.findOne({
-        _id: result.purchaseOrder,
-        company: companyId,
-      });
-      if (poForEbm) {
-        const processedPo = await EBMPurchaseService.processPurchaseDocument(companyId, poForEbm, "PurchaseOrder", {
-          branchId: req.body.branchId || req.body.bhfId,
+      if (!result.ebmImportReference) {
+        const poForEbm = await PurchaseOrder.findOne({
+          _id: result.purchaseOrder,
+          company: companyId,
         });
-        if (processedPo?.ebm?.ebmStatus !== "failed") {
-          await EBMStockService.submitStockForGRN(result._id, {
-            companyId,
+        if (poForEbm) {
+          const processedPo = await EBMPurchaseService.processPurchaseDocument(companyId, poForEbm, "PurchaseOrder", {
             branchId: req.body.branchId || req.body.bhfId,
+            operator: { id: req.user?._id || req.user?.id, name: req.user?.name },
           });
-        } else {
-          console.warn("Skipping GRN EBM stock reporting because purchase confirmation failed permanently.");
+          if (processedPo?.ebm?.ebmStatus !== "failed") {
+            await EBMStockService.submitStockForGRN(result._id, {
+              companyId,
+              branchId: req.body.branchId || req.body.bhfId,
+            });
+          } else {
+            console.warn("Skipping GRN EBM stock reporting because purchase confirmation failed permanently.");
+          }
         }
       }
     } catch (ebmErr) {
@@ -1187,7 +1317,18 @@ exports.deleteGRN = async (req, res, next) => {
       });
     }
 
-    await GoodsReceivedNote.findByIdAndDelete(id);
+    await transactionService.runInTransaction(async () => {
+      if (grn.ebmImportReference) {
+        const unlink = await EBMImportedItem.updateOne(
+          { _id: grn.ebmImportReference, company: companyId, grn: id, stockUpdated: false },
+          { $set: { grn: null, purchaseOrder: null } },
+        );
+        if (unlink.matchedCount !== 1) {
+          throw Object.assign(new Error('The imported item changed and its receipt cannot be deleted safely.'), { status: 409 });
+        }
+      }
+      await GoodsReceivedNote.findByIdAndDelete(id);
+    });
 
     res.json({ success: true, message: "GRN deleted successfully" });
   } catch (err) {

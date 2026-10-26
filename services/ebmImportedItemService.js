@@ -1,169 +1,292 @@
-const EBMImportedItem = require('../models/EBMImportedItem');
+﻿const EBMImportedItem = require('../models/EBMImportedItem');
 const EBMDevice = require('../models/EBMDevice');
 const EBMSyncState = require('../models/EBMSyncState');
-const Company = require('../models/Company');
 const Product = require('../models/Product');
+const Warehouse = require('../models/Warehouse');
 const Supplier = require('../models/Supplier');
-const PurchaseOrder = require('../models/PurchaseOrder');
-const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const ebmService = require('./ebmService');
+const crypto = require('crypto');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
-const { formatVsdcDateTime } = require('./ebmService');
-const { generateUniqueNumber } = require('../models/utils/autoIncrement');
 const { EBM_SYNC_TYPES } = require('../constants/ebmSyncTypes');
+const { assertHeadOfficeOperation } = require('./ebmOperationPolicy');
+const { runInTransaction } = require('./transactionService');
+const { buildImportSelectRequest } = require('../utils/vsdcPayloadSanitizer');
+const { cursorSemanticsConfirmed, assertResultTimestamp, cursorRegressionError } = require('../utils/ebmCursorPolicy');
 
-const FIRST_SYNC_DT = '20000101000000';
 const SYNC_TYPE = EBM_SYNC_TYPES.IMPORTED_ITEMS;
 
-function asArray(value) {
-  return Array.isArray(value) ? value : [];
+function getInitialImportCursor(mode = ebmService.getConfig().mode) {
+  const configured = process.env.EBM_IMPORT_INITIAL_CURSOR;
+  if (typeof configured === 'string' && /^\d{14}$/.test(configured) && parseVsdcDate(configured)) {
+    return configured;
+  }
+  const error = new Error(
+    'Set EBM_IMPORT_INITIAL_CURSOR to the taxpayer-approved 14-digit YYYYMMDDHHmmss starting cursor before syncing imported items.',
+  );
+  error.code = 'EBM_IMPORT_CURSOR_BASELINE_REQUIRED';
+  error.statusCode = 503;
+  error.retryable = false;
+  error.mode = mode;
+  throw error;
 }
 
 function parseVsdcDate(value) {
   if (!value) return null;
   const raw = String(value);
   if (/^\d{8}$/.test(raw)) {
-    return new Date(`${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T00:00:00Z`);
+    const date = new Date(`${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T00:00:00Z`);
+    return !Number.isNaN(date.getTime())
+      && date.toISOString().slice(0, 10).replace(/-/g, '') === raw
+      ? date
+      : null;
   }
   if (/^\d{14}$/.test(raw)) {
-    return new Date(`${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T${raw.slice(8, 10)}:${raw.slice(10, 12)}:${raw.slice(12, 14)}Z`);
+    const date = new Date(`${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}T${raw.slice(8, 10)}:${raw.slice(10, 12)}:${raw.slice(12, 14)}Z`);
+    if (Number.isNaN(date.getTime())) return null;
+    const normalized = date.toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+    return normalized === raw ? date : null;
   }
   const parsed = new Date(raw);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function normalizeBranchId(value) {
-  return String(value || '00').padStart(2, '0').slice(-2);
+const SELECT_CHAR_LIMITS = Object.freeze({
+  taskCd: 50,
+  dclDe: 8,
+  dclNo: 50,
+  hsCd: 17,
+  itemNm: 500,
+  imptItemsttsCd: 5,
+  imptItemSttsCd: 5,
+  orgnNatCd: 5,
+  exptNatCd: 5,
+  pkgUnitCd: 5,
+  qtyUnitCd: 5,
+  spplrNm: 500,
+  agntNm: 500,
+  invcFcurCd: 5,
+});
+
+const SELECT_NUMBER_LIMITS = Object.freeze({
+  pkg: 13,
+  qty: 13,
+  totWt: 13,
+  netWt: 13,
+  invcFcurAmt: 18,
+  invcFcurExcrt: 18,
+});
+
+const RRA_IMPORT_STATUS_FIELDS = Object.freeze(['imptItemsttsCd', 'imptItemSttsCd']);
+
+function failValidation(message, details = {}) {
+  const error = new Error(message);
+  error.code = 'EBM_IMPORT_RESPONSE_INVALID';
+  error.statusCode = 502;
+  error.retryable = false;
+  Object.assign(error, details);
+  throw error;
 }
 
-function firstValue(...values) {
-  return values.find((value) => value !== undefined && value !== null && String(value).trim() !== '');
+function failRowValidation(index, field, reason) {
+  failValidation(`Imported-item row ${index + 1} has ${reason} for ${field}.`, {
+    rowIndex: index + 1,
+    field,
+  });
 }
 
-function cleanString(value, maxLength, fallback = '') {
-  const resolved = firstValue(value, fallback);
-  return String(resolved == null ? '' : resolved).trim().slice(0, maxLength);
+function isExactDecimalWithinPrecision(value, precision, scale) {
+  const match = /^(-?)(?:0|[1-9]\d*)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(value);
+  if (!match) return false;
+  const exponent = Number(match[3] || 0);
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 1000) return false;
+  const fraction = (value.match(/\.(\d+)/)?.[1] || '');
+  const coefficientText = value.replace(/^-/, '').split(/[.eE]/)[0] + fraction;
+  const coefficient = BigInt(coefficientText || '0');
+  const scaledExponent = exponent - fraction.length + scale;
+  let scaled;
+  if (scaledExponent >= 0) {
+    scaled = coefficient * (10n ** BigInt(scaledExponent));
+  } else {
+    const divisor = 10n ** BigInt(-scaledExponent);
+    if (coefficient % divisor !== 0n) return false;
+    scaled = coefficient / divisor;
+  }
+  return scaled.toString().length <= precision;
 }
 
-function toOptionalNumber(value) {
-  if (value === undefined || value === null || value === '') return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+function validateSelectRequest(device, branchId, lastReqDt) {
+  return buildImportSelectRequest({
+    tin: device?.tin,
+    bhfId: branchId,
+    lastReqDt,
+  });
 }
 
-function formatVsdcDate(value) {
-  if (!value) return '';
-  const raw = String(value).trim();
-  if (/^\d{8}$/.test(raw)) return raw;
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return '';
-  const year = String(date.getUTCFullYear()).padStart(4, '0');
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(date.getUTCDate()).padStart(2, '0');
-  return `${year}${month}${day}`;
-}
-
-function getActor(user) {
-  const id = cleanString(user?.id || user?._id || user?.email || 'system', 20, 'system');
-  const name = cleanString(user?.name || user?.fullName || user?.email || 'System', 60, 'System');
-  return { id, name };
-}
-
-function omitBlankOptionalFields(payload, requiredFields) {
-  const required = new Set(requiredFields);
-  return Object.fromEntries(Object.entries(payload).filter(([key, value]) => {
-    if (required.has(key)) return true;
-    return value !== null && value !== undefined && value !== '';
-  }));
-}
-
-function buildSaveImportItemPayload(imported, device, branchId, user, statusCode = '2') {
-  const raw = imported.raw || {};
-  const actor = getActor(user);
-  const requiredFields = [
-    'tin',
-    'bhfId',
-    'taskCd',
-    'dclDe',
-    'itemSeq',
-    'dclNo',
-    'hsCd',
-    'imptItemSttsCd',
-    'itemNm',
-    'regrId',
-    'regrNm',
-    'modrId',
-    'modrNm',
-  ];
-
-  const payload = {
-    companyId: imported.company,
-    tin: cleanString(device?.tin, 9),
-    bhfId: normalizeBranchId(branchId),
-    taskCd: cleanString(firstValue(raw.taskCd, imported.importTaskCode), 30),
-    dclDe: formatVsdcDate(firstValue(raw.dclDe, raw.declarationDate, imported.importDate)),
-    itemSeq: toOptionalNumber(firstValue(raw.itemSeq, raw.itemSequence, raw.seq, 1)),
-    dclNo: cleanString(firstValue(raw.dclNo, imported.importDeclarationNo), 20),
-    hsCd: cleanString(firstValue(raw.hsCd, raw.hscd, raw.hsCode), 10),
-    imptItemSttsCd: cleanString(firstValue(statusCode, raw.imptItemSttsCd, '2'), 5),
-    itemNm: cleanString(firstValue(raw.itemNm, imported.itemName), 200),
-    orgnNatCd: cleanString(firstValue(raw.orgnNatCd, imported.originCountryCode), 5),
-    exptNatCd: cleanString(raw.exptNatCd, 5),
-    pkg: toOptionalNumber(raw.pkg),
-    pkgUnitCd: cleanString(raw.pkgUnitCd, 5),
-    qty: toOptionalNumber(firstValue(raw.qty, imported.quantity)),
-    qtyUnitCd: cleanString(firstValue(raw.qtyUnitCd, imported.unitCode), 5),
-    totWt: toOptionalNumber(raw.totWt),
-    netWt: toOptionalNumber(raw.netWt),
-    spplrNm: cleanString(firstValue(raw.spplrNm, raw.splrNm, imported.supplierName), 60),
-    agntNm: cleanString(raw.agntNm, 60),
-    invcFcurAmt: toOptionalNumber(raw.invcFcurAmt),
-    invcFcurCd: cleanString(raw.invcFcurCd, 5),
-    invcFcurExcrt: toOptionalNumber(raw.invcFcurExcrt),
-    dclRefNum: cleanString(raw.dclRefNum, 30),
-    regrId: actor.id,
-    regrNm: actor.name,
-    modrId: actor.id,
-    modrNm: actor.name,
-  };
-
-  const missing = requiredFields.filter((field) => payload[field] === null || payload[field] === undefined || payload[field] === '');
-  if (missing.length) {
-    const error = new Error(`Imported item is missing RRA confirmation fields: ${missing.join(', ')}`);
-    error.code = 'EBM_IMPORT_ITEM_PAYLOAD_INVALID';
-    error.statusCode = 400;
-    error.retryable = false;
-    error.missingFields = missing;
-    throw error;
+function validateSelectRow(row, index) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) {
+    failRowValidation(index, 'row', 'an invalid value');
   }
 
-  return omitBlankOptionalFields(payload, requiredFields);
-}
-function normalizeImportedItem(raw, companyId, branchId) {
-  const importTaskCode = String(raw.taskCd || raw.importTaskCode || raw.taskCode || raw.taskNo || raw.dclNo || '').trim();
-  const quantity = Number(raw.qty || raw.quantity || raw.importQty || 0);
-  const taxTypeCode = raw.taxTyCd || raw.taxTypeCode || null;
+  for (const [field, maxLength] of Object.entries(SELECT_CHAR_LIMITS)) {
+    if (!(field in row)) continue;
+    // The v1.0.5 response table does not mark row fields required, and its
+    // example explicitly permits null. Preserve absent/null values rather
+    // than inferring requiredness from the field description.
+    if (row[field] === null) continue;
+    if (typeof row[field] !== 'string' || row[field].length > maxLength) {
+      failRowValidation(index, field, `an invalid CHAR value (maximum length ${maxLength})`);
+    }
+  }
+  for (const [field, maxDigits] of Object.entries(SELECT_NUMBER_LIMITS)) {
+    if (!(field in row)) continue;
+    const value = row[field];
+    if (value === null) continue;
+    if (typeof value === 'string' && maxDigits === 18) {
+      if (!isExactDecimalWithinPrecision(value, maxDigits, 2)) {
+        failRowValidation(index, field, `a NUMBER value exceeding precision ${maxDigits}, scale 2`);
+      }
+      continue;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      failRowValidation(index, field, 'an invalid NUMBER value');
+    }
+    const asText = String(value);
+    if (/[eE]/.test(asText) || (asText.split('.')[1] || '').length > 2
+      || (asText.split('.')[0].replace('-', '').length + 2) > maxDigits) {
+      failRowValidation(index, field, `a NUMBER value exceeding precision ${maxDigits}, scale 2`);
+    }
+  }
 
+  if ('itemSeq' in row && row.itemSeq !== null
+    && (typeof row.itemSeq !== 'number' || !Number.isSafeInteger(row.itemSeq)
+      || row.itemSeq < 0 || String(row.itemSeq).length > 10)) {
+    failRowValidation(index, 'itemSeq', 'an invalid NUMBER value (expected a non-negative safe integer)');
+  }
+  if (typeof row.dclDe === 'string' && row.dclDe.length > 0
+    && (!/^\d{8}$/.test(row.dclDe) || !parseVsdcDate(row.dclDe))) {
+    failRowValidation(index, 'dclDe', 'an invalid YYYYMMDD date');
+  }
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sourceItemKeyFor(raw, occurrence = 0) {
+  // Keep the existing key where the candidate identity fields are all
+  // present. For sparse rows, use a deterministic hash of the complete raw
+  // record rather than inventing missing identity values.
+  if (['taskCd', 'dclDe', 'dclNo', 'itemSeq'].every((field) => raw[field] !== null && raw[field] !== undefined)) {
+    return JSON.stringify([raw.taskCd, raw.dclDe, raw.dclNo, raw.itemSeq]);
+  }
+  return `raw:${crypto.createHash('sha256').update(stableJson(raw)).digest('hex')}:${occurrence}`;
+}
+
+function validateSelectResponse(response) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    failValidation('VSDC import selection returned a malformed response envelope.', {
+      field: 'response',
+    });
+  }
+  if (typeof response.resultCd !== 'string' || response.resultCd.length !== 3) {
+    failValidation('VSDC import selection returned an invalid resultCd.', {
+      field: 'resultCd',
+    });
+  }
+  if (typeof response.resultMsg !== 'string') {
+    failValidation('VSDC import selection returned an invalid resultMsg.', {
+      field: 'resultMsg',
+    });
+  }
+  if (response.resultCd !== '000') {
+    const error = new Error(`VSDC import selection failed (${response.resultCd}): ${response.resultMsg}`);
+    error.code = 'EBM_IMPORT_SELECT_REJECTED';
+    error.statusCode = 502;
+    error.retryable = false;
+    error.resultCd = response.resultCd;
+    error.resultMsg = response.resultMsg;
+    throw error;
+  }
+  if (typeof response.resultDt !== 'string'
+    || !/^\d{14}$/.test(response.resultDt)
+    || !parseVsdcDate(response.resultDt)) {
+    failValidation('VSDC import selection returned an invalid server cursor.', {
+      field: 'resultDt',
+    });
+  }
+  if (!response.data || typeof response.data !== 'object' || Array.isArray(response.data)
+    || !Array.isArray(response.data.itemList)) {
+    failValidation('VSDC import selection must return data.itemList as an array.', {
+      field: 'data.itemList',
+    });
+  }
+
+  const identities = new Set();
+  response.data.itemList.forEach((row, index) => {
+    validateSelectRow(row, index);
+    const key = sourceItemKeyFor(row);
+    const hasCandidateIdentity = ['taskCd', 'dclDe', 'dclNo', 'itemSeq']
+      .every((field) => row[field] !== null && row[field] !== undefined);
+    if (hasCandidateIdentity && identities.has(key)) {
+      failValidation(`VSDC import selection returned duplicate item identity in row ${index + 1}.`, {
+        rowIndex: index + 1,
+        field: 'identity',
+      });
+    }
+    identities.add(key);
+  });
+  return response.data.itemList;
+}
+
+function normalizeImportedItem(raw, companyId, branchId, mode, occurrence = 0) {
+  const sourceItemKey = sourceItemKeyFor(raw, occurrence);
+  const returnedStatusValues = RRA_IMPORT_STATUS_FIELDS
+    .map((field) => raw[field])
+    .filter((value) => typeof value === 'string');
+  const distinctStatusValues = [...new Set(returnedStatusValues)];
+  const statusConflict = distinctStatusValues.length > 1;
+  const returnedStatusCode = statusConflict ? null : (distinctStatusValues[0] ?? null);
   return {
     company: companyId,
     branchId,
-    importTaskCode,
-    importDeclarationNo: raw.dclNo || raw.declarationNo || raw.importDeclarationNo || null,
-    importDate: parseVsdcDate(raw.dclDe || raw.importDate || raw.dclDt),
-    itemCode: raw.itemCd || raw.itemCode || null,
-    itemName: raw.itemNm || raw.itemName || raw.goodsNm || importTaskCode,
-    itemClassCode: raw.itemClsCd || raw.itemClassCode || null,
-    quantity,
-    unitCode: raw.qtyUnitCd || raw.unitCode || raw.qtyUnit || null,
-    originCountryCode: raw.orgnNatCd || raw.originCountryCode || raw.countryCode || null,
-    supplierTin: raw.splrTin || raw.supplierTin || null,
-    supplierName: raw.splrNm || raw.supplierName || null,
-    unitCost: Number(raw.prc || raw.unitCost || raw.amount || 0),
-    taxTypeCode,
-    taxRate: taxTypeCode === 'B' ? 18 : 0,
+    mode,
+    sourceItemKey,
+    // Source identity and direct projections; all other source properties stay in raw.
+    importTaskCode: raw.taskCd ?? null,
+    itemSeq: raw.itemSeq ?? null,
+    importDeclarationNo: raw.dclNo ?? null,
+    importDate: raw.dclDe ? parseVsdcDate(raw.dclDe) : null,
+    itemCode: null,
+    itemName: raw.itemNm ?? null,
+    itemClassCode: null,
+    quantity: raw.qty ?? null,
+    unitCode: raw.qtyUnitCd ?? null,
+    originCountryCode: raw.orgnNatCd ?? null,
+    supplierTin: null,
+    supplierName: raw.spplrNm ?? null,
+    unitCost: null,
+    taxTypeCode: null,
+    taxRate: null,
+    // This is the status observed in the latest select response, not proof
+    // that a local status-update request was accepted or a transition valid.
+    rraStatusCode: returnedStatusCode,
     raw,
     pulledAt: new Date(),
   };
+}
+
+function blockedImportMutation(operation) {
+  const error = new Error(
+    `${operation} is blocked until RRA confirms the import status-update endpoint/fields and the business rule for local goods receipt. No RRA request or stock/GRN change was made.`,
+  );
+  error.code = 'EBM_IMPORT_CONTRACT_UNCONFIRMED';
+  error.statusCode = 409;
+  error.retryable = false;
+  return error;
 }
 
 async function getInitializedDevice(companyId, branchId) {
@@ -184,96 +307,126 @@ async function getInitializedDevice(companyId, branchId) {
   return device;
 }
 
-async function getSyncState(companyId, branchId) {
+async function getSyncState(companyId, branchId, initialCursor) {
   const mode = ebmService.getConfig().mode;
   return EBMSyncState.findOneAndUpdate(
     { company: companyId, branchId, syncType: SYNC_TYPE, mode },
     {
-      $setOnInsert: { company: companyId, branchId, syncType: SYNC_TYPE, mode, lastReqDt: FIRST_SYNC_DT },
+      $setOnInsert: { company: companyId, branchId, syncType: SYNC_TYPE, mode, lastReqDt: initialCursor },
       $set: { lastAttemptAt: new Date() },
     },
     { upsert: true, new: true },
   );
 }
 
-async function runController(handler, req) {
-  return new Promise((resolve, reject) => {
-    const res = {
-      statusCode: 200,
-      status(code) {
-        this.statusCode = code;
-        return this;
-      },
-      json(payload) {
-        if (this.statusCode >= 400 || payload?.success === false) {
-          const err = new Error(payload?.message || 'Controller request failed');
-          err.statusCode = this.statusCode;
-          err.payload = payload;
-          reject(err);
-          return;
-        }
-        resolve(payload);
-      },
-    };
-    handler(req, res, reject);
-  });
-}
-
 class EBMImportedItemService {
+  static getMode() {
+    return ebmService.getConfig().mode;
+  }
+
   static async syncImports(companyId, options = {}) {
-    const branchId = normalizeBranchId(options.branchId || options.bhfId || '00');
+    const branchId = assertHeadOfficeOperation('EBM imported-item management', options.branchId || options.bhfId || '00');
     const full = options.full === true;
+    const mode = ebmService.getConfig().mode;
+    const semanticsConfirmed = cursorSemanticsConfirmed(mode, 'EBM_IMPORT_CURSOR_SEMANTICS_CONFIRMED');
+    const initialCursor = getInitialImportCursor(mode);
     const device = await getInitializedDevice(companyId, branchId);
-    const state = await getSyncState(companyId, branchId);
-    const lastReqDt = full ? FIRST_SYNC_DT : (state.lastReqDt || FIRST_SYNC_DT);
+    const state = await getSyncState(companyId, branchId, initialCursor);
+    const previousCursor = state.lastReqDt || initialCursor;
+    const lastReqDt = full || !semanticsConfirmed ? initialCursor : previousCursor;
 
     try {
-      const response = await ebmService.selectImportItems({
-        companyId,
-        tin: device.tin,
-        bhfId: branchId,
-        lastReqDt,
-      });
-      const items = asArray(response.data?.itemList || response.data?.importItemList || response.data?.imports);
-      const ops = [];
-
-      for (const item of items) {
-        const normalized = normalizeImportedItem(item, companyId, branchId);
-        if (!normalized.importTaskCode) continue;
-        ops.push({
+      const request = validateSelectRequest(device, branchId, lastReqDt);
+      const response = await ebmService.selectImportItems(request, { companyId });
+      const items = validateSelectResponse(response);
+      if (!assertResultTimestamp(response.resultDt)
+        || (semanticsConfirmed && response.resultDt < lastReqDt)) {
+        throw cursorRegressionError('RRA imported-item lookup');
+      }
+      const nextCursor = semanticsConfirmed ? response.resultDt : initialCursor;
+      const sparseOccurrences = new Map();
+      const ops = items.map((item) => {
+        const hasCandidateIdentity = ['taskCd', 'dclDe', 'dclNo', 'itemSeq']
+          .every((field) => item[field] !== null && item[field] !== undefined);
+        const rawHash = hasCandidateIdentity ? null : sourceItemKeyFor(item).replace(/:\d+$/, '');
+        const occurrence = rawHash ? (sparseOccurrences.get(rawHash) || 0) : 0;
+        if (rawHash) sparseOccurrences.set(rawHash, occurrence + 1);
+        const normalized = normalizeImportedItem(item, companyId, branchId, mode, occurrence);
+        return {
           updateOne: {
-            filter: { company: companyId, branchId, importTaskCode: normalized.importTaskCode },
+            filter: {
+              company: companyId,
+              branchId,
+              mode,
+              sourceItemKey: normalized.sourceItemKey,
+            },
             update: {
               $set: normalized,
-              $setOnInsert: { confirmationStatus: 'pending', stockUpdated: false },
+              $setOnInsert: {
+                confirmationStatus: 'pending',
+                stockUpdated: false,
+              },
             },
             upsert: true,
           },
-        });
-      }
-
-      const write = ops.length ? await EBMImportedItem.bulkWrite(ops) : {};
-      state.lastReqDt = response.resultDt || formatVsdcDateTime();
-      state.lastSuccessfulSyncAt = new Date();
-      state.lastErrorMessage = null;
-      state.summary = {
-        syncType: SYNC_TYPE,
-        lastReqDt,
-        received: items.length,
-        upserted: write.upsertedCount || 0,
-        matched: write.matchedCount || 0,
-      };
-      await state.save();
+        };
+      });
+      const summary = await runInTransaction(async () => {
+        const write = ops.length ? await EBMImportedItem.bulkWrite(ops) : {};
+        const nextSummary = {
+          syncType: SYNC_TYPE,
+          lastReqDt,
+          received: items.length,
+          upserted: write.upsertedCount || 0,
+          matched: write.matchedCount || 0,
+          cursorAdvanced: semanticsConfirmed,
+          cursorPolicy: semanticsConfirmed ? 'incremental_confirmed' : 'fixed_baseline_replay_unconfirmed',
+        };
+        const cursorUpdate = await EBMSyncState.updateMany(
+          {
+            company: companyId,
+            branchId,
+            syncType: SYNC_TYPE,
+            mode,
+            lastReqDt: previousCursor,
+          },
+          {
+            $set: {
+              lastReqDt: nextCursor,
+              lastSuccessfulSyncAt: new Date(),
+              lastErrorMessage: null,
+              summary: nextSummary,
+            },
+          },
+        );
+        if (!cursorUpdate.matchedCount) {
+          const error = new Error('Imported-item cursor changed during sync; no rows or cursor were committed. Retry the sync.');
+          error.code = 'EBM_IMPORT_SYNC_CURSOR_CONFLICT';
+          error.statusCode = 409;
+          error.retryable = true;
+          throw error;
+        }
+        return nextSummary;
+      });
 
       return {
         branchId,
-        mode: ebmService.getConfig().mode,
-        ...state.summary,
+        mode,
+        ...summary,
         resultDt: response.resultDt,
+        cursorAdvanced: semanticsConfirmed,
       };
     } catch (error) {
-      state.lastErrorMessage = error.message || 'Imported item sync failed';
-      await state.save();
+      await EBMSyncState.updateMany(
+        {
+          company: companyId,
+          branchId,
+          syncType: SYNC_TYPE,
+          mode,
+          lastReqDt: previousCursor,
+        },
+        { $set: { lastErrorMessage: error.message || 'Imported item sync failed' } },
+      );
       throw error;
     }
   }
@@ -284,6 +437,7 @@ class EBMImportedItemService {
     const devices = await EBMDevice.find({
       status: EBM_DEVICE_STATUSES.INITIALIZED,
       initializedMode: ebmService.getConfig().mode,
+      branchId: '00',
     }).lean();
 
     const results = [];
@@ -306,9 +460,11 @@ class EBMImportedItemService {
   }
 
   static async listImports(companyId, query = {}) {
-    const filter = { company: companyId };
+    const filter = { company: companyId, mode: ebmService.getConfig().mode };
     if (query.status) filter.confirmationStatus = query.status;
-    if (query.branchId) filter.branchId = normalizeBranchId(query.branchId);
+    if (query.branchId) {
+      filter.branchId = assertHeadOfficeOperation('EBM imported-item listing', query.branchId);
+    }
     return EBMImportedItem.find(filter)
       .populate('product', 'name sku')
       .populate('warehouse', 'name code')
@@ -318,181 +474,67 @@ class EBMImportedItemService {
       .limit(Math.min(Number(query.limit || 100), 500));
   }
 
-  static async confirmImport(companyId, importId, options, user) {
-    const branchId = normalizeBranchId(options.branchId || options.bhfId || '00');
-    const imported = await EBMImportedItem.findOne({ _id: importId, company: companyId });
+  static async confirmImport() {
+    throw blockedImportMutation('Imported-item confirmation');
+  }
+
+  /** Save local receiving links only. This does not confirm an import with RRA or receive stock. */
+  static async mapImport(companyId, importId, mapping) {
+    const imported = await EBMImportedItem.findOne({ _id: importId, company: companyId }).lean();
     if (!imported) {
       const error = new Error('Imported item not found');
       error.statusCode = 404;
       throw error;
     }
-    if (imported.confirmationStatus === 'confirmed' && imported.stockUpdated) return imported;
-
-    const device = await getInitializedDevice(companyId, branchId);
-    try {
-      const payload = buildSaveImportItemPayload(imported, device, branchId, user, '2');
-      const response = await ebmService.saveImportItems(payload);
-      imported.confirmationStatus = 'confirmed';
-      imported.rraConfirmedAt = new Date();
-      imported.rraResult = response.raw || response;
-      imported.confirmationError = null;
-      imported.confirmedAt = new Date();
-      imported.confirmedBy = user?.id || user?._id || null;
-      await imported.save();
-    } catch (error) {
-      imported.confirmationError = error.message || 'RRA import confirmation failed';
-      await imported.save();
-      throw error;
-    }
-
-    try {
-      await this.updateStockFromImport(imported, options, user);
-    } catch (error) {
-      imported.stockUpdated = false;
-      imported.stockUpdateError = error.message || 'Stock update failed after RRA import confirmation';
-      await imported.save();
-      return imported;
-    }
-
-    return EBMImportedItem.findById(imported._id).populate('grn', 'referenceNo status');
-  }
-
-  static async updateStockFromImport(imported, options, user) {
-    if (imported.stockUpdated && imported.grn) return imported;
-
-    const companyId = imported.company;
-    const productId = options.productId || imported.product;
-    const warehouseId = options.warehouseId || options.warehouse || imported.warehouse;
-    if (!productId || !warehouseId) {
-      throw new Error('Product and warehouse are required to update stock from an imported item.');
-    }
-
-    const product = await Product.findOne({ _id: productId, company: companyId });
-    if (!product) throw new Error('Selected product was not found for this company.');
-
-    const grnController = require('../controllers/grnController');
-    const controllerUser = {
-      company: { _id: companyId },
-      id: user?.id || user?._id,
-      _id: user?.id || user?._id,
-      name: user?.name,
-      email: user?.email,
-    };
-
-    if (imported.grn) {
-      const existingGrn = await GoodsReceivedNote.findOne({ _id: imported.grn, company: companyId });
-      if (!existingGrn) throw new Error('Linked GRN was not found for retry.');
-      if (existingGrn.status !== 'confirmed') {
-        await runController(grnController.confirmGRN, {
-          user: controllerUser,
-          params: { id: imported.grn },
-          body: {},
-        });
-      }
-      imported.stockUpdated = true;
-      imported.stockUpdateError = null;
-      await imported.save();
-      return imported;
-    }
-
-    let supplier = null;
-    if (options.supplierId) {
-      supplier = await Supplier.findOne({ _id: options.supplierId, company: companyId });
-    }
-    if (!supplier && imported.supplierTin) {
-      supplier = await Supplier.findOne({ company: companyId, taxId: imported.supplierTin });
-    }
-    if (!supplier) {
-      supplier = await Supplier.create({
-        company: companyId,
-        name: imported.supplierName || 'RRA Imported Supplier',
-        taxId: imported.supplierTin || undefined,
-        contact: { country: imported.originCountryCode || undefined },
-        createdBy: user?.id || user?._id || undefined,
-      });
-    }
-
-    const po = await PurchaseOrder.create({
-      company: companyId,
-      supplier: supplier._id,
-      warehouse: warehouseId,
-      status: 'approved',
-      currencyCode: 'RWF',
-      orderDate: imported.importDate || new Date(),
-      expectedDeliveryDate: new Date(),
-      notes: `Auto-created from RRA import ${imported.importTaskCode}`,
-      approvedBy: user?.id || user?._id || undefined,
-      approvedAt: new Date(),
-      createdBy: user?.id || user?._id || undefined,
-      lines: [{
-        product: product._id,
-        qtyOrdered: imported.quantity,
-        unitCost: imported.unitCost || Number(options.unitCost || 0),
-        taxRate: imported.taxRate || Number(options.taxRate || 0),
-      }],
-    });
-
-    const poLine = po.lines[0];
-    const referenceNo = await generateUniqueNumber('GRN', GoodsReceivedNote, companyId, 'referenceNo');
-    const baseReq = {
-      user: controllerUser,
-      body: {
-        purchaseOrderId: po._id,
-        warehouse: warehouseId,
-        referenceNo,
-        supplierInvoiceNo: imported.importDeclarationNo || imported.importTaskCode,
-        receivedDate: new Date(),
-        lines: [{
-          purchaseOrderLine: poLine._id,
-          product: product._id,
-          qtyReceived: imported.quantity,
-          unitCost: imported.unitCost || Number(options.unitCost || 0),
-          taxRate: imported.taxRate || Number(options.taxRate || 0),
-        }],
-      },
-    };
-
-    const created = await runController(grnController.createGRN, baseReq);
-    const grn = created.data;
-    await GoodsReceivedNote.updateOne(
-      { _id: grn._id, company: companyId },
-      { $set: { ebmImportReference: imported.importTaskCode, ebmImportedItem: imported._id } },
-    );
-    imported.product = product._id;
-    imported.warehouse = warehouseId;
-    imported.supplier = supplier._id;
-    imported.purchaseOrder = po._id;
-    imported.grn = grn._id;
-    await imported.save();
-
-    await runController(grnController.confirmGRN, {
-      ...baseReq,
-      params: { id: grn._id },
-      body: {},
-    });
-
-    imported.stockUpdated = true;
-    imported.stockUpdateError = null;
-    await imported.save();
-    return imported;
-  }
-
-  static async retryStockUpdate(companyId, importId, options, user) {
-    const imported = await EBMImportedItem.findOne({ _id: importId, company: companyId });
-    if (!imported) {
-      const error = new Error('Imported item not found');
-      error.statusCode = 404;
-      throw error;
-    }
-    if (imported.confirmationStatus !== 'confirmed') {
-      const error = new Error('Only RRA-confirmed imports can retry stock update.');
+    if (imported.confirmationStatus !== 'pending' || imported.stockUpdated || imported.grn) {
+      const error = new Error('Only pending imports without a goods receipt can be mapped.');
+      error.code = 'EBM_IMPORT_MAPPING_LOCKED';
       error.statusCode = 409;
       throw error;
     }
-    await this.updateStockFromImport(imported, options, user);
-    return EBMImportedItem.findById(imported._id).populate('grn', 'referenceNo status');
+
+    const [product, warehouse, supplier] = await Promise.all([
+      Product.findOne({ _id: mapping.productId, company: companyId, isActive: true }).lean(),
+      Warehouse.findOne({ _id: mapping.warehouseId, company: companyId, isActive: true }).lean(),
+      Supplier.findOne({ _id: mapping.supplierId, company: companyId, isActive: true }).lean(),
+    ]);
+    if (!product) {
+      const error = new Error('Select an active product belonging to this company.');
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!warehouse) {
+      const error = new Error('Select an active warehouse belonging to this company.');
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!supplier) {
+      const error = new Error('Select an active supplier belonging to this company.');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const updated = await EBMImportedItem.findOneAndUpdate(
+      { _id: importId, company: companyId, confirmationStatus: 'pending', stockUpdated: false, grn: null },
+      { $set: { product: mapping.productId, warehouse: mapping.warehouseId, supplier: mapping.supplierId } },
+      { new: true },
+    );
+    if (!updated) {
+      const error = new Error('The imported item changed while it was being mapped. Refresh and try again.');
+      error.code = 'EBM_IMPORT_MAPPING_CONFLICT';
+      error.statusCode = 409;
+      throw error;
+    }
+    return updated;
   }
 
+  static async updateStockFromImport() {
+    throw blockedImportMutation('Imported-item stock receipt');
+  }
+
+  static async retryStockUpdate() {
+    throw blockedImportMutation('Imported-item stock retry');
+  }
   static async rejectImport(companyId, importId, reason, user) {
     const imported = await EBMImportedItem.findOne({ _id: importId, company: companyId });
     if (!imported) {
@@ -500,8 +542,8 @@ class EBMImportedItemService {
       error.statusCode = 404;
       throw error;
     }
-    if (imported.confirmationStatus === 'confirmed') {
-      const error = new Error('Confirmed imported items cannot be rejected.');
+    if (imported.confirmationStatus === 'confirmed' || imported.grn || imported.stockUpdated) {
+      const error = new Error('An imported item with a goods receipt or posted stock cannot be rejected locally.');
       error.statusCode = 409;
       throw error;
     }
@@ -515,8 +557,11 @@ class EBMImportedItemService {
   }
 }
 
-EBMImportedItemService.__test__ = { buildSaveImportItemPayload };
+EBMImportedItemService.__test__ = {
+  validateSelectRequest,
+  validateSelectResponse,
+  normalizeImportedItem,
+  sourceItemKeyFor,
+};
 
 module.exports = EBMImportedItemService;
-
-

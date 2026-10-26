@@ -10,6 +10,13 @@ const { CHART_OF_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { syncSystemRoles } = require('../scripts/seedSystemRoles');
 const CurrencyService = require('./CurrencyService');
 
+const configuredUpsertAttempts = Number(process.env.PRISMA_RETRY_ATTEMPTS || 3);
+const BOOTSTRAP_UPSERT_ATTEMPTS = Number.isFinite(configuredUpsertAttempts) && configuredUpsertAttempts > 0
+  ? Math.floor(configuredUpsertAttempts)
+  : 3;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function accountData(definition, createdById = null) {
   return {
     name: definition.name,
@@ -22,6 +29,34 @@ function accountData(definition, createdById = null) {
   };
 }
 
+async function upsertCanonicalAccount(companyId, code, definition, createdById = null) {
+  const create = {
+    id: generateObjectId(),
+    companyId,
+    code: String(code),
+    ...accountData(definition, createdById),
+  };
+  const update = accountData(definition);
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await prisma.chartOfAccount.upsert({
+        where: { companyId_code: { companyId, code: String(code) } },
+        create,
+        update,
+      });
+      return;
+    } catch (error) {
+      if (error.code !== 'P1017' || attempt >= BOOTSTRAP_UPSERT_ATTEMPTS) throw error;
+      console.warn(
+        `[Bootstrap] Chart account ${code} connection closed during upsert`
+        + ` — retrying (${attempt}/${BOOTSTRAP_UPSERT_ATTEMPTS - 1})`,
+      );
+      await sleep(attempt * 500);
+    }
+  }
+}
+
 async function syncCompanyChartOfAccounts(companyId, createdById = null) {
   let created = 0;
   let updated = 0;
@@ -32,21 +67,10 @@ async function syncCompanyChartOfAccounts(companyId, createdById = null) {
       select: { id: true },
     });
 
+    await upsertCanonicalAccount(companyId, code, definition, createdById);
     if (existing) {
-      await prisma.chartOfAccount.update({
-        where: { id: existing.id },
-        data: accountData(definition),
-      });
       updated += 1;
     } else {
-      await prisma.chartOfAccount.create({
-        data: {
-          id: generateObjectId(),
-          companyId,
-          code: String(code),
-          ...accountData(definition, createdById),
-        },
-      });
       created += 1;
     }
   }

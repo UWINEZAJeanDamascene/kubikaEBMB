@@ -807,6 +807,7 @@ exports.createDirectSale = async (req, res, next) => {
       }
 
       // 1. Create the invoice
+      const saleConfirmedAt = new Date();
       invoice = await Invoice.create([{
         company: companyId,
         client: client._id,
@@ -830,8 +831,9 @@ exports.createDirectSale = async (req, res, next) => {
         terms: terms || '',
         dueDate: dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
         createdBy: req.user.id,
+        confirmedAt: saleConfirmedAt,
         confirmedBy: req.user.id,
-        confirmedDate: new Date(),
+        confirmedDate: saleConfirmedAt,
         stockDeducted: true,
         autoConfirm: true
       }], { session });
@@ -1420,7 +1422,7 @@ exports.createDirectSale = async (req, res, next) => {
     if (autoFiscalSubmission) {
       // Fiscal communication must not roll back a completed sale. The service
       // records failures and retryable payloads in the durable EBM queue.
-      EBMSalesService.submitInvoiceAsync(invoice._id, { companyId });
+      EBMSalesService.submitInvoiceAsync(invoice._id, { companyId, modifierUserId: req.user.id || req.user._id });
     }
 
     // Send email notification

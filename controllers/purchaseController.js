@@ -702,6 +702,7 @@ exports.receivePurchase = async (req, res, next) => {
     try {
       responsePurchase = await EBMPurchaseService.processPurchaseDocument(companyId, purchase, "Purchase", {
         branchId: req.body.branchId || req.body.bhfId,
+        operator: { id: req.user?._id || req.user?.id, name: req.user?.name },
       });
       if (responsePurchase?.ebm?.ebmStatus !== "failed") {
         await EBMStockService.submitStockForDirectPurchase(purchase._id, {

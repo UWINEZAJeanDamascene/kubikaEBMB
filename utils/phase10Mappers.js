@@ -6,6 +6,7 @@ const { generateObjectId, toIdString } = require('./objectId');
 const { decimalToNumber, decimalToString, mapTimestamps } = require('./decimalHelpers');
 const { mergeUpdatePayload } = require('./masterDataMappers');
 const { tenantCreateBase } = require('./inventoryJournalMappers');
+const VSDC_CODE_DEFINITIONS = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.1-4.3.json');
 
 const moneyStr = (v) => decimalToString(v, 2);
 const qtyNum = (v) => decimalToNumber(v, 0);
@@ -1858,16 +1859,20 @@ function ebmDeviceToApi(row) {
     ...companyRefs(row),
     tin: row.tin,
     branchId: row.branchId,
+    environment: row.environment || row.initializedMode || row.lastAttemptMode || 'mock',
     branchName: row.branchName ?? null,
     branchRef: row.branchRefId ?? null,
     deviceSerialNo: row.deviceSerialNo,
     status: row.status,
     initializedAt: row.initializedAt ?? null,
     lastAttemptAt: row.lastAttemptAt ?? null,
+    lastRequestId: row.lastRequestId ?? null,
+    sequenceSeedStatus: row.sequenceSeedStatus ?? null,
+    lastSuccessfulContactAt: row.lastSuccessfulContactAt ?? null,
+    lastSuccessfulFiscalAt: row.lastSuccessfulFiscalAt ?? null,
     lastErrorMessage: row.lastErrorMessage ?? null,
     initializedMode: row.initializedMode ?? null,
     lastAttemptMode: row.lastAttemptMode ?? null,
-    initResult: row.initResult ?? null,
     createdBy: row.createdById ?? null,
     updatedBy: row.updatedById ?? null,
     ...mapTimestamps(row),
@@ -1876,8 +1881,11 @@ function ebmDeviceToApi(row) {
 
 const EBM_DEVICE_HEADER = {
   company: 'companyId', companyId: 'companyId', tin: 'tin', branchId: 'branchId',
+  environment: 'environment',
   branchName: 'branchName', branchRef: 'branchRefId', deviceSerialNo: 'deviceSerialNo',
-  status: 'status', initializedAt: 'initializedAt', lastAttemptAt: 'lastAttemptAt',
+  status: 'status', initializedAt: 'initializedAt', lastAttemptAt: 'lastAttemptAt', lastRequestId: 'lastRequestId',
+  sequenceSeedStatus: 'sequenceSeedStatus',
+  lastSuccessfulContactAt: 'lastSuccessfulContactAt', lastSuccessfulFiscalAt: 'lastSuccessfulFiscalAt',
   lastErrorMessage: 'lastErrorMessage', initializedMode: 'initializedMode',
   lastAttemptMode: 'lastAttemptMode', initResult: 'initResult', updatedBy: 'updatedById',
 };
@@ -1898,10 +1906,20 @@ function ebmCodeToApi(row) {
     ...companyRefs(row),
     codeClass: row.codeClass,
     codeClassName: row.codeClassName ?? null,
+    codeClassDescription: row.codeClassDescription ?? null,
+    classUserDefinedName1: row.classUserDefinedName1 ?? null,
+    classUserDefinedName2: row.classUserDefinedName2 ?? null,
+    classUserDefinedName3: row.classUserDefinedName3 ?? null,
+    codeClassUseYn: row.codeClassUseYn ?? null,
+    codeClassSource: row.codeClassSource ?? {},
     code: row.code,
     name: row.name ?? null,
     description: row.description ?? null,
     sortOrder: row.sortOrder,
+    userDefinedCode1: row.userDefinedCode1 ?? null,
+    userDefinedCode2: row.userDefinedCode2 ?? null,
+    userDefinedCode3: row.userDefinedCode3 ?? null,
+    useYn: row.useYn ?? null,
     active: row.active,
     source: row.source ?? {},
     lastSyncedAt: row.lastSyncedAt,
@@ -1911,7 +1929,11 @@ function ebmCodeToApi(row) {
 
 const EBM_CODE_HEADER = {
   company: 'companyId', companyId: 'companyId', codeClass: 'codeClass', codeClassName: 'codeClassName',
-  code: 'code', name: 'name', description: 'description', sortOrder: 'sortOrder',
+  codeClassDescription: 'codeClassDescription', classUserDefinedName1: 'classUserDefinedName1',
+  classUserDefinedName2: 'classUserDefinedName2', classUserDefinedName3: 'classUserDefinedName3',
+  codeClassUseYn: 'codeClassUseYn', codeClassSource: 'codeClassSource', code: 'code', name: 'name',
+  description: 'description', sortOrder: 'sortOrder', userDefinedCode1: 'userDefinedCode1',
+  userDefinedCode2: 'userDefinedCode2', userDefinedCode3: 'userDefinedCode3', useYn: 'useYn',
   active: 'active', source: 'source', lastSyncedAt: 'lastSyncedAt',
 };
 
@@ -1934,6 +1956,8 @@ function ebmItemClassToApi(row) {
     parentCode: row.parentCode ?? null,
     taxTypeCode: row.taxTypeCode ?? null,
     majorTarget: row.majorTarget,
+    majorTargetYn: row.majorTargetYn ?? null,
+    useYn: row.useYn ?? null,
     active: row.active,
     source: row.source ?? {},
     lastSyncedAt: row.lastSyncedAt,
@@ -1944,7 +1968,8 @@ function ebmItemClassToApi(row) {
 const EBM_ITEM_CLASS_HEADER = {
   company: 'companyId', companyId: 'companyId', itemClassCode: 'itemClassCode',
   itemClassName: 'itemClassName', itemClassLevel: 'itemClassLevel', parentCode: 'parentCode',
-  taxTypeCode: 'taxTypeCode', majorTarget: 'majorTarget', active: 'active',
+  taxTypeCode: 'taxTypeCode', majorTarget: 'majorTarget', majorTargetYn: 'majorTargetYn',
+  useYn: 'useYn', active: 'active',
   source: 'source', lastSyncedAt: 'lastSyncedAt',
 };
 
@@ -1958,13 +1983,24 @@ const ebmItemClassTranslateUpdate = genericTranslateUpdate(EBM_ITEM_CLASS_HEADER
 
 function ebmTinToApi(row) {
   if (!row) return null;
+  const taxpayerStatus = VSDC_CODE_DEFINITIONS.classifications
+    .find((item) => item.codeClass === '15')?.details
+    .find((item) => item.code === row.statusCode) || null;
   return {
     _id: row.id,
+    ...companyRefs(row),
+    branchId: row.branchId ?? null,
     tin: row.tin,
     taxpayerName: row.taxpayerName,
     statusCode: row.statusCode ?? null,
+    taxpayerStatusCode: row.statusCode ?? null,
+    taxpayerStatusLabel: taxpayerStatus?.name || null,
+    taxpayerStatusKnown: Boolean(taxpayerStatus),
+    taxpayerEligibility: 'not_evaluated',
     provinceName: row.provinceName ?? null,
     districtName: row.districtName ?? null,
+    sectorName: row.sectorName ?? null,
+    verificationMode: row.verificationMode ?? null,
     active: row.active,
     source: row.source ?? {},
     lastSyncedAt: row.lastSyncedAt,
@@ -1973,13 +2009,16 @@ function ebmTinToApi(row) {
 }
 
 const EBM_TIN_HEADER = {
+  company: 'companyId', companyId: 'companyId', branchId: 'branchId',
   tin: 'tin', taxpayerName: 'taxpayerName', statusCode: 'statusCode',
-  provinceName: 'provinceName', districtName: 'districtName', active: 'active',
+  provinceName: 'provinceName', districtName: 'districtName', sectorName: 'sectorName',
+  active: 'active',
+  verificationMode: 'verificationMode',
   source: 'source', lastSyncedAt: 'lastSyncedAt',
 };
 
-const ebmTinTranslateCreate = (data) => globalTranslateCreate(data, EBM_TIN_HEADER, [], { source: data.source ?? {} });
-const ebmTinTranslateUpdate = genericTranslateUpdate(EBM_TIN_HEADER);
+const ebmTinTranslateCreate = (data) => globalTranslateCreate(data, EBM_TIN_HEADER, ['companyId'], { source: data.source ?? {} });
+const ebmTinTranslateUpdate = genericTranslateUpdate(EBM_TIN_HEADER, ['companyId']);
 
 function ebmNoticeToApi(row) {
   if (!row) return null;
@@ -1989,9 +2028,10 @@ function ebmNoticeToApi(row) {
     noticeNumber: row.noticeNumber,
     title: row.title ?? null,
     content: row.content ?? null,
+    detailUrl: row.detailUrl ?? null,
+    registrantName: row.registrantName ?? null,
     noticeDate: row.noticeDate ?? null,
     active: row.active,
-    source: row.source ?? {},
     lastSyncedAt: row.lastSyncedAt,
     ...mapTimestamps(row),
   };
@@ -1999,7 +2039,8 @@ function ebmNoticeToApi(row) {
 
 const EBM_NOTICE_HEADER = {
   company: 'companyId', companyId: 'companyId', noticeNumber: 'noticeNumber', title: 'title',
-  content: 'content', noticeDate: 'noticeDate', active: 'active', source: 'source', lastSyncedAt: 'lastSyncedAt',
+  content: 'content', detailUrl: 'detailUrl', registrantName: 'registrantName',
+  noticeDate: 'noticeDate', active: 'active', source: 'source', lastSyncedAt: 'lastSyncedAt',
 };
 
 function ebmNoticeTranslateCreate(data) {
@@ -2009,11 +2050,20 @@ const ebmNoticeTranslateUpdate = genericTranslateUpdate(EBM_NOTICE_HEADER, ['com
 
 function ebmImportedItemToApi(row) {
   if (!row) return null;
+  const importedRef = (relation, id) => {
+    if (!relation || typeof relation !== 'object') return id ?? null;
+    const { id: relationId, ...details } = relation;
+    return { _id: relationId || id, ...details };
+  };
   return {
     _id: row.id,
     ...companyRefs(row),
+    mode: row.mode ?? 'legacy-unknown',
     branchId: row.branchId,
+    mode: row.mode,
+    sourceItemKey: row.sourceItemKey,
     importTaskCode: row.importTaskCode,
+    itemSeq: row.itemSeq == null ? null : Number(row.itemSeq),
     importDeclarationNo: row.importDeclarationNo ?? null,
     importDate: row.importDate ?? null,
     itemCode: row.itemCode ?? null,
@@ -2024,9 +2074,9 @@ function ebmImportedItemToApi(row) {
     originCountryCode: row.originCountryCode ?? null,
     supplierTin: row.supplierTin ?? null,
     supplierName: row.supplierName ?? null,
-    unitCost: qtyNum(row.unitCost),
+    unitCost: row.unitCost == null ? null : qtyNum(row.unitCost),
     taxTypeCode: row.taxTypeCode ?? null,
-    taxRate: rateNum(row.taxRate),
+    taxRate: row.taxRate == null ? null : rateNum(row.taxRate),
     raw: row.raw ?? {},
     confirmationStatus: row.confirmationStatus,
     pulledAt: row.pulledAt,
@@ -2038,19 +2088,21 @@ function ebmImportedItemToApi(row) {
     stockUpdated: row.stockUpdated,
     stockUpdateError: row.stockUpdateError ?? null,
     confirmationError: row.confirmationError ?? null,
-    product: row.productId ?? null,
-    warehouse: row.warehouseId ?? null,
-    supplier: row.supplierId ?? null,
+    product: importedRef(row.product, row.productId),
+    warehouse: importedRef(row.warehouse, row.warehouseId),
+    supplier: importedRef(row.supplier, row.supplierId),
     purchaseOrder: row.purchaseOrderId ?? null,
-    grn: row.grnId ?? null,
+    grn: importedRef(row.grn, row.grnId),
     rraConfirmedAt: row.rraConfirmedAt ?? null,
     rraResult: row.rraResult ?? null,
+    rraStatusCode: row.rraStatusCode ?? null,
     ...mapTimestamps(row),
   };
 }
 
 const EBM_IMPORTED_ITEM_HEADER = {
-  branchId: 'branchId', importTaskCode: 'importTaskCode', importDeclarationNo: 'importDeclarationNo',
+  branchId: 'branchId', mode: 'mode', sourceItemKey: 'sourceItemKey', importTaskCode: 'importTaskCode',
+  itemSeq: 'itemSeq', importDeclarationNo: 'importDeclarationNo',
   importDate: 'importDate', itemCode: 'itemCode', itemName: 'itemName', itemClassCode: 'itemClassCode',
   quantity: 'quantity', unitCode: 'unitCode', originCountryCode: 'originCountryCode',
   supplierTin: 'supplierTin', supplierName: 'supplierName', unitCost: 'unitCost',
@@ -2060,6 +2112,7 @@ const EBM_IMPORTED_ITEM_HEADER = {
   stockUpdated: 'stockUpdated', stockUpdateError: 'stockUpdateError', confirmationError: 'confirmationError',
   product: 'productId', warehouse: 'warehouseId', supplier: 'supplierId',
   purchaseOrder: 'purchaseOrderId', grn: 'grnId', rraConfirmedAt: 'rraConfirmedAt', rraResult: 'rraResult',
+  rraStatusCode: 'rraStatusCode',
 };
 
 const EBM_IMPORTED_ITEM_IDS = [
@@ -2068,8 +2121,9 @@ const EBM_IMPORTED_ITEM_IDS = [
 
 function ebmImportedItemTranslateCreate(data) {
   return headerTranslateCreate(data, EBM_IMPORTED_ITEM_HEADER, EBM_IMPORTED_ITEM_IDS, {
-    quantity: data.quantity ?? 0,
-    unitCost: moneyStr(data.unitCost ?? 0),
+    quantity: data.quantity ?? null,
+    unitCost: data.unitCost == null ? null : moneyStr(data.unitCost),
+    taxRate: data.taxRate == null ? null : decimalToString(data.taxRate, 4),
     raw: data.raw ?? {},
   });
 }
@@ -2077,9 +2131,20 @@ const ebmImportedItemTranslateUpdate = genericTranslateUpdate(EBM_IMPORTED_ITEM_
 
 function ebmUnmatchedPurchaseToApi(row) {
   if (!row) return null;
+  const storedRaw = row.raw && typeof row.raw === 'object' ? row.raw : {};
+  const duplicateRows = Array.isArray(storedRaw.__ebmDuplicateSourceRecords)
+    ? storedRaw.__ebmDuplicateSourceRecords
+    : [];
+  const sourceItems = Array.isArray(storedRaw.itemList) ? storedRaw.itemList : [];
+  const itemList = sourceItems.map((item) => Object.fromEntries([
+    'itemSeq', 'itemCd', 'itemClsCd', 'itemNm', 'bcd', 'pkgUnitCd', 'pkg', 'qtyUnitCd',
+    'qty', 'prc', 'splyAmt', 'dcRt', 'dcAmt', 'taxTyCd', 'taxblAmt', 'taxAmt', 'totAmt',
+  ].filter((field) => Object.prototype.hasOwnProperty.call(item || {}, field))
+    .map((field) => [field, item[field]])));
   return {
     _id: row.id,
     ...companyRefs(row),
+    mode: row.mode ?? 'legacy-unknown',
     branchId: row.branchId,
     supplierTin: row.supplierTin ?? null,
     supplierName: row.supplierName ?? null,
@@ -2087,8 +2152,17 @@ function ebmUnmatchedPurchaseToApi(row) {
     invoiceDate: row.invoiceDate ?? null,
     totalAmount: qtyNum(row.totalAmount),
     taxAmount: qtyNum(row.taxAmount),
-    raw: row.raw ?? {},
-    status: row.status,
+    sourceDetails: {
+      supplierBranchId: storedRaw.spplrBhfId ?? null,
+      purchaseOrderCode: storedRaw.prcOrdCd ?? null,
+      purchaseDate: storedRaw.pchsDt ?? storedRaw.salesDt ?? null,
+      currencyCode: storedRaw.invcFcurCd ?? null,
+      foreignCurrencyAmount: storedRaw.invcFcurAmt ?? null,
+      foreignExchangeRate: storedRaw.invcFcurExcrt ?? null,
+      itemList,
+    },
+    sourceRecordCount: duplicateRows.length || 1,
+    status: duplicateRows.length > 1 ? 'ambiguous' : row.status,
     linkedDocumentType: row.linkedDocumentType ?? null,
     linkedDocument: row.linkedDocumentId ?? null,
     reviewedBy: row.reviewedById ?? null,
@@ -2099,7 +2173,7 @@ function ebmUnmatchedPurchaseToApi(row) {
 }
 
 const EBM_UNMATCHED_HEADER = {
-  branchId: 'branchId', supplierTin: 'supplierTin', supplierName: 'supplierName',
+  mode: 'mode', branchId: 'branchId', supplierTin: 'supplierTin', supplierName: 'supplierName',
   sellerInvoiceNo: 'sellerInvoiceNo', invoiceDate: 'invoiceDate', totalAmount: 'totalAmount',
   taxAmount: 'taxAmount', raw: 'raw', status: 'status', linkedDocumentType: 'linkedDocumentType',
   linkedDocument: 'linkedDocumentId', reviewedBy: 'reviewedById', reviewedAt: 'reviewedAt', pulledAt: 'pulledAt',
@@ -2128,6 +2202,14 @@ function ebmSubmissionQueueToApi(row) {
     documentId: row.documentId,
     endpoint: row.endpoint,
     operationKey: row.operationKey,
+    correlationId: row.correlationId ?? null,
+    environment: row.environment ?? null,
+    prerequisiteType: row.prerequisiteType ?? null,
+    prerequisiteEndpoint: row.prerequisiteEndpoint ?? null,
+    prerequisiteOperationKey: row.prerequisiteOperationKey ?? null,
+    fiscalResponse: row.fiscalResponse ?? null,
+    sourceAppliedAt: row.sourceAppliedAt ?? null,
+    dependentsDispatchedAt: row.dependentsDispatchedAt ?? null,
     payload: row.payload ?? {},
     ebmStatus: row.ebmStatus,
     retryCount: row.retryCount,
@@ -2144,7 +2226,12 @@ function ebmSubmissionQueueToApi(row) {
 
 const EBM_QUEUE_HEADER = {
   companyId: 'companyId', company: 'companyId', documentType: 'documentType', documentId: 'documentId',
-  endpoint: 'endpoint', operationKey: 'operationKey', payload: 'payload', ebmStatus: 'ebmStatus',
+  endpoint: 'endpoint', operationKey: 'operationKey', correlationId: 'correlationId',
+  environment: 'environment',
+  prerequisiteType: 'prerequisiteType', prerequisiteEndpoint: 'prerequisiteEndpoint',
+  prerequisiteOperationKey: 'prerequisiteOperationKey', fiscalResponse: 'fiscalResponse',
+  sourceAppliedAt: 'sourceAppliedAt', dependentsDispatchedAt: 'dependentsDispatchedAt',
+  payload: 'payload', ebmStatus: 'ebmStatus',
   retryCount: 'retryCount', maxRetries: 'maxRetries', nextRetryAt: 'nextRetryAt',
   lastAttemptAt: 'lastAttemptAt', lastError: 'lastError', attempts: 'attempts',
   isRetryable: 'isRetryable', resolvedAt: 'resolvedAt',

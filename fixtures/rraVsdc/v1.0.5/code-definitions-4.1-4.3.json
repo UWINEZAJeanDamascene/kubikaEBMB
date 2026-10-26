@@ -1,0 +1,39 @@
+﻿{
+  "source": {
+    "documentId": "RRA_VSDC_DOC_v1.0.5",
+    "version": "1.0.5",
+    "sha256": "25DF854736B60E7E4EB128BF99904813C5D96ACF99464B7B48F23C7FAB3DF9C1",
+    "section": "4.1-4.3",
+    "printedPage": 58,
+    "physicalPdfPage": 62
+  },
+  "classifications": [
+    {
+      "codeClass": "04",
+      "codeClassName": "Tax Type",
+      "details": [
+        { "code": "A", "sortOrder": 1, "name": "A-EX", "description": "A-EX", "remark": "" },
+        { "code": "B", "sortOrder": 2, "name": "B-18.00%", "description": "B-18.00%", "remark": "" },
+        { "code": "C", "sortOrder": 3, "name": "C", "description": "C", "remark": "" },
+        { "code": "D", "sortOrder": 4, "name": "D", "description": "D", "remark": "" }
+      ]
+    },
+    {
+      "codeClass": "15",
+      "codeClassName": "Taxpayer Status",
+      "details": [
+        { "code": "A", "sortOrder": 1, "name": "Active", "description": "Active", "remark": "" },
+        { "code": "D", "sortOrder": 2, "name": "Discard", "description": "Discard", "remark": "" }
+      ]
+    },
+    {
+      "codeClass": "24",
+      "codeClassName": "Product Type",
+      "details": [
+        { "code": "1", "sortOrder": 1, "name": "Raw Material", "description": "Raw Material", "remark": "" },
+        { "code": "2", "sortOrder": 2, "name": "Finished Product", "description": "Finished Product", "remark": "" },
+        { "code": "3", "sortOrder": 3, "name": "Service without stock", "description": "Service without stock", "remark": "" }
+      ]
+    }
+  ]
+}

@@ -11,7 +11,7 @@
     "migrate:backfill-account-balances": "node scripts/backfill_account_balances.js --dry-run",
     "drop-category-unique-index": "node scripts/removeCategoryUniqueIndex.js",
     "test": "jest --runInBand --passWithNoTests",
-    "test:ebm": "jest --runInBand test/vsdcPayloadSanitizer.test.js test/ebmService.endpoints.test.js test/ebmVsdcSpecCompliance.test.js test/ebmSyncTypes.test.js test/ebmSalesService.payload.test.js test/ebmStockService.payload.test.js test/ebmImportedItemService.payload.test.js test/ebmCustomerTinService.test.js test/ebmPurchaseService.payload.test.js test/ebmProductService.payload.test.js test/ebmBranchService.payload.test.js test/ebmStockTypeCodes.test.js",
+    "test:ebm": "jest --runInBand test/vsdcPayloadSanitizer.test.js test/ebmService.endpoints.test.js test/ebmVsdcSpecCompliance.test.js test/ebmSyncTypes.test.js test/ebmOperationPrerequisites.test.js test/ebmPurchaseRetrieval.test.js test/ebmSalesService.payload.test.js test/ebmStockService.payload.test.js test/ebmStockContractGate.test.js test/ebmImportedItemService.payload.test.js test/ebmCustomerTinService.test.js test/ebmPurchaseService.payload.test.js test/ebmProductService.payload.test.js test/ebmBranchService.payload.test.js test/ebmStockTypeCodes.test.js test/ebmStockSequenceStep11.test.js test/ebmStockReconciliationController.test.js test/ebmLookupPermissions.test.js",
     "test:ebm:mock": "node scripts/ebm-e2e-runner.js",
     "migrate:journal": "node scripts/migrate_journal_engine.js",
     "migrate:bank-transactions": "node scripts/backfillBankTransactionsFromJournalEntries.js",

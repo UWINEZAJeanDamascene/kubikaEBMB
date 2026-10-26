@@ -25,6 +25,7 @@ const FIELD_MAP = {
   confirmedBy: { target: 'confirmedById', isId: true },
   confirmedAt: { target: 'confirmedAt' },
   freight: { target: 'freight' },
+  ebmImportReference: { target: 'ebmImportReference' },
 };
 
 module.exports = buildDocumentModel({
