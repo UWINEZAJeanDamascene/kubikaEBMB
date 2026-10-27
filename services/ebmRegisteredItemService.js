@@ -108,8 +108,29 @@ async function findRegisteredItems(scope) {
   });
 }
 
+async function registeredItemCodeExists({ companyId, tin, itemCd }) {
+  if (typeof companyId !== 'string' || !companyId.trim()) {
+    throw invalidScope('companyId');
+  }
+  if (typeof tin !== 'string' || !/^\d{9}$/.test(tin)) {
+    throw invalidScope('tin');
+  }
+  if (typeof itemCd !== 'string' || !itemCd || Array.from(itemCd).length > 20) {
+    throw invalidScope('itemCd');
+  }
+  const row = await prisma.ebmRegisteredItem.findFirst({
+    // §4.17 says itemCd is unique per item. Check every cached branch and
+    // environment for this taxpayer instead of relying on the narrower
+    // per-branch/environment key used to persist select results.
+    where: { companyId: companyId.trim(), tin, itemCd },
+    select: { id: true },
+  });
+  return Boolean(row);
+}
+
 module.exports = {
   findRegisteredItems,
+  registeredItemCodeExists,
   mapRegisteredItemForUpsert,
   persistRegisteredItems,
   validateScope,

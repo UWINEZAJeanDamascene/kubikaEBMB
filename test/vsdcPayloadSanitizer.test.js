@@ -815,6 +815,35 @@ describe('VSDC payload sanitizer', () => {
     expect(sanitized.itemList[0]).not.toHaveProperty('companyId');
   });
 
+  it('accepts only the documented one-character registration type codes', () => {
+    expect(buildPurchaseSaveRequest(validPurchaseSaveRequest({ regTyCd: 'A' })).regTyCd).toBe('A');
+    expect(buildPurchaseSaveRequest(validPurchaseSaveRequest({ regTyCd: 'M' })).regTyCd).toBe('M');
+    for (const invalidCode of ['MANUAL', 'X']) {
+      let error;
+      try {
+        buildPurchaseSaveRequest(validPurchaseSaveRequest({ regTyCd: invalidCode }));
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toMatchObject({ code: 'EBM_PURCHASE_REQUEST_INVALID', field: 'request.regTyCd', statusCode: 422 });
+    }
+  });
+
+  it('validates purchase receipt type as class 38 P/R independently from sales receipt type', () => {
+    for (const rcptTyCd of ['P', 'R']) {
+      expect(buildPurchaseSaveRequest(validPurchaseSaveRequest({ rcptTyCd })).rcptTyCd).toBe(rcptTyCd);
+    }
+    for (const rcptTyCd of ['S', 'C', 'PURCHASE']) {
+      let error;
+      try {
+        buildPurchaseSaveRequest(validPurchaseSaveRequest({ rcptTyCd }));
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toMatchObject({ code: 'EBM_PURCHASE_REQUEST_INVALID', field: 'request.rcptTyCd', statusCode: 422 });
+    }
+  });
+
   it('covers the complete documented purchase save header and nested item field sets', () => {
     const input = validPurchaseSaveRequest({
       cnclReqDt: '20261020123000', cnclDt: '20261020123000', rfdDt: '20261020123000',

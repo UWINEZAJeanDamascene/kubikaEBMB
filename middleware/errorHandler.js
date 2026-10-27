@@ -95,6 +95,13 @@ const errorHandler = (err, req, res, next) => {
     success: false,
     message,
     code,
+    ...(typeof err.resultCd === 'string' && /^\d{3}$/.test(err.resultCd)
+      ? {
+          resultCd: err.resultCd,
+          ...(typeof err.resultCodeSystem === 'string' ? { resultCodeSystem: err.resultCodeSystem } : {}),
+          ...(typeof err.resultCodeDescription === 'string' ? { resultCodeDescription: err.resultCodeDescription } : {}),
+        }
+      : {}),
     ...(typeof err.requestId === 'string' && /^[a-f0-9-]{36}$/i.test(err.requestId)
       ? { requestId: err.requestId }
       : {}),

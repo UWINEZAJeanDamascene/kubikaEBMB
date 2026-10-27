@@ -1,0 +1,45 @@
+{
+  "source": {
+    "documentId": "RRA_VSDC_DOC_v1.0.5",
+    "version": "1.0.5",
+    "sha256": "25DF854736B60E7E4EB128BF99904813C5D96ACF99464B7B48F23C7FAB3DF9C1",
+    "pdf": "../../../../rra_vsdc_spec_v1_0_5_official.pdf"
+  },
+  "scope": {
+    "section": "4.16",
+    "printedPages": "74",
+    "physicalPdfPages": "78"
+  },
+  "integrity": {
+    "algorithm": "SHA-256",
+    "canonicalization": "UTF-8 JSON.stringify(classifications), preserving PDF row order and code strings",
+    "rowCount": 13,
+    "sha256": "0546fe7e6979d091ac701624d3fe16e01a94ee8f610c178e472431d11072d932"
+  },
+  "notes": [
+    "The published table identifies code classification 32 as Refund reason code.",
+    "This is reference data; tenant-scoped synchronized active RRA codes remain authoritative for transaction submissions."
+  ],
+  "classifications": [
+    {
+      "codeClass": "32",
+      "codeClassName": "Refund reason code",
+      "section": "4.16",
+      "details": [
+        { "code": "01", "sortOrder": 1, "name": "Missing Quantity", "description": "Missing Quantity", "remark": "" },
+        { "code": "02", "sortOrder": 2, "name": "Missing Item", "description": "Missing Item", "remark": "" },
+        { "code": "03", "sortOrder": 3, "name": "Damaged", "description": "Damaged", "remark": "" },
+        { "code": "04", "sortOrder": 4, "name": "Wasted", "description": "Wasted", "remark": "" },
+        { "code": "05", "sortOrder": 5, "name": "Raw Material Shortage", "description": "Raw Material Shortage", "remark": "" },
+        { "code": "06", "sortOrder": 6, "name": "Refund", "description": "Refund", "remark": "" },
+        { "code": "07", "sortOrder": 7, "name": "Wrong Customer TIN", "description": "Wrong Customer TIN", "remark": "" },
+        { "code": "08", "sortOrder": 8, "name": "Wrong Customer name", "description": "Wrong Customer name", "remark": "" },
+        { "code": "09", "sortOrder": 9, "name": "Wrong Amount/price", "description": "Wrong Amount/price", "remark": "" },
+        { "code": "10", "sortOrder": 10, "name": "Wrong Quantity", "description": "Wrong Quantity", "remark": "" },
+        { "code": "11", "sortOrder": 11, "name": "Wrong Item(s)", "description": "Wrong Item(s)", "remark": "" },
+        { "code": "12", "sortOrder": 12, "name": "Wrong tax type", "description": "Wrong tax type", "remark": "" },
+        { "code": "13", "sortOrder": 13, "name": "Other reason", "description": "Other reason", "remark": "" }
+      ]
+    }
+  ]
+}

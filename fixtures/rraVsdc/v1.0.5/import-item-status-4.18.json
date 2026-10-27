@@ -1,0 +1,31 @@
+{
+  "source": {
+    "documentId": "RRA_VSDC_DOC_v1.0.5",
+    "version": "1.0.5",
+    "sha256": "25DF854736B60E7E4EB128BF99904813C5D96ACF99464B7B48F23C7FAB3DF9C1",
+    "pdf": "../../../../rra_vsdc_spec_v1_0_5_official.pdf"
+  },
+  "scope": {
+    "section": "4.18",
+    "printedPages": "75",
+    "physicalPdfPages": "79",
+    "classificationCode": "26",
+    "classificationName": "Import item Status"
+  },
+  "integrity": {
+    "rowCount": 4,
+    "algorithm": "SHA-256",
+    "canonicalization": "UTF-8 JSON.stringify(codes), preserving PDF row order and code strings",
+    "sha256": "25e5a362daffa835cc650f523867a70303fccd52c32f09eb69ce4d2f8340ad1f"
+  },
+  "notes": [
+    "The source defines status labels only. It does not define allowed transitions, local receipt rules, or a status-update request contract.",
+    "Unknown status values are retained and surfaced as unknown; the reference list is not used to discard source records."
+  ],
+  "codes": [
+    { "code": "1", "sortOrder": 1, "name": "Unsent", "description": "", "remark": "" },
+    { "code": "2", "sortOrder": 2, "name": "Waiting", "description": "", "remark": "" },
+    { "code": "3", "sortOrder": 3, "name": "Approved", "description": "", "remark": "" },
+    { "code": "4", "sortOrder": 4, "name": "Cancelled", "description": "", "remark": "" }
+  ]
+}

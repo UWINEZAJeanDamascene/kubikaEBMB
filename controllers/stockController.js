@@ -35,8 +35,66 @@ async function markReversedMovements(rows, companyId) {
   const ids = rows.map((row) => row._id);
   const reversals = await StockMovement.find({ company: companyId, reversalOfMovement: { $in: ids } }).select('reversalOfMovement');
   const reversedIds = new Set(reversals.map((row) => String(row.reversalOfMovement)));
+  const idOf = (value) => String(value?._id || value?.id || value || '');
+  const serialLookups = [];
+  for (const row of rows) {
+    if (Array.isArray(row.serialNumbers) && row.serialNumbers.length) continue;
+    const productId = idOf(row.product);
+    const warehouseId = idOf(row.warehouse);
+    if (!productId || !warehouseId) continue;
+
+    // Older opening-stock imports stored serials in the serial register but
+    // predated serialNumbers on StockMovement. The source note plus exact
+    // product/warehouse pair safely identifies those opening units.
+    if (row.reason === 'initial_stock') {
+      serialLookups.push({
+        product: productId,
+        warehouse: warehouseId,
+        notes: { $in: ['Imported opening stock serial number', 'Opening stock included with product import'] },
+      });
+    }
+
+    // Legacy direct purchases kept an exact purchase reference in each serial
+    // note. Keep this fallback bounded to that reference and stock location.
+    if (row.reason === 'purchase' && row.referenceNumber) {
+      serialLookups.push({ product: productId, warehouse: warehouseId, notes: `Direct purchase ${row.referenceNumber}` });
+    }
+
+    // Stock adjustments created before movement-serial persistence already
+    // recorded the movement ID in the serial note.
+    serialLookups.push({ notes: `Received via stock movement ${idOf(row)}` });
+  }
+
+  const serialRows = serialLookups.length
+    ? await StockSerialNumber.find({ company: companyId, $or: serialLookups })
+      .select('serialNo product warehouse notes')
+      .lean()
+    : [];
+  const serialsByMovement = new Map();
+  for (const row of rows) {
+    if (Array.isArray(row.serialNumbers) && row.serialNumbers.length) continue;
+    const productId = idOf(row.product);
+    const warehouseId = idOf(row.warehouse);
+    const expectedNotes = new Set([`Received via stock movement ${idOf(row)}`]);
+    if (row.reason === 'initial_stock') {
+      expectedNotes.add('Imported opening stock serial number');
+      expectedNotes.add('Opening stock included with product import');
+    }
+    if (row.reason === 'purchase' && row.referenceNumber) expectedNotes.add(`Direct purchase ${row.referenceNumber}`);
+
+    const matched = serialRows.filter((serial) => expectedNotes.has(String(serial.notes || ''))
+      && idOf(serial.product) === productId
+      && idOf(serial.warehouse) === warehouseId)
+      .map((serial) => String(serial.serialNo || '').trim())
+      .filter(Boolean);
+    if (matched.length) serialsByMovement.set(idOf(row), [...new Set(matched)]);
+  }
+
   return rows.map((row) => ({
     ...row.toObject(),
+    serialNumbers: Array.isArray(row.serialNumbers) && row.serialNumbers.length
+      ? row.serialNumbers
+      : (serialsByMovement.get(idOf(row)) || []),
     isReversed: reversedIds.has(String(row._id)),
   }));
 }
@@ -822,7 +880,7 @@ exports.getStockLevels = async (req, res, next) => {
       productName: 'p.name',
       productSku: 'p.sku',
       quantity: 'sl.qty_on_hand',
-      availableQuantity: 'GREATEST(sl.qty_on_hand - sl.qty_reserved, 0)',
+      availableQuantity: 'GREATEST(sl.qty_on_hand - sl.qty_reserved - COALESCE(quarantined_batches.quantity, 0), 0)',
       reservedQuantity: 'sl.qty_reserved',
       unitCost: 'sl.avg_cost',
       totalCost: 'sl.total_value',
@@ -843,7 +901,8 @@ exports.getStockLevels = async (req, res, next) => {
       const term = addParam(`%${escapeLike(String(search).trim())}%`);
       where.push(`(p.name ILIKE ${term} ESCAPE '\\' OR p.sku ILIKE ${term} ESCAPE '\\' OR w.name ILIKE ${term} ESCAPE '\\' OR w.code ILIKE ${term} ESCAPE '\\')`);
     }
-    const available = 'GREATEST(sl.qty_on_hand - sl.qty_reserved, 0)';
+    const quarantinedQuantity = 'COALESCE(quarantined_batches.quantity, 0)';
+    const available = `GREATEST(sl.qty_on_hand - sl.qty_reserved - ${quarantinedQuantity}, 0)`;
     if (lowStock === 'true') where.push(`sl.qty_on_hand > 0 AND ${available} <= p.low_stock_threshold`);
     if (status === 'out_of_stock') where.push('sl.qty_on_hand <= 0');
     if (status === 'low_stock') where.push(`sl.qty_on_hand > 0 AND ${available} <= p.low_stock_threshold`);
@@ -854,6 +913,14 @@ exports.getStockLevels = async (req, res, next) => {
       JOIN products p ON p.id = sl.product_id AND p.company_id = sl.company_id
       JOIN warehouses w ON w.id = sl.warehouse_id AND w.company_id = sl.company_id
       LEFT JOIN categories c ON c.id = p.category_id AND c.company_id = p.company_id
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(sb.qty_on_hand), 0)::double precision AS quantity
+        FROM stock_batches sb
+        WHERE sb.company_id = sl.company_id
+          AND sb.product_id = sl.product_id
+          AND sb.warehouse_id = sl.warehouse_id
+          AND sb.is_quarantined = TRUE
+      ) quarantined_batches ON TRUE
       WHERE ${whereSql}`;
     const dataSql = `
       SELECT sl.id AS "_id", sl.product_id AS "productId", p.name AS "productName", p.sku AS "productSku",
@@ -861,6 +928,7 @@ exports.getStockLevels = async (req, res, next) => {
              sl.warehouse_id AS "warehouseId", w.name AS "warehouseName", w.is_active AS "warehouseActive",
              sl.qty_on_hand::double precision AS "currentStock",
              sl.qty_reserved::double precision AS "reservedQuantity",
+             ${quarantinedQuantity}::double precision AS "quarantinedQuantity",
              ${available}::double precision AS "availableQuantity",
              sl.avg_cost::double precision AS "averageCost",
              sl.total_value::double precision AS "totalValue",
@@ -887,6 +955,14 @@ exports.getStockLevels = async (req, res, next) => {
                 JOIN products top_product ON top_product.id = top_level.product_id AND top_product.company_id = top_level.company_id
                 JOIN warehouses top_warehouse ON top_warehouse.id = top_level.warehouse_id AND top_warehouse.company_id = top_level.company_id
                 LEFT JOIN categories top_category ON top_category.id = top_product.category_id AND top_category.company_id = top_product.company_id
+                LEFT JOIN LATERAL (
+                  SELECT COALESCE(SUM(sb.qty_on_hand), 0)::double precision AS quantity
+                  FROM stock_batches sb
+                  WHERE sb.company_id = top_level.company_id
+                    AND sb.product_id = top_level.product_id
+                    AND sb.warehouse_id = top_level.warehouse_id
+                    AND sb.is_quarantined = TRUE
+                ) quarantined_batches ON TRUE
                 WHERE ${whereSql.replaceAll('sl.', 'top_level.').replaceAll('p.', 'top_product.').replaceAll('w.', 'top_warehouse.').replaceAll('c.', 'top_category.')}
                 ORDER BY top_level.total_value DESC, top_level.id ASC LIMIT 1) AS "topValueItem"
       ${fromSql}`;

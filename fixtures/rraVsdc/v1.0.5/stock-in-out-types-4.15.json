@@ -1,0 +1,39 @@
+{
+  "source": {
+    "documentId": "RRA_VSDC_DOC_v1.0.5",
+    "version": "1.0.5",
+    "sha256": "25DF854736B60E7E4EB128BF99904813C5D96ACF99464B7B48F23C7FAB3DF9C1",
+    "pdf": "../../../../rra_vsdc_spec_v1_0_5_official.pdf"
+  },
+  "scope": {
+    "section": "4.15",
+    "printedPages": "73-74",
+    "physicalPdfPages": "77-78",
+    "classificationCode": "12",
+    "classificationName": "Stock In/Out Type"
+  },
+  "integrity": {
+    "rowCount": 12,
+    "algorithm": "SHA-256",
+    "canonicalization": "UTF-8 JSON.stringify(codes), preserving PDF row order and code strings",
+    "sha256": "e78afc150a208d43240e1268f5d837368274be99455660c4f6f99656451d3f2b"
+  },
+  "notes": [
+    "The published table defines code, sort order, name, and description only; business workflow meanings beyond those labels are application mappings.",
+    "The local opening-stock mapping uses incoming adjustment code 06; this is an application mapping, not a separate RRA code."
+  ],
+  "codes": [
+    { "code": "01", "sortOrder": 1, "name": "Import", "description": "Incoming-Import" },
+    { "code": "02", "sortOrder": 2, "name": "Purchase", "description": "Incoming- Purchase" },
+    { "code": "03", "sortOrder": 3, "name": "Return", "description": "Incoming- Return" },
+    { "code": "04", "sortOrder": 4, "name": "Stock Movement", "description": "Incoming- Stock Movement" },
+    { "code": "05", "sortOrder": 5, "name": "Processing", "description": "Incoming- Processing" },
+    { "code": "06", "sortOrder": 6, "name": "Adjustment", "description": "Incoming- Adjustment" },
+    { "code": "11", "sortOrder": 11, "name": "Sale", "description": "Outgoing- Sale" },
+    { "code": "12", "sortOrder": 12, "name": "Return", "description": "Outgoing- Return" },
+    { "code": "13", "sortOrder": 13, "name": "Stock Movement", "description": "Outgoing- Stock Movement" },
+    { "code": "14", "sortOrder": 14, "name": "Processing", "description": "Outgoing- Processing" },
+    { "code": "15", "sortOrder": 15, "name": "Discarding", "description": "Outgoing- Discarding" },
+    { "code": "16", "sortOrder": 16, "name": "Adjustment", "description": "Outgoing- Adjustment" }
+  ]
+}

@@ -6,6 +6,7 @@ const { parse } = require('csv-parse/sync');
 const { stringify } = require('csv-stringify/sync');
 const { getEntityDefinition } = require('./importDefinitions');
 const { mapColumns } = require('./importMappingEngine');
+const { RRA_CODE_CLASS_IDS } = require('../constants/ebmCodeClasses');
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_ROWS = 10000;
@@ -345,6 +346,14 @@ function isWellFormedRraItemClassCode(value) {
   return /^\d{6,14}$/.test(String(value || '').trim());
 }
 
+function ebmCodeClassId(code) {
+  return String(code?.codeClass || code?.codeClassId || code?.classCode || '').trim().padStart(2, '0');
+}
+
+function isTaxTypeCode(code) { return ebmCodeClassId(code) === RRA_CODE_CLASS_IDS.TAX_TYPE; }
+function isPackagingUnitCode(code) { return ebmCodeClassId(code) === RRA_CODE_CLASS_IDS.PACKAGING_UNIT; }
+function isQuantityUnitCode(code) { return ebmCodeClassId(code) === RRA_CODE_CLASS_IDS.QUANTITY_UNIT; }
+
 async function buildProductEnrichmentContext(companyId) {
   const Category = require('../models/Category');
   const Warehouse = require('../models/Warehouse');
@@ -419,6 +428,20 @@ async function enrichProductRow(companyId, clean, context, rowNumber) {
   clean.quantityUnitCode = unitCode;
   clean.packagingUnitCode = String(clean.packagingUnitCode || '').toUpperCase();
 
+  clean.itemTypeCode = String(clean.itemTypeCode || '').trim();
+  const selectedItemType = context.ebmCodes.find((code) => ebmCodeClassId(code) === '24' && String(code.code) === clean.itemTypeCode);
+  if (!isBlank(clean.itemTypeCode) && (!['1', '2', '3'].includes(clean.itemTypeCode) || !selectedItemType)) {
+    clean.itemTypeCode = null;
+    warnings.push({ field: 'itemTypeCode', blocking: true, message: 'Select an active product type from this workspace’s synced RRA code class 24.' });
+  }
+
+  clean.originNationCode = String(clean.originNationCode || '').trim();
+  const selectedOriginNation = context.ebmCodes.find((code) => ebmCodeClassId(code) === '05' && String(code.code) === clean.originNationCode);
+  if (!isBlank(clean.originNationCode) && !selectedOriginNation) {
+    clean.originNationCode = null;
+    warnings.push({ field: 'originNationCode', blocking: true, message: 'Select an active origin nation from this workspace’s synced RRA code class 05.' });
+  }
+
   const suppliedItemClassCode = String(clean.itemClassCode || '').trim();
   const exactClass = context.itemClasses.find((itemClass) => String(itemClass.itemClassCode) === suppliedItemClassCode);
   if (exactClass) {
@@ -435,9 +458,9 @@ async function enrichProductRow(companyId, clean, context, rowNumber) {
   clean.barcodeType = clean.barcodeType || 'CODE128';
   clean.barcodeType = String(clean.barcodeType).toUpperCase();
   clean.taxTypeCode = String(clean.taxTypeCode || (context.company?.is_vat_registered === false ? 'A' : 'B')).toUpperCase();
-  const isTaxType = (code) => /tax.*type|^tax$/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`);
-  const isPackagingUnit = (code) => /packag/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`);
-  const isQuantityUnit = (code) => /quantity|unit.*quantity|unit of quantity/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`);
+  const isTaxType = isTaxTypeCode;
+  const isPackagingUnit = isPackagingUnitCode;
+  const isQuantityUnit = isQuantityUnitCode;
   const selectedTaxType = context.ebmCodes.find((code) => isTaxType(code) && String(code.code).toUpperCase() === clean.taxTypeCode);
   const taxTypesAvailable = context.ebmCodes.some(isTaxType);
   if (!taxTypesAvailable || !selectedTaxType) warnings.push({ field: 'taxTypeCode', blocking: true, message: 'Sync RRA tax type codes, then choose a code from this workspace dropdown.' });
@@ -526,7 +549,7 @@ function cleanMappedRow(entityType, row, mapping) {
     clean[field.key] = isBlank(value) ? null : String(value).trim();
   }
   if (entityType === 'products') {
-    for (const key of ['taxTypeCode', 'itemClassCode', 'packagingUnitCode', 'quantityUnitCode', 'inventoryAccount', 'cogsAccount', 'revenueAccount']) {
+    for (const key of ['taxTypeCode', 'itemTypeCode', 'originNationCode', 'itemClassCode', 'packagingUnitCode', 'quantityUnitCode', 'inventoryAccount', 'cogsAccount', 'revenueAccount']) {
       if (clean[key]) clean[key] = clean[key].split(/\s+-\s+/, 1)[0].trim();
     }
   }
@@ -990,6 +1013,38 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
     return 'already_captured';
   }
 
+  // A product update can be retried after its serial records were committed
+  // by an earlier stock flow that did not leave an initial_stock movement.
+  // Treat a complete, still-on-hand serial set at the same warehouse as
+  // already received; never create a second quantity movement for it.
+  const serialNumbers = parseImportedSerialNumbers(data.serialNumbers);
+  if (String(data.trackingType || '').toLowerCase() === 'serial' && serialNumbers.length) {
+    const StockSerialNumber = require('../models/StockSerialNumber');
+    const existingSerials = await StockSerialNumber.find({
+      company: companyId,
+      serialNo: { $in: serialNumbers },
+    }).select('serialNo product warehouse status').lean();
+    if (existingSerials.length) {
+      const bySerial = new Map(existingSerials.map((record) => [String(record.serialNo).toUpperCase(), record]));
+      const alreadyPresent = serialNumbers.filter((serial) => bySerial.has(serial));
+      const inventoryPresentStatuses = new Set(['in_stock', 'returned', 'reserved']);
+      const allPresentAndAvailableHere = alreadyPresent.length === serialNumbers.length
+        && existingSerials.every((record) => String(record.product) === String(productId)
+          && String(record.warehouse) === String(warehouse._id)
+          && inventoryPresentStatuses.has(String(record.status || '').toLowerCase()));
+      if (allPresentAndAvailableHere) return 'already_captured';
+
+      const conflictingSerial = existingSerials[0]?.serialNo || alreadyPresent[0];
+      const error = new Error(
+        `Opening stock was not posted because serial ${conflictingSerial} is already recorded. `
+        + 'Verify the serials, warehouse, and on-hand status before retrying this import.',
+      );
+      error.code = 'IMPORT_SERIAL_STOCK_CONFLICT';
+      error.statusCode = 409;
+      throw error;
+    }
+  }
+
   await OpeningStockService.createOpeningStock({
     companyId,
     userId,
@@ -1001,7 +1056,7 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
     lotNumber: data.lotNumber,
     manufactureDate: parseDateValue(data.manufactureDate),
     expiryDate: parseDateValue(data.expiryDate),
-    serialNumbers: parseImportedSerialNumbers(data.serialNumbers),
+    serialNumbers,
     requireTrackingIdentifiers: true,
     notes: 'Opening stock included with product import'
   });
@@ -1328,11 +1383,15 @@ function productPayload(companyId, userId, data) {
     taxRate,
     ebm: {
       taxTyCd: taxCode,
+      itemTyCd: data.itemTypeCode || null,
+      orgnNatCd: data.originNationCode || null,
       itemClassCd: data.itemClassCode,
       pkgUnitCd: data.packagingUnitCode,
       qtyUnitCd: data.quantityUnitCode,
       itemClassCode: data.itemClassCode,
       taxTypeCode: taxCode,
+      itemTypeCode: data.itemTypeCode || null,
+      originCountryCode: data.originNationCode || null,
       packagingUnitCode: data.packagingUnitCode,
       quantityUnitCode: data.quantityUnitCode
     },
@@ -1721,10 +1780,12 @@ async function generateTemplate(entityType, companyId) {
       category: context.categories.map((item) => item.name).filter(Boolean),
       supplier: context.suppliers.map((item) => item.name).filter(Boolean),
       warehouse: context.warehouses.map((item) => item.name).filter(Boolean),
-      taxTypeCode: context.ebmCodes.filter((item) => /tax.*type|^tax$/i.test(`${item.codeClassName || ''} ${item.codeClass || ''}`)).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+      taxTypeCode: context.ebmCodes.filter(isTaxTypeCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+      itemTypeCode: context.ebmCodes.filter((item) => ebmCodeClassId(item) === '24').map((item) => `${String(item.code)} - ${item.name || item.description || item.code}`),
+      originNationCode: context.ebmCodes.filter((item) => ebmCodeClassId(item) === '05').map((item) => `${String(item.code)} - ${item.name || item.description || item.code}`),
       itemClassCode: context.itemClasses.map((item) => `${item.itemClassCode} - ${item.itemClassName || item.itemClassCode}`).filter(Boolean),
-      packagingUnitCode: context.ebmCodes.filter((item) => /packag/i.test(`${item.codeClassName || ''} ${item.codeClass || ''}`)).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
-      quantityUnitCode: context.ebmCodes.filter((item) => /quantity|unit.*quantity|unit of quantity/i.test(`${item.codeClassName || ''} ${item.codeClass || ''}`)).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+      packagingUnitCode: context.ebmCodes.filter(isPackagingUnitCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+      quantityUnitCode: context.ebmCodes.filter(isQuantityUnitCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
       inventoryAccount: context.accounts.filter((item) => String(item.type).toLowerCase() === 'asset').map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
       cogsAccount: context.accounts.filter((item) => ['cogs', 'expense'].includes(String(item.type).toLowerCase())).map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
       revenueAccount: context.accounts.filter((item) => String(item.type).toLowerCase() === 'revenue').map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
@@ -1808,6 +1869,10 @@ module.exports = {
     duplicateKeyFor,
     quantityUnitFor,
     isWellFormedRraItemClassCode,
+    ebmCodeClassId,
+    isTaxTypeCode,
+    isPackagingUnitCode,
+    isQuantityUnitCode,
     productPayload,
   }
 };

@@ -1,5 +1,13 @@
 const reconcileCodeDefinitionBaseline = require('../utils/ebmCodeDefinitionReconciliation');
 const fixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.7-4.10.json');
+const progressFixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.11.json');
+const registrationFixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.12.json');
+const purchaseReceiptFixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.13.json');
+const stockInOutFixture = require('../fixtures/rraVsdc/v1.0.5/stock-in-out-types-4.15.json');
+const refundReasonFixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.16.json');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 function makeCache(classifications = fixture.classifications) {
   const classes = classifications.map((item) => ({
@@ -85,5 +93,88 @@ describe('§§4.7–4.10 code-definition reconciliation', () => {
     const inactive = reconcileCodeDefinitionBaseline(classes, codes).classes.find((item) => item.codeClass === '37');
     expect(inactive.cacheClassStatus).toBe('inactive');
     expect(inactive.details.every((detail) => detail.cacheStatus === 'inactive' && !detail.exactMatch)).toBe(true);
+  });
+});
+
+describe('§4.11 transaction-progress reconciliation', () => {
+  test('compares each published progress code with active synchronized class 11 values', () => {
+    const baseline = progressFixture.classifications[0];
+    const classes = [{ codeClass: '11', name: baseline.codeClassName, useYn: 'Y', active: true }];
+    const codes = baseline.details.map((detail) => ({
+      codeClass: '11', code: detail.code, name: detail.name, description: detail.description,
+      sortOrder: detail.sortOrder, useYn: 'Y', active: true,
+    }));
+    const progress = reconcileCodeDefinitionBaseline(classes, codes).classes.find((item) => item.codeClass === '11');
+
+    expect(progress).toMatchObject({
+      section: '4.11', baselineClassName: 'Unit of Quantity', cacheClassStatus: 'active', classExactMatch: true,
+    });
+    expect(progress.details).toHaveLength(6);
+    expect(progress.details.every((detail) => detail.exactMatch && detail.cacheStatus === 'active')).toBe(true);
+  });
+});
+
+describe('§4.12 registration-type reconciliation', () => {
+  test('compares A and M against active synchronized class 31 values', () => {
+    const baseline = registrationFixture.classifications[0];
+    const classes = [{ codeClass: '31', name: 'Registration Type', useYn: 'Y', active: true }];
+    const codes = baseline.details.map((detail) => ({
+      codeClass: '31', code: detail.code, name: detail.name, description: detail.description,
+      sortOrder: detail.sortOrder, useYn: 'Y', active: true,
+    }));
+    const registration = reconcileCodeDefinitionBaseline(classes, codes).classes.find((item) => item.codeClass === '31');
+
+    expect(registration).toMatchObject({
+      section: '4.12', baselineClassName: 'Registration Type', cacheClassStatus: 'active', classExactMatch: true,
+    });
+    expect(registration.details.map(({ code, exactMatch, cacheStatus }) => [code, exactMatch, cacheStatus]))
+      .toEqual([['A', true, 'active'], ['M', true, 'active']]);
+  });
+});
+
+describe('§4.13 purchase-receipt-type reconciliation', () => {
+  test('compares P and R against active synchronized class 38 values', () => {
+    const baseline = purchaseReceiptFixture.classifications[0];
+    const classes = [{ codeClass: '38', name: 'Purchase Receipt Type', useYn: 'Y', active: true }];
+    const codes = baseline.details.map((detail) => ({
+      codeClass: '38', code: detail.code, name: detail.name, description: detail.description,
+      sortOrder: detail.sortOrder, useYn: 'Y', active: true,
+    }));
+    const receiptType = reconcileCodeDefinitionBaseline(classes, codes).classes.find((item) => item.codeClass === '38');
+
+    expect(receiptType).toMatchObject({
+      section: '4.13', baselineClassName: 'Purchase Receipt Type', cacheClassStatus: 'active', classExactMatch: true,
+    });
+    expect(receiptType.details.map(({ code, exactMatch, cacheStatus }) => [code, exactMatch, cacheStatus]))
+      .toEqual([['P', true, 'active'], ['R', true, 'active']]);
+  });
+});
+
+describe('§4.16 refund-reason reconciliation', () => {
+  test('keeps the source PDF identity and ordered fixture digest verifiable', () => {
+    const fixturePath = require.resolve('../fixtures/rraVsdc/v1.0.5/code-definitions-4.16.json');
+    const pdfPath = path.resolve(path.dirname(fixturePath), refundReasonFixture.source.pdf);
+    expect(crypto.createHash('sha256').update(fs.readFileSync(pdfPath)).digest('hex').toUpperCase())
+      .toBe(refundReasonFixture.source.sha256);
+    expect(refundReasonFixture.classifications[0].details).toHaveLength(refundReasonFixture.integrity.rowCount);
+    expect(crypto.createHash('sha256').update(JSON.stringify(refundReasonFixture.classifications), 'utf8').digest('hex'))
+      .toBe(refundReasonFixture.integrity.sha256);
+  });
+
+  test('compares all 13 class 32 refund reasons against active synchronized values', () => {
+    const baseline = refundReasonFixture.classifications[0];
+    const classes = [{ codeClass: '32', name: baseline.codeClassName, useYn: 'Y', active: true }];
+    const codes = baseline.details.map((detail) => ({
+      codeClass: '32', code: detail.code, name: detail.name, description: detail.description,
+      sortOrder: detail.sortOrder, useYn: 'Y', active: true,
+    }));
+    const refund = reconcileCodeDefinitionBaseline(classes, codes).classes.find((item) => item.codeClass === '32');
+
+    expect(refund).toMatchObject({
+      section: '4.16', baselineClassName: 'Refund reason code', cacheClassStatus: 'active', classExactMatch: true,
+    });
+    expect(refund.details).toHaveLength(13);
+    expect(refund.details.every((detail) => detail.exactMatch && detail.cacheStatus === 'active')).toBe(true);
+    expect(refund.details.map(({ code }) => code)).toEqual(baseline.details.map(({ code }) => code));
   });
 });

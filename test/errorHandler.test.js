@@ -39,4 +39,27 @@ describe('errorHandler production diagnostics', () => {
       code: 'INTERNAL_ERROR',
     });
   });
+
+  test('exposes known VSDC result-code metadata without exposing raw response data', () => {
+    process.env.NODE_ENV = 'production';
+    const error = Object.assign(new Error('Device rejected'), {
+      code: 'EBM_VSDC_REJECTED',
+      resultCd: '901',
+      resultCodeSystem: 'Server',
+      resultCodeDescription: 'It is not valid device',
+      response: { secret: 'must-not-leak' },
+    });
+    const response = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+
+    errorHandler(error, { method: 'POST', path: '/api/ebm/test' }, response, jest.fn());
+
+    expect(response.json).toHaveBeenCalledWith({
+      success: false,
+      message: 'Device rejected',
+      code: 'EBM_VSDC_REJECTED',
+      resultCd: '901',
+      resultCodeSystem: 'Server',
+      resultCodeDescription: 'It is not valid device',
+    });
+  });
 });

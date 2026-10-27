@@ -2,6 +2,7 @@ jest.mock('../lib/prisma', () => ({
   prisma: {
     ebmRegisteredItem: {
       findMany: jest.fn(),
+      findFirst: jest.fn(),
     },
   },
 }));
@@ -9,6 +10,7 @@ jest.mock('../lib/prisma', () => ({
 const { prisma } = require('../lib/prisma');
 const {
   findRegisteredItems,
+  registeredItemCodeExists,
   persistRegisteredItems,
 } = require('../services/ebmRegisteredItemService');
 
@@ -74,6 +76,47 @@ describe('registered RRA item persistence', () => {
       },
     });
     expect(tx.ebmRegisteredItem.upsert.mock.calls[0][0].create.id).toMatch(/^[a-f\d]{24}$/);
+  });
+
+  it('checks item-code uniqueness across cached branches and environments for the taxpayer', async () => {
+    prisma.ebmRegisteredItem.findFirst.mockResolvedValue({ id: 'registered-item-id' });
+
+    await expect(registeredItemCodeExists({
+      companyId: SCOPE.companyId,
+      tin: SCOPE.tin,
+      itemCd: 'RW2NTBA0000012',
+    })).resolves.toBe(true);
+
+    expect(prisma.ebmRegisteredItem.findFirst).toHaveBeenCalledWith({
+      where: {
+        companyId: SCOPE.companyId,
+        tin: SCOPE.tin,
+        itemCd: 'RW2NTBA0000012',
+      },
+      select: { id: true },
+    });
+  });
+
+  it('returns false when the taxpayer item code is absent from the synchronized cache', async () => {
+    prisma.ebmRegisteredItem.findFirst.mockResolvedValue(null);
+
+    await expect(registeredItemCodeExists({
+      companyId: SCOPE.companyId,
+      tin: SCOPE.tin,
+      itemCd: 'RW2NTBA0000012',
+    })).resolves.toBe(false);
+  });
+
+  it.each([
+    [{ companyId: '', tin: SCOPE.tin, itemCd: 'RW2NTBA0000012' }, 'companyId'],
+    [{ companyId: SCOPE.companyId, tin: '123', itemCd: 'RW2NTBA0000012' }, 'tin'],
+    [{ companyId: SCOPE.companyId, tin: SCOPE.tin, itemCd: 'X'.repeat(21) }, 'itemCd'],
+  ])('rejects malformed item-code lookup scope for %s', async (scope, field) => {
+    await expect(registeredItemCodeExists(scope)).rejects.toMatchObject({
+      code: 'EBM_ITEM_LOOKUP_SCOPE_INVALID',
+      field,
+    });
+    expect(prisma.ebmRegisteredItem.findFirst).not.toHaveBeenCalled();
   });
 
   it('preserves inactive records and does not delete items absent from a later response', async () => {

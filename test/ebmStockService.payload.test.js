@@ -18,6 +18,19 @@ const validStockMovementWirePayload = () => ({
 });
 
 describe('EBM stock item payload', () => {
+  it('validates stock registration type against the documented A/M codes', () => {
+    const { sanitizeForEndpoint } = require('../utils/vsdcPayloadSanitizer');
+    const { VSDC_ENDPOINTS } = require('../services/ebmService');
+    for (const regTyCd of ['A', 'M']) {
+      expect(sanitizeForEndpoint(VSDC_ENDPOINTS.SAVE_STOCK_ITEMS, {
+        ...validStockMovementWirePayload(), regTyCd,
+      }).regTyCd).toBe(regTyCd);
+    }
+    expect(() => sanitizeForEndpoint(VSDC_ENDPOINTS.SAVE_STOCK_ITEMS, {
+      ...validStockMovementWirePayload(), regTyCd: 'X',
+    })).toThrow(/regTyCd/);
+  });
+
   it('blocks unconfirmed stock contract before creating a queue claim outside mock mode', async () => {
     const ebmService = require('../services/ebmService');
     const EBMQueueService = require('../services/ebmQueueService');
@@ -200,6 +213,8 @@ describe('EBM stock item payload', () => {
     };
     const branch = { rraBranchId: '00' };
     const EBMDevice = require('../models/EBMDevice');
+    const EBMCode = require('../models/EBMCode');
+    EBMCode.findOne.mockClear();
     const deviceLookup = jest.spyOn(EBMDevice, 'findOne').mockReturnValue({ lean: jest.fn().mockResolvedValue({ tin: '999991130' }) });
 
     await expect(EBMStockService.__test__.buildMovementPayload(
@@ -229,6 +244,9 @@ describe('EBM stock item payload', () => {
     );
 
     expect(payload.sarNo).toBe(41);
+    expect(EBMCode.findOne).toHaveBeenCalledWith(expect.objectContaining({
+      company: 'company-1', active: true, useYn: 'Y', codeClass: '31', code: 'M',
+    }));
     deviceLookup.mockRestore();
   });
 

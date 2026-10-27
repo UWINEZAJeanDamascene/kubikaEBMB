@@ -24,6 +24,10 @@ jest.mock('../services/sequenceService', () => ({
   nextGlobalSequence: jest.fn(async () => '0000001'),
 }));
 
+jest.mock('../services/ebmRegisteredItemService', () => ({
+  registeredItemCodeExists: jest.fn(async () => false),
+}));
+
 jest.mock('../services/ebmBranchService', () => ({
   ensureBranchRegistered: jest.fn(async () => true),
 }));
@@ -47,6 +51,7 @@ const EBMBranchService = require('../services/ebmBranchService');
 const ebmService = require('../services/ebmService');
 const EBMProductService = require('../services/ebmProductService');
 const { nextGlobalSequence } = require('../services/sequenceService');
+const { registeredItemCodeExists } = require('../services/ebmRegisteredItemService');
 
 function baseProduct(overrides = {}) {
   return {
@@ -84,6 +89,7 @@ function baseProduct(overrides = {}) {
 describe('EBM product registration payload', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    registeredItemCodeExists.mockResolvedValue(false);
     EBMItemClass.exists.mockResolvedValue(true);
     EBMCode.exists.mockResolvedValue(true);
     EBMCode.countDocuments.mockResolvedValue(1);
@@ -126,6 +132,7 @@ describe('EBM product registration payload', () => {
         isrcAplcbYn: 'N',
         useYn: 'Y',
       }),
+      { companyId: 'company-1', branchId: '00' },
     );
     const request = ebmService.saveItems.mock.calls[0][0];
     expect(request).not.toHaveProperty('grpPrcL1');
@@ -159,6 +166,43 @@ describe('EBM product registration payload', () => {
     expect(typeof payload.itemTyCd).toBe('string');
     expect(payload.itemCd).toBe(`RW${itemTyCd}BGKG0000001`);
     expect(nextGlobalSequence).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips a generated code already present in the synchronized taxpayer item catalog', async () => {
+    Product.findOne.mockResolvedValue(baseProduct());
+    Warehouse.findOne.mockReturnValue({
+      lean: jest.fn(async () => ({ _id: 'warehouse-1', rraBranchId: '00' })),
+    });
+    nextGlobalSequence
+      .mockResolvedValueOnce('0000001')
+      .mockResolvedValueOnce('0000002');
+    registeredItemCodeExists
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+
+    await EBMProductService.registerProduct('company-1', 'product-1');
+
+    expect(registeredItemCodeExists).toHaveBeenNthCalledWith(1, {
+      companyId: 'company-1', tin: '999991130', itemCd: 'RW2BGKG0000001',
+    });
+    expect(ebmService.saveItems).toHaveBeenCalledWith(expect.objectContaining({
+      itemCd: 'RW2BGKG0000002',
+    }), expect.anything());
+  });
+
+  it.each([
+    ['lowercase country', { countryCode: 'rw', itemTyCd: '2', pkgUnitCd: 'NT', qtyUnitCd: 'BA', sequence: '0000012' }],
+    ['padded unit whitespace', { countryCode: 'RW', itemTyCd: '2', pkgUnitCd: 'NT ', qtyUnitCd: 'BA', sequence: '0000012' }],
+    ['zero sequence', { countryCode: 'RW', itemTyCd: '2', pkgUnitCd: 'NT', qtyUnitCd: 'BA', sequence: '0000000' }],
+    ['sequence whitespace', { countryCode: 'RW', itemTyCd: '2', pkgUnitCd: 'NT', qtyUnitCd: 'BA', sequence: ' 12 ' }],
+  ])('rejects %s rather than silently normalizing the item-code components', async (_label, components) => {
+    expect(() => EBMProductService.__test__.buildRraItemCode(components)).toThrow();
+  });
+
+  it('matches the §4.17 published item-code example exactly', () => {
+    expect(EBMProductService.__test__.buildRraItemCode({
+      countryCode: 'RW', itemTyCd: '2', pkgUnitCd: 'NT', qtyUnitCd: 'BA', sequence: '12',
+    })).toBe('RW2NTBA0000012');
   });
 
   it.each([
@@ -431,10 +475,63 @@ describe('EBM product registration payload', () => {
         bhfId: '00',
         itemCd: 'RW2NTU0000001',
       }),
+      { companyId: 'company-1', branchId: '00' },
     );
     expect(product.ebm.ebmItemCode).toBe('RW2NTU0000001');
     expect(product.ebm.ebmItemCode).not.toBe(product.sku);
     expect(EBMProductService.__test__.isValidRraItemCode(product.ebm.ebmItemCode)).toBe(true);
+  });
+
+  it('preserves the exact identifier of an already registered item even if it is outside the local generator pattern', async () => {
+    const existingItemCode = '00123456789012345678';
+    const product = baseProduct({
+      ebm: {
+        ...baseProduct().ebm,
+        isRegisteredWithEBM: true,
+        ebmRegistrationStatus: 'registered',
+        ebmItemCode: existingItemCode,
+      },
+    });
+    Product.findOne.mockResolvedValue(product);
+    Warehouse.findOne.mockReturnValue({
+      lean: jest.fn(async () => ({ _id: 'warehouse-1', rraBranchId: '00' })),
+    });
+
+    await EBMProductService.registerProduct('company-1', 'product-1');
+
+    expect(ebmService.saveItems).toHaveBeenCalledWith(expect.objectContaining({
+      itemCd: existingItemCode,
+    }), { companyId: 'company-1', branchId: '00' });
+    expect(nextGlobalSequence).not.toHaveBeenCalled();
+    expect(registeredItemCodeExists).not.toHaveBeenCalled();
+    expect(product.ebm.ebmItemCode).toBe(existingItemCode);
+  });
+
+  it('blocks re-submission of an item marked registered when its identifier is missing', async () => {
+    const product = baseProduct({
+      ebm: {
+        ...baseProduct().ebm,
+        isRegisteredWithEBM: true,
+        ebmRegistrationStatus: 'registered',
+        ebmItemCode: null,
+      },
+    });
+    Product.findOne.mockResolvedValue(product);
+    Warehouse.findOne.mockReturnValue({
+      lean: jest.fn(async () => ({ _id: 'warehouse-1', rraBranchId: '00' })),
+    });
+
+    await expect(EBMProductService.registerProduct('company-1', 'product-1')).rejects.toMatchObject({
+      code: 'EBM_REGISTERED_ITEM_CODE_MISSING',
+      statusCode: 409,
+    });
+    expect(ebmService.saveItems).not.toHaveBeenCalled();
+    expect(nextGlobalSequence).not.toHaveBeenCalled();
+    expect(product.ebm).toMatchObject({
+      isRegisteredWithEBM: true,
+      ebmRegistrationStatus: 'registered',
+      ebmItemCode: null,
+    });
   });
 
   it('keeps the separate packaging and quantity code strings in the item DTO and generated item code', async () => {

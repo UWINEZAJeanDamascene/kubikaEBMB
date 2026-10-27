@@ -2,6 +2,11 @@ const Purchase = require("../models/Purchase");
 const Product = require("../models/Product");
 const Supplier = require("../models/Supplier");
 const StockMovement = require("../models/StockMovement");
+const StockLevel = require("../models/StockLevel");
+const InventoryBatch = require("../models/InventoryBatch");
+const StockBatch = require("../models/StockBatch");
+const StockSerialNumber = require("../models/StockSerialNumber");
+const Warehouse = require("../models/Warehouse");
 const Company = require("../models/Company");
 const APPayment = require("../models/APPayment");
 const PDFDocument = require("pdfkit");
@@ -428,11 +433,59 @@ exports.updatePurchase = async (req, res, next) => {
       });
     }
 
-    purchase = await Purchase.findOneAndUpdate(
-      { _id: req.params.id, company: companyId },
-      req.body,
-      { new: true, runValidators: true },
-    ).populate("supplier items.product createdBy");
+    const incomingItems = Array.isArray(req.body.items) ? req.body.items : null;
+    const hasTrackingUpdates = incomingItems?.some((item) => [
+      'trackingType', 'batchNo', 'lotNo', 'manufactureDate', 'expiryDate', 'serialNumbers',
+    ].some((field) => Object.prototype.hasOwnProperty.call(item || {}, field)));
+    if (hasTrackingUpdates) {
+      const { dbClient } = require('../lib/prisma');
+      const savedLines = await dbClient().purchaseLine.findMany({
+        where: { companyId: String(companyId), purchaseId: String(purchase._id) },
+        orderBy: { lineOrder: 'asc' },
+        select: { id: true, productId: true, extra: true },
+      });
+      const incomingProductIds = incomingItems.map((item) => String(item.product?._id || item.product || ''));
+      if (savedLines.length !== incomingItems.length
+        || savedLines.some((line, index) => String(line.productId) !== incomingProductIds[index])) {
+        return res.status(400).json({
+          success: false,
+          message: 'Tracking details can only be updated while keeping the existing purchase lines in the same order.',
+        });
+      }
+      purchase = await runInTransaction(async () => {
+        const updatedPurchase = await Purchase.findOneAndUpdate(
+          { _id: req.params.id, company: companyId },
+          req.body,
+          { new: true, runValidators: true },
+        ).populate("supplier items.product createdBy");
+        for (let index = 0; index < savedLines.length; index += 1) {
+          const item = incomingItems[index];
+          const extra = savedLines[index].extra && typeof savedLines[index].extra === 'object'
+            ? { ...savedLines[index].extra }
+            : {};
+          for (const field of ['trackingType', 'batchNo', 'lotNo', 'manufactureDate', 'expiryDate']) {
+            if (!Object.prototype.hasOwnProperty.call(item, field)) continue;
+            if (item[field] == null || item[field] === '') delete extra[field];
+            else extra[field] = String(item[field]).trim();
+          }
+          if (Object.prototype.hasOwnProperty.call(item, 'serialNumbers')) {
+            const serialNumbers = Array.isArray(item.serialNumbers)
+              ? item.serialNumbers.map((serial) => String(serial).trim().toUpperCase()).filter(Boolean)
+              : [];
+            if (serialNumbers.length) extra.serialNumbers = serialNumbers;
+            else delete extra.serialNumbers;
+          }
+          await dbClient().purchaseLine.update({ where: { id: savedLines[index].id }, data: { extra } });
+        }
+        return updatedPurchase;
+      });
+    } else {
+      purchase = await Purchase.findOneAndUpdate(
+        { _id: req.params.id, company: companyId },
+        req.body,
+        { new: true, runValidators: true },
+      ).populate("supplier items.product createdBy");
+    }
 
     res.json({
       success: true,
@@ -517,6 +570,69 @@ exports.receivePurchase = async (req, res, next) => {
       });
     }
 
+    const warehouseId = req.body.warehouseId
+      || req.body.warehouse
+      || purchase.warehouse?._id
+      || purchase.warehouse
+      || purchase.warehouseId;
+    const warehouse = warehouseId
+      ? await Warehouse.findOne({ _id: warehouseId, company: companyId }).lean()
+      : null;
+    if (!warehouse) {
+      return res.status(400).json({ success: false, message: 'Select a valid receiving warehouse before receiving this direct purchase.' });
+    }
+
+    const getTrackingType = (product, item) => product.trackingType === 'serial' || product.trackSerialNumbers || item.trackingType === 'serial'
+      ? 'serial'
+      : product.trackingType === 'batch' || product.trackBatch || item.trackingType === 'batch' ? 'batch' : 'none';
+    if (req.body.items != null && !Array.isArray(req.body.items)) {
+      return res.status(400).json({ success: false, message: 'Receipt tracking details must be a list of purchase line entries.' });
+    }
+    const submittedLines = new Map();
+    for (const line of req.body.items || []) {
+      const lineIndex = Number(line?.lineIndex);
+      if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= (purchase.items || []).length || submittedLines.has(lineIndex)) {
+        return res.status(400).json({ success: false, message: 'Receipt tracking details contain an invalid or repeated purchase line.' });
+      }
+      submittedLines.set(lineIndex, line);
+    }
+
+    // Validate traceability against the saved product configuration before
+    // changing stock, journals, or the purchase status. The identifiers come
+    // from the supplier's physical delivery, not from an inferred default.
+    const serialsPerProduct = new Map();
+    const receiveTrackingByIndex = new Map();
+    for (const [index, item] of (purchase.items || []).entries()) {
+      const product = item.product;
+      const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
+      if (!product || qty <= 0) continue;
+      const submittedTracking = submittedLines.get(index);
+      const tracking = { ...item, ...(submittedTracking || {}) };
+      receiveTrackingByIndex.set(index, tracking);
+      const trackingType = getTrackingType(product, item);
+      if (trackingType === 'batch' && !String(tracking.batchNo || '').trim()) {
+        return res.status(400).json({ success: false, message: `Line ${index + 1} (${product.name}): enter a batch number before receiving.` });
+      }
+      if (trackingType === 'serial') {
+        const serials = (Array.isArray(tracking.serialNumbers) ? tracking.serialNumbers : [])
+          .map((serial) => String(serial).trim().toUpperCase()).filter(Boolean);
+        if (!Number.isInteger(qty) || serials.length !== qty) {
+          return res.status(400).json({ success: false, message: `Line ${index + 1} (${product.name}): enter exactly ${qty} unique serial number(s) before receiving.` });
+        }
+        if (new Set(serials).size !== serials.length) {
+          return res.status(400).json({ success: false, message: `Line ${index + 1} (${product.name}): serial numbers must be unique.` });
+        }
+        const productId = String(product._id || product);
+        const used = serialsPerProduct.get(productId) || new Set();
+        const duplicateInPurchase = serials.find((serial) => used.has(serial));
+        if (duplicateInPurchase) {
+          return res.status(400).json({ success: false, message: `Serial number ${duplicateInPurchase} appears more than once in this purchase.` });
+        }
+        serials.forEach((serial) => used.add(serial));
+        serialsPerProduct.set(productId, used);
+      }
+    }
+
     // Fetch supplier early (used in notifications) to avoid temporal-dead-zone errors
     const supplier = await Supplier.findOne({
       _id: purchase.supplier,
@@ -528,7 +644,50 @@ exports.receivePurchase = async (req, res, next) => {
       const useSession = !!trx;
       const opts = useSession ? { session: trx } : {};
 
-      for (const item of purchase.items) {
+      // Serialize receipts for this document. A second request may have read a
+      // draft snapshot before the first one completed; re-check the stored
+      // state after acquiring the row lock so retry/concurrent requests cannot
+      // add the same purchase to stock twice.
+      const { dbClient } = require('../lib/prisma');
+      await dbClient().$queryRaw`
+        SELECT id FROM purchases
+        WHERE id = ${String(purchase._id)} AND company_id = ${String(companyId)}
+        FOR UPDATE`;
+      const persistedPurchaseState = await dbClient().purchase.findUnique({
+        where: { id: String(purchase._id) },
+        select: { companyId: true, status: true, stockAdded: true },
+      });
+      if (!persistedPurchaseState
+        || persistedPurchaseState.companyId !== String(companyId)
+        || persistedPurchaseState.stockAdded
+        || !['draft', 'ordered'].includes(persistedPurchaseState.status)) {
+        throw Object.assign(new Error('This direct purchase has already been received or is no longer receivable.'), { status: 409, code: 'PURCHASE_ALREADY_RECEIVED' });
+      }
+
+      const productIdsToLock = [...new Set((purchase.items || [])
+        .map((item) => item.product?._id || item.product)
+        .filter(Boolean)
+        .map(String))].sort();
+      for (const productId of productIdsToLock) {
+        await dbClient().$queryRaw`
+          SELECT id FROM products
+          WHERE id = ${productId} AND company_id = ${String(companyId)}
+          FOR UPDATE`;
+      }
+
+      const normalizedSerials = [...serialsPerProduct.entries()].flatMap(([productId, serials]) => [...serials].map((serialNo) => ({ productId, serialNo })));
+      if (normalizedSerials.length) {
+        const duplicate = await StockSerialNumber.find({
+          company: companyId,
+          $or: normalizedSerials.map(({ productId, serialNo }) => ({ product: productId, serialNo })),
+        }, null, opts).select('serialNo product').lean();
+        if (duplicate.length) {
+          throw Object.assign(new Error(`Serial number ${duplicate[0].serialNo} is already recorded for this product.`), { status: 409, code: 'DUPLICATE_SERIAL_NUMBER' });
+        }
+      }
+
+      for (const [itemIndex, item] of purchase.items.entries()) {
+        const tracking = receiveTrackingByIndex.get(itemIndex) || item;
         const productId = item.product?._id || item.product;
         const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
         const unitCost = Number(item.unitCost ?? 0) || 0;
@@ -545,6 +704,20 @@ exports.receivePurchase = async (req, res, next) => {
 
         const previousStock = Number(product.currentStock || 0);
         const newStock = previousStock + qty;
+        const trackingType = getTrackingType(product, item);
+        const serialNumbers = trackingType === 'serial'
+          ? (Array.isArray(tracking.serialNumbers) ? tracking.serialNumbers : []).map((serial) => String(serial).trim().toUpperCase()).filter(Boolean)
+          : [];
+        const batchNo = trackingType === 'batch' ? String(tracking.batchNo).trim().toUpperCase() : null;
+        const lotNo = tracking.lotNo ? String(tracking.lotNo).trim().toUpperCase() : null;
+        const parseOptionalDate = (value) => {
+          if (!value) return null;
+          const date = value instanceof Date ? value : new Date(value);
+          if (!Number.isFinite(date.getTime())) throw Object.assign(new Error(`Invalid tracking date for ${product.name}.`), { status: 400 });
+          return date;
+        };
+        const manufactureDate = parseOptionalDate(tracking.manufactureDate);
+        const expiryDate = parseOptionalDate(tracking.expiryDate);
 
         // Create inventory layer for received goods
         await inventoryService.createLayer(
@@ -554,8 +727,8 @@ exports.receivePurchase = async (req, res, next) => {
           unitCost,
           { sourceType: "purchase", sourceId: purchase._id },
           useSession
-            ? { session: trx, userId: req.user.id }
-            : { userId: req.user.id },
+            ? { session: trx, userId: req.user.id, warehouse: warehouse._id }
+            : { userId: req.user.id, warehouse: warehouse._id },
         );
 
         // Create stock movement (ledger entry)
@@ -565,6 +738,11 @@ exports.receivePurchase = async (req, res, next) => {
           type: "in",
           reason: "purchase",
           quantity: qty,
+          warehouse: warehouse._id,
+          batchNumber: batchNo,
+          lotNumber: lotNo,
+          serialNumbers,
+          expiryDate,
           previousStock,
           newStock,
           unitCost,
@@ -578,6 +756,67 @@ exports.receivePurchase = async (req, res, next) => {
           performedBy: req.user.id,
         });
         await sm.save(opts);
+
+        await StockLevel.recalculateWAC(companyId, product._id, warehouse._id, qty, unitCost);
+
+        const inventoryBatch = new InventoryBatch({
+          company: companyId,
+          product: product._id,
+          warehouse: warehouse._id,
+          batchNumber: batchNo,
+          lotNumber: lotNo,
+          expiryDate,
+          manufacturingDate: manufactureDate,
+          quantity: qty,
+          availableQuantity: qty,
+          unitCost,
+          totalCost: qty * unitCost,
+          supplier: purchase.supplier,
+          stockMovement: sm._id,
+          receivedDate: new Date(),
+          notes: `Direct purchase ${purchase.purchaseNumber}`,
+          createdBy: req.user.id,
+        });
+        await inventoryBatch.save(opts);
+
+        if (trackingType === 'batch') {
+          let stockBatch = await StockBatch.findOne({ company: companyId, product: product._id, warehouse: warehouse._id, batchNo }, null, opts);
+          if (!stockBatch) {
+            stockBatch = new StockBatch({
+              company: companyId,
+              product: product._id,
+              warehouse: warehouse._id,
+              batchNo,
+              qtyReceived: qty,
+              qtyOnHand: qty,
+              unitCost,
+              manufactureDate,
+              expiryDate,
+              notes: `Direct purchase ${purchase.purchaseNumber}`,
+            });
+          } else {
+            const oldQty = Number(stockBatch.qtyOnHand) || 0;
+            const nextQty = oldQty + qty;
+            stockBatch.unitCost = nextQty > 0 ? ((oldQty * (Number(stockBatch.unitCost) || 0) + qty * unitCost) / nextQty) : unitCost;
+            stockBatch.qtyOnHand = nextQty;
+            stockBatch.qtyReceived = (Number(stockBatch.qtyReceived) || 0) + qty;
+            if (manufactureDate) stockBatch.manufactureDate = manufactureDate;
+            if (expiryDate) stockBatch.expiryDate = expiryDate;
+          }
+          await stockBatch.save(opts);
+        }
+
+        if (trackingType === 'serial') {
+          await StockSerialNumber.create(serialNumbers.map((serialNo) => ({
+            company: companyId,
+            product: product._id,
+            warehouse: warehouse._id,
+            serialNo,
+            unitCost,
+            status: 'in_stock',
+            notes: `Direct purchase ${purchase.purchaseNumber}`,
+          })), opts);
+        }
 
         // Update product stock and average cost (ensure numeric coercion)
         product.currentStock = newStock;

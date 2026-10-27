@@ -16,12 +16,18 @@ const { cursorSemanticsConfirmed, assertResultTimestamp, cursorRegressionError }
 const SYNC_TYPE = EBM_SYNC_TYPES.IMPORTED_ITEMS;
 
 function getInitialImportCursor(mode = ebmService.getConfig().mode) {
-  const configured = process.env.EBM_IMPORT_INITIAL_CURSOR;
+  const mockMode = mode === 'mock';
+  const cursorSetting = mockMode ? 'EBM_MOCK_IMPORT_INITIAL_CURSOR' : 'EBM_IMPORT_INITIAL_CURSOR';
+  const configured = mockMode
+    ? process.env.EBM_MOCK_IMPORT_INITIAL_CURSOR || process.env.EBM_IMPORT_INITIAL_CURSOR
+    : process.env.EBM_IMPORT_INITIAL_CURSOR;
   if (typeof configured === 'string' && /^\d{14}$/.test(configured) && parseVsdcDate(configured)) {
     return configured;
   }
   const error = new Error(
-    'Set EBM_IMPORT_INITIAL_CURSOR to the taxpayer-approved 14-digit YYYYMMDDHHmmss starting cursor before syncing imported items.',
+    mockMode
+      ? `Set ${cursorSetting} to a valid 14-digit YYYYMMDDHHmmss mock starting cursor before syncing imported items.`
+      : 'Set EBM_IMPORT_INITIAL_CURSOR to the taxpayer-approved 14-digit YYYYMMDDHHmmss starting cursor before syncing imported items.',
   );
   error.code = 'EBM_IMPORT_CURSOR_BASELINE_REQUIRED';
   error.statusCode = 503;

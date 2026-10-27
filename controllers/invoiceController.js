@@ -23,8 +23,8 @@ const { consumeApproval: consumePosManagerApproval } = require('./posManagerAppr
 const {
   drawEbmCertificationBlock,
   drawTaxBreakdown,
+  formatMoney,
   formatReceiptDate,
-  formatRwf,
   generateQrPng,
   lineTaxDetails,
 } = require("../utils/pdfUtils");
@@ -252,6 +252,17 @@ exports.getInvoice = async (req, res, next) => {
         success: false,
         message: "Invoice not found",
       });
+    }
+
+    const fiscalMode = String(hydratedInvoice.ebm?.fiscalEnvironment || '').toLowerCase();
+    const fiscalQr = fiscalMode === 'production' && hydratedInvoice.ebm?.ebmStatus === 'submitted'
+      ? await generateQrPng(hydratedInvoice.ebm, { width: 164 })
+      : null;
+    if (fiscalQr) {
+      hydratedInvoice.ebm = {
+        ...hydratedInvoice.ebm,
+        qrCodeDataUrl: `data:image/png;base64,${fiscalQr.toString('base64')}`,
+      };
     }
 
     // Get receipt metadata if exists
@@ -1315,7 +1326,7 @@ exports.generateInvoicePDF = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, invoiceNumber: 1, status: 1, invoiceDate: 1, dueDate: 1, items: 1, payments: 1, ebm: 1, terms: 1, notes: 1, totalDiscount: 1, posPromotion: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, grandTotal: 1, amountPaid: 1, amountOutstanding: 1 }).lean();
+    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, invoiceNumber: 1, status: 1, invoiceDate: 1, dueDate: 1, items: 1, payments: 1, ebm: 1, terms: 1, notes: 1, customerTin: 1, customerName: 1, customerAddress: 1, currencyCode: 1, exchangeRate: 1, totalDiscount: 1, posPromotion: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, grandTotal: 1, amountPaid: 1, amountOutstanding: 1 }).lean();
     await hydrateInvoiceRelations(invoice);
 
     if (!invoice) {
@@ -1328,13 +1339,19 @@ exports.generateInvoicePDF = async (req, res, next) => {
     // Get company info
     const company = await Company.findById(companyId);
 
-    const qrPng = await generateQrPng(invoice.ebm, { width: 110 });
+    const fiscalMode = String(invoice.ebm?.fiscalEnvironment || invoice.ebm?.mode || invoice.ebm?.environment || '').toLowerCase();
+    const qrPng = fiscalMode === 'production' && invoice.ebm?.ebmStatus === 'submitted'
+      ? await generateQrPng(invoice.ebm, { width: 110 })
+      : null;
 
     // Create PDF document with more breathable layout
     const doc = new PDFDocument({ margin: 50, size: "A4", bufferPages: true });
 
     // Set response headers
     res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
     res.setHeader(
       "Content-Disposition",
       `attachment; filename=invoice-${invoice.referenceNo || invoice.invoiceNumber}.pdf`,
@@ -1343,7 +1360,7 @@ exports.generateInvoicePDF = async (req, res, next) => {
     // Pipe PDF to response
     doc.pipe(res);
 
-    const currency = "RWF";
+    const currency = String(invoice.currencyCode || "RWF").trim().toUpperCase();
     /* Legacy non-RWF currency selector retained only in history; invoice PDFs always print RWF.
       currency === "USD"
         ? "$"
@@ -1359,7 +1376,7 @@ exports.generateInvoicePDF = async (req, res, next) => {
 
     // Helper to format money
     const fmt = (v) => {
-      return formatRwf(v);
+      return formatMoney(v, currency);
     };
     const fmtDate = (value, withTime = false) => {
       if (!value) return "N/A";
@@ -1377,9 +1394,14 @@ exports.generateInvoicePDF = async (req, res, next) => {
       if (typeof address === "string") return address;
       return [address.street, address.city, address.state, address.country, address.postcode].filter(Boolean).join(", ");
     };
-    const companyTin = company?.tax_identification_number || company?.registration_number || "";
-    const customerTin = String(invoice.customerTin || invoice.client?.taxId || "").replace(/\D/g, "").slice(0, 9);
+    const companyTin = String(company?.tax_identification_number || company?.taxIdentificationNumber || company?.tin || "").trim();
+    const customerTin = String(invoice.customerTin || invoice.client?.taxId || "").trim();
     const hasCustomerTin = /^\d{9}$/.test(customerTin);
+    const fiscalPayload = invoice.ebm?.salesPayload || invoice.ebm?.rraPayload || {};
+    const receiptPayload = fiscalPayload.receipt || {};
+    const branchId = fiscalPayload.bhfId || invoice.ebm?.branchId || null;
+    const purchaseCode = fiscalPayload.prcOrdCd || invoice.ebm?.prcOrdCd || null;
+    const customerPhone = invoice.customerPhone || invoice.client?.contact?.phone || fiscalPayload.custMblNo || receiptPayload.custMblNo || null;
 
     // Page counter
     let pageNumber = 1;
@@ -1387,12 +1409,12 @@ exports.generateInvoicePDF = async (req, res, next) => {
     // Draw header - reusable for first page and subsequent pages
     const drawHeader = () => {
       // Clear top area
-      doc.fillColor("#1f2937").font("Helvetica-Bold").fontSize(20);
-      doc.text(company?.name || "Company", 50, 48);
+      doc.fillColor("#0f172a").font("Helvetica-Bold").fontSize(20);
+      doc.text(company?.name || "Company", 50, 42, { width: 300 });
 
-      doc.font("Helvetica").fontSize(9).fillColor("#6b7280");
+      doc.font("Helvetica").fontSize(8.5).fillColor("#526174");
       const contactX = 50;
-      let contactY = 70;
+      let contactY = 67;
       const companyAddress = formatAddress(company?.address);
       if (companyAddress) {
         doc.text(companyAddress, contactX, contactY, { width: 260 });
@@ -1407,18 +1429,14 @@ exports.generateInvoicePDF = async (req, res, next) => {
         contactY += 12;
       }
       if (companyTin) {
-        doc.text(`TIN: ${String(companyTin).replace(/\D/g, "").slice(0, 9)}`, contactX, contactY);
-        contactY += 12;
-      }
-      if (company?.is_vat_registered && companyTin) {
-        doc.text(`VAT No: ${String(companyTin).replace(/\D/g, "").slice(0, 9)}`, contactX, contactY);
+        doc.text(`TIN: ${companyTin}`, contactX, contactY);
       }
 
       // Invoice title block
-      doc.fontSize(26).fillColor("#111827").font("Helvetica-Bold");
-      doc.text("INVOICE", 0, 50, { align: "right" });
-      doc.fontSize(10).font("Helvetica").fillColor("#6b7280");
-      doc.text(`# ${invoice.invoiceNumber}`, 0, 80, { align: "right" });
+      doc.fontSize(25).fillColor("#0f172a").font("Helvetica-Bold");
+      doc.text("INVOICE", 0, 40, { align: "right" });
+      doc.fontSize(10).font("Helvetica").fillColor("#526174");
+      doc.text(`# ${invoice.invoiceNumber || invoice.referenceNo}`, 0, 72, { align: "right" });
 
       // Status badge
       const statusColors = {
@@ -1432,21 +1450,21 @@ exports.generateInvoicePDF = async (req, res, next) => {
         "#6b7280",
         invoice.status,
       ];
-      doc.fillColor(statusInfo[0]).font("Helvetica-Bold").fontSize(10);
-      doc.text(statusInfo[1].toUpperCase(), 0, 98, { align: "right" });
+      doc.fillColor(statusInfo[0]).font("Helvetica-Bold").fontSize(8);
+      doc.text(statusInfo[1].toUpperCase(), 0, 90, { align: "right" });
 
       // Horizontal rule
       doc
-        .moveTo(50, 120)
-        .lineTo(doc.page.width - 50, 120)
-        .lineWidth(0.5)
-        .strokeColor("#e5e7eb")
+        .moveTo(50, 116)
+        .lineTo(doc.page.width - 50, 116)
+        .lineWidth(1.5)
+        .strokeColor("#14b8a6")
         .stroke();
     };
 
     // Footer: page numbers and timestamp
     const drawFooter = (pn) => {
-      const bottom = doc.page.height - 40;
+      const bottom = doc.page.height - 72;
       doc.fontSize(8).fillColor("#9ca3af").font("Helvetica");
       doc.text(`Generated: ${new Date().toLocaleString()}`, 50, bottom, {
         align: "left",
@@ -1457,54 +1475,78 @@ exports.generateInvoicePDF = async (req, res, next) => {
     // Draw invoice details and bill-to box
     const drawInvoiceDetails = (startY) => {
       // Dates box
-      doc.rect(50, startY, 230, 80).fillAndStroke("#ffffff", "#e5e7eb");
-      doc.fillColor("#374151").fontSize(10).font("Helvetica-Bold");
-      doc.text("INVOICE DETAILS", 60, startY + 8);
+      doc.roundedRect(50, startY, 240, 150, 7).fillAndStroke("#f8fafc", "#dbe4ee");
+      doc.fillColor("#0f172a").fontSize(9).font("Helvetica-Bold");
+      doc.text("INVOICE DETAILS", 62, startY + 11);
 
-      doc.font("Helvetica").fontSize(9).fillColor("#6b7280");
-      doc.text("Invoice Date:", 60, startY + 26);
+      doc.font("Helvetica").fontSize(8).fillColor("#64748b");
+      doc.text("Invoice date", 62, startY + 31);
       doc.fillColor("#111827").text(
         fmtDate(invoice.invoiceDate),
-        140,
-        startY + 26,
+        145,
+        startY + 31,
       );
 
-      doc.fillColor("#6b7280").text("Due Date:", 60, startY + 42);
+      doc.fillColor("#64748b").text("Due date", 62, startY + 48);
       doc.fillColor("#111827").text(
         invoice.dueDate
           ? fmtDate(invoice.dueDate)
           : "On Delivery",
-        140,
-        startY + 42,
+        145,
+        startY + 48,
       );
 
-      doc.fillColor("#6b7280").text("Currency:", 60, startY + 58);
-      doc.fillColor("#111827").text(currency, 140, startY + 58);
+      doc.fillColor("#64748b").text("Currency", 62, startY + 65);
+      doc.fillColor("#111827").text(currency, 145, startY + 65);
+      doc.fillColor("#64748b").text("RRA branch", 62, startY + 82);
+      doc.fillColor("#111827").text(branchId || "Not assigned", 145, startY + 82);
+      doc.fillColor("#64748b").text("Fiscal status", 62, startY + 99);
+      const fiscalStatusLabel = fiscalMode === 'mock'
+        ? 'Mock only - not RRA certified'
+        : fiscalMode === 'sandbox'
+          ? 'Sandbox - not production certified'
+          : fiscalMode === 'production' && invoice.ebm?.ebmStatus === 'submitted'
+            ? 'RRA response accepted'
+            : invoice.ebm?.ebmStatus === 'failed'
+              ? 'Submission failed'
+              : 'Not yet fiscalized';
+      doc.fillColor(fiscalMode === 'mock' || fiscalMode === 'sandbox' ? "#b45309" : "#0f766e").font("Helvetica-Bold").fontSize(7.5).text(fiscalStatusLabel, 145, startY + 99, { width: 135 });
+      doc.font("Helvetica").fontSize(8).fillColor("#64748b").text("VSDC invoice no", 62, startY + 116);
+      doc.fillColor("#111827").text(fiscalPayload.invcNo == null ? "Not allocated" : String(fiscalPayload.invcNo), 145, startY + 116, { width: 135 });
+      doc.fillColor("#64748b").text("Original invoice no", 62, startY + 133);
+      doc.fillColor("#111827").text(fiscalPayload.orgInvcNo == null ? "-" : String(fiscalPayload.orgInvcNo), 145, startY + 133, { width: 135 });
 
       // Bill To
-      doc.rect(300, startY, 250, 80).fillAndStroke("#ffffff", "#e5e7eb");
-      doc.fillColor("#374151").fontSize(10).font("Helvetica-Bold");
-      doc.text("BILL TO", 310, startY + 8);
-      doc.font("Helvetica").fontSize(10).fillColor("#111827");
+      doc.roundedRect(305, startY, 240, 150, 7).fillAndStroke("#f8fafc", "#dbe4ee");
+      doc.fillColor("#0f172a").fontSize(9).font("Helvetica-Bold");
+      doc.text("BILL TO", 317, startY + 11);
+      doc.font("Helvetica-Bold").fontSize(11).fillColor("#111827");
       doc.text(
         invoice.customerName || invoice.client?.name || "N/A",
-        310,
-        startY + 28,
+        317,
+        startY + 31,
+        { width: 215 },
       );
-      doc.fontSize(9).fillColor("#6b7280");
-      let billY = startY + 44;
+      doc.font("Helvetica").fontSize(8).fillColor("#526174");
+      let billY = startY + 50;
       if (hasCustomerTin) {
-        doc.text(`Customer TIN: ${customerTin}`, 310, billY);
-        billY += 14;
-        doc.text("Business", 310, billY);
-        billY += 14;
-      } else {
-        doc.text("Individual", 310, billY);
-        billY += 14;
+        doc.text(`Buyer TIN: ${customerTin}`, 317, billY);
+        billY += 13;
+      } else if (!hasCustomerTin && customerTin) {
+        doc.fillColor("#b91c1c").text(`Buyer TIN (check format): ${customerTin}`, 317, billY, { width: 215 });
+        billY += 13;
       }
-      const customerAddress = invoice.customerAddress || invoice.client?.contact?.address;
+      if (purchaseCode) {
+        doc.fillColor("#526174").text(`Purchase code: ${purchaseCode}`, 317, billY, { width: 215 });
+        billY += 13;
+      }
+      if (customerPhone) {
+        doc.text(`Phone: ${customerPhone}`, 317, billY);
+        billY += 13;
+      }
+      const customerAddress = formatAddress(invoice.customerAddress || invoice.client?.contact?.address);
       if (customerAddress)
-        doc.text(customerAddress, 310, billY, { width: 230 });
+        doc.text(customerAddress, 317, billY, { width: 215 });
     };
 
     const drawRraDetails = (startY) => {
@@ -1512,6 +1554,7 @@ exports.generateInvoicePDF = async (req, res, next) => {
         y: startY,
         ebm: invoice.ebm || {},
         qrPng,
+        title: fiscalMode === 'production' && invoice.ebm?.ebmStatus === 'submitted' ? 'RRA FISCAL RECEIPT' : 'FISCAL RECEIPT DETAILS',
         receiptDateFormatter: formatReceiptDate,
       });
     };
@@ -1522,10 +1565,10 @@ exports.generateInvoicePDF = async (req, res, next) => {
       doc.fillColor("#ffffff").fontSize(10).font("Helvetica-Bold");
       doc.text("#", 56, y + 8);
       doc.text("Item / Description", 80, y + 8);
-      doc.text("Qty", 320, y + 8, { width: 30, align: "right" });
-      doc.text("Unit Price", 370, y + 8, { width: 70, align: "right" });
-      doc.text("Tax", 450, y + 8, { width: 50, align: "right" });
-      doc.text("Total", 510, y + 8, { width: 70, align: "right" });
+      doc.text("Qty", 310, y + 8, { width: 40, align: "right" });
+      doc.text("Unit Price", 355, y + 8, { width: 65, align: "right" });
+      doc.text("Tax", 425, y + 8, { width: 45, align: "right" });
+      doc.text("Total", 475, y + 8, { width: 70, align: "right" });
     };
 
     // Start first page
@@ -1538,12 +1581,12 @@ exports.generateInvoicePDF = async (req, res, next) => {
       firstContentY = 176;
     }
     drawInvoiceDetails(firstContentY);
-    drawRraDetails(firstContentY + 90);
 
     // Table
-    let y = firstContentY + 244;
+    let y = firstContentY + 174;
+    let tableSectionStartY = y;
     tableHeader(y);
-    y += 36;
+    y += 34;
     doc.font("Helvetica").fontSize(9).fillColor("#111827");
 
     // Rows with automatic page breaks and repeated header
@@ -1551,19 +1594,22 @@ exports.generateInvoicePDF = async (req, res, next) => {
       // Page break if low space
       if (y > doc.page.height - 160) {
         // footer for the page
+        doc.rect(50, tableSectionStartY, doc.page.width - 100, Math.max(1, y - tableSectionStartY))
+          .lineWidth(0.8).strokeColor("#dbe4ee").stroke();
         drawFooter(pageNumber);
         doc.addPage();
         pageNumber += 1;
         drawHeader();
         y = 140; // position after header
+        tableSectionStartY = y;
         tableHeader(y);
-        y += 36;
+        y += 34;
         doc.font("Helvetica").fontSize(9).fillColor("#111827");
       }
 
       // Alternate background
       if (idx % 2 === 0) {
-        doc.rect(50, y - 6, doc.page.width - 100, 32).fill("#f9fafb");
+        doc.rect(50, y - 6, doc.page.width - 100, 44).fill("#f9fafb");
         doc.fillColor("#111827");
       }
 
@@ -1574,24 +1620,30 @@ exports.generateInvoicePDF = async (req, res, next) => {
       doc.text(`${idx + 1}`, 56, y);
       doc.text(productName, 80, y, { width: 230 });
       doc.fontSize(7).fillColor("#6b7280");
-      doc.text(`Class: ${tax.itemClassCd}  Tax Type: ${tax.taxTypeLabel}`, 80, y + 11, { width: 230 });
-      doc.text(`Taxable: ${formatRwf(tax.taxableAmount)}  VAT: ${formatRwf(tax.vatAmount)}`, 80, y + 22, { width: 230 });
+      const itemCodeLabel = tax.itemCode ? `Item code: ${tax.itemCode}` : "Item code: not recorded";
+      const unitLabel = tax.quantityUnitCode || item.unit || "unit not recorded";
+      const packageLabel = tax.packageUnitCode ? `  Package: ${tax.packageQuantity ?? '-'} ${tax.packageUnitCode}` : "";
+      doc.text(`${itemCodeLabel}  Qty unit: ${unitLabel}${packageLabel}`, 80, y + 11, { width: 230 });
+      doc.text(`${tax.itemClassCd !== "N/A" ? `Class: ${tax.itemClassCd}  ` : ""}${tax.taxTypeLabel}`, 80, y + 22, { width: 230 });
+      const taxableLabel = tax.taxableAmount == null ? "Not recorded" : fmt(tax.taxableAmount);
+      const taxAmountLabel = tax.vatAmount == null ? "Not recorded" : fmt(tax.vatAmount);
+      doc.text(`Taxable: ${taxableLabel}  Tax: ${taxAmountLabel}${tax.discountAmount > 0 ? `  Discount: ${fmt(tax.discountAmount)}` : ""}`, 80, y + 33, { width: 230 });
       doc.fontSize(9).fillColor("#111827");
-      doc.text((item.quantity || 0).toString(), 320, y, {
+      doc.text((item.quantity || 0).toString(), 310, y, {
         width: 40,
         align: "right",
       });
-      doc.text(fmt(item.unitPrice), 370, y, { width: 70, align: "right" });
-      doc.text(tax.taxTypeLabel, 450, y, {
-        width: 50,
+      doc.text(fmt(item.unitPrice), 355, y, { width: 65, align: "right" });
+      doc.text(tax.taxTyCd || 'N/A', 425, y, {
+        width: 45,
         align: "right",
       });
-      doc.text(formatRwf(tax.lineTotal), 510, y, { width: 70, align: "right" });
-      y += 44;
+      doc.text(tax.lineTotal == null ? "Not recorded" : fmt(tax.lineTotal), 475, y, { width: 70, align: "right" });
+      y += 38;
     });
 
     // Draw totals block (ensure space)
-    if (y > doc.page.height - 200) {
+    if (y > doc.page.height - 300) {
       drawFooter(pageNumber);
       doc.addPage();
       pageNumber += 1;
@@ -1599,7 +1651,8 @@ exports.generateInvoicePDF = async (req, res, next) => {
       y = 140;
     }
 
-    const totalsX = doc.page.width - 300;
+    const totalsX = 50;
+    const totalsWidth = doc.page.width - 100;
     const invoiceLineDiscount = (invoice.items || invoice.lines || []).reduce((sum, line) => {
       const base = Number(line.lineSubtotal ?? line.subtotal ?? (Number(line.quantity || line.qty || 0) * Number(line.unitPrice || line.price || 0)));
       return sum + Math.max(0, base) * Math.max(0, Number(line.discountPct || 0)) / 100;
@@ -1610,29 +1663,39 @@ exports.generateInvoicePDF = async (req, res, next) => {
       : invoice.posPromotion?.code
         ? `Promotion: ${invoice.posPromotion.code}`
         : "Discount";
-    let ty = drawTaxBreakdown(doc, {
+    const totalsBottom = drawTaxBreakdown(doc, {
       x: totalsX,
       y,
-      width: 250,
+      width: totalsWidth,
       ebm: invoice.ebm || {},
       fallback: invoice.toObject ? invoice.toObject({ virtuals: true }) : invoice,
+      currency,
       discountAmount: pdfDiscountAmount,
       discountLabel: pdfDiscountLabel,
-    }) + 8;
+      border: false,
+      background: "#f9fafb",
+    });
+    // One continuous outline makes the item table and its fiscal totals read as
+    // a single invoice section, while retaining a subtle divider between them.
+    doc.moveTo(totalsX + 10, y + 1).lineTo(totalsX + totalsWidth - 10, y + 1)
+      .lineWidth(0.6).strokeColor("#e5e7eb").stroke();
+    doc.rect(totalsX, tableSectionStartY, totalsWidth, totalsBottom - tableSectionStartY)
+      .lineWidth(0.8).strokeColor("#dbe4ee").stroke();
+    let ty = totalsBottom + 8;
 
     if (invoice.amountPaid > 0) {
       doc.fillColor("#10b981").fontSize(10).font("Helvetica");
-      doc.text("Paid", totalsX, ty - 8, { width: 140, align: "left" });
-      doc.text(`- ${fmt(invoice.amountPaid)}`, totalsX + 100, ty - 8, {
-        width: 120,
+      doc.text("Paid", totalsX + 10, ty - 8, { width: 200, align: "left" });
+      doc.text(`- ${fmt(invoice.amountPaid)}`, totalsX + totalsWidth - 140, ty - 8, {
+        width: 130,
         align: "right",
       });
       ty += 18;
 
       doc.fillColor("#ef4444").fontSize(11).font("Helvetica-Bold");
-      doc.text("BALANCE DUE", totalsX, ty - 8, { width: 140, align: "left" });
-      doc.text(fmt(invoice.balance), totalsX + 100, ty - 8, {
-        width: 120,
+      doc.text("BALANCE DUE", totalsX + 10, ty - 8, { width: 200, align: "left" });
+      doc.text(fmt(invoice.balance), totalsX + totalsWidth - 140, ty - 8, {
+        width: 130,
         align: "right",
       });
     }
@@ -1682,7 +1745,9 @@ exports.generateInvoicePDF = async (req, res, next) => {
     // Terms and notes
     y += 18;
     if (invoice.terms) {
-      if (y > doc.page.height - 120) {
+      doc.font("Helvetica").fontSize(9);
+      const termsHeight = doc.heightOfString(String(invoice.terms), { width: doc.page.width - 120, font: "Helvetica", fontSize: 9 });
+      if (y + 38 + termsHeight > doc.page.height - 92) {
         drawFooter(pageNumber);
         doc.addPage();
         pageNumber += 1;
@@ -1695,11 +1760,13 @@ exports.generateInvoicePDF = async (req, res, next) => {
       y += 20;
       doc.font("Helvetica").fontSize(9).fillColor("#111827");
       doc.text(invoice.terms, 56, y + 6, { width: doc.page.width - 120 });
-      y += 40;
+      y += termsHeight + 36;
     }
 
     if (invoice.notes) {
-      if (y > doc.page.height - 120) {
+      doc.font("Helvetica").fontSize(9);
+      const notesHeight = doc.heightOfString(String(invoice.notes), { width: doc.page.width - 120, font: "Helvetica", fontSize: 9 });
+      if (y + 18 + notesHeight > doc.page.height - 92) {
         drawFooter(pageNumber);
         doc.addPage();
         pageNumber += 1;
@@ -1711,7 +1778,20 @@ exports.generateInvoicePDF = async (req, res, next) => {
       y += 14;
       doc.font("Helvetica").fontSize(9).fillColor("#6b7280");
       doc.text(invoice.notes, 56, y, { width: doc.page.width - 120 });
+      y += notesHeight + 18;
     }
+
+    // Keep fiscal receipt evidence after all invoice and payment details.
+    const fiscalBlockHeight = 166;
+    const fiscalY = y + 12;
+    if (fiscalY + fiscalBlockHeight > doc.page.height - 96) {
+      drawFooter(pageNumber);
+      doc.addPage();
+      pageNumber += 1;
+      drawHeader();
+      y = 140;
+    }
+    drawRraDetails(y + 12);
 
     // Finalize: draw footer on last page then end
     drawFooter(pageNumber);

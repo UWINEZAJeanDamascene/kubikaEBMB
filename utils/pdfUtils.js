@@ -1,12 +1,5 @@
 const QRCode = require("qrcode");
 
-const TAX_TYPES = {
-  A: "Exempt",
-  B: "VAT 18%",
-  C: "Export",
-  D: "Non-Tax",
-};
-
 function toNumber(value, fallback = 0) {
   if (value == null) return fallback;
   if (typeof value === "object" && typeof value.toString === "function") {
@@ -18,7 +11,14 @@ function toNumber(value, fallback = 0) {
 }
 
 function formatRwf(value) {
-  return `RWF ${Math.round(toNumber(value)).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+  return formatMoney(value, "RWF");
+}
+
+function formatMoney(value, currency = "RWF") {
+  const currencyCode = /^[A-Z]{3}$/.test(String(currency || "").toUpperCase())
+    ? String(currency).toUpperCase()
+    : "RWF";
+  return `${currencyCode} ${toNumber(value).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
 }
 
 function formatReceiptDate(value) {
@@ -41,9 +41,11 @@ function formatReceiptDate(value) {
   }).format(date);
 }
 
-function taxTypeLabel(code) {
-  const normalized = String(code || "A").toUpperCase();
-  return `${normalized} (${TAX_TYPES[normalized] || "Unknown"})`;
+function taxTypeLabel(code, rate = null) {
+  const normalized = String(code || "").trim().toUpperCase();
+  if (!normalized) return "Tax class not recorded";
+  const parsedRate = rate == null || rate === "" ? null : toNumber(rate, null);
+  return `Tax class ${normalized}${parsedRate == null ? "" : ` (${parsedRate.toFixed(2)}%)`}`;
 }
 
 function buildQrContent(ebm = {}) {
@@ -76,38 +78,67 @@ function drawEbmCertificationBlock(doc, {
   width = doc.page.width - 100,
   ebm = {},
   qrPng = null,
-  title = "RRA EBM CERTIFICATION",
+  title = "FISCAL RECEIPT DETAILS",
   receiptDateFormatter = (value) => value || "N/A",
   originalReceiptNo = null,
 } = {}) {
   const status = ebm.ebmStatus || "not_submitted";
   const qrSize = 78;
-  const height = originalReceiptNo ? 150 : 136;
-  const textWidth = width - qrSize - 36;
+  const height = originalReceiptNo ? 184 : 166;
+  const textWidth = width - qrSize - 132;
   const receiptNo = certificationValue(ebm, "rcptNo", "Pending RRA Certification");
   const receiptDate = status === "submitted" ? receiptDateFormatter(ebm.rcptDt) : certificationValue(ebm, "rcptDt");
   const intrlData = certificationValue(ebm, "intrlData");
   const rcptSign = certificationValue(ebm, "rcptSign");
 
-  doc.rect(x, y, width, height).fillAndStroke("#f8fafc", "#94a3b8");
-  doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10).text(title, x + 10, y + 9);
-  doc.font("Helvetica").fontSize(8).fillColor("#475569");
-  doc.text(`RRA Receipt No: ${receiptNo}`, x + 10, y + 29, { width: textWidth });
-  doc.text(`Receipt Date: ${receiptDate}`, x + 10, y + 43, { width: textWidth });
-  doc.text(`Internal Data: ${intrlData}`, x + 10, y + 57, { width: textWidth });
-  doc.font("Courier").fontSize(7).fillColor("#111827");
-  doc.text(`Receipt Signature: ${rcptSign}`, x + 10, y + 72, { width: textWidth, lineGap: 1 });
-  doc.font("Helvetica").fontSize(8).fillColor("#475569");
+  doc.roundedRect(x, y, width, height, 8).fillAndStroke("#ffffff", "#dbe4ee");
+  doc.roundedRect(x, y, width, 32, 8).fill("#eef5f8");
+  doc.rect(x, y + 22, width, 10).fill("#eef5f8");
+  const mode = String(ebm.mode || ebm.environment || ebm.fiscalEnvironment || "").toLowerCase();
+  const fiscalLabel = mode === "mock"
+    ? "MOCK RESPONSE - NOT RRA CERTIFIED"
+    : mode === "sandbox"
+      ? "SANDBOX RESPONSE - NOT PRODUCTION CERTIFIED"
+      : mode === "production" && status === "submitted"
+        ? "RRA FISCAL RESPONSE ACCEPTED"
+        : status === "submitted"
+          ? "FISCAL RESPONSE - ENVIRONMENT UNVERIFIED"
+          : status === "failed"
+            ? "RRA FISCAL SUBMISSION FAILED"
+            : "RRA FISCAL SUBMISSION PENDING";
+  doc.fillColor("#0f172a").font("Helvetica-Bold").fontSize(9.5).text(title, x + 12, y + 10);
+  const badgeColor = mode === "mock" || mode === "sandbox" ? "#a16207" : status === "failed" ? "#b91c1c" : mode === "production" && status === "submitted" ? "#0f766e" : "#475569";
+  doc.font("Helvetica-Bold").fontSize(7).fillColor(badgeColor);
+  doc.text(fiscalLabel, x + width / 2, y + 11, { width: width / 2 - 14, align: "right" });
+
+  const fiscalRows = [
+    ["Receipt no", receiptNo],
+    ["Receipt date", receiptDate],
+    ["SDC ID", certificationValue(ebm, "sdcId")],
+    ["MRC no", certificationValue(ebm, "mrcNo")],
+    ["Receipt counter", `${certificationValue(ebm, "curRcptNo")} / ${certificationValue(ebm, "totRcptNo")}`],
+    ["Report no", certificationValue(ebm, "rptNo")],
+  ];
+  fiscalRows.forEach(([label, value], index) => {
+    const rowY = y + 40 + index * 13;
+    doc.font("Helvetica").fontSize(7.5).fillColor("#64748b").text(`${label}:`, x + 12, rowY, { width: 76 });
+    doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#1e293b").text(String(value), x + 88, rowY, { width: textWidth - 76 });
+  });
+  doc.font("Helvetica").fontSize(6.5).fillColor("#64748b").text("Internal data", x + 12, y + 122, { width: 72 });
+  doc.font("Helvetica").fontSize(6.5).fillColor("#334155").text(intrlData, x + 88, y + 122, { width: textWidth - 76, height: 10, ellipsis: true });
+  doc.font("Helvetica").fontSize(6.5).fillColor("#64748b").text("Receipt signature", x + 12, y + 136, { width: 76 });
+  doc.font("Courier").fontSize(6).fillColor("#334155").text(rcptSign, x + 88, y + 136, { width: textWidth - 76, height: 10, ellipsis: true });
   if (originalReceiptNo) {
-    doc.text(`Original Receipt No: ${originalReceiptNo}`, x + 10, y + 116, { width: textWidth });
+    doc.font("Helvetica").fontSize(6.5).fillColor("#64748b").text(`Original receipt no: ${originalReceiptNo}`, x + 12, y + 154, { width: textWidth });
   }
 
   const qrX = x + width - qrSize - 14;
-  const qrY = y + 36;
-  if (qrPng) {
+  const qrY = y + 47;
+  if (qrPng && status === "submitted" && mode === "production") {
     doc.image(qrPng, qrX, qrY, { width: qrSize, height: qrSize });
   } else {
-    drawQrPlaceholder(doc, qrX, qrY, qrSize, status === "failed" ? "Not Certified" : "QR Pending");
+    const placeholder = mode === "mock" ? "MOCK ONLY" : mode === "sandbox" ? "SANDBOX ONLY" : status === "failed" ? "Not Certified" : "QR Pending";
+    drawQrPlaceholder(doc, qrX, qrY, qrSize, placeholder);
   }
   return y + height;
 }
@@ -115,77 +146,113 @@ function drawEbmCertificationBlock(doc, {
 function extractPayloadTotals(ebm = {}, fallback = {}) {
   const payload = ebm.salesPayload || ebm.rraPayload || {};
   return {
-    taxblAmtA: toNumber(payload.taxblAmtA, fallback.taxblAmtA || fallback.totalAEx),
-    taxblAmtB: toNumber(payload.taxblAmtB, fallback.taxblAmtB || fallback.totalB18),
+    taxblAmtA: toNumber(payload.taxblAmtA, fallback.taxblAmtA),
+    taxblAmtB: toNumber(payload.taxblAmtB, fallback.taxblAmtB),
     taxblAmtC: toNumber(payload.taxblAmtC, fallback.taxblAmtC),
     taxblAmtD: toNumber(payload.taxblAmtD, fallback.taxblAmtD),
-    taxAmtA: toNumber(payload.taxAmtA, fallback.taxAmtA || fallback.totalTaxA),
-    taxAmtB: toNumber(payload.taxAmtB, fallback.taxAmtB || fallback.totalTaxB || fallback.taxAmount),
+    taxAmtA: toNumber(payload.taxAmtA, fallback.taxAmtA),
+    taxAmtB: toNumber(payload.taxAmtB, fallback.taxAmtB),
     taxAmtC: toNumber(payload.taxAmtC, fallback.taxAmtC),
     taxAmtD: toNumber(payload.taxAmtD, fallback.taxAmtD),
+    taxRtA: toNumber(payload.taxRtA, fallback.taxRtA),
+    taxRtB: toNumber(payload.taxRtB, fallback.taxRtB),
+    taxRtC: toNumber(payload.taxRtC, fallback.taxRtC),
+    taxRtD: toNumber(payload.taxRtD, fallback.taxRtD),
     totTaxblAmt: toNumber(payload.totTaxblAmt, fallback.subtotal),
     totTaxAmt: toNumber(payload.totTaxAmt, fallback.taxAmount || fallback.totalTax),
     totAmt: toNumber(payload.totAmt, fallback.totalAmount || fallback.grandTotal || fallback.total),
   };
 }
 
-function drawTaxBreakdown(doc, { x, y, width = 250, ebm = {}, fallback = {}, title = "INVOICE TOTALS", negative = false, discountAmount = 0, discountLabel = "Discount" } = {}) {
+function drawTaxBreakdown(doc, { x, y, width = 250, ebm = {}, fallback = {}, title = "INVOICE TOTALS", negative = false, discountAmount = 0, discountLabel = "Discount", currency = "RWF", border = true, background = "#ffffff" } = {}) {
   const totals = extractPayloadTotals(ebm, fallback);
   const sign = negative ? -1 : 1;
   const rows = [
-    ["A", totals.taxblAmtA],
-    ["B", totals.taxblAmtB],
-    ["C", totals.taxblAmtC],
-    ["D", totals.taxblAmtD],
-  ].filter(([, amount]) => Math.round(Math.abs(amount)) !== 0);
+    ["A", totals.taxblAmtA, totals.taxAmtA, totals.taxRtA],
+    ["B", totals.taxblAmtB, totals.taxAmtB, totals.taxRtB],
+    ["C", totals.taxblAmtC, totals.taxAmtC, totals.taxRtC],
+    ["D", totals.taxblAmtD, totals.taxAmtD, totals.taxRtD],
+  ].filter(([, taxable, tax]) => Math.round(Math.abs(taxable)) !== 0 || Math.round(Math.abs(tax)) !== 0);
 
-  const rowHeight = 16;
+  const rowHeight = 18;
   const hasDiscount = toNumber(discountAmount) > 0;
-  const height = 56 + rows.length * rowHeight + 48 + (hasDiscount ? rowHeight : 0);
-  doc.rect(x, y, width, height).fillAndStroke("#ffffff", "#e5e7eb");
+  const height = 72 + rows.length * rowHeight + 48 + (hasDiscount ? rowHeight : 0);
+  const wide = width >= 400;
+  const classWidth = wide ? 200 : 92;
+  const taxableX = wide ? x + 235 : x + 103;
+  const taxableWidth = wide ? 115 : 67;
+  const taxX = wide ? x + width - 115 : x + width - 65;
+  const taxWidth = wide ? 100 : 55;
+  const totalValueWidth = wide ? 130 : 100;
+  const totalValueX = x + width - totalValueWidth - 10;
+  if (border) doc.rect(x, y, width, height).fillAndStroke(background, "#e5e7eb");
+  else if (background) doc.rect(x, y, width, height).fill(background);
   doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10).text(title, x + 10, y + 9);
   let cy = y + 29;
-  doc.font("Helvetica").fontSize(8).fillColor("#374151");
-  rows.forEach(([code, amount]) => {
-    doc.text(`Taxable Amount (${taxTypeLabel(code)}):`, x + 10, cy, { width: width - 115 });
-    doc.text(formatRwf(sign * amount), x + width - 110, cy, { width: 100, align: "right" });
+  doc.font("Helvetica").fontSize(7).fillColor("#374151");
+  doc.font("Helvetica-Bold").fontSize(7).fillColor("#64748b");
+  doc.text("TAX CLASS / RATE", x + 10, cy, { width: classWidth });
+  doc.text("TAXABLE", taxableX, cy, { width: taxableWidth, align: "right" });
+  doc.text("TAX", taxX, cy, { width: taxWidth, align: "right" });
+  cy += 13;
+  doc.font("Helvetica").fontSize(7).fillColor("#374151");
+  rows.forEach(([code, taxable, tax, rate]) => {
+    doc.text(taxTypeLabel(code, rate), x + 10, cy, { width: classWidth });
+    doc.text(formatMoney(sign * taxable, currency), taxableX, cy, { width: taxableWidth, align: "right" });
+    doc.text(formatMoney(sign * tax, currency), taxX, cy, { width: taxWidth, align: "right" });
     cy += rowHeight;
   });
   doc.moveTo(x + 10, cy).lineTo(x + width - 10, cy).strokeColor("#e5e7eb").stroke();
   cy += 8;
-  doc.text("Total Taxable Amount:", x + 10, cy, { width: width - 115 });
-  doc.text(formatRwf(sign * totals.totTaxblAmt), x + width - 110, cy, { width: 100, align: "right" });
+  doc.text("Total Taxable Amount:", x + 10, cy, { width: totalValueX - x - 20 });
+  doc.text(formatMoney(sign * totals.totTaxblAmt, currency), totalValueX, cy, { width: totalValueWidth, align: "right" });
   cy += rowHeight;
   if (hasDiscount) {
     doc.fillColor("#047857").font("Helvetica-Bold");
-    doc.text(discountLabel, x + 10, cy, { width: width - 115 });
-    doc.text(formatRwf(-Math.abs(toNumber(discountAmount))), x + width - 110, cy, { width: 100, align: "right" });
+    doc.text(discountLabel, x + 10, cy, { width: totalValueX - x - 20 });
+    doc.text(formatMoney(-Math.abs(toNumber(discountAmount)), currency), totalValueX, cy, { width: totalValueWidth, align: "right" });
     doc.fillColor("#374151").font("Helvetica");
     cy += rowHeight;
   }
-  doc.text("Total VAT (18%):", x + 10, cy, { width: width - 115 });
-  doc.text(formatRwf(sign * totals.totTaxAmt), x + width - 110, cy, { width: 100, align: "right" });
+  doc.text("Total Tax:", x + 10, cy, { width: totalValueX - x - 20 });
+  doc.text(formatMoney(sign * totals.totTaxAmt, currency), totalValueX, cy, { width: totalValueWidth, align: "right" });
   cy += rowHeight + 2;
   doc.rect(x, cy - 4, width, 28).fill("#111827");
   doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(11);
-  doc.text(negative ? "AMOUNT REFUNDED" : "GRAND TOTAL", x + 10, cy + 3, { width: width - 115 });
-  doc.text(formatRwf(sign * totals.totAmt), x + width - 110, cy + 3, { width: 100, align: "right" });
+  doc.text(negative ? "AMOUNT REFUNDED" : "GRAND TOTAL", x + 10, cy + 3, { width: totalValueX - x - 20 });
+  doc.text(formatMoney(sign * totals.totAmt, currency), totalValueX, cy + 3, { width: totalValueWidth, align: "right" });
   return y + height;
 }
 
 function lineTaxDetails(line = {}) {
   const product = line.product || {};
   const ebm = product.ebm || {};
-  const taxTyCd = String(line.taxTyCd || line.taxCode || ebm.taxTyCd || ebm.taxTypeCode || (toNumber(line.taxRate) === 18 ? "B" : "A")).toUpperCase();
-  const lineTotal = toNumber(line.totAmt ?? line.lineTotal ?? line.totalWithTax);
-  const vatAmount = toNumber(line.taxAmt ?? line.lineTax ?? line.taxAmount, taxTyCd === "B" ? Math.round(lineTotal - lineTotal / 1.18) : 0);
+  const rawTaxType = line.taxTyCd || line.taxCode || ebm.taxTyCd || ebm.taxTypeCode || null;
+  const taxTyCd = rawTaxType == null ? null : String(rawTaxType).trim().toUpperCase();
+  const taxRate = line.taxRt ?? line.taxRate ?? ebm.taxRt ?? ebm.taxRate ?? null;
+  const rawLineTotal = line.totAmt ?? line.lineTotal ?? line.totalWithTax;
+  const rawVatAmount = line.totTaxAmt ?? line.taxAmt ?? line.lineTax ?? line.taxAmount;
+  const rawTaxableAmount = line.taxblAmt ?? line.splyAmt ?? line.lineSubtotal ?? line.subtotal;
+  const lineTotal = rawLineTotal == null ? null : toNumber(rawLineTotal);
+  const vatAmount = rawVatAmount == null ? null : toNumber(rawVatAmount);
+  const taxableAmount = rawTaxableAmount != null
+    ? toNumber(rawTaxableAmount)
+    : lineTotal != null && vatAmount != null
+      ? Math.max(0, lineTotal - vatAmount)
+      : null;
   return {
+    itemCode: line.itemCd || line.itemCode || line.productCode || product.sku || null,
     itemClassCd: line.itemClsCd || line.itemClassCd || ebm.itemClassCd || ebm.itemClassCode || "N/A",
     taxTyCd,
-    taxTypeLabel: taxTypeLabel(taxTyCd),
-    taxableAmount: toNumber(line.taxblAmt, Math.max(0, lineTotal - vatAmount)),
+    taxRate: taxRate == null || taxRate === "" ? null : toNumber(taxRate, null),
+    taxTypeLabel: taxTypeLabel(taxTyCd, taxRate),
+    taxableAmount,
     vatAmount,
     lineTotal,
+    quantityUnitCode: line.qtyUnitCd || line.quantityUnitCode || null,
+    packageUnitCode: line.pkgUnitCd || line.packageUnitCode || null,
+    packageQuantity: line.pkg ?? null,
+    discountAmount: toNumber(line.dcAmt ?? line.discountAmount),
   };
 }
 
@@ -195,6 +262,7 @@ module.exports = {
   drawTaxBreakdown,
   extractPayloadTotals,
   formatReceiptDate,
+  formatMoney,
   formatRwf,
   generateQrPng,
   lineTaxDetails,

@@ -149,6 +149,7 @@ async function createOpeningStock({
         totalCost,
         batchNumber: batchNumber || null,
         lotNumber: lotNumber || null,
+        serialNumbers: trackingType === 'serial' ? normalizedSerials : [],
         expiryDate: expiryDate || null,
         referenceType: 'opening_stock',
         referenceNumber: referenceNumber || `OPEN-${Date.now()}`,
@@ -375,8 +376,23 @@ async function ensureImportedTrackingRecords({
 
     // Backfill the InventoryBatch record made by an earlier import run so both
     // the standard batch view and tracked-batch view retain the identifiers.
-    const existingOpening = await StockMovement.findOne({ company: companyId, product: productId, warehouse: warehouseId, reason: 'initial_stock' }).select('_id').lean();
+    let existingOpeningQuery = StockMovement.findOne({ company: companyId, product: productId, warehouse: warehouseId, reason: 'initial_stock' }).select('_id');
+    if (session) existingOpeningQuery = existingOpeningQuery.session(session);
+    const existingOpening = await existingOpeningQuery.lean();
     if (existingOpening) {
+      const movementTrackingUpdates = {};
+      if (batchNumber) movementTrackingUpdates.batchNumber = String(batchNumber).trim().toUpperCase();
+      if (lotNumber) movementTrackingUpdates.lotNumber = String(lotNumber).trim().toUpperCase();
+      if (expiryDate) movementTrackingUpdates.expiryDate = expiryDate;
+      if (serials.length) movementTrackingUpdates.serialNumbers = serials;
+      if (Object.keys(movementTrackingUpdates).length) {
+        await StockMovement.updateOne(
+          { _id: existingOpening._id, company: companyId },
+          { $set: movementTrackingUpdates },
+          opts,
+        );
+      }
+
       const { dbClient } = require('../lib/prisma');
       const inventoryBatch = await dbClient().inventoryBatch.findFirst({
         where: { companyId: String(companyId), productId: String(productId), warehouseId: String(warehouseId), stockMovementId: String(existingOpening._id) },

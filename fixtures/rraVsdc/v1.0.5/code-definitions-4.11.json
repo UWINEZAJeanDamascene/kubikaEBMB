@@ -1,0 +1,38 @@
+{
+  "source": {
+    "documentId": "RRA_VSDC_DOC_v1.0.5",
+    "version": "1.0.5",
+    "sha256": "25DF854736B60E7E4EB128BF99904813C5D96ACF99464B7B48F23C7FAB3DF9C1",
+    "pdf": "../../../../rra_vsdc_spec_v1_0_5_official.pdf"
+  },
+  "scope": {
+    "section": "4.11",
+    "printedPages": "72",
+    "physicalPdfPages": "76"
+  },
+  "integrity": {
+    "algorithm": "SHA-256",
+    "canonicalization": "UTF-8 JSON.stringify(classifications), preserving detail array order",
+    "rowCount": 6,
+    "sha256": "8f86f6c849dbbc57d73a080c393db941e256de7c07d3cc94d072e1cbb2959f7e"
+  },
+  "notes": [
+    "The published table identifies code classification 11 but labels its Code Classification Name as Unit of Quantity. This apparent inconsistency is preserved verbatim; the section title is Transaction Progress.",
+    "This published baseline is reference data, not a substitute for a tenant-scoped current RRA code-sync response or sandbox/production acceptance."
+  ],
+  "classifications": [
+    {
+      "codeClass": "11",
+      "codeClassName": "Unit of Quantity",
+      "section": "4.11",
+      "details": [
+        { "code": "01", "sortOrder": 1, "name": "Wait for Approval", "description": "Wait for Approval", "remark": "" },
+        { "code": "02", "sortOrder": 2, "name": "Approved", "description": "Approved", "remark": "" },
+        { "code": "03", "sortOrder": 3, "name": "Cancel Requested", "description": "Cancel Requested", "remark": "" },
+        { "code": "04", "sortOrder": 4, "name": "Canceled", "description": "Canceled", "remark": "" },
+        { "code": "05", "sortOrder": 5, "name": "Refunded", "description": "Refunded", "remark": "" },
+        { "code": "06", "sortOrder": 6, "name": "Transferred", "description": "Transferred", "remark": "" }
+      ]
+    }
+  ]
+}

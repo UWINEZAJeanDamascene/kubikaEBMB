@@ -73,6 +73,13 @@ describe('universal product import enrichment contract', () => {
     expect(ImportService.__test__.isWellFormedRraItemClassCode('not-a-code')).toBe(false);
   });
 
+  it('does not treat the §4.11 class-name typo as a quantity-unit namespace', () => {
+    const classifiers = ImportService.__test__;
+    expect(classifiers.isQuantityUnitCode({ codeClass: '10', codeClassName: 'Unit of Quantity', code: 'U' })).toBe(true);
+    expect(classifiers.isQuantityUnitCode({ codeClass: '11', codeClassName: 'Unit of Quantity', code: '02' })).toBe(false);
+    expect(classifiers.isQuantityUnitCode({ codeClass: '11', codeClassName: 'Unit of Quantity', code: 'Approved' })).toBe(false);
+  });
+
   it('normalizes duplicate product keys within an import file', () => {
     expect(ImportService.__test__.duplicateKeyFor('products', { sku: ' prd-025 ' })).toBe('PRD-025');
   });

@@ -1,5 +1,6 @@
 const { MAX_VSDC_NUMBER_BIGINT } = require('../constants/ebmFiscalNumber');
 const { SAVE_SALES_ENDPOINT } = require('../constants/ebmSalesEndpoint');
+const { getVsdcApiResponseCode } = require('./vsdcApiResponseCodes');
 
 const SELECT_IMPORT_ITEMS_ENDPOINT = '/imports/selectImportItems';
 const RRA_TAX_TYPE_CODES = Object.freeze(['A', 'B', 'C', 'D']);
@@ -313,9 +314,9 @@ const PURCHASE_SAVE_HEADER_DTO_FIELDS = Object.freeze({
   // with source invoice identifiers. Omit until RRA confirms the wire semantics.
   spplrInvcNo: { type: 'integer', length: 38, blocked: true },
   spplrSdcId: { type: 'char', length: 12 },
-  regTyCd: { type: 'char', length: 5, required: true },
+  regTyCd: { type: 'char', length: 1, required: true, allowedValues: ['A', 'M'] },
   pchsTyCd: { type: 'char', length: 5, required: true },
-  rcptTyCd: { type: 'char', length: 5, required: true },
+  rcptTyCd: { type: 'char', length: 1, required: true, allowedValues: ['P', 'R'] },
   pmtTyCd: { type: 'char', length: 5, required: true },
   pchsSttsCd: { type: 'char', length: 5, required: true },
   cfmDt: { type: 'dateTime14' }, pchsDt: { type: 'date8', required: true },
@@ -413,8 +414,11 @@ function buildPurchaseDtoObject(source, fields, path) {
       const actualLength = typeof value === 'string' ? Array.from(value).length : -1;
       if (typeof value !== 'string' || (rule.required && !value.trim())
         || (rule.exactLength ? actualLength !== rule.length : actualLength > rule.length)
-        || (rule.digits && !/^\d+$/.test(value))) {
-        const requirement = rule.digits
+        || (rule.digits && !/^\d+$/.test(value))
+        || (rule.allowedValues && !rule.allowedValues.includes(value))) {
+        const requirement = rule.allowedValues
+          ? `one of ${rule.allowedValues.join(', ')}`
+          : rule.digits
           ? `${rule.exactLength ? 'exactly ' : 'at most '}${rule.length} digits`
           : `a string within the character limit of ${rule.length}`;
         throw purchaseDtoError(`${path}.${field}`, `must be ${requirement}`);
@@ -503,7 +507,7 @@ const STOCK_SAVE_HEADER_DTO_FIELDS = Object.freeze({
   bhfId: { type: 'char', length: 2, exactLength: true, digits: true, required: true },
   sarNo: { type: 'integer', precision: 38, required: true },
   orgSarNo: { type: 'integer', precision: 38, required: true },
-  regTyCd: { type: 'char', length: 5, required: true },
+  regTyCd: { type: 'char', length: 1, required: true, allowedValues: ['A', 'M'] },
   custTin: { type: 'char', length: 9, digits: true, nullable: true },
   custNm: { type: 'char', length: 100, nullable: true },
   custBhfId: { type: 'char', length: 2, digits: true, nullable: true },
@@ -1640,7 +1644,8 @@ function mapVsdcErrorCode(resultCd) {
     883: 'This purchase order code has already been used on another fiscal sale.',
     884: 'The customer TIN is invalid according to RRA.',
   };
-  return messages[code] || null;
+  if (code === '000') return null;
+  return messages[code] || getVsdcApiResponseCode(code)?.description || null;
 }
 
 module.exports = {

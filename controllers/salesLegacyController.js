@@ -104,6 +104,42 @@ async function consumeTrackedBatches(companyId, productId, warehouseId, quantity
   return { allocations, totalCost, quantity };
 }
 
+async function findAvailableSerialsOutsideQuarantine({ companyId, productId, warehouseId, serialNumbers }) {
+  const pageSize = 500;
+  const candidates = [];
+  for (let offset = 0; offset < serialNumbers.length; offset += pageSize) {
+    const serialChunk = serialNumbers.slice(offset, offset + pageSize);
+    const rows = await StockSerialNumber.find({
+      company: companyId,
+      product: productId,
+      warehouse: warehouseId,
+      serialNo: { $in: serialChunk },
+      status: { $in: ['in_stock', 'returned'] },
+    }).select('_id serialNo batch').limit(serialChunk.length).lean();
+    candidates.push(...rows);
+  }
+
+  const batchIds = [...new Set(candidates
+    .map((serial) => String(serial.batch?._id || serial.batch?.id || serial.batch || ''))
+    .filter(Boolean))];
+  const quarantinedBatchIds = new Set();
+  for (let offset = 0; offset < batchIds.length; offset += pageSize) {
+    const batchChunk = batchIds.slice(offset, offset + pageSize);
+    const rows = await StockBatch.find({
+      company: companyId,
+      _id: { $in: batchChunk },
+      isQuarantined: true,
+      qtyOnHand: { $gt: 0 },
+    }).select('_id').limit(batchChunk.length).lean();
+    for (const batch of rows) quarantinedBatchIds.add(String(batch._id));
+  }
+
+  return candidates.filter((serial) => {
+    const batchId = String(serial.batch?._id || serial.batch?.id || serial.batch || '');
+    return !batchId || !quarantinedBatchIds.has(batchId);
+  });
+}
+
 async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash }) {
   if (!requestKey) return false;
   const rows = await dbClient().$queryRawUnsafe(
@@ -195,7 +231,8 @@ exports.createDirectSale = async (req, res, next) => {
     // Mock mode is intentionally manual so development/test checkouts never
     // acquire fabricated fiscal receipts. Sandbox and production POS sales
     // are submitted after the sale transaction commits.
-    const autoFiscalSubmission = ebmService.getConfig().mode !== 'mock';
+    const fiscalMode = String(ebmService.getConfig().mode || 'mock').toLowerCase();
+    const autoFiscalSubmission = fiscalMode !== 'mock';
     requestKey = String(req.get('Idempotency-Key') || '').trim();
     if (requestKey && !/^[a-zA-Z0-9_-]{16,100}$/.test(requestKey)) {
       return res.status(400).json({ success: false, code: 'POS_INVALID_IDEMPOTENCY_KEY', message: 'Checkout idempotency key is invalid.' });
@@ -414,6 +451,21 @@ exports.createDirectSale = async (req, res, next) => {
     const stockLevelByProduct = new Map(
       selectedWarehouseLevels.map((level) => [String(level.product_id), level]),
     );
+    const quarantineWhere = {
+      companyId: String(companyId),
+      warehouseId: String(warehouseId),
+      productId: { in: productIds.map(String) },
+      isQuarantined: true,
+      qtyOnHand: { gt: 0 },
+    };
+    const quarantinedRows = productIds.length
+      ? await dbClient().stockBatch.groupBy({
+        by: ['productId'],
+        where: quarantineWhere,
+        _sum: { qtyOnHand: true },
+      })
+      : [];
+    const quarantinedByProduct = new Map(quarantinedRows.map((row) => [String(row.productId), Number(row._sum?.qtyOnHand || 0)]));
     let requiresManagerApproval = false;
 
     for (const [itemIndex, item] of items.entries()) {
@@ -491,13 +543,12 @@ exports.createDirectSale = async (req, res, next) => {
         if (serialNumbers.length !== quantity || new Set(serialNumbers).size !== serialNumbers.length) {
           return res.status(400).json({ success: false, code: 'POS_SERIALS_REQUIRED', message: `Enter exactly ${quantity} unique serial number(s) for ${product.name}.` });
         }
-        const availableSerials = await StockSerialNumber.find({
-          company: companyId,
-          product: product._id,
-          warehouse: warehouseId,
-          serialNo: { $in: serialNumbers },
-          status: { $in: ['in_stock', 'returned'] },
-        }).select('_id serialNo').lean();
+        const availableSerials = await findAvailableSerialsOutsideQuarantine({
+          companyId,
+          productId: product._id,
+          warehouseId,
+          serialNumbers,
+        });
         const signedSerials = new Set((snapshotProduct?.serialNumbers || []).map((serial) => String(serial).toUpperCase()));
         if (offlineContext && serialNumbers.some((serial) => !signedSerials.has(serial))) {
           return res.status(403).json({ success: false, code: 'POS_OFFLINE_SERIAL_NOT_IN_SNAPSHOT', message: `A serial number for ${product.name} was not available in the signed offline snapshot.` });
@@ -513,10 +564,13 @@ exports.createDirectSale = async (req, res, next) => {
       if (isStockable) {
         const stockLevel = stockLevelByProduct.get(String(product._id));
         const availableStock = stockLevel
-          ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - Number(stockLevel.qty_reserved || 0))
+          ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - Number(stockLevel.qty_reserved || 0) - (quarantinedByProduct.get(String(product._id)) || 0))
           : 0;
-        if (availableStock < quantity && !offlineContext
-          && !(allowNegativeStock && productTrackingType === 'none')) {
+        const maySellBelowOnHand = allowNegativeStock
+          && productTrackingType === 'none'
+          && (quarantinedByProduct.get(String(product._id)) || 0) <= 0;
+        const hasQuarantinedStock = (quarantinedByProduct.get(String(product._id)) || 0) > 0;
+        if (availableStock < quantity && (!offlineContext || hasQuarantinedStock) && !maySellBelowOnHand) {
           return res.status(409).json({
             success: false,
             code: 'ERR_INSUFFICIENT_STOCK',
@@ -817,7 +871,12 @@ exports.createDirectSale = async (req, res, next) => {
         lines: invoiceLines,
         status: paymentStatus, // Already confirmed/paid status
         posOrigin: true,
-        ebm: autoFiscalSubmission ? { ebmStatus: 'pending', retryCount: 0 } : {},
+        ebm: {
+          fiscalEnvironment: fiscalMode,
+          environment: fiscalMode,
+          ebmStatus: autoFiscalSubmission ? 'pending' : 'not_submitted',
+          retryCount: 0,
+        },
         currencyCode: invoiceCurrency,
         subtotal: subtotal,
         totalDiscount: totalDiscount,
@@ -953,8 +1012,9 @@ exports.createDirectSale = async (req, res, next) => {
         const { product, quantity, warehouseId: selectedWarehouseId, lineData } = stockUpdate;
         const stockLevel = stockLevelByProduct.get(String(product._id));
         const reserved = Number(stockLevel?.qty_reserved || 0);
+        const quarantined = quarantinedByProduct.get(String(product._id)) || 0;
         let actualAvailableStock = stockLevel
-          ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - reserved)
+          ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - reserved - quarantined)
           : 0;
         if (offlineContext || (allowNegativeStock && stockUpdate.trackingType === 'none')) {
           const stockRows = await dbClient().$queryRawUnsafe(
@@ -963,7 +1023,7 @@ exports.createDirectSale = async (req, res, next) => {
             quantity, Number(product.averageCost) || 0,
           );
           const stockRow = stockRows[0];
-          actualAvailableStock = Math.max(0, Number(stockRow.previousStock) - Number(stockRow.reservedStock));
+          actualAvailableStock = Math.max(0, Number(stockRow.previousStock) - Number(stockRow.reservedStock) - quarantined);
           const shortage = Math.max(0, quantity - actualAvailableStock);
           if (shortage > 0 && offlineContext) {
             offlineConflicts.push({
@@ -1577,7 +1637,7 @@ exports.getPosProducts = async (req, res, next) => {
       ? Buffer.from(JSON.stringify({ name: lastProduct.name, id: String(lastProduct._id) })).toString('base64url')
       : null;
 
-    const [warehouseStockLevels, priceListPricing, transferVisibility] = await Promise.all([
+    const [warehouseStockLevels, priceListPricing, transferVisibility, quarantinedRows] = await Promise.all([
       warehouseId && products.length
       ? StockLevel.find({
           company_id: companyId,
@@ -1587,17 +1647,32 @@ exports.getPosProducts = async (req, res, next) => {
       : [],
       getWarehousePriceListPrices(companyId, warehouseId, products.map((product) => product._id)),
       getWarehouseTransferVisibility(companyId, warehouseId, products.map((product) => product._id)),
+      products.length
+        ? dbClient().stockBatch.groupBy({
+          by: ['productId'],
+          where: {
+            companyId: String(companyId),
+            productId: { in: products.map((product) => String(product._id)) },
+            ...(warehouseId ? { warehouseId: String(warehouseId) } : {}),
+            isQuarantined: true,
+            qtyOnHand: { gt: 0 },
+          },
+          _sum: { qtyOnHand: true },
+        })
+        : [],
     ]);
     const warehouseStockByProduct = new Map(
       warehouseStockLevels.map((level) => [String(level.product_id), level]),
     );
+    const quarantinedByProduct = new Map(quarantinedRows.map((row) => [String(row.productId), Number(row._sum?.qtyOnHand || 0)]));
 
     // Enhance with availability info
     const enhancedProducts = products.map(p => {
       const stockLevel = warehouseStockByProduct.get(String(p._id));
       const onHandStock = warehouseId ? toNumber(stockLevel?.qty_on_hand) : toNumber(p.currentStock);
       const reservedStock = warehouseId ? toNumber(stockLevel?.qty_reserved) : toNumber(p.qtyReserved);
-      const currentStock = Math.max(0, onHandStock - reservedStock);
+      const quarantinedStock = quarantinedByProduct.get(String(p._id)) || 0;
+      const currentStock = Math.max(0, onHandStock - reservedStock - quarantinedStock);
       return {
         _id: p._id,
         name: p.name,
@@ -1611,6 +1686,7 @@ exports.getPosProducts = async (req, res, next) => {
         currentStock,
         onHandStock,
         reservedStock,
+        quarantinedStock,
         averageCost: toNumber(p.averageCost),
         category: p.category,
         isAvailable: currentStock > 0 || p.isStockable === false,

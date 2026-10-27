@@ -372,7 +372,7 @@ async function resolveRefundReasonCode(companyId, requestedCode = null) {
   const activeRefundCodes = await EBMCode.find({
     company: companyId,
     active: true,
-    codeClassName: { $regex: 'refund', $options: 'i' },
+    codeClass: '32',
   }).sort({ code: 1 }).lean();
   const codes = activeRefundCodes.filter((entry) => entry.useYn === 'Y' && entry.codeClassUseYn === 'Y');
   if (requestedCode) {
@@ -415,20 +415,15 @@ async function findCode(
 }
 
 async function resolveSalesStatusCode(companyId) {
-  const codes = await EBMCode.find({
-    company: companyId,
-    active: true,
-    codeClassName: { $regex: 'progress|status', $options: 'i' },
-  }).sort({ sortOrder: 1, code: 1 }).lean();
-  const candidates = [...new Map(codes.filter((code) => /approved|confirmed/i.test(`${code.name || ''} ${code.description || ''}`))
-    .map((code) => [String(code.code), code])).values()];
-  if (candidates.length !== 1) {
+  const progressCodes = await listActiveFiscalCodes(companyId, RRA_CODE_CLASS_IDS.TRANSACTION_PROGRESS);
+  const approved = progressCodes.filter((code) => String(code.code) === '02');
+  if (approved.length !== 1) {
     throw sourceFieldError(
-      candidates.length ? 'EBM_SALES_STATUS_CODE_AMBIGUOUS' : 'EBM_SALES_STATUS_CODE_MISSING',
-      `Expected exactly one synchronized RRA approved/confirmed transaction-progress code; found ${candidates.length}.`,
+      approved.length ? 'EBM_SALES_STATUS_CODE_AMBIGUOUS' : 'EBM_SALES_STATUS_CODE_MISSING',
+      `Expected the active synchronized RRA §4.11 Approved code 02 in class ${RRA_CODE_CLASS_IDS.TRANSACTION_PROGRESS}; found ${approved.length}.`,
     );
   }
-  return String(candidates[0].code);
+  return String(approved[0].code);
 }
 
 async function resolveHeaderCodes(invoice, companyId, { forceNormalSale = false, refundAfterSale = false } = {}) {
@@ -1022,6 +1017,7 @@ async function applySuccess(invoiceId, companyId, response, payload) {
     lastError: null,
     salesCorrelationId: `sales:${invoiceId}`,
     rcptTyCd: payload.rcptTyCd,
+    fiscalEnvironment: response.mode || null,
     pmtTyCd: payload.pmtTyCd,
     salesTyCd: payload.salesTyCd,
     cfmDt: payload.cfmDt,
@@ -1689,5 +1685,6 @@ module.exports = {
     assertPurchaserAcceptance,
     formatSalesDate,
     preflightSalesSubmission,
+    resolveRefundReasonCode,
   },
 };

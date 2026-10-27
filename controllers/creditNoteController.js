@@ -213,7 +213,10 @@ exports.generateCreditNotePDF = async (req, res, next) => {
     const refundReason = refundCode
       ? await EBMCode.findOne({ company: companyId, code: refundCode, active: true }).lean()
       : null;
-    const qrPng = await generateQrPng(note.ebm, { width: 110 });
+    const fiscalMode = String(note.ebm?.fiscalEnvironment || note.ebm?.mode || note.ebm?.environment || '').toLowerCase();
+    const qrPng = fiscalMode === 'production' && note.ebm?.ebmStatus === 'submitted'
+      ? await generateQrPng(note.ebm, { width: 110 })
+      : null;
     const originalInvoice = note.invoice || {};
     const lineArray = note.lines?.length ? note.lines : note.items || [];
 
@@ -295,12 +298,12 @@ exports.generateCreditNotePDF = async (req, res, next) => {
       doc.text(String(index + 1), 56, y);
       doc.text(line.product?.name || line.productName || "Item", 80, y, { width: 220 });
       doc.fontSize(7).fillColor("#6b7280");
-      doc.text(`Class: ${tax.itemClassCd}  Tax Type: ${tax.taxTypeLabel}  Taxable: ${formatRwf(-tax.taxableAmount)}`, 80, y + 12, { width: 240 });
+      doc.text(`Class: ${tax.itemClassCd}  Tax Type: ${tax.taxTypeLabel}  Taxable: ${tax.taxableAmount == null ? "Not recorded" : formatRwf(-tax.taxableAmount)}`, 80, y + 12, { width: 240 });
       doc.fontSize(9).fillColor("#111827");
       doc.text(String(line.quantity || 0), 318, y, { width: 35, align: "right" });
       doc.text(formatRwf(line.unitPrice), 365, y, { width: 70, align: "right" });
-      doc.text(formatRwf(-tax.vatAmount), 445, y, { width: 55, align: "right" });
-      doc.text(formatRwf(-tax.lineTotal), 508, y, { width: 72, align: "right" });
+      doc.text(tax.vatAmount == null ? "Not recorded" : formatRwf(-tax.vatAmount), 445, y, { width: 55, align: "right" });
+      doc.text(tax.lineTotal == null ? "Not recorded" : formatRwf(-tax.lineTotal), 508, y, { width: 72, align: "right" });
       y += 44;
     });
 

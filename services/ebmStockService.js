@@ -22,6 +22,7 @@ const { sanitizeForEndpoint } = require('../utils/vsdcPayloadSanitizer');
 const Decimal = require('@prisma/client').Prisma.Decimal;
 const { cursorSemanticsConfirmed } = require('../utils/ebmCursorPolicy');
 const { getStockSaveBlock } = require('./ebmStockContractGate');
+const { RRA_CODE_CLASS_IDS } = require('../constants/ebmCodeClasses');
 const {
   EBM_STOCK_TYPE_CODES,
   getAdjustmentCode,
@@ -143,8 +144,9 @@ async function resolveRegistrationTypeCode(companyId) {
   const code = await EBMCode.findOne({
     company: companyId,
     active: true,
-    codeClassName: { $regex: "Registration Type", $options: "i" },
-    $or: [{ name: { $regex: "Manual", $options: "i" } }, { code: "M" }],
+    useYn: "Y",
+    codeClass: RRA_CODE_CLASS_IDS.REGISTRATION_TYPE,
+    code: "M",
   }).lean();
   if (!code?.code) {
     const error = new Error("An active, approved EBM registration type is required for stock reporting.");
@@ -156,16 +158,24 @@ async function resolveRegistrationTypeCode(companyId) {
 }
 
 async function resolveStockTypeCode(companyId, code) {
-  const isIn = /^0[1-4]$/.test(String(code));
+  const normalizedCode = String(code);
+  const isIn = /^0[1-6]$/.test(normalizedCode);
+  const isOut = /^1[1-6]$/.test(normalizedCode);
+  if (!isIn && !isOut) {
+    const error = new Error(`Stock movement type ${normalizedCode} is outside the RRA §4.15 stock in/out code ranges.`);
+    error.code = "EBM_STOCK_TYPE_CODE_INVALID";
+    error.retryable = false;
+    throw error;
+  }
   const approved = await EBMCode.findOne({
     company: companyId,
-    code: String(code),
+    code: normalizedCode,
     active: true,
     useYn: "Y",
-    codeClassName: { $regex: isIn ? "Stock In Type" : "Stock Out Type", $options: "i" },
+    codeClass: RRA_CODE_CLASS_IDS.STOCK_IN_OUT_TYPE,
   }).lean();
   if (!approved) {
-    const error = new Error(`Stock movement type ${code} is not present as an active RRA code for this company.`);
+    const error = new Error(`Stock movement type ${normalizedCode} is not present as an active RRA §4.15 code for this company.`);
     error.code = "EBM_STOCK_TYPE_CODE_UNCONFIRMED";
     error.retryable = false;
     throw error;

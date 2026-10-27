@@ -13,12 +13,13 @@ const STOCK_BATCH_LIST_SELECT = [
 exports.getStockBatches = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { product, warehouse, search, page = 1, limit = 50 } = req.query;
+    const { product, warehouse, search, isQuarantined, page = 1, limit = 50 } = req.query;
 
     const query = { company: companyId };
 
     if (product) query.product = product;
     if (warehouse) query.warehouse = warehouse;
+    if (isQuarantined === 'true' || isQuarantined === 'false') query.isQuarantined = isQuarantined === 'true';
 
     // Search by batch number
     if (search) {
@@ -221,16 +222,17 @@ exports.deleteStockBatch = async (req, res, next) => {
 exports.getExpiringBatches = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { days = 30, warehouse } = req.query;
+    const parsedDays = Number.parseInt(String(req.query.days ?? '30'), 10);
+    const days = Number.isInteger(parsedDays) ? Math.min(365, Math.max(0, parsedDays)) : 30;
+    const { warehouse } = req.query;
 
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() + parseInt(days));
 
     const query = {
       company: companyId,
-      expiryDate: { $lte: cutoffDate, $gte: new Date() },
+      expiryDate: { $lte: cutoffDate },
       qtyOnHand: { $gt: 0 },
-      isQuarantined: false
     };
 
     if (warehouse) query.warehouse = warehouse;
@@ -253,9 +255,17 @@ exports.quarantineStockBatch = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { isQuarantined } = req.body;
 
+    if (typeof isQuarantined !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        code: 'BATCH_QUARANTINE_STATE_REQUIRED',
+        message: 'Provide isQuarantined as true or false.',
+      });
+    }
+
     const batch = await StockBatch.findOneAndUpdate(
       { _id: req.params.id, company: companyId },
-      { isQuarantined },
+      { $set: { isQuarantined } },
       { new: true }
     ).populate('product', 'name sku');
 

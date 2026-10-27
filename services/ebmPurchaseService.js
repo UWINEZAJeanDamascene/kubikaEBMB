@@ -293,7 +293,7 @@ function normalizePurchaseSale(raw, companyId, branchId, retrievalContext = null
 
 const PURCHASE_SELECT_HEADER_FIELDS = Object.freeze({
   spplrTin: ['char', 9], spplrNm: ['char', 60], spplrBhfId: ['char', 2],
-  spplrInvcNo: ['number', 38, 0], prcOrdCd: ['char', 6], rcptTyCd: ['char', 5],
+  spplrInvcNo: ['number', 38, 0], prcOrdCd: ['char', 6], rcptTyCd: ['char', 1],
   pmtTyCd: ['char', 5], cfmDt: ['datetime19'], salesDt: ['date8'],
   stockRlsDt: ['datetime19'], totItemCnt: ['number', 10, 0],
   taxblAmtA: ['number', 18, 2], taxblAmtB: ['number', 18, 2],
@@ -390,6 +390,9 @@ function validatePurchaseSelectResponse(response) {
     if (!sale || typeof sale !== 'object' || Array.isArray(sale)) throw purchaseResponseError(root, 'must be an object');
     for (const [field, schema] of Object.entries(PURCHASE_SELECT_HEADER_FIELDS)) {
       if (Object.prototype.hasOwnProperty.call(sale, field)) validatePurchaseSelectField(sale[field], schema, `${root}.${field}`);
+    }
+    if (sale.rcptTyCd != null && !['P', 'R'].includes(sale.rcptTyCd)) {
+      throw purchaseResponseError(`${root}.rcptTyCd`, 'must be the documented purchase receipt type P or R from class 38');
     }
     if (Object.prototype.hasOwnProperty.call(sale, 'taxTyCd')) validatePurchaseSelectField(sale.taxTyCd, ['number', 5, 0], `${root}.taxTyCd`, true);
     if (Object.prototype.hasOwnProperty.call(sale, 'itemList')) {
@@ -1020,4 +1023,5 @@ module.exports.__test__ = {
   isIntactPurchaseEvidenceSnapshot,
   findMatchingDocument,
   confirmMatchedDocument,
+  validatePurchaseSelectResponse,
 };

@@ -1,7 +1,6 @@
 jest.mock('../models/EBMCode', () => ({
   findOne: jest.fn(({ code }) => ({ lean: jest.fn(async () => ({ code })) })),
   find: jest.fn((query) => {
-    const className = String(query?.codeClassName?.$regex || '').toLowerCase();
     const classId = String(query?.codeClass || '');
     const active = (row) => ({ ...row, active: true, useYn: 'Y', codeClassUseYn: 'Y' });
     const codeByClass = {
@@ -30,11 +29,31 @@ jest.mock('../models/EBMCode', () => ({
         active({ code: 'P', name: 'Proforma', description: 'Sales and purchase type : Proforma' }),
         active({ code: 'T', name: 'Training', description: 'Sales and purchase type : Training' }),
       ],
-      progress: [active({ code: '02', name: 'Approved', description: 'Approved' })],
+      '11': [
+        active({ code: '01', name: 'Wait for Approval', description: 'Wait for Approval' }),
+        active({ code: '02', name: 'Approved', description: 'Approved' }),
+        active({ code: '03', name: 'Cancel Requested', description: 'Cancel Requested' }),
+        active({ code: '04', name: 'Canceled', description: 'Canceled' }),
+        active({ code: '05', name: 'Refunded', description: 'Refunded' }),
+        active({ code: '06', name: 'Transferred', description: 'Transferred' }),
+      ],
+      '32': [
+        active({ code: '01', name: 'Missing Quantity', description: 'Missing Quantity' }),
+        active({ code: '02', name: 'Missing Item', description: 'Missing Item' }),
+        active({ code: '03', name: 'Damaged', description: 'Damaged' }),
+        active({ code: '04', name: 'Wasted', description: 'Wasted' }),
+        active({ code: '05', name: 'Raw Material Shortage', description: 'Raw Material Shortage' }),
+        active({ code: '06', name: 'Refund', description: 'Refund' }),
+        active({ code: '07', name: 'Wrong Customer TIN', description: 'Wrong Customer TIN' }),
+        active({ code: '08', name: 'Wrong Customer name', description: 'Wrong Customer name' }),
+        active({ code: '09', name: 'Wrong Amount/price', description: 'Wrong Amount/price' }),
+        active({ code: '10', name: 'Wrong Quantity', description: 'Wrong Quantity' }),
+        active({ code: '11', name: 'Wrong Item(s)', description: 'Wrong Item(s)' }),
+        active({ code: '12', name: 'Wrong tax type', description: 'Wrong tax type' }),
+        active({ code: '13', name: 'Other reason', description: 'Other reason' }),
+      ],
     };
-    const result = /progress|status/.test(className)
-      ? codeByClass.progress
-      : codeByClass[classId] || [];
+    const result = codeByClass[classId] || [];
 
     return {
       sort: jest.fn(() => ({ lean: jest.fn(async () => result) })),
@@ -57,6 +76,18 @@ const EBMQueueService = require('../services/ebmQueueService');
 const EBMFiscalSequenceService = require('../services/ebmFiscalSequenceService');
 const EBMTinService = require('../services/ebmCustomerTinService');
 const { sanitizeForEndpoint } = require('../utils/vsdcPayloadSanitizer');
+
+describe('RRA refund reason code selection', () => {
+  it('uses only active synchronized classification 32 codes and preserves the selected two-digit code', async () => {
+    await expect(EBMSalesService.__test__.resolveRefundReasonCode('company-1', '03')).resolves.toBe('03');
+    expect(EBMCode.find).toHaveBeenCalledWith({ company: 'company-1', active: true, codeClass: '32' });
+  });
+
+  it('rejects a code that is not in the synchronized RRA refund-reason class', async () => {
+    await expect(EBMSalesService.__test__.resolveRefundReasonCode('company-1', '99'))
+      .rejects.toMatchObject({ code: 'EBM_REFUND_REASON_CODE_UNKNOWN' });
+  });
+});
 
 const BASE_LINE = {
   qty: '2.00',

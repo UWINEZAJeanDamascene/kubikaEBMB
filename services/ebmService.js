@@ -8,7 +8,13 @@ const {
 const VSDC_1_0_5_CODE_DEFINITION_4_1_TO_4_3 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.1-4.3.json');
 const VSDC_1_0_5_CODE_DEFINITION_4_4 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.4.json');
 const VSDC_1_0_5_CODE_DEFINITION_4_7_TO_4_10 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.7-4.10.json');
+const VSDC_1_0_5_CODE_DEFINITION_4_11 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.11.json');
+const VSDC_1_0_5_CODE_DEFINITION_4_12 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.12.json');
+const VSDC_1_0_5_CODE_DEFINITION_4_13 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.13.json');
+const VSDC_1_0_5_STOCK_IN_OUT_TYPES_4_15 = require('../fixtures/rraVsdc/v1.0.5/stock-in-out-types-4.15.json');
+const VSDC_1_0_5_REFUND_REASON_CODES_4_16 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.16.json');
 const { preserveImportDecimalPrecision } = require('../utils/ebmImportResponseParser');
+const { VSDC_API_RESPONSE_CODES, getVsdcApiResponseCode } = require('../utils/vsdcApiResponseCodes');
 
 const EBM_MODES = Object.freeze({
   MOCK: 'mock',
@@ -41,12 +47,9 @@ const RETRYABLE_RESULT_CODES = new Set([
   '999',
 ]);
 
-const RESULT_CODE_DETAILS = Object.freeze({
-  881: 'Purchase is mandatory',
-  882: 'Purchase code is invalid',
-  883: 'Purchase already used',
-  884: 'Invalid customer TIN was provided',
-});
+const RESULT_CODE_DETAILS = Object.freeze(Object.fromEntries(
+  VSDC_API_RESPONSE_CODES.map(({ code, description }) => [code, description]),
+));
 
 const DEFAULTS = Object.freeze({
   mode: EBM_MODES.MOCK,
@@ -113,6 +116,56 @@ const BRANCH_REGISTRATION_GUARDED_ENDPOINTS = new Set([
   VSDC_ENDPOINTS.SAVE_STOCK_MASTER,
 ]);
 
+const SAVE_ENDPOINT_GATES = Object.freeze({
+  [VSDC_ENDPOINTS.SAVE_BRANCH_USER]: {
+    flag: 'RRA_VSDC_BRANCH_USER_SAVE_ENABLED',
+    errorCode: 'EBM_BRANCH_USER_CONTRACT_BLOCKED',
+    specReference: 'section 3.3.3.2 (PDF pp. 29-30)',
+  },
+  [VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE]: {
+    flag: 'RRA_VSDC_BRANCH_INSURANCE_SAVE_ENABLED',
+    errorCode: 'EBM_BRANCH_INSURANCE_CONTRACT_BLOCKED',
+    specReference: 'section 3.3.3.3 (PDF pp. 30-31)',
+  },
+  [VSDC_ENDPOINTS.SAVE_ITEMS]: {
+    flag: 'RRA_VSDC_ITEM_SAVE_SANDBOX_ENABLED',
+    productionFlags: ['RRA_VSDC_ITEM_SAVE_CONTRACT_CONFIRMED', 'RRA_VSDC_ITEM_CODE_GENERATION_CONFIRMED'],
+    errorCode: 'EBM_ITEM_SAVE_CONTRACT_UNCONFIRMED',
+    specReference: 'sections 3.3.4.1 and 4.17',
+    mockAllowed: true,
+  },
+  [VSDC_ENDPOINTS.SAVE_PURCHASES]: {
+    flag: 'RRA_VSDC_PURCHASE_SAVE_SANDBOX_ENABLED',
+    productionFlags: ['RRA_VSDC_PURCHASE_SAVE_CONTRACT_CONFIRMED', 'RRA_VSDC_PURCHASE_SAVE_MAPPING_CONFIRMED'],
+    errorCode: 'EBM_PURCHASE_SAVE_CONTRACT_UNCONFIRMED',
+    specReference: 'section 3.3.7.2',
+    mockAllowed: true,
+  },
+});
+
+function isBranchSaveFeatureEnabled(endpoint) {
+  if (endpoint === VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMER) return true;
+  const gate = SAVE_ENDPOINT_GATES[endpoint];
+  return Boolean(gate && process.env[gate.flag] === 'true');
+}
+
+function assertBranchSaveFeatureEnabled(endpoint, mode = resolveMode(), { allowMock = false } = {}) {
+  const gate = SAVE_ENDPOINT_GATES[endpoint];
+  if (!gate || (mode === EBM_MODES.MOCK && allowMock && gate.mockAllowed)) return true;
+  if (isBranchSaveFeatureEnabled(endpoint)) {
+    if (mode !== EBM_MODES.PRODUCTION
+      || (gate.productionFlags || []).every((flag) => process.env[flag] === 'true')) return true;
+  }
+
+  const error = new EBMServiceError(
+    `${endpoint} is disabled until its RRA contract is confirmed for this environment. Set ${gate.flag}=true only after the required review for ${gate.specReference}.`,
+    { code: gate.errorCode, mode, endpoint, status: 409, retryable: false },
+  );
+  error.statusCode = 409;
+  error.dispatched = false;
+  throw error;
+}
+
 class EBMServiceError extends Error {
   constructor(message, options = {}) {
     super(message);
@@ -125,6 +178,9 @@ class EBMServiceError extends Error {
     this.payload = options.payload || null;
     this.retryable = options.retryable !== false;
     this.cause = options.cause;
+    this.resultCd = options.resultCd ?? options.response?.resultCd ?? null;
+    this.resultCodeSystem = options.resultCodeSystem ?? null;
+    this.resultCodeDescription = options.resultCodeDescription ?? null;
   }
 }
 
@@ -209,7 +265,8 @@ function normalizeVsdcResponse(raw, mode, endpoint, payload) {
   const resultCd = response.resultCd;
 
   if (resultCd !== RESULT_CODES.SUCCESS) {
-    const codeDescription = RESULT_CODE_DETAILS[resultCd] || mapVsdcErrorCode(resultCd);
+    const codeDescription = mapVsdcErrorCode(resultCd) || RESULT_CODE_DETAILS[resultCd];
+    const responseCode = getVsdcApiResponseCode(typeof resultCd === 'string' ? resultCd : '');
     throw new EBMServiceError(
       `VSDC returned ${resultCd || 'an unknown result code'} for ${endpoint}: ${response.resultMsg || codeDescription || 'No message'}`,
       {
@@ -220,6 +277,8 @@ function normalizeVsdcResponse(raw, mode, endpoint, payload) {
         payload,
         retryable: isRetryableResultCode(resultCd),
         resultCd,
+        resultCodeSystem: responseCode?.system || null,
+        resultCodeDescription: responseCode?.description || null,
       },
     );
   }
@@ -276,7 +335,15 @@ class EBMService {
     return this.mode === EBM_MODES.PRODUCTION;
   }
 
-  async call(endpoint, payload = {}) {
+  isBranchSaveFeatureEnabled(endpoint) {
+    return isBranchSaveFeatureEnabled(endpoint);
+  }
+
+  assertBranchSaveFeatureEnabled(endpoint, mode = this.mode, options = {}) {
+    return assertBranchSaveFeatureEnabled(endpoint, mode, options);
+  }
+
+  async call(endpoint, payload = {}, context = {}) {
     if (!endpoint || !Object.values(VSDC_ENDPOINTS).includes(endpoint)) {
       throw new EBMServiceError(`Unknown VSDC endpoint: ${endpoint}`, {
         code: 'EBM_UNKNOWN_ENDPOINT',
@@ -286,10 +353,20 @@ class EBMService {
       });
     }
 
+    if ([
+      VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMER,
+      VSDC_ENDPOINTS.SAVE_BRANCH_USER,
+      VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE,
+      VSDC_ENDPOINTS.SAVE_ITEMS,
+      VSDC_ENDPOINTS.SAVE_PURCHASES,
+    ].includes(endpoint)) {
+      this.assertBranchSaveFeatureEnabled(endpoint, this.mode, { allowMock: this.isMockMode() });
+    }
+
     if (endpoint !== VSDC_ENDPOINTS.INITIALIZE_DEVICE) {
       const EBMDeviceService = require('./ebmDeviceService');
-      const companyId = payload.companyId || payload.company_id || payload.company;
-      const branchId = payload.bhfId || payload.branchId;
+      const companyId = context.companyId || payload.companyId || payload.company_id || payload.company;
+      const branchId = context.branchId || payload.bhfId || payload.branchId;
       await EBMDeviceService.ensureInitialized({
         companyId,
         branchId,
@@ -299,8 +376,8 @@ class EBMService {
 
     if (!BRANCH_REGISTRATION_EXEMPT_ENDPOINTS.has(endpoint) && BRANCH_REGISTRATION_GUARDED_ENDPOINTS.has(endpoint)) {
       const EBMBranchService = require('./ebmBranchService');
-      const companyId = payload.companyId || payload.company_id || payload.company;
-      const branchId = payload.bhfId || payload.branchId;
+      const companyId = context.companyId || payload.companyId || payload.company_id || payload.company;
+      const branchId = context.branchId || payload.bhfId || payload.branchId;
       await EBMBranchService.ensureBranchRegistered({
         companyId,
         branchId,
@@ -416,11 +493,50 @@ class EBMService {
             srtOrd: detail.sortOrder,
           })),
         }));
+        const transactionProgressClasses = VSDC_1_0_5_CODE_DEFINITION_4_11.classifications.map((classification) => ({
+          cdCls: classification.codeClass,
+          cdClsNm: classification.codeClassName,
+          useYn: 'Y',
+          dtlList: classification.details.map((detail) => ({
+            cd: detail.code,
+            cdNm: detail.name,
+            cdDesc: detail.description,
+            useYn: 'Y',
+            srtOrd: detail.sortOrder,
+          })),
+        }));
+        const registrationTypeClasses = VSDC_1_0_5_CODE_DEFINITION_4_12.classifications.map((classification) => ({
+          cdCls: classification.codeClass,
+          cdClsNm: classification.codeClassName,
+          useYn: 'Y',
+          dtlList: classification.details.map((detail) => ({
+            cd: detail.code,
+            cdNm: detail.name,
+            cdDesc: detail.description,
+            useYn: 'Y',
+            srtOrd: detail.sortOrder,
+          })),
+        }));
+        const purchaseReceiptTypeClasses = VSDC_1_0_5_CODE_DEFINITION_4_13.classifications.map((classification) => ({
+          cdCls: classification.codeClass,
+          cdClsNm: classification.codeClassName,
+          useYn: 'Y',
+          dtlList: classification.details.map((detail) => ({
+            cd: detail.code,
+            cdNm: detail.name,
+            cdDesc: detail.description,
+            useYn: 'Y',
+            srtOrd: detail.sortOrder,
+          })),
+        }));
         return makeSuccessResponse({
           clsList: [
             ...codeDefinitionClasses,
             ...nationClass,
             ...fiscalCodeClasses,
+            ...transactionProgressClasses,
+            ...registrationTypeClasses,
+            ...purchaseReceiptTypeClasses,
             {
               cdCls: '17',
               cdClsNm: 'Packaging Unit',
@@ -437,27 +553,29 @@ class EBMService {
                 { cd: 'KGM', cdNm: 'Kilogram', cdDesc: 'Kilogram', useYn: 'Y' },
               ],
             },
-            { cdCls: '09', cdClsNm: 'Refund Reason', dtlList: [
-              { cd: '01', cdNm: 'Customer cancellation', cdDesc: 'Customer cancellation', useYn: 'Y' },
-              { cd: '02', cdNm: 'Wrong item', cdDesc: 'Wrong item', useYn: 'Y' },
-              { cd: '06', cdNm: 'Refund', cdDesc: 'Refund', useYn: 'Y' },
-            ] },
-            { cdCls: '11', cdClsNm: 'Stock In Type', dtlList: [
-              { cd: '01', cdNm: 'Purchase', cdDesc: 'Purchase receipt', useYn: 'Y' },
-              { cd: '04', cdNm: 'Adjustment', cdDesc: 'Stock adjustment in', useYn: 'Y' },
-            ] },
-            { cdCls: '12', cdClsNm: 'Stock Out Type', dtlList: [
-              { cd: '01', cdNm: 'Sale', cdDesc: 'Sale issue', useYn: 'Y' },
-              { cd: '04', cdNm: 'Adjustment', cdDesc: 'Stock adjustment out', useYn: 'Y' },
-            ] },
-            { cdCls: '16', cdClsNm: 'Registration Type', dtlList: [
-              { cd: 'A', cdNm: 'Automatic', cdDesc: 'Automatic registration', useYn: 'Y' },
-              { cd: 'M', cdNm: 'Manual', cdDesc: 'Manual registration', useYn: 'Y' },
-            ] },
-            { cdCls: '18', cdClsNm: 'Purchase Receipt Type', dtlList: [
-              { cd: 'P', cdNm: 'Purchase', cdDesc: 'Purchase receipt', useYn: 'Y' },
-              { cd: 'C', cdNm: 'Credit Note', cdDesc: 'Purchase credit note', useYn: 'Y' },
-            ] },
+            ...VSDC_1_0_5_REFUND_REASON_CODES_4_16.classifications.map((classification) => ({
+              cdCls: classification.codeClass,
+              cdClsNm: classification.codeClassName,
+              useYn: 'Y',
+              dtlList: classification.details.map((detail) => ({
+                cd: detail.code,
+                cdNm: detail.name,
+                cdDesc: detail.description,
+                useYn: 'Y',
+                srtOrd: detail.sortOrder,
+              })),
+            })),
+            {
+              cdCls: VSDC_1_0_5_STOCK_IN_OUT_TYPES_4_15.scope.classificationCode,
+              cdClsNm: VSDC_1_0_5_STOCK_IN_OUT_TYPES_4_15.scope.classificationName,
+              dtlList: VSDC_1_0_5_STOCK_IN_OUT_TYPES_4_15.codes.map((record) => ({
+                cd: record.code,
+                cdNm: record.name,
+                cdDesc: record.description,
+                useYn: 'Y',
+                srtOrd: record.sortOrder,
+              })),
+            },
           ].map((codeClass) => ({
             ...codeClass,
             useYn: codeClass.useYn || 'Y',
@@ -755,12 +873,35 @@ class EBMService {
 
       case VSDC_ENDPOINTS.SELECT_STOCK_ITEMS:
         return makeSuccessResponse({
-          itemList: [
+          stockList: [
             {
-              itemCd: 'RW1MOCK000000001',
-              itemNm: 'Mock reconciled item',
-              rsdQty: 10,
-              bhfId,
+              sarNo: '1',
+              totItemCnt: '1',
+              custTin: tin,
+              custBhfId: bhfId,
+              ocrnDt: formatVsdcDate(),
+              totTaxblAmt: '10000.00',
+              totTaxAmt: '1800.00',
+              totAmt: '11800.00',
+              itemList: [
+                {
+                  itemSeq: '1',
+                  itemClsCd: '5059690800',
+                  itemCd: 'RW1MOCK000000001',
+                  itemNm: 'Mock stock movement',
+                  pkgUnitCd: 'NT',
+                  pkg: '1.00',
+                  qtyUnitCd: 'U',
+                  qty: '1.00',
+                  prc: '10000.00',
+                  splyAmt: '10000.00',
+                  totDcAmt: '0.00',
+                  taxblAmt: '10000.00',
+                  taxTyCd: 'B',
+                  taxAmt: '1800.00',
+                  totAmt: '11800.00',
+                },
+              ],
             },
           ],
         }, now);
@@ -867,16 +1008,16 @@ class EBMService {
     return this.call(VSDC_ENDPOINTS.SELECT_ITEMS, payload);
   }
 
-  saveItems(payload) {
-    return this.call(VSDC_ENDPOINTS.SAVE_ITEMS, payload);
+  saveItems(payload, context = {}) {
+    return this.call(VSDC_ENDPOINTS.SAVE_ITEMS, payload, context);
   }
 
   saveItemComposition(payload) {
     return this.call(VSDC_ENDPOINTS.SAVE_ITEM_COMPOSITION, payload);
   }
 
-  selectImportItems(payload) {
-    return this.call(VSDC_ENDPOINTS.SELECT_IMPORT_ITEMS, payload);
+  selectImportItems(payload, context = {}) {
+    return this.call(VSDC_ENDPOINTS.SELECT_IMPORT_ITEMS, payload, context);
   }
 
   saveImportItems(payload) {
@@ -895,24 +1036,24 @@ class EBMService {
     return this.call(VSDC_ENDPOINTS.SELECT_SALES, payload);
   }
 
-  selectPurchaseSales(payload) {
-    return this.call(VSDC_ENDPOINTS.SELECT_PURCHASE_SALES, payload);
+  selectPurchaseSales(payload, context = {}) {
+    return this.call(VSDC_ENDPOINTS.SELECT_PURCHASE_SALES, payload, context);
   }
 
-  savePurchases(payload) {
-    return this.call(VSDC_ENDPOINTS.SAVE_PURCHASES, payload);
+  savePurchases(payload, context = {}) {
+    return this.call(VSDC_ENDPOINTS.SAVE_PURCHASES, payload, context);
   }
 
-  selectStockItems(payload) {
-    return this.call(VSDC_ENDPOINTS.SELECT_STOCK_ITEMS, payload);
+  selectStockItems(payload, context = {}) {
+    return this.call(VSDC_ENDPOINTS.SELECT_STOCK_ITEMS, payload, context);
   }
 
-  saveStockItems(payload) {
-    return this.call(VSDC_ENDPOINTS.SAVE_STOCK_ITEMS, payload);
+  saveStockItems(payload, context = {}) {
+    return this.call(VSDC_ENDPOINTS.SAVE_STOCK_ITEMS, payload, context);
   }
 
-  saveStockMaster(payload) {
-    return this.call(VSDC_ENDPOINTS.SAVE_STOCK_MASTER, payload);
+  saveStockMaster(payload, context = {}) {
+    return this.call(VSDC_ENDPOINTS.SAVE_STOCK_MASTER, payload, context);
   }
 }
 
@@ -921,8 +1062,13 @@ module.exports.EBMService = EBMService;
 module.exports.EBMServiceError = EBMServiceError;
 module.exports.EBM_MODES = EBM_MODES;
 module.exports.RESULT_CODES = RESULT_CODES;
+module.exports.RESULT_CODE_DETAILS = RESULT_CODE_DETAILS;
+module.exports.getVsdcApiResponseCode = getVsdcApiResponseCode;
+module.exports.normalizeVsdcResponse = normalizeVsdcResponse;
 module.exports.NON_RETRYABLE_RESULT_CODES = NON_RETRYABLE_RESULT_CODES;
 module.exports.isRetryableResultCode = isRetryableResultCode;
+module.exports.isBranchSaveFeatureEnabled = isBranchSaveFeatureEnabled;
+module.exports.assertBranchSaveFeatureEnabled = assertBranchSaveFeatureEnabled;
 module.exports.VSDC_ENDPOINTS = VSDC_ENDPOINTS;
 module.exports.extractInitInfo = extractInitInfo;
 module.exports.formatVsdcDate = formatVsdcDate;

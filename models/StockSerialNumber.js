@@ -38,6 +38,7 @@ const FIELD_MAP = {
   dispatchedAt: { target: 'dispatchedAt' },
   returnedVia: { target: 'returnedVia', isId: true },
   returnedAt: { target: 'returnedAt' },
+  notes: { target: 'notes' },
   createdAt: { target: 'createdAt' },
   updatedAt: { target: 'updatedAt' },
 };

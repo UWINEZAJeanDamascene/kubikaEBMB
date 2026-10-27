@@ -832,6 +832,12 @@ exports.confirmGRN = async (req, res, next) => {
         totalCost: line.landedUnitCost * line.qtyReceived,
         warehouse: grn.warehouse,
         supplier: grn.supplier,
+        batchNumber: trackingType === 'batch' && line.batchNo ? String(line.batchNo).trim().toUpperCase() : null,
+        lotNumber: line.lotNo ? String(line.lotNo).trim().toUpperCase() : null,
+        serialNumbers: trackingType === 'serial' && Array.isArray(line.serialNumbers)
+          ? line.serialNumbers.map((serial) => String(serial).trim().toUpperCase()).filter(Boolean)
+          : [],
+        expiryDate: lineExpDate,
         referenceType: "purchase_order",
         referenceNumber: po.referenceNo,
         referenceDocument: po._id,

@@ -3,6 +3,7 @@ const router = express.Router();
 const { protect } = require('../middleware/auth');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const stockBatchController = require('../controllers/stockBatchController');
+const { cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
 // @route   GET /api/stock-batches
 // @desc    Get all stock batches
@@ -32,7 +33,13 @@ router.put('/:id', protect, requirePermissionOrRoles('stock', 'update', ['admin'
 // @route   PUT /api/stock-batches/:id/quarantine
 // @desc    Quarantine/unquarantine a stock batch
 // @access  Private (admin, stock_manager)
-router.put('/:id/quarantine', protect, requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), stockBatchController.quarantineStockBatch);
+router.put(
+  '/:id/quarantine',
+  protect,
+  requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']),
+  cacheInvalidationMiddleware({ types: ['product', 'stock', 'pos'] }),
+  stockBatchController.quarantineStockBatch,
+);
 
 // @route   DELETE /api/stock-batches/:id
 // @desc    Delete a stock batch

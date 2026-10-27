@@ -28,6 +28,20 @@ async function _checkAvailability(companyId, fromWarehouse, lines) {
       _sum: { reservedQuantity: true, quantity: true },
     })
     : [];
+  const quarantinedGroups = productIds.length
+    ? await dbClient().stockBatch.groupBy({
+      by: ['productId'],
+      where: {
+        companyId: String(companyId),
+        warehouseId: String(fromWarehouse),
+        productId: { in: productIds },
+        isQuarantined: true,
+        qtyOnHand: { gt: 0 },
+      },
+      _sum: { qtyOnHand: true },
+    })
+    : [];
+  const quarantinedByProduct = new Map(quarantinedGroups.map((group) => [String(group.productId), Number(group._sum?.qtyOnHand || 0)]));
   const availabilityByProduct = new Map(batchGroups.map((group) => [
     String(group.productId),
     {
@@ -48,7 +62,7 @@ async function _checkAvailability(companyId, fromWarehouse, lines) {
     const prod = availabilityProducts.get(productId);
     const grouped = availabilityByProduct.get(String(prod._id));
     const onHand = grouped?.onHand == null ? Number(prod.currentStock || 0) : grouped.onHand;
-    const available = onHand - (grouped?.reserved || 0);
+    const available = onHand - (grouped?.reserved || 0) - (quarantinedByProduct.get(productId) || 0);
     if (available < qty) throw { code: 'INSUFFICIENT_STOCK', product: prod._id };
   }
 }
@@ -286,6 +300,19 @@ async function allocateTransferIdentity(db, line, product, transfer, session) {
   const requestedBatchNumbers = Array.isArray(currentIdentity.batches)
     ? currentIdentity.batches.map((batch) => String(batch.batchNumber || '').trim()).filter(Boolean)
     : currentIdentity.batchNumber ? [String(currentIdentity.batchNumber).trim()] : [];
+  const quarantinedBatches = await db.stockBatch.findMany({
+    where: {
+      companyId: transferId(transfer.company),
+      productId,
+      warehouseId: transferId(transfer.fromWarehouse),
+      isQuarantined: true,
+      qtyOnHand: { gt: 0 },
+    },
+    select: { id: true, batchNo: true },
+    take: 1000,
+  });
+  const quarantinedBatchNumbers = quarantinedBatches.map((batch) => String(batch.batchNo || '').trim()).filter(Boolean);
+  const quarantinedBatchIds = quarantinedBatches.map((batch) => batch.id);
   const batches = await db.inventoryBatch.findMany({
     where: {
       companyId: transferId(transfer.company),
@@ -293,6 +320,7 @@ async function allocateTransferIdentity(db, line, product, transfer, session) {
       warehouseId: transferId(transfer.fromWarehouse),
       status: { in: ['active', 'partially_used'] },
       availableQuantity: { gt: 0 },
+      ...(quarantinedBatchNumbers.length ? { batchNumber: { notIn: quarantinedBatchNumbers } } : {}),
       ...(requestedBatchNumbers.length ? { batchNumber: { in: requestedBatchNumbers } } : {}),
     },
     orderBy: [{ receivedDate: 'asc' }, { id: 'asc' }],
@@ -324,6 +352,11 @@ async function allocateTransferIdentity(db, line, product, transfer, session) {
     });
     remaining -= take;
   }
+  if (remaining > 0 && quarantinedBatchNumbers.length) {
+    // With quarantined units present, an unlabelled/unmatched inventory lot
+    // cannot safely be assumed to represent non-quarantined stock.
+    throw { code: product.trackBatch ? 'INSUFFICIENT_BATCH_STOCK' : 'INSUFFICIENT_STOCK', product: productId };
+  }
   if (product.trackBatch && remaining > 0) {
     throw { code: 'INSUFFICIENT_BATCH_STOCK', product: productId };
   }
@@ -338,6 +371,7 @@ async function allocateTransferIdentity(db, line, product, transfer, session) {
         productId,
         warehouseId: transferId(transfer.fromWarehouse),
         status: 'in_stock',
+        ...(quarantinedBatchIds.length ? { OR: [{ batchId: null }, { batchId: { notIn: quarantinedBatchIds } }] } : {}),
         ...(requestedSerials.length ? { serialNo: { in: requestedSerials } } : {}),
       },
       orderBy: [{ serialNo: 'asc' }, { id: 'asc' }],

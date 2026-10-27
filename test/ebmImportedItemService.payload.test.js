@@ -43,6 +43,7 @@ const {
 } = require('../utils/phase10Mappers');
 
 const priorInitialImportCursor = process.env.EBM_IMPORT_INITIAL_CURSOR;
+const priorMockInitialImportCursor = process.env.EBM_MOCK_IMPORT_INITIAL_CURSOR;
 
 const validRow = Object.freeze({
   taskCd: 'TASK-1',
@@ -98,6 +99,8 @@ describe('EBM imported item synchronization safety', () => {
   afterAll(() => {
     if (priorInitialImportCursor === undefined) delete process.env.EBM_IMPORT_INITIAL_CURSOR;
     else process.env.EBM_IMPORT_INITIAL_CURSOR = priorInitialImportCursor;
+    if (priorMockInitialImportCursor === undefined) delete process.env.EBM_MOCK_IMPORT_INITIAL_CURSOR;
+    else process.env.EBM_MOCK_IMPORT_INITIAL_CURSOR = priorMockInitialImportCursor;
   });
 
   it('builds exactly the documented select request without internal identifiers', () => {
@@ -180,6 +183,7 @@ describe('EBM imported item synchronization safety', () => {
 
   it('requires an explicitly configured valid import baseline before creating state or dispatching', async () => {
     delete process.env.EBM_IMPORT_INITIAL_CURSOR;
+    delete process.env.EBM_MOCK_IMPORT_INITIAL_CURSOR;
     await expect(EBMImportedItemService.syncImports('company-1')).rejects.toMatchObject({
       code: 'EBM_IMPORT_CURSOR_BASELINE_REQUIRED',
       statusCode: 503,

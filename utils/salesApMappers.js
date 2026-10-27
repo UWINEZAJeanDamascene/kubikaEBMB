@@ -1709,6 +1709,12 @@ function purchaseTranslateCreate(data) {
           ...(line.encumbrance_id || line.encumbranceId ? { encumbrance_id: toIdString(line.encumbrance_id || line.encumbranceId) } : {}),
           ...(line.taxCode ? { taxCode: line.taxCode } : {}),
           ...(line.discount != null ? { discount: Number(line.discount) || 0 } : {}),
+          ...(line.trackingType ? { trackingType: String(line.trackingType) } : {}),
+          ...(line.batchNo ? { batchNo: String(line.batchNo).trim() } : {}),
+          ...(line.lotNo ? { lotNo: String(line.lotNo).trim() } : {}),
+          ...(line.manufactureDate ? { manufactureDate: line.manufactureDate } : {}),
+          ...(line.expiryDate ? { expiryDate: line.expiryDate } : {}),
+          ...(Array.isArray(line.serialNumbers) ? { serialNumbers: line.serialNumbers.map((value) => String(value).trim().toUpperCase()).filter(Boolean) } : {}),
         },
       }),
   );

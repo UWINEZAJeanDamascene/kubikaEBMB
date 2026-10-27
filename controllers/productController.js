@@ -1,5 +1,6 @@
 ﻿const mongoose = require('mongoose');
 const Product = require('../models/Product');
+const { dbClient } = require('../lib/prisma');
 const User = require('../models/User');
 const StockMovement = require('../models/StockMovement');
 const Quotation = require('../models/Quotation');
@@ -286,8 +287,23 @@ exports.getProducts = async (req, res, next) => {
       total = await totalPromise;
     }
 
+    const quarantinedRows = products.length
+      ? await dbClient().stockBatch.groupBy({
+        by: ['productId'],
+        where: {
+          companyId: String(companyId),
+          productId: { in: products.map((product) => String(product._id)) },
+          isQuarantined: true,
+          qtyOnHand: { gt: 0 },
+        },
+        _sum: { qtyOnHand: true },
+      })
+      : [];
+    const quarantinedByProduct = new Map(quarantinedRows.map((row) => [String(row.productId), Number(row._sum?.qtyOnHand || 0)]));
+
     const data = products.map((p) => {
       const obj = serializeProductDoc(p);
+      obj.quarantinedStock = quarantinedByProduct.get(String(p._id)) || 0;
       if ((!p.averageCost || Number(p.averageCost) === 0) && p.costPrice && Number(p.costPrice) > 0) {
         obj.averageCost = p.costPrice;
       }
@@ -345,7 +361,14 @@ exports.getProduct = async (req, res, next) => {
     }
 
 
-    return res.json({ success: true, data: product });
+    const quarantined = await dbClient().stockBatch.aggregate({
+      where: { companyId: String(companyId), productId: String(product._id), isQuarantined: true, qtyOnHand: { gt: 0 } },
+      _sum: { qtyOnHand: true },
+    });
+    return res.json({
+      success: true,
+      data: { ...product, quarantinedStock: Number(quarantined._sum?.qtyOnHand || 0) },
+    });
   } catch (error) {
     next(error);
   }

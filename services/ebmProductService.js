@@ -6,6 +6,7 @@ const ebmService = require("./ebmService");
 const EBMBranchService = require("./ebmBranchService");
 const Company = require("../models/Company");
 const { nextGlobalSequence } = require("./sequenceService");
+const { registeredItemCodeExists } = require('./ebmRegisteredItemService');
 const { assertHeadOfficeOperation, assertPharmacyInsurance } = require('./ebmOperationPolicy');
 const { buildItemSaveRequest, VSDC_ENDPOINTS } = require('../utils/vsdcPayloadSanitizer');
 
@@ -173,21 +174,23 @@ function isValidRraItemCode(value) {
 }
 
 function buildRraItemCode({ countryCode, itemTyCd, pkgUnitCd, qtyUnitCd, sequence }) {
-  const country = String(countryCode || '').trim().toUpperCase();
+  const country = countryCode;
   const itemType = itemTyCd;
   const packageUnit = pkgUnitCd;
   const quantityUnit = qtyUnitCd;
-  const sequenceText = String(sequence ?? '').trim();
+  const sequenceText = typeof sequence === 'number' && Number.isSafeInteger(sequence)
+    ? String(sequence)
+    : sequence;
   if (!/^[A-Z]{2}$/.test(country)
     || typeof itemType !== 'string'
     || !['1', '2', '3'].includes(itemType)
-    || [packageUnit, quantityUnit].some((part) => !/^[A-Z0-9]{1,5}$/.test(part))) {
+    || [packageUnit, quantityUnit].some((part) => typeof part !== 'string' || !/^[A-Z0-9]{1,5}$/.test(part))) {
     const error = new TypeError('RRA item-code components must each be a non-empty alphanumeric code of at most five characters.');
     error.code = 'EBM_ITEM_CODE_COMPONENT_INVALID';
     error.statusCode = 422;
     throw error;
   }
-  if (!/^\d{1,7}$/.test(sequenceText)) {
+  if (typeof sequenceText !== 'string' || !/^\d{1,7}$/.test(sequenceText) || /^0+$/.test(sequenceText)) {
     const error = new RangeError('RRA item-code sequence exceeded the seven-digit §4.17 range.');
     error.code = 'EBM_ITEM_CODE_SEQUENCE_EXHAUSTED';
     error.statusCode = 409;
@@ -203,7 +206,7 @@ function buildRraItemCode({ countryCode, itemTyCd, pkgUnitCd, qtyUnitCd, sequenc
   return code;
 }
 
-async function generateRraItemCode(companyId, components, productId) {
+async function generateRraItemCode(companyId, components, productId, tin) {
   // §4.17's sequence is taxpayer-wide; it must not restart when product
   // country/type/package/quantity or the selected branch changes.
   const sequenceName = 'ebm_item_v105';
@@ -215,7 +218,11 @@ async function generateRraItemCode(companyId, components, productId) {
       _id: { $ne: productId },
       "ebm.ebmItemCode": code,
     });
-    if (!existing) return code;
+    if (existing) continue;
+    // Product records are not the only local source of an item code: synced
+    // RRA catalogs may contain items that have no local product yet.
+    if (await registeredItemCodeExists({ companyId: String(companyId), tin, itemCd: code })) continue;
+    return code;
   }
 
   const error = new Error("Unable to generate a unique RRA item code after 20 attempts");
@@ -396,14 +403,27 @@ class EBMProductService {
       const itemTyCd = getEbmValue(product, 'itemTyCd', 'itemTypeCode');
       const orgnNatCd = String(product.ebm.orgnNatCd).trim();
       const existingItemCode = product.ebm.ebmItemCode;
-      const itemCode = product.ebm.isRegisteredWithEBM === true && isValidRraItemCode(existingItemCode)
-        ? existingItemCode
-        : await generateRraItemCode(companyId, {
+      let itemCode;
+      if (product.ebm.isRegisteredWithEBM === true) {
+        if (typeof existingItemCode !== 'string' || existingItemCode.length === 0) {
+          const error = new Error('This item is marked as registered with RRA but has no stored item code. Reconcile the RRA item before resubmitting it.');
+          error.code = 'EBM_REGISTERED_ITEM_CODE_MISSING';
+          error.statusCode = 409;
+          error.retryable = false;
+          throw error;
+        }
+        // A confirmed remote identifier is immutable here. Its exact format
+        // may differ from locally generated codes; never replace it with a
+        // newly generated identity during a later save attempt.
+        itemCode = existingItemCode;
+      } else {
+        itemCode = await generateRraItemCode(companyId, {
           countryCode: orgnNatCd,
           itemTyCd,
           pkgUnitCd,
           qtyUnitCd,
-        }, product._id);
+        }, product._id, tin);
+      }
       itemCodeForAttempt = itemCode;
       if (String(product.ebm?.isrcAplcbYn || 'N').toUpperCase() === 'Y') {
         assertPharmacyInsurance(company);
@@ -458,7 +478,10 @@ class EBMProductService {
       product.ebm.ebmRegistrationRequestId = null;
       await product.save();
       itemSubmissionStarted = true;
-      const response = await ebmService.saveItems(request);
+      // Company and branch scope are local routing context and must not be
+      // added to the VSDC wire DTO. Pass them separately so the shared EBM
+      // client can enforce initialized-device and branch-registration guards.
+      const response = await ebmService.saveItems(request, { companyId, branchId });
       if (malformedItemSaveResponse(response)) {
         throw createUnknownItemOutcomeError(response);
       }
@@ -478,7 +501,12 @@ class EBMProductService {
       await product.save();
       return product;
     } catch (error) {
-      if (['EBM_ITEM_BRANCH_SCOPE_MISMATCH', 'EBM_PHARMACY_ONLY', 'EBM_HEAD_OFFICE_BRANCH_REQUIRED'].includes(error.code)) {
+      if ([
+        'EBM_ITEM_BRANCH_SCOPE_MISMATCH',
+        'EBM_PHARMACY_ONLY',
+        'EBM_HEAD_OFFICE_BRANCH_REQUIRED',
+        'EBM_REGISTERED_ITEM_CODE_MISSING',
+      ].includes(error.code)) {
         // Preserve known RRA registration when a local applicability/scope
         // check blocks an attempt before a new item submission is made.
         product.ebm.ebmRegistrationError = error.message || 'EBM item registration was blocked by local applicability checks';

@@ -1,0 +1,54 @@
+{
+  "source": {
+    "documentId": "RRA_VSDC_DOC_v1.0.5",
+    "version": "1.0.5",
+    "sha256": "25DF854736B60E7E4EB128BF99904813C5D96ACF99464B7B48F23C7FAB3DF9C1",
+    "pdf": "../../../../rra_vsdc_spec_v1_0_5_official.pdf"
+  },
+  "scope": {
+    "section": "4.14",
+    "printedPages": "73",
+    "physicalPdfPages": "77"
+  },
+  "integrity": {
+    "algorithm": "SHA-256",
+    "canonicalization": "UTF-8 JSON.stringify(codes), preserving PDF row order and code strings",
+    "rowCount": 29,
+    "sha256": "32928ffb5a040f333733e3f4f787b018c99c734af47433d09f4d2adf67ed1181"
+  },
+  "notes": [
+    "Descriptions and Client/Server labels are transcribed from the published table, including its original spelling and punctuation.",
+    "The table does not define retryability. Application retry behavior remains a separate policy and is not inferred from the Client/Server column."
+  ],
+  "codes": [
+    { "code": "000", "system": "Server", "description": "It is succeeded" },
+    { "code": "001", "system": "Server", "description": "There is no search result" },
+    { "code": "881", "system": "Client", "description": "Purchase is mandatory" },
+    { "code": "882", "system": "Client", "description": "Purchase code is invalid" },
+    { "code": "883", "system": "Client", "description": "Purchase already used" },
+    { "code": "884", "system": "Client", "description": "Invalid customer TIN was provided" },
+    { "code": "891", "system": "Client", "description": "An error occurred while Request URL is created." },
+    { "code": "892", "system": "Client", "description": "An error occurred while Request Header data is created." },
+    { "code": "893", "system": "Client", "description": "An error occurred while Request Body data is created." },
+    { "code": "894", "system": "Client", "description": "An error regarding server communication occurred." },
+    { "code": "895", "system": "Client", "description": "An error regarding unallowed Request Method occurred." },
+    { "code": "896", "system": "Client", "description": "An error regarding Request Status occurred." },
+    { "code": "899", "system": "Client", "description": "An error regarding Client occurred." },
+    { "code": "900", "system": "Server", "description": "There is no Header information" },
+    { "code": "901", "system": "Server", "description": "It is not valid device" },
+    { "code": "902", "system": "Server", "description": "This device is installed" },
+    { "code": "903", "system": "Server", "description": "Only VSDC device can be verified." },
+    { "code": "910", "system": "Server", "description": "Request parameter error" },
+    { "code": "911", "system": "Server", "description": "There is no request full text" },
+    { "code": "912", "system": "Server", "description": "There is a request Method error." },
+    { "code": "921", "system": "Server", "description": "Sales or sales invoice data which is declared cannot be received." },
+    { "code": "922", "system": "Server", "description": "Sales invoice data can be received after receiving the sales data." },
+    { "code": "990", "system": "Server", "description": "The maxium number of views are exceeded" },
+    { "code": "991", "system": "Server", "description": "There is an error during registration" },
+    { "code": "992", "system": "Server", "description": "There is an error during modification" },
+    { "code": "993", "system": "Server", "description": "There is an error during deletion" },
+    { "code": "994", "system": "Server", "description": "There is an overlapped Data" },
+    { "code": "995", "system": "Server", "description": "There is no downloaded file" },
+    { "code": "999", "system": "Server", "description": "There is an unknown error. Please ask it administrator" }
+  ]
+}

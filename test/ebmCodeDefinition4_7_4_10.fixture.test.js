@@ -12,8 +12,13 @@ const fixturePath = path.join(
 );
 const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 const ebmService = require('../services/ebmService');
+const transactionProgressFixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.11.json');
+const registrationTypeFixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.12.json');
+const purchaseReceiptTypeFixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.13.json');
+const stockInOutTypeFixture = require('../fixtures/rraVsdc/v1.0.5/stock-in-out-types-4.15.json');
+const refundReasonFixture = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.16.json');
 
-describe('RRA VSDC v1.0.5 code definitions §§4.7–4.10 baseline', () => {
+describe('RRA VSDC v1.0.5 code definitions §§4.7–4.11 baseline', () => {
   test('matches the controlled PDF source identity', () => {
     expect(fixture.source).toMatchObject({
       documentId: 'RRA_VSDC_DOC_v1.0.5',
@@ -76,9 +81,10 @@ describe('RRA VSDC v1.0.5 code definitions §§4.7–4.10 baseline', () => {
     const mockClasses = response.data.clsList;
     const classIds = mockClasses.map(({ cdCls }) => cdCls);
 
-    expect(classIds.filter((id) => ['33', '14', '37', '07'].includes(id))).toEqual(['33', '14', '37', '07']);
-    expect(mockClasses.filter(({ cdCls }) => ['33', '14', '37', '07'].includes(cdCls))).toHaveLength(4);
+    expect(classIds.filter((id) => ['33', '14', '37', '07', '11', '31', '38', '32'].includes(id))).toEqual(['33', '14', '37', '07', '11', '31', '38', '32']);
+    expect(mockClasses.filter(({ cdCls }) => ['33', '14', '37', '07', '11', '31', '38', '32'].includes(cdCls))).toHaveLength(8);
     expect(classIds).not.toContain('06');
+    expect(classIds).not.toContain('09');
 
     for (const baseline of fixture.classifications) {
       const actual = mockClasses.find(({ cdCls }) => cdCls === baseline.codeClass);
@@ -96,6 +102,37 @@ describe('RRA VSDC v1.0.5 code definitions §§4.7–4.10 baseline', () => {
       })));
       expect(actual.dtlList.every(({ useYn }) => useYn === 'Y')).toBe(true);
     }
+    const progressBaseline = transactionProgressFixture.classifications[0];
+    const progressMock = mockClasses.find(({ cdCls }) => cdCls === progressBaseline.codeClass);
+    expect(progressMock).toMatchObject({ cdClsNm: progressBaseline.codeClassName, useYn: 'Y' });
+    expect(progressMock.dtlList.map(({ cd, cdNm, cdDesc, srtOrd }) => [cd, srtOrd, cdNm, cdDesc]))
+      .toEqual(progressBaseline.details.map(({ code, sortOrder, name, description }) => [code, sortOrder, name, description]));
+    expect(progressMock.dtlList.every(({ useYn }) => useYn === 'Y')).toBe(true);
+    const registrationBaseline = registrationTypeFixture.classifications[0];
+    const registrationMock = mockClasses.find(({ cdCls }) => cdCls === registrationBaseline.codeClass);
+    expect(registrationMock).toMatchObject({ cdClsNm: registrationBaseline.codeClassName, useYn: 'Y' });
+    expect(registrationMock.dtlList.map(({ cd, cdNm, cdDesc, srtOrd }) => [cd, cdNm, cdDesc, srtOrd]))
+      .toEqual(registrationBaseline.details.map(({ code, name, description, sortOrder }) => [code, name, description, sortOrder]));
+    expect(registrationMock.dtlList.every(({ useYn }) => useYn === 'Y')).toBe(true);
+    expect(classIds).not.toContain('16');
+    const purchaseReceiptBaseline = purchaseReceiptTypeFixture.classifications[0];
+    const purchaseReceiptMock = mockClasses.find(({ cdCls }) => cdCls === purchaseReceiptBaseline.codeClass);
+    expect(purchaseReceiptMock).toMatchObject({ cdClsNm: purchaseReceiptBaseline.codeClassName, useYn: 'Y' });
+    expect(purchaseReceiptMock.dtlList.map(({ cd, cdNm, cdDesc, srtOrd }) => [cd, cdNm, cdDesc, srtOrd]))
+      .toEqual(purchaseReceiptBaseline.details.map(({ code, name, description, sortOrder }) => [code, name, description, sortOrder]));
+    expect(purchaseReceiptMock.dtlList.every(({ useYn }) => useYn === 'Y')).toBe(true);
+    expect(classIds).not.toContain('18');
+    const stockInOutClass = mockClasses.find(({ cdCls }) => cdCls === '12');
+    expect(stockInOutClass).toMatchObject({ cdClsNm: stockInOutTypeFixture.scope.classificationName, useYn: 'Y' });
+    expect(stockInOutClass.dtlList.map(({ cd, cdNm, cdDesc, srtOrd }) => [cd, cdNm, cdDesc, srtOrd]))
+      .toEqual(stockInOutTypeFixture.codes.map(({ code, name, description, sortOrder }) => [code, name, description, sortOrder]));
+    expect(stockInOutClass.dtlList.every(({ useYn }) => useYn === 'Y')).toBe(true);
+    const refundBaseline = refundReasonFixture.classifications[0];
+    const refundMock = mockClasses.find(({ cdCls }) => cdCls === refundBaseline.codeClass);
+    expect(refundMock).toMatchObject({ cdClsNm: refundBaseline.codeClassName, useYn: 'Y' });
+    expect(refundMock.dtlList.map(({ cd, cdNm, cdDesc, srtOrd }) => [cd, cdNm, cdDesc, srtOrd]))
+      .toEqual(refundBaseline.details.map(({ code, name, description, sortOrder }) => [code, name, description, sortOrder]));
+    expect(refundMock.dtlList.every(({ useYn }) => useYn === 'Y')).toBe(true);
     expect(() => require('../services/ebmCodeSyncService').validateStandardCodeResponse(response)).not.toThrow();
   });
 });

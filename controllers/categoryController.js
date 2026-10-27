@@ -1,5 +1,6 @@
 const Category = require('../models/Category');
 const Product = require('../models/Product');
+const { dbClient } = require('../lib/prisma');
 
 const CATEGORY_FIELDS = ['name', 'description', 'parent', 'defaultInventoryAccount', 'defaultCogsAccount', 'defaultRevenueAccount', 'isActive', 'customFields'];
 
@@ -58,8 +59,28 @@ exports.getCategories = async (req, res, next) => {
     }
     const categories = await categoryQuery.lean();
 
+    // Group once by category so the list/tree can show per-category product
+    // totals without issuing one count query per category. Keep the company
+    // predicate explicit, even though this read is also tenant-scoped.
+    const productCounts = req.query.forPicker !== '1' && categories.length
+      ? await dbClient().product.groupBy({
+        by: ['categoryId'],
+        where: {
+          companyId: String(companyId),
+          categoryId: { in: categories.map((category) => String(category._id)) },
+        },
+        _count: { _all: true },
+      })
+      : [];
+    const productCountByCategory = new Map(
+      productCounts.map((row) => [String(row.categoryId), row._count._all]),
+    );
+
     const map = new Map();
-    categories.forEach(c => map.set(String(c._id), Object.assign(c, { children: [] })));
+    categories.forEach((c) => map.set(String(c._id), Object.assign(c, {
+      children: [],
+      productsCount: productCountByCategory.get(String(c._id)) || 0,
+    })));
 
     const roots = [];
     for (const c of categories) {

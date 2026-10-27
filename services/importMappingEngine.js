@@ -33,6 +33,8 @@ const ALIASES = {
   accountType: ['account_type', 'type', 'ledger_type'],
   parentAccountCode: ['parent_account_code', 'parent code', 'parent', 'parent_code'],
   taxTypeCode: ['tax_type', 'tax_type_code', 'tax code', 'taxcode', 'vat', 'vat_code', 'tax_ty_cd'],
+  itemTypeCode: ['item_type_code', 'item_ty_cd', 'item_type', 'product_type_code', 'product_type'],
+  originNationCode: ['origin_nation_code', 'origin_country_code', 'origin_country', 'orgn_nat_cd', 'country_of_origin', 'origin_nation'],
   itemClassCode: ['item_class_code', 'item_classification_code', 'item_class_cd', 'rra_class_code'],
   packagingUnitCode: ['packaging_unit_code', 'pkg_unit_cd', 'package_unit', 'packaging'],
   quantityUnitCode: ['quantity_unit_code', 'qty_unit_cd', 'uom', 'unit', 'unit_code'],

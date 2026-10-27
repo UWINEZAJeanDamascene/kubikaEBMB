@@ -2,12 +2,33 @@ const CODE_DEFINITION_BASELINE = require('../fixtures/rraVsdc/v1.0.5/code-defini
 const NATION_CODE_DEFINITION_BASELINE = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.4.json');
 const UNIT_CODE_DEFINITION_BASELINE = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.5-4.6.json');
 const CURRENCY_TRANSACTION_PAYMENT_BASELINE = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.7-4.10.json');
+const TRANSACTION_PROGRESS_BASELINE = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.11.json');
+const REGISTRATION_TYPE_BASELINE = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.12.json');
+const PURCHASE_RECEIPT_TYPE_BASELINE = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.13.json');
+const STOCK_IN_OUT_TYPE_BASELINE = require('../fixtures/rraVsdc/v1.0.5/stock-in-out-types-4.15.json');
+const REFUND_REASON_CODE_BASELINE = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.16.json');
 
 const BASELINES = [
   CODE_DEFINITION_BASELINE,
   NATION_CODE_DEFINITION_BASELINE,
   UNIT_CODE_DEFINITION_BASELINE,
   CURRENCY_TRANSACTION_PAYMENT_BASELINE,
+  TRANSACTION_PROGRESS_BASELINE,
+  REGISTRATION_TYPE_BASELINE,
+  PURCHASE_RECEIPT_TYPE_BASELINE,
+  {
+    ...STOCK_IN_OUT_TYPE_BASELINE,
+    classifications: [{
+      codeClass: STOCK_IN_OUT_TYPE_BASELINE.scope.classificationCode,
+      codeClassName: STOCK_IN_OUT_TYPE_BASELINE.scope.classificationName,
+      section: '4.15',
+      details: STOCK_IN_OUT_TYPE_BASELINE.codes.map((record) => ({
+        ...record,
+        remark: '',
+      })),
+    }],
+  },
+  REFUND_REASON_CODE_BASELINE,
 ];
 
 function isRecordActive(record, parentClassActive = true) {
@@ -132,6 +153,7 @@ function reconcileCodeDefinitionBaseline(classes = [], codes = []) {
 
     return {
       codeClass,
+      section: baselineClass.section,
       baselineStatus: 'published',
       baselineClassName: baselineClass.codeClassName,
       baselineSource: baseline.source,

@@ -1,0 +1,33 @@
+{
+  "source": {
+    "documentId": "RRA_VSDC_DOC_v1.0.5",
+    "version": "1.0.5",
+    "sha256": "25DF854736B60E7E4EB128BF99904813C5D96ACF99464B7B48F23C7FAB3DF9C1",
+    "pdf": "../../../../rra_vsdc_spec_v1_0_5_official.pdf"
+  },
+  "scope": {
+    "section": "4.12",
+    "printedPages": "72",
+    "physicalPdfPages": "76"
+  },
+  "integrity": {
+    "algorithm": "SHA-256",
+    "canonicalization": "UTF-8 JSON.stringify(classifications), preserving detail array order",
+    "rowCount": 2,
+    "sha256": "1908f244c69b8b6b7707b50fc7c402ffd64b4738adad9b501159f0b8f811cf25"
+  },
+  "notes": [
+    "This published baseline is reference data, not a substitute for a tenant-scoped current RRA code-sync response or sandbox/production acceptance."
+  ],
+  "classifications": [
+    {
+      "codeClass": "31",
+      "codeClassName": "Registration Type",
+      "section": "4.12",
+      "details": [
+        { "code": "A", "sortOrder": 1, "name": "Automatic", "description": "Automatic", "remark": "" },
+        { "code": "M", "sortOrder": 2, "name": "Manual", "description": "Manual", "remark": "" }
+      ]
+    }
+  ]
+}

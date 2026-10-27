@@ -1,5 +1,6 @@
 const Invoice = require('../models/Invoice');
 const Company = require('../models/Company');
+const ebmService = require('../services/ebmService');
 const slowQueryMonitor = require('../utils/slowQueryMonitor');
 const {
   extractPayloadTotals,
@@ -121,11 +122,15 @@ exports.getReceipt = async (req, res, next) => {
     if (!invoice) return res.status(404).json({ success: false, message: 'Sale not found' });
 
     const company = await timedQuery('pos_getReceipt_company', () => Company.findById(companyId).lean());
-    const qrPng = await generateQrPng(invoice.ebm, { width: 110 });
+    const fiscalMode = String(invoice.ebm?.fiscalEnvironment || invoice.ebm?.environment || invoice.ebm?.mode || ebmService.getConfig().mode || '').toLowerCase();
+    const qrPng = fiscalMode === 'production' && invoice.ebm?.ebmStatus === 'submitted'
+      ? await generateQrPng(invoice.ebm, { width: 110 })
+      : null;
     const data = invoice.toObject({ virtuals: true });
     data.ebm = data.ebm || {};
+    data.ebm.environment = data.ebm.fiscalEnvironment || data.ebm.environment || fiscalMode || null;
+    data.ebm.fiscalEnvironment = data.ebm.fiscalEnvironment || fiscalMode || null;
     const ebmStatus = data.ebm.ebmStatus || 'not_submitted';
-    const placeholder = ebmStatus === 'failed' ? 'Not Certified' : 'Pending';
     data.companyReceipt = {
       name: company?.name || 'Company',
       tin: company?.tax_identification_number || company?.registration_number || '',
@@ -138,25 +143,35 @@ exports.getReceipt = async (req, res, next) => {
     data.discountAmount = Number(data.totalDiscount) || 0;
     data.discountAmountRwf = formatRwf(data.discountAmount);
     data.promotionLabel = data.posPromotion?.name || data.posPromotion?.code || null;
-    data.receiptLines = (data.items || data.lines || []).map((line) => {
+    data.receiptLines = (data.items || data.lines || []).map((line, index) => {
       const tax = lineTaxDetails(line);
+      const fiscalLine = data.ebm?.salesPayload?.itemList?.[index] || {};
       const itemName = line.product?.name || line.productName || line.description || 'Item';
       return {
         itemName,
+        itemCode: fiscalLine.itemCd || line.productCode || line.product?.sku || null,
+        taxClassCode: fiscalLine.itemClsCd || line.product?.ebm?.itemClsCd || null,
         quantity: line.quantity || line.qty || 0,
         unit: getReceiptUnit(itemName, line.unit || line.product?.unit),
         unitPriceRwf: formatRwf(line.unitPrice),
         taxType: tax.taxTyCd,
+        taxRate: fiscalLine.taxRt ?? line.taxRate ?? null,
         taxTypeLabel: tax.taxTypeLabel,
-        taxableAmountRwf: formatRwf(tax.taxableAmount),
-        vatAmountRwf: formatRwf(tax.vatAmount),
-        lineTotalRwf: formatRwf(tax.lineTotal),
+        taxableAmountRwf: tax.taxableAmount == null ? 'Not recorded' : formatRwf(tax.taxableAmount),
+        vatAmountRwf: tax.vatAmount == null ? 'Not recorded' : formatRwf(tax.vatAmount),
+        lineTotalRwf: tax.lineTotal == null ? 'Not recorded' : formatRwf(tax.lineTotal),
       };
     });
+    const salesPayload = data.ebm.salesPayload || {};
+    data.rraBranchId = salesPayload.bhfId || null;
+    data.rraInvoiceNo = salesPayload.invcNo == null ? null : String(salesPayload.invcNo);
+    data.rraOriginalInvoiceNo = salesPayload.orgInvcNo == null ? null : String(salesPayload.orgInvcNo);
+    data.rraPurchaseCode = salesPayload.prcOrdCd || null;
+    data.rraCustomerPhone = salesPayload.receipt?.custMblNo || data.client?.contact?.phone || null;
     const totals = extractPayloadTotals(data.ebm, data);
     data.rraTotals = {
       taxableByType: ['A', 'B', 'C', 'D']
-        .map((code) => ({ code, label: taxTypeLabel(code), amount: totals[`taxblAmt${code}`], amountRwf: formatRwf(totals[`taxblAmt${code}`]) }))
+        .map((code) => ({ code, rate: totals[`taxRt${code}`], label: taxTypeLabel(code, totals[`taxRt${code}`]), amount: totals[`taxblAmt${code}`], amountRwf: formatRwf(totals[`taxblAmt${code}`]), taxAmount: totals[`taxAmt${code}`], taxAmountRwf: formatRwf(totals[`taxAmt${code}`]) }))
         .filter((row) => Math.round(Math.abs(row.amount)) !== 0),
       totalTaxableAmountRwf: formatRwf(totals.totTaxblAmt),
       totalVatRwf: formatRwf(totals.totTaxAmt),
@@ -172,12 +187,12 @@ exports.getReceipt = async (req, res, next) => {
       changeGivenRwf: formatRwf((data.payments || []).reduce((sum, payment) => sum + (Number(payment.changeGiven) || 0), 0)
         || Math.max(0, Number(data.amountPaid || 0) - Number(data.grandTotal || data.totalAmount || 0))),
     };
-    data.ebm.rcptNoDisplay = data.ebm.rcptNo || (ebmStatus === 'pending' ? 'Pending RRA' : placeholder);
-    data.ebm.rcptDtDisplay = data.ebm.rcptDt ? formatReceiptDate(data.ebm.rcptDt) : placeholder;
-    data.ebm.intrlDataDisplay = data.ebm.intrlData || placeholder;
-    data.ebm.rcptSignDisplay = data.ebm.rcptSign || placeholder;
+    data.ebm.rcptNoDisplay = data.ebm.rcptNo == null ? null : String(data.ebm.rcptNo);
+    data.ebm.rcptDtDisplay = data.ebm.rcptDt ? formatReceiptDate(data.ebm.rcptDt) : null;
+    data.ebm.intrlDataDisplay = data.ebm.intrlData || null;
+    data.ebm.rcptSignDisplay = data.ebm.rcptSign || null;
     data.ebm.qrCodeDataUrl = qrPng ? `data:image/png;base64,${qrPng.toString('base64')}` : null;
-    data.ebm.qrPlaceholder = qrPng ? null : (ebmStatus === 'failed' ? 'Not Certified' : 'QR Pending');
+    data.ebm.qrPlaceholder = qrPng || ebmStatus === 'submitted' ? null : 'No RRA QR response';
     data.customerTinDisplay = data.customerTin || data.client?.taxId || null;
 
     res.json({ success: true, data });

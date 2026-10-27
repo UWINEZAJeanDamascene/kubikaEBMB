@@ -7,6 +7,18 @@ const { decimalToNumber, decimalToString, mapTimestamps } = require('./decimalHe
 const { mergeUpdatePayload } = require('./masterDataMappers');
 const { tenantCreateBase } = require('./inventoryJournalMappers');
 const VSDC_CODE_DEFINITIONS = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.1-4.3.json');
+const { getRraImportItemStatusName } = require('../constants/ebmImportItemStatuses');
+
+function rraImportStatusCodeForApi(row) {
+  const sourceCodes = [row.raw?.imptItemsttsCd, row.raw?.imptItemSttsCd]
+    .filter((value) => typeof value === 'string');
+  const distinct = [...new Set(sourceCodes)];
+  if (distinct.length > 1) return null;
+  if (typeof row.rraStatusCode === 'string'
+    && distinct.length === 1
+    && row.rraStatusCode !== distinct[0]) return null;
+  return typeof row.rraStatusCode === 'string' ? row.rraStatusCode : distinct[0] ?? null;
+}
 
 const moneyStr = (v) => decimalToString(v, 2);
 const qtyNum = (v) => decimalToNumber(v, 0);
@@ -2096,6 +2108,7 @@ function ebmImportedItemToApi(row) {
     rraConfirmedAt: row.rraConfirmedAt ?? null,
     rraResult: row.rraResult ?? null,
     rraStatusCode: row.rraStatusCode ?? null,
+    rraStatusName: getRraImportItemStatusName(rraImportStatusCodeForApi(row)),
     ...mapTimestamps(row),
   };
 }
