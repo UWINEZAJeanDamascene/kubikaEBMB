@@ -1515,6 +1515,8 @@ model Product {
   sku                   String
   barcode               String?
   barcodeType           BarcodeType            @default(CODE128) @map("barcode_type")
+  imageUrl              String?                @map("image_url")
+  imageUrls             String[]               @default([]) @map("image_urls")
   description           String?
   categoryId            String                 @map("category_id") @db.Char(24)
   unit                  String                 @default("pcs")

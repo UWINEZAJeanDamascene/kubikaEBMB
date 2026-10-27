@@ -310,6 +310,106 @@ class EBMCodeSyncService {
     };
   }
 
+  static async syncAllInitializedBranches(companyId, options = {}) {
+    const mode = ebmService.getConfig().mode;
+    const devices = await EBMDevice.find({
+      company: companyId,
+      status: EBM_DEVICE_STATUSES.INITIALIZED,
+      initializedMode: mode,
+    }).sort({ branchId: 1 }).lean();
+    if (!devices.length) {
+      const error = new Error(`No initialized EBM devices are available for code sync in ${mode} mode.`);
+      error.code = 'EBM_DEVICE_NOT_INITIALIZED';
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const devicesByBranch = new Map();
+    for (const device of devices) {
+      const branchDevices = devicesByBranch.get(device.branchId) || [];
+      branchDevices.push(device);
+      devicesByBranch.set(device.branchId, branchDevices);
+    }
+
+    const branches = [];
+    for (const [branchId, branchDevices] of devicesByBranch) {
+      const branchName = branchDevices[0]?.branchName || null;
+      if (!/^\d{2}$/.test(branchId) || branchDevices.length !== 1) {
+        const message = !/^\d{2}$/.test(branchId)
+          ? 'Initialized device has an invalid two-digit RRA branch ID.'
+          : `Multiple initialized device records exist for branch ${branchId}; resolve the duplicate before syncing.`;
+        branches.push({
+          companyId,
+          branchId,
+          branchName,
+          mode,
+          outcome: 'failed',
+          succeededCount: 0,
+          failedCount: 1,
+          results: [{
+            companyId,
+            branchId,
+            mode,
+            success: false,
+            errorCode: 'EBM_DEVICE_BRANCH_MAPPING_AMBIGUOUS',
+            error: message,
+          }],
+        });
+        continue;
+      }
+
+      try {
+        const result = await this.syncAll(companyId, {
+          branchId,
+          full: options.full === true,
+          ...(options.syncTypes ? { syncTypes: options.syncTypes } : {}),
+        });
+        branches.push({ ...result, branchName });
+      } catch (error) {
+        branches.push({
+          companyId,
+          branchId,
+          branchName,
+          mode,
+          outcome: 'failed',
+          succeededCount: 0,
+          failedCount: 1,
+          results: [{
+            companyId,
+            branchId,
+            mode,
+            success: false,
+            errorCode: error.code || 'EBM_LOOKUP_SYNC_FAILED',
+            error: error.message || 'Code sync failed for this branch.',
+            requestId: error.requestId || null,
+          }],
+        });
+      }
+    }
+
+    const succeededCount = branches.reduce((total, branch) => total + (branch.succeededCount || 0), 0);
+    const failedCount = branches.reduce((total, branch) => total + (branch.failedCount || 0), 0);
+    const succeededBranchCount = branches.filter((branch) => branch.outcome === 'complete').length;
+    const failedBranchCount = branches.length - succeededBranchCount;
+    return {
+      companyId,
+      branchId: null,
+      branchIds: branches.map((branch) => branch.branchId),
+      mode,
+      scope: 'all_initialized_branches',
+      startedAt: branches.map((branch) => branch.startedAt).filter(Boolean).sort()[0] || null,
+      completedAt: new Date().toISOString(),
+      outcome: failedCount === 0 ? 'complete' : succeededCount === 0 ? 'failed' : 'partial',
+      branchCount: branches.length,
+      succeededBranchCount,
+      failedBranchCount,
+      succeededCount,
+      failedCount,
+      branches,
+      results: branches.flatMap((branch) => branch.results || []),
+    };
+  }
+
   static async syncType(companyId, branchId, syncType, basePayload, options = {}) {
     const state = await getSyncState(companyId, branchId, syncType);
     const mode = ebmService.getConfig().mode;
@@ -872,6 +972,7 @@ class EBMCodeSyncService {
         warehouseName: warehouse.name,
         warehouseCode: warehouse.code,
         configuredBranchId: branchId,
+        location: warehouse.location && typeof warehouse.location === 'object' ? warehouse.location : {},
       });
       warehousesByBranch.set(branchId, matches);
     }

@@ -167,6 +167,46 @@ function serializeProductDoc(product) {
   return product;
 }
 
+function validateProductImageUrl(value) {
+  if (value == null || value === '') return null;
+  if (typeof value !== 'string' || value.trim().length > 2048) return 'Image URL must be a URL up to 2048 characters.';
+  try {
+    const parsed = new URL(value.trim());
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+      return 'Image URL must use HTTP or HTTPS and must not contain credentials.';
+    }
+  } catch {
+    return 'Enter a valid image URL beginning with https:// or http://.';
+  }
+  return null;
+}
+
+function normalizeAndValidateProductImageUrls(value) {
+  if (value == null || value === '') return { urls: [], error: null };
+  if (!Array.isArray(value) || value.length > 36) {
+    return { urls: [], error: 'Add up to 36 angle image URLs for the 360° product view.' };
+  }
+  const urls = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || !item.trim()) continue;
+    const url = item.trim();
+    const error = validateProductImageUrl(url);
+    if (error) return { urls: [], error: `Invalid 360° angle image URL: ${error}` };
+    if (!urls.includes(url)) urls.push(url);
+  }
+  return { urls, error: null };
+}
+
+async function findBarcodeConflict(barcode, companyId, excludeProductId = null) {
+  const normalizedBarcode = String(barcode || '').trim();
+  if (!normalizedBarcode) return null;
+  const matches = await Product.find({
+    company: companyId,
+    barcode: { $regex: `^${escapeRegex(normalizedBarcode)}$`, $options: 'i' },
+  }).limit(2).lean();
+  return matches.find((match) => String(match._id) !== String(excludeProductId || '')) || null;
+}
+
 // @desc    Get all products
 // @route   GET /api/products
 // @access  Private
@@ -231,7 +271,7 @@ exports.getProducts = async (req, res, next) => {
     const isPicker = req.query.forPicker === '1';
     const isStockLevels = req.query.forStockLevels === '1';
     const PRODUCT_LIST_SELECT = (isPicker ? [
-      '_id', 'company', 'name', 'sku', 'barcode', 'unit', 'currentStock',
+      '_id', 'company', 'name', 'sku', 'barcode', 'imageUrl', 'imageUrls', 'unit', 'currentStock',
       'isActive', 'isArchived', 'trackingType', 'trackBatch',
       'trackSerialNumbers', 'defaultWarehouse', 'sellingPrice', 'costPrice',
       'preferredSupplier', 'averageCost', 'taxCode', 'taxRate', 'createdAt', 'updatedAt'
@@ -240,7 +280,7 @@ exports.getProducts = async (req, res, next) => {
       'reservedQuantity', 'averageCost', 'costPrice', 'lowStockThreshold',
       'isActive', 'isArchived', 'createdAt', 'updatedAt'
     ] : [
-      '_id', 'company', 'name', 'sku', 'barcode', 'category', 'unit', 'supplier',
+      '_id', 'company', 'name', 'sku', 'barcode', 'imageUrl', 'imageUrls', 'category', 'unit', 'supplier',
       'currentStock', 'reservedQuantity', 'isActive', 'lowStockThreshold',
       'averageCost', 'sellingPrice', 'costPrice', 'costingMethod', 'isArchived',
       'trackingType', 'trackBatch', 'trackSerialNumbers', 'defaultWarehouse', 'ebm', 'createdAt', 'updatedAt'
@@ -334,7 +374,7 @@ exports.getProduct = async (req, res, next) => {
     const companyId = (company && company._id) ? company._id : company;
 
     const PRODUCT_DETAIL_SELECT = [
-      '_id', 'company', 'name', 'sku', 'barcode', 'barcodeType', 'description',
+      '_id', 'company', 'name', 'sku', 'barcode', 'barcodeType', 'imageUrl', 'imageUrls', 'description',
       'category', 'unit', 'supplier', 'preferredSupplier', 'currentStock',
       'reservedQuantity', 'isActive', 'isStockable', 'lowStockThreshold',
       'averageCost', 'sellingPrice', 'costPrice', 'costingMethod',
@@ -379,11 +419,22 @@ exports.getProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.createProduct = async (req, res, next) => {
   try {
+    const imageUrlError = validateProductImageUrl(req.body.imageUrl);
+    if (imageUrlError) return res.status(422).json({ success: false, errors: { imageUrl: imageUrlError } });
+    if (typeof req.body.imageUrl === 'string') req.body.imageUrl = req.body.imageUrl.trim();
+    const imageSequence = normalizeAndValidateProductImageUrls(req.body.imageUrls);
+    if (imageSequence.error) return res.status(422).json({ success: false, errors: { imageUrls: imageSequence.error } });
+    req.body.imageUrls = imageSequence.urls;
     const company = req.user && req.user.company;
     const companyId = (company && company._id) ? company._id : company;
     
     req.body.company = companyId;
     req.body.createdBy = req.user.id;
+
+    const barcodeConflict = await findBarcodeConflict(req.body.barcode, companyId);
+    if (barcodeConflict) {
+      return res.status(409).json({ success: false, code: 'PRODUCT_BARCODE_IN_USE', message: 'This barcode is already assigned to another product in this workspace.' });
+    }
 
     // If category is provided, pre-fill account suggestions from category defaults (suggestion only)
     if (req.body.category) {
@@ -468,6 +519,16 @@ exports.createProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.updateProduct = async (req, res, next) => {
   try {
+    if (Object.prototype.hasOwnProperty.call(req.body, 'imageUrl')) {
+      const imageUrlError = validateProductImageUrl(req.body.imageUrl);
+      if (imageUrlError) return res.status(422).json({ success: false, errors: { imageUrl: imageUrlError } });
+      if (typeof req.body.imageUrl === 'string') req.body.imageUrl = req.body.imageUrl.trim();
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body, 'imageUrls')) {
+      const imageSequence = normalizeAndValidateProductImageUrls(req.body.imageUrls);
+      if (imageSequence.error) return res.status(422).json({ success: false, errors: { imageUrls: imageSequence.error } });
+      req.body.imageUrls = imageSequence.urls;
+    }
     const company = req.user && req.user.company;
     const companyId = (company && company._id) ? company._id : company;
     
@@ -478,6 +539,13 @@ exports.updateProduct = async (req, res, next) => {
         success: false, 
         message: 'Product not found' 
       });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, 'barcode')) {
+      const barcodeConflict = await findBarcodeConflict(req.body.barcode, companyId, product._id);
+      if (barcodeConflict) {
+        return res.status(409).json({ success: false, code: 'PRODUCT_BARCODE_IN_USE', message: 'This barcode is already assigned to another product in this workspace.' });
+      }
     }
 
     // Store old values for history (slim snapshot - never embed nested history)

@@ -4,12 +4,8 @@
 // Backup migrates to Prisma.
 const mongoose = require('mongoose');
 const { runInTransaction } = require('../services/transactionService');
-const { generateObjectId } = require('../utils/objectId');
 const { parseOptionalPagination, paginationMeta } = require('../utils/pagination');
 const Backup = require('../models/Backup');
-const Company = require('../models/Company');
-const Currency = require('../models/Currency');
-const User = require('../models/User');
 const fs = require('fs');
 const path = require('path');
 const { promisify } = require('util');
@@ -17,85 +13,124 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const { google } = require('googleapis');
 const { notifyBackupSuccess, notifyBackupFailed } = require('../services/notificationHelper');
+const { Prisma } = require('@prisma/client');
+const { prisma } = require('../lib/prisma');
 
-// Get list of all models that can be backed up
-/**
- * Every collection the backup feature knows about.
- *
- * `restorable: false` marks one that is still MongoDB-only. Those are excluded
- * from new backups rather than attempted-and-failed, for two reasons:
- *
- *  - With MONGODB_URI unset their reads throw, so including them would make
- *    EVERY archive `completed_with_errors` — and the restore guard would then
- *    refuse every backup ever taken. A safety gate that blocks everything is
- *    just an outage.
- *  - The restore runs in a single PostgreSQL transaction (see performRestore).
- *    A Mongo write cannot join that transaction, so including one would break
- *    the all-or-nothing guarantee.
- *
- * Flip a collection to `restorable: true` when its model moves to Prisma.
- */
-const BACKUP_COLLECTIONS = [
-  { name: 'ActionLog', restorable: true },
-  { name: 'Budget', restorable: true },
-  { name: 'CashDrawer', restorable: false },        // Mongoose-only
-  { name: 'Category', restorable: true },
-  { name: 'Client', restorable: true },
-  { name: 'Company', restorable: true },
-  { name: 'CreditNote', restorable: true },
-  { name: 'Currency', restorable: true },
-  { name: 'Department', restorable: true },
-  { name: 'ExchangeRate', restorable: true },
-  { name: 'InventoryBatch', restorable: true },
-  { name: 'Invoice', restorable: true },
-  { name: 'InvoiceReceiptMetadata', restorable: true },
-  { name: 'IPWhitelist', restorable: true },
-  { name: 'Notification', restorable: true },
-  { name: 'NotificationSettings', restorable: true },
-  { name: 'Product', restorable: true },
-  { name: 'Purchase', restorable: true },
-  { name: 'Quotation', restorable: true },
-  { name: 'RecurringInvoice', restorable: true },
-  { name: 'ReorderPoint', restorable: true },
-  { name: 'Role', restorable: true },
-  { name: 'SerialNumber', restorable: true },
-  { name: 'StockAudit', restorable: true },
-  { name: 'StockMovement', restorable: true },
-  { name: 'StockTransfer', restorable: true },
-  { name: 'Subscription', restorable: false },      // Mongoose-only
-  { name: 'Supplier', restorable: true },
-  { name: 'User', restorable: true },
-  { name: 'Warehouse', restorable: true },
-];
+// Derive coverage from Prisma's generated schema, not a stale manual allowlist.
+// Tenant tables need a direct company/companyId scalar for safe scoping. The
+// Company root row is archived separately and updated in place during restore;
+// Backup metadata is excluded so restore never deletes its own backup record.
+const COMPANY_MODEL = (Prisma.dmmf?.datamodel?.models || []).find((model) => model.name === 'Company');
+const TENANT_MODELS = (Prisma.dmmf?.datamodel?.models || [])
+  .map((model) => {
+    const ownerField = model.fields.find((field) =>
+      field.kind === 'scalar' && ['companyId', 'company'].includes(field.name));
+    if (!ownerField || ['Backup', 'Company'].includes(model.name)) return null;
+    const delegateName = model.name[0].toLowerCase() + model.name.slice(1);
+    if (!prisma[delegateName]) {
+      throw new Error(`Tenant model ${model.name} has no Prisma delegate; backup coverage is unsafe`);
+    }
+    return { name: model.name, delegateName, ownerField: ownerField.name, fields: model.fields };
+  })
+  .filter(Boolean)
+  .sort((a, b) => a.name.localeCompare(b.name));
 
-/** Collections included in a new backup: the PostgreSQL-backed ones. */
-const getBackupableCollections = () =>
-  BACKUP_COLLECTIONS.filter((c) => c.restorable).map((c) => c.name);
+const TENANT_MODEL_BY_NAME = new Map(TENANT_MODELS.map((model) => [model.name, model]));
+const getBackupableCollections = () => TENANT_MODELS.map((model) => model.name);
 
-/** Collections deliberately left out, surfaced in the archive manifest. */
-const getExcludedCollections = () =>
-  BACKUP_COLLECTIONS.filter((c) => !c.restorable).map((c) => c.name);
-
-
-/**
- * Resolve a backupable collection to its model.
- *
- * Must NOT use mongoose.model(name): most models are Prisma-backed compat
- * objects, and the mongoose registry holds only the bare `strict: false` stubs
- * registered for compatibility. Reading through those hits a MongoDB connection
- * that no longer exists, so every collection would come back empty and the
- * backup would report success while containing nothing.
- *
- * Returns null when a name has no model file, so the caller can record it as
- * skipped rather than silently writing an empty array.
- */
-const resolveBackupModel = (collectionName) => {
-  try {
-    return require(`../models/${collectionName}`);
-  } catch (error) {
-    if (error && error.code === 'MODULE_NOT_FOUND') return null;
-    throw error;
+const getRestoreOrder = () => {
+  const dependencies = new Map(TENANT_MODELS.map((model) => [model.name, new Set()]));
+  for (const model of TENANT_MODELS) {
+    for (const relation of model.fields.filter((field) => field.kind === 'object' && field.relationFromFields?.length)) {
+      const requiredRelation = relation.relationFromFields.some((fieldName) =>
+        model.fields.find((field) => field.name === fieldName)?.isRequired);
+      if (requiredRelation && TENANT_MODEL_BY_NAME.has(relation.type) && relation.type !== model.name) {
+        dependencies.get(model.name).add(relation.type);
+      }
+    }
   }
+  const ordered = [];
+  const remaining = new Map([...dependencies].map(([name, deps]) => [name, new Set(deps)]));
+  while (remaining.size) {
+    const ready = [...remaining].filter(([, deps]) => deps.size === 0).map(([name]) => name).sort();
+    if (!ready.length) throw new Error(`Tenant backup restore has a Prisma relation cycle: ${[...remaining.keys()].join(', ')}`);
+    for (const name of ready) {
+      ordered.push(TENANT_MODEL_BY_NAME.get(name));
+      remaining.delete(name);
+      for (const deps of remaining.values()) deps.delete(name);
+    }
+  }
+  return ordered;
+};
+
+// Fail at startup if schema relations cannot be restored in a safe order.
+const TENANT_RESTORE_ORDER = getRestoreOrder();
+
+const getTenantRelations = (model) => model.fields
+  .filter((field) => field.kind === 'object' && field.relationFromFields?.length && TENANT_MODEL_BY_NAME.has(field.type))
+  .map((relation) => ({
+    target: relation.type,
+    fields: relation.relationFromFields,
+    nullable: relation.relationFromFields.every((fieldName) =>
+      !model.fields.find((field) => field.name === fieldName)?.isRequired),
+  }));
+
+const getPrimaryWhere = (model, record, companyId) => {
+  const keys = model.primaryKey?.fields?.length
+    ? model.primaryKey.fields
+    : model.fields.filter((field) => field.isId).map((field) => field.name);
+  if (!keys.length || keys.some((key) => record[key] === undefined || record[key] === null)) {
+    throw new Error(`Cannot safely restore ${model.name}: primary key is missing from an archived row`);
+  }
+  return { [model.ownerField]: companyId, ...Object.fromEntries(keys.map((key) => [key, record[key]])) };
+};
+
+const BACKUP_PAGE_SIZE = 500;
+const readTenantModel = async (model, companyId) => {
+  const delegate = prisma[model.delegateName];
+  const uniqueFields = model.fields.filter((field) => field.isId || field.isUnique).map((field) => field.name);
+  // Prisma's findMany orderBy argument is always an array. Models with
+  // compound unique keys need multiple entries, while single-key models still
+  // use the same valid shape.
+  const orderBy = (uniqueFields.length ? uniqueFields : [model.ownerField])
+    .map((field) => ({ [field]: 'asc' }));
+  const where = { [model.ownerField]: companyId };
+  const records = [];
+  for (let skip = 0; ; skip += BACKUP_PAGE_SIZE) {
+    const page = await delegate.findMany({ where, orderBy, skip, take: BACKUP_PAGE_SIZE });
+    records.push(...page);
+    if (page.length < BACKUP_PAGE_SIZE) break;
+  }
+  return records;
+};
+
+const readCompanySnapshot = async (companyId) => {
+  if (!COMPANY_MODEL || !prisma.company) throw new Error('Company model is unavailable for backup');
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  if (!company) throw new Error('Company record was not found for backup');
+  return serializePrismaValue(company);
+};
+
+const serializePrismaValue = (value) => {
+  if (typeof value === 'bigint') return { __backupScalar: 'bigint', value: value.toString() };
+  if (Buffer.isBuffer(value)) return { __backupScalar: 'bytes', value: value.toString('base64') };
+  if (Array.isArray(value)) return value.map(serializePrismaValue);
+  if (value && typeof value === 'object' && !(value instanceof Date) && typeof value.toJSON !== 'function') {
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, serializePrismaValue(nested)]));
+  }
+  return value;
+};
+
+const restoreScalarTypes = (model, record) => {
+  const output = { ...record };
+  for (const field of model.fields) {
+    if (!Object.prototype.hasOwnProperty.call(output, field.name)) continue;
+    const value = output[field.name];
+    if (value && value.__backupScalar === 'bigint' && field.type === 'BigInt') output[field.name] = BigInt(value.value);
+    else if (value && value.__backupScalar === 'bytes' && field.type === 'Bytes') output[field.name] = Buffer.from(value.value, 'base64');
+    else if (value != null && field.type === 'DateTime' && typeof value === 'string') output[field.name] = new Date(value);
+  }
+  return output;
 };
 
 /**
@@ -133,7 +168,7 @@ const generateChecksum = (data) => {
 exports.getBackups = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
+
     // Opt-in pagination: callers that send page/limit get a page and totals;
     // callers that send neither keep the previous all-rows behaviour, so the
     // existing backups screen is unaffected.
@@ -172,10 +207,10 @@ exports.getBackups = async (req, res) => {
 exports.getBackup = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
-    const backup = await Backup.findOne({ 
-      _id: req.params.id, 
-      company: companyId 
+
+    const backup = await Backup.findOne({
+      _id: req.params.id,
+      company: companyId
     })
       .populate('createdBy', 'name email')
       .populate('verification.verifiedBy', 'name email')
@@ -208,13 +243,21 @@ exports.getBackup = async (req, res) => {
 exports.createBackup = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    const { 
-      name, 
-      type = 'manual', 
+    const {
+      name,
+      type = 'manual',
       storageLocation = 'local',
-      pointInTime = null,
-      collections = getBackupableCollections()
     } = req.body;
+
+    if (req.body.pointInTime) {
+      return res.status(400).json({
+        success: false,
+        message: 'Application backups are full snapshots. Historical point-in-time recovery must be performed through the database provider.',
+        code: 'BACKUP_PITR_NOT_SUPPORTED',
+      });
+    }
+
+    const configuredSettings = await Backup.findOne({ company: companyId, type: 'scheduled' }).sort({ createdAt: -1 });
 
     // Create backup record
     const backup = await Backup.create({
@@ -223,13 +266,13 @@ exports.createBackup = async (req, res) => {
       type,
       status: 'pending',
       storageLocation,
-      pointInTime: pointInTime ? new Date(pointInTime) : null,
+      cloudConfig: configuredSettings?.cloudConfig || {},
       createdBy: req.user?._id,
       collections: []
     });
 
     // Start backup process in background
-    performBackup(backup._id, companyId, collections).catch(err => {
+    performBackup(backup._id, companyId).catch(err => {
       console.error('Backup failed:', err);
     });
 
@@ -249,7 +292,7 @@ exports.createBackup = async (req, res) => {
 };
 
 // Perform the actual backup
-const performBackup = async (backupId, companyId, collections) => {
+const performBackup = async (backupId, companyId) => {
   const backup = await Backup.findById(backupId);
   if (!backup) return;
 
@@ -259,8 +302,9 @@ const performBackup = async (backupId, companyId, collections) => {
 
     const backupData = {
       companyId,
+      company: await readCompanySnapshot(companyId),
       timestamp: new Date().toISOString(),
-      pointInTime: backup.pointInTime,
+      snapshotType: 'full-tenant-snapshot',
       collections: []
     };
 
@@ -270,53 +314,32 @@ const performBackup = async (backupId, companyId, collections) => {
     const filePath = path.join(backupDir, fileName);
 
     // Backup each collection
-    for (const collectionName of collections) {
+    for (const model of TENANT_MODELS) {
       try {
-        const Model = resolveBackupModel(collectionName);
-        if (!Model || typeof Model.find !== 'function') {
-          // Recorded as an error, not skipped silently: a collection missing
-          // from the archive must be visible in the manifest, or a restore
-          // from this file would quietly leave that data behind.
-          console.warn(`[backup] No usable model for ${collectionName}`);
-          backupData.collections.push({
-            name: collectionName,
-            documentCount: 0,
-            data: [],
-            error: 'No usable model — collection not backed up',
-          });
-          continue;
-        }
-        let query = { company: companyId };
-        
-        // If point-in-time recovery, filter by date
-        if (backup.pointInTime) {
-          query.createdAt = { $lte: backup.pointInTime };
-        }
-
-        const documents = await Model.find(query).lean();
-        
+        const documents = await readTenantModel(model, companyId);
         backupData.collections.push({
-          name: collectionName,
+          name: model.name,
           documentCount: documents.length,
-          data: documents
+          data: documents.map(serializePrismaValue),
         });
       } catch (err) {
-        console.warn(`Could not backup collection ${collectionName}:`, err.message);
+        console.warn(`Could not backup tenant model ${model.name}:`, err.message);
         backupData.collections.push({
-          name: collectionName,
+          name: model.name,
           documentCount: 0,
           data: [],
-          error: err.message
+          error: err.message,
         });
       }
     }
 
+
     // Compress and save backup
     const jsonData = JSON.stringify(backupData);
     const compressedData = zlib.gzipSync(Buffer.from(jsonData));
-    
+
     fs.writeFileSync(filePath, compressedData);
-    
+
     const checksum = generateChecksum(compressedData);
 
     // A backup that could not read every collection is NOT 'completed'.
@@ -339,7 +362,7 @@ const performBackup = async (backupId, companyId, collections) => {
     // 'valid' here means the archive file matches its checksum — it does not
     // mean the archive contains every collection. See status above.
     backup.verification.integrityStatus = 'valid';
-    
+
     // Update collections info
     backup.collections = backupData.collections.map(c => ({
       name: c.name,
@@ -350,7 +373,24 @@ const performBackup = async (backupId, companyId, collections) => {
 
     // If cloud backup is enabled, upload to cloud
     if (backup.storageLocation !== 'local') {
-      await uploadToCloud(backup);
+      const uploadResult = await uploadToCloud(backup);
+      backup.verification = {
+        ...(backup.verification || {}),
+        cloudUploadStatus: uploadResult.success ? 'uploaded' : 'failed',
+        cloudUploadError: uploadResult.success ? null : uploadResult.error,
+        cloudUploadedAt: uploadResult.success ? new Date().toISOString() : null,
+      };
+      // Keep a valid local snapshot restorable, but make the failed off-site
+      // copy explicit in the same record returned to operators.
+      backup.cloudUrl = uploadResult.success ? uploadResult.url : null;
+      await backup.save();
+    }
+
+    // Verify every complete archive automatically once its local file and any
+    // requested remote copy attempt have finished. Incomplete archives retain
+    // their completed_with_errors status and are never labeled verified.
+    if (backup.status === 'completed') {
+      await performVerification(backupId, backup.createdBy || null);
     }
 
     console.log(
@@ -363,7 +403,7 @@ const performBackup = async (backupId, companyId, collections) => {
     backup.status = 'failed';
     backup.errorMessage = error.message;
     await backup.save();
-    
+
     // Send notification for failed backup
     await notifyBackupFailed(companyId, backup, error.message);
   }
@@ -371,16 +411,59 @@ const performBackup = async (backupId, companyId, collections) => {
 
 // Upload backup to cloud storage
 const uploadToCloud = async (backup) => {
-  // Upload to configured cloud provider. Implements Google Drive support.
+  // A remote location is only recorded after the provider confirms the upload.
   try {
     if (backup.storageLocation === 's3') {
-      // TODO: implement real S3 upload with AWS SDK
-      backup.cloudUrl = `s3://backups/${path.basename(backup.filePath)}`;
+      const bucket = backup.cloudConfig?.bucket || process.env.AWS_S3_BUCKET;
+      const region = backup.cloudConfig?.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
+      const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+      const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+      if (!bucket || !region || !accessKeyId || !secretAccessKey) {
+        throw new Error('S3 backup requires bucket, region, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY configuration.');
+      }
+      const endpoint = new URL(process.env.AWS_S3_ENDPOINT || `https://s3.${region}.amazonaws.com`);
+      const objectKey = `${process.env.AWS_S3_PREFIX ? `${process.env.AWS_S3_PREFIX.replace(/^\/+|\/+$/g, '')}/` : ''}${path.basename(backup.filePath)}`;
+      const encodedPath = `/${encodeURIComponent(bucket)}/${objectKey.split('/').map(encodeURIComponent).join('/')}`;
+      const body = fs.readFileSync(backup.filePath);
+      const payloadHash = crypto.createHash('sha256').update(body).digest('hex');
+      const now = new Date();
+      const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+      const dateStamp = amzDate.slice(0, 8);
+      const host = endpoint.host;
+      const headers = {
+        host,
+        'content-type': 'application/gzip',
+        'x-amz-content-sha256': payloadHash,
+        'x-amz-date': amzDate,
+      };
+      if (process.env.AWS_SESSION_TOKEN) headers['x-amz-security-token'] = process.env.AWS_SESSION_TOKEN;
+      const signedHeaders = Object.keys(headers).sort().join(';');
+      const canonicalHeaders = Object.keys(headers).sort().map((key) => `${key}:${String(headers[key]).trim()}\n`).join('');
+      const canonicalRequest = ['PUT', encodedPath, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+      const scope = `${dateStamp}/${region}/s3/aws4_request`;
+      const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, crypto.createHash('sha256').update(canonicalRequest).digest('hex')].join('\n');
+      const hmac = (key, value) => crypto.createHmac('sha256', key).update(value).digest();
+      const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, dateStamp), region), 's3'), 'aws4_request');
+      headers.authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${crypto.createHmac('sha256', signingKey).update(stringToSign).digest('hex')}`;
+      await new Promise((resolve, reject) => {
+        const transport = endpoint.protocol === 'http:' ? require('http') : require('https');
+        const request = transport.request({ protocol: endpoint.protocol, hostname: endpoint.hostname, port: endpoint.port || undefined, method: 'PUT', path: encodedPath, headers: { ...headers, 'content-length': body.length } }, (response) => {
+          let responseBody = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk) => { responseBody += chunk; });
+          response.on('end', () => response.statusCode >= 200 && response.statusCode < 300
+            ? resolve()
+            : reject(new Error(`S3 upload failed with HTTP ${response.statusCode}: ${responseBody.slice(0, 500)}`)));
+        });
+        request.on('error', reject);
+        request.end(body);
+      });
+      return { success: true, url: `s3://${bucket}/${objectKey}` };
     } else if (backup.storageLocation === 'google-drive' || backup.storageLocation === 'cloud') {
       // Handle both 'google-drive' and 'cloud' (default to Google Drive) storage types
       try {
         let serviceAccount = null;
-        
+
         // Try multiple sources for credentials
         const possiblePaths = [
           path.join(process.cwd(), 'config', 'google-credentials.json'),
@@ -436,7 +519,7 @@ const uploadToCloud = async (backup) => {
         };
 
         console.log('Starting Google Drive upload for:', backup.filePath);
-        
+
         const response = await drive.files.create({
           resource: fileMetadata,
           media,
@@ -446,36 +529,37 @@ const uploadToCloud = async (backup) => {
         });
 
         const fileId = response.data.id;
+        if (!fileId) throw new Error('Google Drive did not return an uploaded file ID.');
         const webViewLink = response.data.webViewLink || (fileId ? `https://drive.google.com/file/d/${fileId}/view` : null);
 
-        backup.cloudUrl = webViewLink || `gdrive://${path.basename(backup.filePath)}`;
-        
+        backup.cloudUrl = webViewLink;
+
         console.log('Google Drive upload successful! File ID:', fileId);
       } catch (err) {
         console.error('Google Drive upload failed:', err.message || err);
         // Set failed status - this indicates the backup itself succeeded but cloud upload failed
-        backup.cloudUrl = `gdrive-failed://${path.basename(backup.filePath)}`;
+        backup.cloudUrl = null;
         // Log additional error details for debugging
         if (err.response) {
           console.error('Google API Error Response:', err.response.data);
         }
-        // Don't re-throw - the local backup is still valid
+        return { success: false, error: err.message || 'Google Drive upload failed' };
       }
     } else if (backup.storageLocation === 'dropbox') {
       try {
         const axios = require('axios');
         const dropboxToken = process.env.DROPBOX_ACCESS_TOKEN;
-        
+
         if (!dropboxToken) {
           throw new Error('Dropbox access token not configured');
         }
-        
+
         // Read the backup file
         const fileContent = fs.readFileSync(backup.filePath);
         const fileName = path.basename(backup.filePath);
-        
+
         console.log('Starting Dropbox upload for:', fileName);
-        
+
         // Upload to Dropbox using their API
         const response = await axios.post(
           'https://content.dropboxapi.com/2/files/upload',
@@ -493,7 +577,7 @@ const uploadToCloud = async (backup) => {
             }
           }
         );
-        
+
         // Get the shared link for the file
         try {
           const shareResponse = await axios.post(
@@ -538,23 +622,25 @@ const uploadToCloud = async (backup) => {
             backup.cloudUrl = `https://www.dropbox.com/home${response.data.path_display}`;
           }
         }
-        
+
         console.log('Dropbox upload successful! Path:', response.data.path_display);
       } catch (err) {
         console.error('Dropbox upload failed:', err.message || err);
         if (err.response) {
           console.error('Dropbox Error Response:', err.response.data);
         }
-        backup.cloudUrl = `dropbox-failed://${path.basename(backup.filePath)}`;
+        backup.cloudUrl = null;
+        return { success: false, error: err.message || 'Dropbox upload failed' };
       }
     } else {
-      console.warn('Unknown storage location:', backup.storageLocation);
-      backup.cloudUrl = null;
+      throw new Error(`Unsupported remote backup storage provider: ${backup.storageLocation}`);
     }
 
     await backup.save();
+    return { success: true, url: backup.cloudUrl };
   } catch (error) {
     console.error('Cloud upload failed:', error);
+    return { success: false, error: error.message || 'Remote backup upload failed' };
   }
 };
 
@@ -564,10 +650,10 @@ const uploadToCloud = async (backup) => {
 exports.restoreBackup = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
-    const backup = await Backup.findOne({ 
-      _id: req.params.id, 
-      company: companyId 
+
+    const backup = await Backup.findOne({
+      _id: req.params.id,
+      company: companyId
     });
 
     if (!backup) {
@@ -653,6 +739,24 @@ const performRestore = async (backupId, companyId, userId) => {
       );
     }
 
+    const expectedNames = new Set(getBackupableCollections());
+    const archivedNames = (backupData.collections || []).map((collection) => collection.name);
+    const duplicateNames = archivedNames.filter((name, index) => archivedNames.indexOf(name) !== index);
+    const missingNames = [...expectedNames].filter((name) => !archivedNames.includes(name));
+    const unexpectedNames = archivedNames.filter((name) => !expectedNames.has(name));
+    if (duplicateNames.length || missingNames.length || unexpectedNames.length) {
+      throw new Error(
+        `Refusing incomplete or incompatible backup: ${missingNames.length} tenant model(s) missing, `
+        + `${duplicateNames.length} duplicate model entr${duplicateNames.length === 1 ? 'y' : 'ies'}, `
+        + `${unexpectedNames.length} unknown model(s). Create a new complete backup before restoring.`,
+      );
+    }
+    if (!backupData.company || backupData.company.id !== companyId || backupData.companyId !== companyId) {
+      throw new Error('Refusing backup: company ownership metadata is missing or does not match this tenant');
+    }
+    const restoreOrder = TENANT_RESTORE_ORDER;
+    const archivedByName = new Map(backupData.collections.map((collection) => [collection.name, collection]));
+
     // Verify checksum
     const currentChecksum = generateChecksum(compressedData);
     if (currentChecksum !== backup.verification.checksum) {
@@ -661,48 +765,72 @@ const performRestore = async (backupId, companyId, userId) => {
 
     // ALL-OR-NOTHING RESTORE.
     //
-    // Every collection is deleted and reinserted inside ONE PostgreSQL
+    // Every tenant model is deleted and reinserted inside ONE PostgreSQL
     // transaction. Previously each collection was handled independently with
     // its own try/catch, so a failure partway through left the company with
     // some collections restored, some emptied by the delete, and some
     // untouched — an unrecoverable mixture, because the delete had already run.
     //
-    // The compat models join this transaction automatically: runInTransaction
-    // publishes the Prisma transaction client on the async context and
-    // prismaCompat resolves its delegate from there (see lib/txContext.js).
-    // Nothing has to be threaded through by hand, which is what makes wrapping
-    // a loop over 28 models feasible at all.
-    //
     // Errors are deliberately NOT caught per collection: the first failure must
     // abort the transaction so Postgres rolls the whole thing back.
     const restoredCounts = [];
-    await runInTransaction(async () => {
-      for (const collection of backupData.collections) {
-        const Model = resolveBackupModel(collection.name);
-        if (!Model || typeof Model.deleteMany !== 'function') {
-          // Throwing rolls back everything done so far, which is correct: a
-          // restore missing a collection is not a restore.
-          throw new Error(`No usable model for collection "${collection.name}"`);
+    await runInTransaction(async (tx) => {
+      const companySnapshot = restoreScalarTypes(COMPANY_MODEL, backupData.company);
+      delete companySnapshot.id;
+      await tx.company.update({ where: { id: companyId }, data: companySnapshot });
+
+      // Nullable tenant-to-tenant references are cleared first so optional
+      // cycles (for example an asset pointing at its disposal event) cannot
+      // prevent a safe child-first delete.
+      for (const model of restoreOrder) {
+        const nullableFields = getTenantRelations(model)
+          .filter((relation) => relation.nullable)
+          .flatMap((relation) => relation.fields);
+        if (nullableFields.length) {
+          const data = Object.fromEntries([...new Set(nullableFields)].map((field) => [field, null]));
+          await tx[model.delegateName].updateMany({ where: { [model.ownerField]: companyId }, data });
         }
+      }
 
-        await Model.deleteMany({ company: companyId });
+      for (const model of [...restoreOrder].reverse()) {
+        await tx[model.delegateName].deleteMany({ where: { [model.ownerField]: companyId } });
+      }
 
-        if (collection.data && collection.data.length > 0) {
-          const newData = collection.data.map((doc) => {
-            const newDoc = { ...doc };
-            // New ids: the archive's ids may collide with rows created since.
-            newDoc._id = generateObjectId();
-            newDoc.company = companyId;
-            newDoc.createdAt = doc.createdAt ? new Date(doc.createdAt) : new Date();
-            newDoc.updatedAt = doc.updatedAt ? new Date(doc.updatedAt) : new Date();
-            return newDoc;
-          });
-
-          await Model.insertMany(newData);
-          restoredCounts.push(`${collection.name}: ${newData.length}`);
-        } else {
-          restoredCounts.push(`${collection.name}: 0`);
+      const deferredRelationUpdates = [];
+      for (const model of restoreOrder) {
+        const collection = archivedByName.get(model.name);
+        if (!Array.isArray(collection.data) || collection.data.length !== collection.documentCount) {
+          throw new Error(`Backup row count is invalid for ${model.name}`);
         }
+        const nullableRelations = getTenantRelations(model).filter((relation) => relation.nullable);
+        const rows = collection.data.map((archivedRecord) => {
+          const record = restoreScalarTypes(model, archivedRecord);
+          record[model.ownerField] = companyId;
+          for (const relation of nullableRelations) {
+            const deferred = {};
+            for (const field of relation.fields) {
+              if (record[field] !== undefined && record[field] !== null) {
+                deferred[field] = record[field];
+                record[field] = null;
+              }
+            }
+            if (Object.keys(deferred).length) deferredRelationUpdates.push({ model, record, data: deferred });
+          }
+          return record;
+        });
+
+        for (let offset = 0; offset < rows.length; offset += BACKUP_PAGE_SIZE) {
+          await tx[model.delegateName].createMany({ data: rows.slice(offset, offset + BACKUP_PAGE_SIZE) });
+        }
+        restoredCounts.push(`${model.name}: ${rows.length}`);
+      }
+
+      for (const update of deferredRelationUpdates) {
+        const result = await tx[update.model.delegateName].updateMany({
+          where: getPrimaryWhere(update.model, update.record, companyId),
+          data: update.data,
+        });
+        if (result.count !== 1) throw new Error(`Could not restore a deferred relation for ${update.model.name}`);
       }
     }, {
       // A full-company restore writes far more than an ordinary request. Without
@@ -736,10 +864,10 @@ const performRestore = async (backupId, companyId, userId) => {
 exports.verifyBackup = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
-    const backup = await Backup.findOne({ 
-      _id: req.params.id, 
-      company: companyId 
+
+    const backup = await Backup.findOne({
+      _id: req.params.id,
+      company: companyId
     });
 
     if (!backup) {
@@ -798,7 +926,7 @@ const performVerification = async (backupId, userId) => {
     backup.verification.verified = currentChecksum === backup.verification.checksum;
     backup.verification.verifiedAt = new Date();
     backup.verification.verifiedBy = userId;
-    
+
     if (backup.verification.verified) {
       backup.verification.integrityStatus = 'valid';
       backup.status = 'verified';
@@ -823,10 +951,10 @@ const performVerification = async (backupId, userId) => {
 exports.deleteBackup = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
-    const backup = await Backup.findOne({ 
-      _id: req.params.id, 
-      company: companyId 
+
+    const backup = await Backup.findOne({
+      _id: req.params.id,
+      company: companyId
     });
 
     if (!backup) {
@@ -857,35 +985,41 @@ exports.deleteBackup = async (req, res) => {
   }
 };
 
-// @desc    Get available point-in-time recovery points
-// @route   GET /api/backups/points-in-time
+// @desc    Get available full backup snapshots
+// @route   GET /api/backups/snapshots
 // @access  Private
-exports.getPointsInTime = async (req, res) => {
+exports.getSnapshots = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
-    const backups = await Backup.find({ 
+
+    const candidateBackups = await Backup.find({
       company: companyId,
-      status: { $in: ['completed', 'verified'] }
+      status: { $in: ['completed', 'verified', 'completed_with_errors'] }
     })
-      .select('name createdAt pointInTime fileSize collections')
+      .select('name createdAt fileSize collections status filePath')
       .sort({ createdAt: -1 })
       .limit(100);
 
-    const pointsInTime = backups.map(b => ({
+    // Keep null filtering out of the legacy query shim: Mongo's `$ne: null`
+    // cannot be represented by this Prisma compatibility layer.
+    const backups = candidateBackups.filter((backup) => Boolean(backup.filePath));
+
+    const snapshots = backups.map(b => ({
       id: b._id,
       name: b.name,
-      timestamp: b.pointInTime || b.createdAt,
+      timestamp: b.createdAt,
       fileSize: b.fileSize,
-      totalDocuments: b.collections.reduce((sum, c) => sum + c.documentCount, 0)
+      totalDocuments: (b.collections || []).reduce((sum, c) => sum + (c.documentCount || 0), 0),
+      status: b.status,
+      restorable: ['completed', 'verified'].includes(b.status),
     }));
 
     res.json({
       success: true,
-      data: pointsInTime
+      data: snapshots
     });
   } catch (error) {
-    console.error('Error getting points in time:', error);
+    console.error('Error getting backup snapshots:', error);
     res.status(500).json({
       success: false,
       message: 'Server error',
@@ -894,15 +1028,19 @@ exports.getPointsInTime = async (req, res) => {
   }
 };
 
+// Backward-compatible alias for older clients. This returns ordinary backup
+// snapshots and has never provided database point-in-time recovery.
+exports.getPointsInTime = exports.getSnapshots;
+
 // @desc    Get backup settings
 // @route   GET /api/backups/settings
 // @access  Private (Admin)
 exports.getBackupSettings = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
+
     // Get the backup settings document (type: 'scheduled')
-    let settings = await Backup.findOne({ 
+    let settings = await Backup.findOne({
       company: companyId,
       type: 'scheduled'
     }).sort({ createdAt: -1 });
@@ -916,7 +1054,9 @@ exports.getBackupSettings = async (req, res) => {
           frequency: 'daily',
           retention: 30,
           storageLocation: 'local',
-          autoVerify: false
+          autoVerify: true,
+          lastRun: null,
+          nextRun: null,
         }
       });
     }
@@ -928,7 +1068,9 @@ exports.getBackupSettings = async (req, res) => {
         frequency: settings.schedule?.frequency || 'daily',
         retention: settings.retention?.keepForDays || 30,
         storageLocation: settings.storageLocation || 'local',
-        autoVerify: settings.schedule?.autoVerify || false,
+        autoVerify: true,
+        lastRun: settings.schedule?.lastRun || null,
+        nextRun: settings.schedule?.nextRun || null,
         cloudConfig: settings.cloudConfig
       }
     });
@@ -948,17 +1090,15 @@ exports.getBackupSettings = async (req, res) => {
 exports.updateBackupSettings = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    const { 
-      enabled,
-      frequency,
-      retention,
-      storageLocation,
-      cloudConfig,
-      autoVerify
-    } = req.body;
+    const { enabled, cloudConfig } = req.body;
+    const validFrequencies = new Set(['hourly', 'daily', 'weekly', 'monthly']);
+    const validStorageLocations = new Set(['local', 'cloud', 's3', 'google-drive', 'dropbox']);
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'enabled must be a boolean.' });
+    }
 
     // Create or update backup settings
-    let backupSettings = await Backup.findOne({ 
+    let backupSettings = await Backup.findOne({
       company: companyId,
       type: 'scheduled'
     });
@@ -972,12 +1112,43 @@ exports.updateBackupSettings = async (req, res) => {
       });
     }
 
-    backupSettings.schedule.enabled = enabled || false;
-    backupSettings.schedule.frequency = frequency || 'daily';
-    backupSettings.schedule.autoVerify = autoVerify || false;
-    backupSettings.retention.keepForDays = retention || 30;
-    backupSettings.storageLocation = storageLocation || 'local';
-    
+    const frequency = req.body.frequency || backupSettings.schedule?.frequency || 'daily';
+    const storageLocation = req.body.storageLocation || backupSettings.storageLocation || 'local';
+    const retention = req.body.retention ?? backupSettings.retention?.keepForDays ?? 30;
+    if (!validFrequencies.has(frequency)) {
+      return res.status(400).json({ success: false, message: 'frequency must be hourly, daily, weekly, or monthly.' });
+    }
+    if (!validStorageLocations.has(storageLocation)) {
+      return res.status(400).json({ success: false, message: 'Unsupported backup storage location.' });
+    }
+    if (!Number.isInteger(Number(retention)) || Number(retention) < 1 || Number(retention) > 365) {
+      return res.status(400).json({ success: false, message: 'retention must be between 1 and 365 days.' });
+    }
+
+    const now = new Date();
+    const intervalMs = {
+      hourly: 60 * 60 * 1000,
+      daily: 24 * 60 * 60 * 1000,
+      weekly: 7 * 24 * 60 * 60 * 1000,
+      monthly: 30 * 24 * 60 * 60 * 1000,
+    }[frequency];
+    const schedule = {
+      ...(backupSettings.schedule || {}),
+      enabled,
+      frequency,
+      autoVerify: true,
+      nextRun: enabled ? new Date(now.getTime() + intervalMs).toISOString() : null,
+      cronExpression: ({ hourly: 'hourly', daily: 'daily', weekly: 'weekly', monthly: 'monthly' })[frequency],
+    };
+    if (!enabled) schedule.nextRun = null;
+    backupSettings.schedule = schedule;
+    backupSettings.retention = {
+      ...(backupSettings.retention || {}),
+      keepForDays: Number(retention),
+      autoDelete: true,
+    };
+    backupSettings.storageLocation = storageLocation;
+
     if (cloudConfig) {
       backupSettings.cloudConfig = {
         provider: cloudConfig.provider || 'local',
@@ -986,33 +1157,21 @@ exports.updateBackupSettings = async (req, res) => {
       };
     }
 
-    // Calculate next run based on frequency
-    const now = new Date();
-    switch (frequency) {
-      case 'hourly':
-        backupSettings.schedule.nextRun = new Date(now.getTime() + 60 * 60 * 1000);
-        backupSettings.schedule.cronExpression = '0 * * * *';
-        break;
-      case 'daily':
-        backupSettings.schedule.nextRun = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-        backupSettings.schedule.cronExpression = '0 2 * * *';
-        break;
-      case 'weekly':
-        backupSettings.schedule.nextRun = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-        backupSettings.schedule.cronExpression = '0 2 * * 0';
-        break;
-      case 'monthly':
-        backupSettings.schedule.nextRun = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-        backupSettings.schedule.cronExpression = '0 2 1 * *';
-        break;
-    }
-
     await backupSettings.save();
 
     res.json({
       success: true,
       message: 'Backup settings updated successfully',
-      data: backupSettings
+      data: {
+        enabled: schedule.enabled,
+        frequency: schedule.frequency,
+        retention: backupSettings.retention.keepForDays,
+        storageLocation: backupSettings.storageLocation,
+        autoVerify: true,
+        lastRun: schedule.lastRun || null,
+        nextRun: schedule.nextRun,
+        cloudConfig: backupSettings.cloudConfig,
+      },
     });
   } catch (error) {
     console.error('Error updating backup settings:', error);
@@ -1030,10 +1189,10 @@ exports.updateBackupSettings = async (req, res) => {
 exports.downloadBackup = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
-    const backup = await Backup.findOne({ 
-      _id: req.params.id, 
-      company: companyId 
+
+    const backup = await Backup.findOne({
+      _id: req.params.id,
+      company: companyId
     });
 
     if (!backup) {
@@ -1067,20 +1226,20 @@ exports.downloadBackup = async (req, res) => {
 exports.getBackupStats = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
-    
+
     const stats = await Backup.aggregate([
       { $match: { company: new mongoose.Types.ObjectId(companyId) } },
       {
         $group: {
           _id: null,
           totalBackups: { $sum: 1 },
-          completedBackups: { 
+          completedBackups: {
             $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
           },
-          verifiedBackups: { 
+          verifiedBackups: {
             $sum: { $cond: [{ $eq: ['$status', 'verified'] }, 1, 0] }
           },
-          failedBackups: { 
+          failedBackups: {
             $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] }
           },
           totalSize: { $sum: '$fileSize' },
@@ -1102,7 +1261,7 @@ exports.getBackupStats = async (req, res) => {
       success: true,
       data: {
         ...result,
-        formattedTotalSize: result.totalSize === 0 ? '0 B' : 
+        formattedTotalSize: result.totalSize === 0 ? '0 B' :
           formatBytes(result.totalSize)
       }
     });

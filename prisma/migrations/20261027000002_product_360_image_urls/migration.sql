@@ -1,0 +1,2 @@
+ALTER TABLE "products"
+  ADD COLUMN "image_urls" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];

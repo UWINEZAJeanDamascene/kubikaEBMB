@@ -1627,7 +1627,7 @@ exports.getPosProducts = async (req, res, next) => {
     // Keyset pagination uses the indexed sort key and a single look-ahead row.
     // It avoids a full matching-row count and work proportional to page depth.
     const fetchedProducts = await Product.find(query)
-      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode category isStockable trackingType trackSerialNumbers trackBatch')
+      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode imageUrl imageUrls category isStockable trackingType trackSerialNumbers trackBatch')
       .sort({ name: 1, _id: 1 })
       .limit(resultLimit + 1);
     const hasMore = fetchedProducts.length > resultLimit;
@@ -1678,6 +1678,8 @@ exports.getPosProducts = async (req, res, next) => {
         name: p.name,
         sku: p.sku,
         barcode: p.barcode,
+        imageUrl: p.imageUrl || null,
+        imageUrls: Array.isArray(p.imageUrls) ? p.imageUrls : [],
         sellingPrice: effectivePrice(String(p._id), toNumber(p.sellingPrice), priceListPricing.priceByProduct),
         standardSellingPrice: toNumber(p.sellingPrice),
         unit: p.unit,

@@ -4,6 +4,8 @@ const ALIASES = {
   name: ['name', 'product_name', 'product name', 'item_name', 'item name', 'description', 'product_title', 'title', 'nom', 'article', 'libelle', 'designation'],
   sku: ['sku', 'code', 'product_code', 'item_code', 'article_code', 'ref', 'reference', 'code_article', 'item_number', 'part_number'],
   barcode: ['barcode', 'bar_code', 'ean', 'ean13', 'upc'],
+  imageUrl: ['image_url', 'image url', 'imageurl', 'product_image_url', 'product image url', 'photo_url', 'photo url'],
+  imageUrls: ['image_urls', '360_view_image_urls', '360 view image urls', 'product_angle_urls', 'angle_image_urls'],
   sellingPrice: ['price', 'unit_price', 'selling_price', 'prix', 'prix_unitaire', 'sale_price', 'retail_price', 'amount'],
   costPrice: ['cost', 'cost_price', 'purchase_price', 'prix_achat', 'unit_cost', 'buying_price'],
   openingStockQuantity: ['quantity', 'qty', 'stock', 'stock_quantity', 'quantite', 'on_hand', 'current_stock', 'opening_stock'],

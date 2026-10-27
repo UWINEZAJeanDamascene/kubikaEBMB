@@ -126,7 +126,7 @@ describe('registered-item select request', () => {
       tin: '999991130',
       bhfId: '02',
       lastReqDt: '20261014120000',
-    });
+    }, { companyId: 'company-1', branchId: '02' });
     expect(ebmService.selectItems.mock.calls[0][0]).toEqual({
       tin: '999991130',
       bhfId: '02',
@@ -144,7 +144,7 @@ describe('registered-item select request', () => {
       tin: '999991130',
       bhfId: '00',
       lastReqDt: '20000101000000',
-    });
+    }, { companyId: 'company-1', branchId: '00' });
     expect(result.summary).toMatchObject({
       cursorPolicy: 'mock_simulated_incremental',
       cursorBaseline: '20000101000000',
@@ -312,7 +312,7 @@ describe('registered-item select request', () => {
       tin: '999991130',
       bhfId: '00',
       lastReqDt: '20000101000000',
-    });
+    }, { companyId: 'company-1', branchId: '00' });
     expect(transactionClient.ebmSyncState.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ lastReqDt: '20261014120000' }),
       data: expect.objectContaining({ lastReqDt: '20261015120000' }),
@@ -448,7 +448,7 @@ describe('registered-item select request', () => {
       tin: '999991130',
       bhfId: '00',
       lastReqDt: '20160523000000',
-    });
+    }, { companyId: 'company-1', branchId: '00' });
     expect(result.lastReqDt).toBe('20160523000000');
     expect(result.summary).toMatchObject({
       cursorPolicy: 'fixed_baseline_replay_unconfirmed',
@@ -474,7 +474,7 @@ describe('registered-item select request', () => {
       tin: '999991130',
       bhfId: '00',
       lastReqDt: '20261014120000',
-    });
+    }, { companyId: 'company-1', branchId: '00' });
     expect(result.lastReqDt).toBe('20261015120000');
     expect(result.summary).toMatchObject({
       cursorPolicy: 'rra_confirmed_incremental',

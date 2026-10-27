@@ -1,138 +1,56 @@
-# Database Backup Configuration
+# Tenant backups
 
-This guide covers automated database backups for your Stock Management System.
+Automated backups are configured per company from **Settings → Backup & Restore**.
+The saved PostgreSQL schedule is the source of truth; `AUTO_BACKUP_ENABLED`,
+`BACKUP_CRON`, and the legacy MongoDB scheduler do not control these backups.
 
-## Configuration
+## Running scheduled backups
 
-Add to `.env.staging` or `.env.production`:
-
-```env
-# Enable automatic backups
-AUTO_BACKUP_ENABLED=true
-
-# Backup schedule (cron format)
-# Default: Daily at 2am
-BACKUP_CRON=0 2 * * *
-
-# Backup retention (days)
-BACKUP_RETENTION_DAYS=30
-
-# Backup directory
-BACKUP_DIR=./backups
-
-# Cloud backup (enable to upload to cloud)
-ENABLE_CLOUD_BACKUP=true
-
-# Optional: AWS S3
-AWS_S3_BUCKET=your-bucket-name
-AWS_REGION=us-east-1
-
-# Optional: Google Drive (requires GOOGLE_DRIVE_FOLDER_ID)
-
-# Optional: Dropbox (requires DROPBOX_ACCESS_TOKEN)
-```
-
----
-
-## How It Works
-
-1. **Scheduled**: Runs daily at 2am (configurable)
-2. **Local**: Creates `.gz` backup in `./backups`
-3. **Cloud**: Uploads to S3/Drive/Dropbox if configured
-4. **Retention**: Deletes backups older than 30 days
-
----
-
-## Manual Backup
+Run the dedicated worker alongside the web application:
 
 ```bash
-# Run backup manually
-node -e "
-const backupScheduler = require('./services/backupScheduler');
-backupScheduler.runBackup();
-"
+npm run worker
 ```
 
----
+The worker checks enabled company schedules every minute, claims due runs
+atomically so multiple worker replicas do not create duplicate backups, and
+creates a tracked automated backup using the same Prisma-backed archive flow as
+manual backups. Frequency is measured from when the schedule is saved and each
+completed run. Every complete archive is automatically checksum-verified after
+creation; incomplete archives remain marked with errors and are not labeled
+verified.
 
-## Restore from Backup
+If the worker is stopped, scheduled runs do not execute until a worker is
+running again. On startup, overdue enabled schedules are picked up by the next
+schedule scan.
 
-```bash
-# Use restore script
-./scripts/restore.sh backups/backup_latest.gz
+## Manual backup and restore
 
-# Or specific file
-./scripts/restore.sh backups/backup_20240115_020000.gz
-```
+Use **Create Backup** on the Backup & Restore page for an immediate backup. Use
+the page's restore action to restore a complete compatible archive. Restore is
+transactional and refuses incomplete or incompatible archives. Each application
+archive is a full tenant snapshot collected during the backup run; its timestamp
+is the snapshot creation time, not a selectable historical database state.
 
----
+## Current boundaries
 
-## Cloud Storage Setup
-
-### AWS S3
-
-1. Create S3 bucket
-2. Create IAM user with S3 access
-3. Add credentials to environment
-
-### Google Drive
-
-1. Set `GOOGLE_DRIVE_FOLDER_ID` in environment
-2. Service account must have access to folder
-
-### Dropbox
-
-1. Create Dropbox app
-2. Add `DROPBOX_ACCESS_TOKEN` to environment
-
----
-
-## Backup Schedule
-
-| Environment | Frequency | Retention |
-|-------------|------------|-----------|
-| Staging | Daily | 7 days |
-| Production | Daily | 30 days |
-
----
-
-## Monitoring
-
-- Check backup logs: `logs/combined.log`
-- Look for: "Backup completed successfully"
-- Alerts: Configure via Sentry for failures
-
----
-
-## Verification
-
-To verify a backup is valid:
-
-```bash
-# List backups
-ls -la backups/
-
-# Check backup size
-du -h backups/backup_*
-
-# Test restore (to test database)
-./scripts/restore.sh --db test_backup
-```
-
----
-
-## Troubleshooting
-
-### "Backup not created"
-- Check MongoDB connection
-- Check disk space: `df -h`
-- Check permissions: `ls -la backups/`
-
-### "Cloud upload failed"
-- Verify cloud credentials
-- Check network connectivity
-- Check bucket/folder permissions
-
-### "Disk full"
-- Clean old backups: `find backups -mtime +7 -delete`
-- Increase retention cleanup frequency
+- Local archive files are written to the application server's `backups`
+  directory. A local-only copy does not protect against loss of that server or
+  its storage. The UI labels these copies **Local only**.
+- Remote copies count as off-site protected only after the provider confirms the
+  upload. A failed remote upload leaves the local archive available and is
+  recorded as **Remote copy failed** with an error; it is not represented as an
+  off-site success.
+- Amazon S3 uses `AWS_S3_BUCKET`, `AWS_REGION` (or `AWS_DEFAULT_REGION`),
+  `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`. Temporary credentials may
+  also use `AWS_SESSION_TOKEN`; optional `AWS_S3_PREFIX` and `AWS_S3_ENDPOINT`
+  support object prefixes and S3-compatible endpoints. The bucket and region
+  saved in backup settings take precedence over the corresponding environment
+  values. Google Drive and Dropbox require their server-side credentials.
+- The retention value is stored with the schedule, but automatic deletion of
+  expired backup files is not implemented yet. Do not rely on that setting for
+  retention enforcement.
+- This is a tenant data export, not a PostgreSQL physical or point-in-time
+  recovery image. The application rejects a requested point-in-time cutoff
+  instead of filtering rows by `createdAt`; database-provider recovery remains
+  the separate layer for exact historical recovery.

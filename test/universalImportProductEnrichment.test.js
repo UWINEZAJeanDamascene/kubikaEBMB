@@ -1,5 +1,6 @@
 const { getEntityDefinition } = require('../services/importDefinitions');
 const ImportService = require('../services/universalImportService');
+const Product = require('../models/Product');
 
 describe('universal product import enrichment contract', () => {
   it('requires the same core product and RRA classification selections as product creation', () => {
@@ -39,6 +40,7 @@ describe('universal product import enrichment contract', () => {
       cogsAccount: '5000',
       revenueAccount: '4000',
       supplierId: 'supplier-1',
+      imageUrls: 'https://cdn.example.test/rice-front.jpg\nhttps://cdn.example.test/rice-side.jpg',
     });
 
     expect(payload).toMatchObject({
@@ -50,6 +52,7 @@ describe('universal product import enrichment contract', () => {
       inventoryAccount: '1400',
       cogsAccount: '5000',
       revenueAccount: '4000',
+      imageUrls: ['https://cdn.example.test/rice-front.jpg', 'https://cdn.example.test/rice-side.jpg'],
       supplier: 'supplier-1',
       ebm: {
         taxTyCd: 'B',
@@ -82,5 +85,38 @@ describe('universal product import enrichment contract', () => {
 
   it('normalizes duplicate product keys within an import file', () => {
     expect(ImportService.__test__.duplicateKeyFor('products', { sku: ' prd-025 ' })).toBe('PRD-025');
+  });
+
+  it('allows an existing barcode when it belongs to the same product identified by SKU', async () => {
+    const product = { _id: 'product-1' };
+    const findOne = jest.spyOn(Product, 'findOne').mockImplementation((query) => ({
+      lean: async () => query.barcode ? product : product,
+    }));
+    try {
+      const errors = await ImportService.__test__.validateRelatedRecords('products', {
+        sku: 'prd-025',
+        barcode: '6001234567890',
+      }, 'company-1', new Map());
+      expect(errors).toEqual([]);
+    } finally {
+      findOne.mockRestore();
+    }
+  });
+
+  it('rejects an existing barcode owned by a different product from the imported SKU', async () => {
+    const existingBarcodeProduct = { _id: 'product-barcode-owner' };
+    const existingSkuProduct = { _id: 'product-sku-owner' };
+    const findOne = jest.spyOn(Product, 'findOne').mockImplementation((query) => ({
+      lean: async () => query.barcode ? existingBarcodeProduct : existingSkuProduct,
+    }));
+    try {
+      const errors = await ImportService.__test__.validateRelatedRecords('products', {
+        sku: 'prd-026',
+        barcode: '6001234567890',
+      }, 'company-1', new Map());
+      expect(errors).toEqual([expect.objectContaining({ field: 'barcode' })]);
+    } finally {
+      findOne.mockRestore();
+    }
   });
 });

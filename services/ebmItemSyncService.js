@@ -152,7 +152,10 @@ class EBMItemSyncService {
       bhfId: branchId,
       lastReqDt,
     });
-    const response = await ebmService.selectItems(lookupRequest);
+    const response = await ebmService.selectItems(lookupRequest, {
+      companyId: tenantId,
+      branchId,
+    });
     const validatedResponse = validateItemSelectResponse(response, {
       tin: device.tin,
       bhfId: branchId,

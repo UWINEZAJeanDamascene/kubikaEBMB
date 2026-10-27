@@ -364,15 +364,32 @@ async function buildProductEnrichmentContext(companyId) {
   const ChartOfAccount = require('../models/ChartOfAccount');
   const Company = require('../models/Company');
 
+  // The HTTP query guard caps each read at 500 rows. Fetch larger tenant
+  // catalogs in stable pages so validation and template generation neither
+  // trip the guard nor silently omit valid choices after the first page.
+  const readAllPages = async (queryFactory) => {
+    const rows = [];
+    const pageSize = 500;
+    for (let skip = 0; ; skip += pageSize) {
+      const page = await queryFactory()
+        .sort({ _id: 1 })
+        .skip(skip)
+        .limit(pageSize)
+        .lean();
+      rows.push(...page);
+      if (page.length < pageSize) return rows;
+    }
+  };
+
   const [company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts] = await Promise.all([
     Company.findById(companyId).lean(),
-    Category.find({ company: companyId }).lean(),
-    Warehouse.find({ company: companyId, isActive: { $ne: false } }).lean(),
-    Supplier.find({ company: companyId, isActive: { $ne: false } }).lean(),
-    Product.find({ company: companyId }).select('brand').lean(),
-    EBMItemClass.find({ company: companyId, active: { $ne: false } }).lean(),
-    EBMCode.find({ company: companyId, active: { $ne: false } }).lean(),
-    ChartOfAccount.find({ company: companyId, isActive: true }).lean(),
+    readAllPages(() => Category.find({ company: companyId })),
+    readAllPages(() => Warehouse.find({ company: companyId, isActive: { $ne: false } })),
+    readAllPages(() => Supplier.find({ company: companyId, isActive: { $ne: false } })),
+    readAllPages(() => Product.find({ company: companyId }).select('brand')),
+    readAllPages(() => EBMItemClass.find({ company: companyId, active: { $ne: false } })),
+    readAllPages(() => EBMCode.find({ company: companyId, active: { $ne: false } })),
+    readAllPages(() => ChartOfAccount.find({ company: companyId, isActive: true })),
   ]);
 
   return { company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts };
@@ -710,6 +727,32 @@ function validateCleanRow(entityType, clean, rowNumber) {
       if (patterns[type] && !patterns[type].test(barcode)) errors.push(buildValidationError(rowNumber, 'barcode', `${type} barcode has an invalid length or format.`, clean.barcode));
       if (type === 'CODE39' && !/^[0-9A-Z .$/+%-]+$/i.test(barcode)) errors.push(buildValidationError(rowNumber, 'barcode', 'Barcode contains characters that are not supported by CODE39.', clean.barcode));
     }
+    if (!isBlank(clean.imageUrl)) {
+      try {
+        const imageUrl = new URL(String(clean.imageUrl).trim());
+        if (!['http:', 'https:'].includes(imageUrl.protocol) || imageUrl.username || imageUrl.password || String(clean.imageUrl).trim().length > 2048) {
+          throw new Error('invalid image URL');
+        }
+      } catch {
+        errors.push(buildValidationError(rowNumber, 'imageUrl', 'Image URL must be a valid HTTP or HTTPS URL up to 2048 characters.', clean.imageUrl));
+      }
+    }
+    if (!isBlank(clean.imageUrls)) {
+      const imageUrls = String(clean.imageUrls).split(/[\r\n;|]+/).map((url) => url.trim()).filter(Boolean);
+      if (imageUrls.length > 36) {
+        errors.push(buildValidationError(rowNumber, 'imageUrls', 'Use no more than 36 angle image URLs.', clean.imageUrls));
+      } else {
+        for (const imageUrl of imageUrls) {
+          try {
+            const parsed = new URL(imageUrl);
+            if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || imageUrl.length > 2048) throw new Error('invalid image URL');
+          } catch {
+            errors.push(buildValidationError(rowNumber, 'imageUrls', 'Each 360° image URL must be a valid HTTP or HTTPS URL up to 2048 characters.', imageUrl));
+            break;
+          }
+        }
+      }
+    }
   }
 
   return { errors, warnings };
@@ -727,6 +770,30 @@ async function validateRelatedRecords(entityType, clean, companyId, cache) {
     return cache.get(key);
   };
   const byName = (name) => new RegExp(`^${escapeRegExp(String(name).trim())}$`, 'i');
+  if (entityType === 'products' && !isBlank(clean.barcode)) {
+    const barcode = String(clean.barcode).trim();
+    const existing = await lookup('../models/Product', 'barcode', barcode, {
+      company: companyId,
+      barcode: { $regex: `^${escapeRegExp(barcode)}$`, $options: 'i' },
+    });
+    // A product update import commonly repeats the product's current barcode.
+    // Treat it as a conflict only when that barcode belongs to a different
+    // product than the row's SKU identifies. This keeps update-by-SKU usable
+    // while preventing accidental reassignment of another product's barcode.
+    const sku = String(clean.sku || '').trim().toUpperCase();
+    const existingBySku = sku ? await lookup('../models/Product', 'sku', sku, {
+      company: companyId,
+      sku,
+    }) : null;
+    if (existing && String(existing._id) !== String(existingBySku?._id || '')) {
+      errors.push({ field: 'barcode', message: 'This barcode is already assigned to a different product in this workspace.' });
+    }
+    const seenBarcodes = cache.get('product-import-barcodes') || new Set();
+    const normalizedBarcode = barcode.toUpperCase();
+    if (seenBarcodes.has(normalizedBarcode)) errors.push({ field: 'barcode', message: 'This barcode appears more than once in the import file.' });
+    seenBarcodes.add(normalizedBarcode);
+    cache.set('product-import-barcodes', seenBarcodes);
+  }
   if (entityType === 'products' && String(clean.trackingType || '').toLowerCase() === 'serial') {
     const serials = parseImportedSerialNumbers(clean.serialNumbers);
     if (serials.length) {
@@ -1359,6 +1426,8 @@ function productPayload(companyId, userId, data) {
     sku: String(data.sku).toUpperCase(),
     description: data.description,
     barcode: data.barcode || null,
+    imageUrl: data.imageUrl ? String(data.imageUrl).trim() : null,
+    imageUrls: isBlank(data.imageUrls) ? [] : String(data.imageUrls).split(/[\r\n;|]+/).map((url) => url.trim()).filter(Boolean).slice(0, 36),
     unit,
     currentStock: 0,
     lowStockThreshold: parseNumber(data.reorderLevel) || 0,
@@ -1874,5 +1943,6 @@ module.exports = {
     isPackagingUnitCode,
     isQuantityUnitCode,
     productPayload,
+    validateRelatedRecords,
   }
 };

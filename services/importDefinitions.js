@@ -19,6 +19,8 @@ const ENTITY_DEFINITIONS = {
       { key: 'category', label: 'Category', required: true, section: 'Basic information', example: 'Dairy', instructions: 'Choose an existing category from the dropdown. Values are loaded from this workspace.' },
       { key: 'barcode', label: 'Barcode', required: false, section: 'Basic information', example: '6001234567890', instructions: 'Optional scanned barcode; keep as text to preserve leading zeroes.' },
       { key: 'barcodeType', label: 'Barcode Type', required: false, section: 'Basic information', example: 'EAN13', instructions: 'CODE128, EAN13, EAN8, UPC, CODE39, ITF14, QR, or NONE.' },
+      { key: 'imageUrl', label: 'Image URL', required: false, section: 'Basic information', example: 'https://example.com/product.jpg', instructions: 'Optional publicly reachable HTTP or HTTPS image URL shown in POS.' },
+      { key: 'imageUrls', label: '360 View Image URLs', required: false, section: 'Basic information', example: 'https://example.com/product-front.jpg\nhttps://example.com/product-side.jpg', instructions: 'Optional 2–36 publicly reachable HTTP or HTTPS images, one angle per line, for drag-to-rotate POS view.' },
       { key: 'unit', label: 'Unit of Measure', required: true, section: 'Basic information', example: 'pcs', instructions: 'kg, g, pcs, box, m, m2, m3, l, ml, ton, bag, roll, sheet, or set.' },
       { key: 'description', label: 'Description', required: false, section: 'Basic information', example: 'Long life milk', instructions: 'Optional product notes.' },
       { key: 'brand', label: 'Brand', required: false, section: 'Basic information', example: 'Inyange', instructions: 'Optional brand name.' },

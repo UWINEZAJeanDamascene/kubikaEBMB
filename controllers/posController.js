@@ -133,7 +133,9 @@ exports.getReceipt = async (req, res, next) => {
     const ebmStatus = data.ebm.ebmStatus || 'not_submitted';
     data.companyReceipt = {
       name: company?.name || 'Company',
-      tin: company?.tax_identification_number || company?.registration_number || '',
+      // A company registration number is not a taxpayer identification number.
+      // Never print it under the TIN label when the actual TIN is missing.
+      tin: company?.tax_identification_number || '',
       address: typeof company?.address === 'string'
         ? company.address
         : [company?.address?.street, company?.address?.city, company?.address?.country].filter(Boolean).join(', '),
@@ -151,6 +153,18 @@ exports.getReceipt = async (req, res, next) => {
         itemName,
         itemCode: fiscalLine.itemCd || line.productCode || line.product?.sku || null,
         taxClassCode: fiscalLine.itemClsCd || line.product?.ebm?.itemClsCd || null,
+        barcode: fiscalLine.bcd || line.product?.barcode || null,
+        packageUnitCode: fiscalLine.pkgUnitCd || null,
+        packageQuantity: fiscalLine.pkg ?? null,
+        quantityUnitCode: fiscalLine.qtyUnitCd || null,
+        taxTypeCode: fiscalLine.taxTyCd || tax.taxTyCd || null,
+        supplyAmount: fiscalLine.splyAmt ?? null,
+        discountRate: fiscalLine.dcRt ?? null,
+        discountAmount: fiscalLine.dcAmt ?? null,
+        insuranceCode: fiscalLine.isrccCd || null,
+        insuranceName: fiscalLine.isrccNm || null,
+        insuranceRate: fiscalLine.isrccRt ?? null,
+        insuranceAmount: fiscalLine.isrccAmt ?? null,
         quantity: line.quantity || line.qty || 0,
         unit: getReceiptUnit(itemName, line.unit || line.product?.unit),
         unitPriceRwf: formatRwf(line.unitPrice),
@@ -167,6 +181,13 @@ exports.getReceipt = async (req, res, next) => {
     data.rraInvoiceNo = salesPayload.invcNo == null ? null : String(salesPayload.invcNo);
     data.rraOriginalInvoiceNo = salesPayload.orgInvcNo == null ? null : String(salesPayload.orgInvcNo);
     data.rraPurchaseCode = salesPayload.prcOrdCd || null;
+    data.rraSalesTypeCode = salesPayload.salesTyCd || null;
+    data.rraReceiptTypeCode = salesPayload.rcptTyCd || null;
+    data.rraPaymentTypeCode = salesPayload.pmtTyCd || null;
+    data.rraInvoiceStatusCode = salesPayload.salesSttsCd || null;
+    data.rraPurchaseAccepted = salesPayload.prchrAcptcYn || null;
+    data.rraValidatedAt = salesPayload.cfmDt || null;
+    data.rraSaleDate = salesPayload.salesDt || null;
     data.rraCustomerPhone = salesPayload.receipt?.custMblNo || data.client?.contact?.phone || null;
     const totals = extractPayloadTotals(data.ebm, data);
     data.rraTotals = {

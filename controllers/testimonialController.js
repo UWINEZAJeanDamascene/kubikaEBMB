@@ -20,6 +20,24 @@ exports.getTestimonials = async (req, res) => {
   }
 };
 
+// Full management list is restricted to platform administrators.
+exports.getAllTestimonialsForAdmin = async (req, res) => {
+  try {
+    const testimonials = await Testimonial.find()
+      .sort({ order: 1, createdAt: -1 });
+    res.status(200).json({
+      success: true,
+      count: testimonials.length,
+      data: testimonials,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
 // Get single testimonial
 exports.getTestimonial = async (req, res) => {
   try {

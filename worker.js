@@ -49,6 +49,7 @@ async function startWorker() {
   startSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').startScheduler());
   startSafely('ebm-retry', () => require('./services/ebmRetryJob').startRetryJob());
   startSafely('report-snapshots', () => require('./services/reportSchedulerService').initializeScheduler());
+  startSafely('tenant-backups', () => require('./services/backupScheduler').startScheduler());
   startSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').startMonitoringScheduler());
 
   // BullMQ job system. It was previously started only inside the web process's
@@ -58,12 +59,8 @@ async function startWorker() {
   // is false at this point in boot — the client is still connecting. Starting
   // them immediately therefore always hit the "Redis not available" path and
   // silently initialized nothing. Wait for the connection first.
-  // NOT started here: backupScheduler. It is a MongoDB backup implementation —
-  // it shells out to `mongodump --uri=config.db.uri`. With MONGODB_URI unset
-  // that expression is `undefined.split('/')`, a TypeError, and even if it ran
-  // it would archive a database that no longer holds the data. It needs a
-  // PostgreSQL implementation (pg_dump, or Neon's own backups) before any
-  // process starts it.
+  // Tenant backups use the Prisma-backed archive implementation and enabled
+  // schedules stored in PostgreSQL; the worker starts that scheduler above.
 
   await startJobSystem();
 
@@ -120,6 +117,7 @@ async function shutdown(signal) {
     };
     stopSafely('ebm-retry', () => require('./services/ebmRetryJob').stopRetryJob());
     stopSafely('report-snapshots', () => require('./services/reportSchedulerService').stopScheduler());
+    stopSafely('tenant-backups', () => require('./services/backupScheduler').stopScheduler());
     stopSafely('notifications', () => require('./services/notificationScheduler').stopScheduler());
     stopSafely('prepaid-expense-amortizations', () => require('./services/prepaidExpenseScheduler').stopScheduler());
     stopSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').stopScheduler());

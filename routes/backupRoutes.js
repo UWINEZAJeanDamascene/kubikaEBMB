@@ -8,6 +8,7 @@ const {
   verifyBackup,
   deleteBackup,
   getPointsInTime,
+  getSnapshots,
   getBackupSettings,
   updateBackupSettings,
   downloadBackup,
@@ -26,6 +27,7 @@ router.get('/stats', getBackupStats);
 
 // Get available point-in-time recovery points
 router.get('/points-in-time', getPointsInTime);
+router.get('/snapshots', getSnapshots);
 
 // Get backup settings
 router.get('/settings', getBackupSettings);

@@ -49,6 +49,17 @@ describe('EBM transport correlation IDs', () => {
     expect(result.requestId).toBe('corr-safe-123');
   });
 
+  it('forwards registered-item tenant context separately from its RRA request DTO', async () => {
+    const payload = { tin: '001234567', bhfId: '02', lastReqDt: '20200101000000' };
+    const context = { companyId: 'tenant-1', branchId: '02' };
+    const response = { resultCd: '000' };
+    service.call = jest.fn().mockResolvedValue(response);
+
+    await expect(service.selectItems(payload, context)).resolves.toBe(response);
+
+    expect(service.call).toHaveBeenCalledWith(VSDC_ENDPOINTS.SELECT_ITEMS, payload, context);
+  });
+
   it('preserves the transport correlation ID when lookup response validation fails', async () => {
     service.http.post = jest.fn().mockResolvedValue({
       status: 200,

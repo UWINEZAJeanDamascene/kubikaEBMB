@@ -34,6 +34,8 @@ const FIELD_MAP = {
   sku: { target: 'sku', transform: (v) => ({ sku: typeof v === 'string' ? v.toUpperCase() : v }) },
   barcode: { target: 'barcode' },
   barcodeType: { target: 'barcodeType' },
+  imageUrl: { target: 'imageUrl' },
+  imageUrls: { target: 'imageUrls' },
   description: { target: 'description' },
   category: { target: 'categoryId', isId: true },
   unit: { target: 'unit' },
@@ -102,7 +104,7 @@ function buildProductInclude(populate = []) {
 }
 
 const PRODUCT_SCALAR_FIELDS = [
-  'id', 'companyId', 'name', 'sku', 'barcode', 'barcodeType', 'description',
+  'id', 'companyId', 'name', 'sku', 'barcode', 'barcodeType', 'imageUrl', 'imageUrls', 'description',
   'categoryId', 'unit', 'supplierId', 'currentStock', 'reservedQuantity',
   'isActive', 'isStockable', 'lowStockThreshold', 'averageCost', 'sellingPrice',
   'costPrice', 'lastSupplyDate', 'lastSaleDate', 'costingMethod',

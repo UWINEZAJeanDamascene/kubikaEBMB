@@ -10,7 +10,7 @@ for (const [source, target] of Object.entries(map)) FIELD_MAP[source] = { target
 const defaults = {
   verification: { verified: false, verifiedAt: null, verifiedBy: null, checksum: null, integrityStatus: 'not_verified', errorMessage: null },
   restore: { restoredAt: null, restoredBy: null, originalBackupId: null },
-  schedule: { enabled: false, frequency: 'daily', cronExpression: null, lastRun: null, nextRun: null },
+  schedule: { enabled: false, frequency: 'daily', cronExpression: null, lastRun: null, nextRun: null, autoVerify: true },
   retention: { keepForDays: 30, autoDelete: true },
   cloudConfig: { provider: 'local', bucket: null, region: null },
 };

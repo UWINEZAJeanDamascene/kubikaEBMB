@@ -1004,8 +1004,8 @@ class EBMService {
     return this.saveBranchInsurance(payload);
   }
 
-  selectItems(payload) {
-    return this.call(VSDC_ENDPOINTS.SELECT_ITEMS, payload);
+  selectItems(payload, context = {}) {
+    return this.call(VSDC_ENDPOINTS.SELECT_ITEMS, payload, context);
   }
 
   saveItems(payload, context = {}) {

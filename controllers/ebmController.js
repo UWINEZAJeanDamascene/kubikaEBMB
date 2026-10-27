@@ -242,10 +242,13 @@ exports.initializeDevice = async (req, res, next) => {
 exports.syncCodes = async (req, res, next) => {
   try {
     const companyId = getCompanyId(req);
-    const result = await EBMCodeSyncService.syncAll(companyId, {
+    const syncOptions = {
       branchId: req.body.branchId || req.body.bhfId,
       full: req.body.full === true,
-    });
+    };
+    const result = req.body.allBranches === true
+      ? await EBMCodeSyncService.syncAllInitializedBranches(companyId, syncOptions)
+      : await EBMCodeSyncService.syncAll(companyId, syncOptions);
     res.json({ success: result.outcome === 'complete', data: result });
   } catch (error) {
     next(error);

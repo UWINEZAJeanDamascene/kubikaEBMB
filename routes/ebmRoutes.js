@@ -123,6 +123,7 @@ router.post(
   body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   body('full').optional().isBoolean(),
+  body('allBranches').optional().isBoolean(),
   body('prcOrdCd').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 5 }),
   validateRequest,
   stripUnvalidatedBody,
