@@ -5272,6 +5272,23 @@ model Notification {
   @@map("notifications")
 }
 
+/// Durable cooldown state for scheduler-generated stock notifications.
+/// One row per company, product, and alert type prevents overlapping workers
+/// from creating duplicate in-app alerts for the same unresolved condition.
+model StockAlertCooldown {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  productId      String   @map("product_id") @db.Char(24)
+  alertType      String   @map("alert_type")
+  lastNotifiedAt DateTime @map("last_notified_at") @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, productId, alertType])
+  @@index([companyId, lastNotifiedAt])
+  @@map("stock_alert_cooldowns")
+}
+
 /// Per-company notification preferences. The Mongoose document nested these
 /// under emailNotifications / smsNotifications / preferences; they are flattened
 /// into columns here so defaults are enforced by the database, and the API shape
@@ -5292,6 +5309,8 @@ model NotificationSettings {
   paymentReminderDays   Int      @default(3) @map("payment_reminder_days")
   summarySendTime       String   @default("09:00") @map("summary_send_time")
   largeOrderThreshold   Decimal  @default(10000) @map("large_order_threshold") @db.Decimal(19, 4)
+  lastDailySummaryDate  String?  @map("last_daily_summary_date") @db.VarChar(10)
+  lastWeeklySummaryDate String?  @map("last_weekly_summary_date") @db.VarChar(10)
   criticalAlertPhones   String[] @map("critical_alert_phones")
   createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)

@@ -158,6 +158,18 @@ const sendLowStockCriticalSMS = async (product, company, phoneNumbers) => {
   return results;
 };
 
+const sendLowStockAlertSMS = async (product, company, phoneNumbers, isCritical = false) => {
+  const severity = isCritical ? 'CRITICAL LOW STOCK' : 'LOW STOCK';
+  const action = isCritical ? 'Immediate reorder required' : 'Please review reorder needs';
+  const message = `${severity} ALERT: ${product.name} (SKU: ${product.sku || 'N/A'}) has ${product.currentStock} units remaining. ${action}.`;
+  const results = [];
+  for (const phone of phoneNumbers) {
+    const result = await sendSMS(phone, message);
+    results.push({ phone, ...result });
+  }
+  return results;
+};
+
 // Send payment overdue critical alert
 const sendPaymentOverdueSMS = async (invoice, company, phoneNumbers) => {
   const message = `⚠️ PAYMENT OVERDUE: Invoice ${invoice.invoiceNumber} for ${(invoice.currency || '$')}${(invoice.balance || invoice.total).toFixed(2)} is overdue. Please contact client immediately.`;
@@ -207,6 +219,7 @@ module.exports = {
   normalizePhoneNumber,
   // Critical event notifications
   sendLowStockCriticalSMS,
+  sendLowStockAlertSMS,
   sendPaymentOverdueSMS,
   sendLargeOrderSMS,
   sendSecurityAlertSMS

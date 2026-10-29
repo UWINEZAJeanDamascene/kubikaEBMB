@@ -328,6 +328,9 @@ exports.registerPublic = async (req, res) => {
     if (code === 'PASSWORD_TOO_SHORT') {
       return res.status(400).json({ success: false, message: 'Password must be at least 8 characters', code });
     }
+    if (code === 'PASSWORD_POLICY_VIOLATION') {
+      return res.status(400).json({ success: false, message: error.message, code });
+    }
     if (error.message === 'MISSING_REQUIRED_FIELDS') {
       return res.status(400).json({ success: false, message: 'Please fill in all required fields' });
     }

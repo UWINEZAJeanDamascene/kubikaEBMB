@@ -1015,6 +1015,9 @@ const sendQuotationEmail = async (quotation, company, client, action = 'sent', r
 // ============================================
 
 module.exports = {
+  // Expose the same non-secret configuration summary used by notification
+  // settings and provider health indicators.
+  validateConfig: () => require('../config/email').validateConfig(),
   sendEmail,
   // Invoice
   sendInvoiceEmail,

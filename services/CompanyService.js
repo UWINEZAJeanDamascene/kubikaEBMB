@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { prisma } = require('../lib/prisma');
+const { getPasswordPolicyError } = require('../utils/passwordPolicy');
 const { generateObjectId, toIdString } = require('../utils/objectId');
 const { companyToApi, companyInputToPrisma, userToApi } = require('../utils/authMappers');
 const passwordUtils = require('../utils/passwordUtils');
@@ -284,9 +285,10 @@ class CompanyService {
     if (!emailCompany || !c.name || !emailAdmin || !a.name || !a.password) {
       throw new Error('MISSING_REQUIRED_FIELDS');
     }
-    if (a.password.length < 8) {
-      const err = new Error('PASSWORD_TOO_SHORT');
-      err.code = 'PASSWORD_TOO_SHORT';
+    const passwordError = getPasswordPolicyError(a.password);
+    if (passwordError) {
+      const err = new Error(passwordError.message);
+      err.code = passwordError.code;
       throw err;
     }
 

@@ -3,6 +3,7 @@ const { notifyPasswordChanged, notifyFailedLogin } = require('../services/notifi
 const sessionService = require('../services/sessionService');
 const authData = require('../services/authDataService');
 const passwordUtils = require('../utils/passwordUtils');
+const { getPasswordPolicyError } = require('../utils/passwordPolicy');
 // Centralized config
 const env = require('../src/config/environment');
 const config = env.getConfig();
@@ -358,6 +359,15 @@ exports.updatePassword = async (req, res, next) => {
       return res.status(400).json({ 
         success: false, 
         message: 'Please provide current and new password' 
+      });
+    }
+
+    const passwordError = getPasswordPolicyError(newPassword);
+    if (passwordError) {
+      return res.status(400).json({
+        success: false,
+        message: passwordError.message,
+        code: passwordError.code,
       });
     }
 

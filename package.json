@@ -4,8 +4,8 @@
   "description": "Stock Management System Backend for Quantity Survey",
   "main": "server.js",
   "scripts": {
-    "start": "npm run db:migrate:deploy && node server.js",
-    "dev": "nodemon server.js",
+    "start": "npm run db:migrate:deploy && concurrently --kill-others --success first --names server,worker --prefix-colors cyan,magenta \"node server.js\" \"node worker.js\"",
+    "dev": "concurrently --kill-others --success first --names server,worker --prefix-colors cyan,magenta \"nodemon server.js\" \"nodemon worker.js\"",
     "worker": "node worker.js",
     "worker:dev": "nodemon worker.js",
     "migrate:backfill-account-balances": "node scripts/backfill_account_balances.js --dry-run",
@@ -66,6 +66,7 @@
     "bullmq": "^5.70.4",
     "bwip-js": "^2.0.11",
     "compression": "^1.8.1",
+    "concurrently": "^10.0.6",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "csv-parse": "^6.2.1",

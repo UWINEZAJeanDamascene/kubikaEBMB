@@ -15,6 +15,7 @@ const Warehouse = require('../models/Warehouse');
 const EBMBranchService = require('../services/ebmBranchService');
 const { toIdString } = require('../utils/objectId');
 const { userToApi } = require('../utils/authMappers');
+const { getPasswordPolicyError } = require('../utils/passwordPolicy');
 
 // Generate JWT Token
 const generateToken = (id, companyId, role) => {
@@ -68,6 +69,9 @@ exports.register = async (req, res, next) => {
         code: 'PASSWORD_TOO_SHORT'
       });
     }
+    if (error.code === 'PASSWORD_POLICY_VIOLATION') {
+      return res.status(400).json({ success: false, message: error.message, code: error.code });
+    }
     next(error);
   }
 };
@@ -87,7 +91,15 @@ exports.login = async (req, res, next) => {
       });
     }
 
-    const result = await UserService.login(email, password, req.body.companyId);
+    const result = await UserService.login(email, password, req.body.companyId, {
+      userAgent: req.get('user-agent') || null,
+      ipAddress: req.ip || req.connection?.remoteAddress || null,
+    });
+
+    if (result.requiresTwoFA) {
+      res.clearCookie('token', { httpOnly: true, secure: config.server.env === 'production', sameSite: 'lax' });
+      return res.json({ success: true, requiresTwoFA: true, challengeToken: result.challengeToken, expiresIn: result.expiresIn });
+    }
 
     // Keep cookie-based clients aligned with the new access token too. The
     // bearer token remains the primary frontend contract, but an old cookie
@@ -123,6 +135,45 @@ exports.login = async (req, res, next) => {
         code: 'ACCOUNT_LOCKED',
         lockedUntil: error.lockedUntil
       });
+    }
+    if (error.code === 'TWO_FACTOR_CONFIGURATION_INVALID') {
+      return res.status(503).json({ success: false, code: error.code, message: 'Two-factor sign-in is enabled but is not fully configured. Contact an administrator.' });
+    }
+    if (error.code === 'TWO_FACTOR_CHALLENGE_UNAVAILABLE') {
+      return res.status(503).json({ success: false, code: error.code, message: 'Two-factor sign-in is temporarily unavailable. Please try again.' });
+    }
+    next(error);
+  }
+};
+
+/** Complete password-authenticated sign-in with the user's TOTP factor. */
+exports.verifyLoginTwoFactor = async (req, res, next) => {
+  try {
+    const result = await UserService.verifyLoginTwoFactor(req.body.challengeToken, req.body.token, {
+      userAgent: req.get('user-agent') || null,
+      ipAddress: req.ip || req.connection?.remoteAddress || null,
+    });
+    res.cookie('token', result.access_token, {
+      httpOnly: true,
+      secure: config.server.env === 'production',
+      sameSite: 'lax',
+      maxAge: config.session.ttl * 1000,
+    });
+    return res.json({
+      success: true,
+      token: result.access_token,
+      access_token: result.access_token,
+      refresh_token: result.refresh_token,
+      userId: result.userId,
+      user: result.user,
+      memberships: result.memberships,
+    });
+  } catch (error) {
+    if (['INVALID_TWO_FACTOR_CHALLENGE', 'INVALID_TWO_FACTOR_CODE'].includes(error.code)) {
+      return res.status(401).json({ success: false, code: error.code, message: 'The verification code is invalid or the sign-in challenge has expired.' });
+    }
+    if (error.code === 'TWO_FACTOR_CHALLENGE_UNAVAILABLE') {
+      return res.status(503).json({ success: false, code: error.code, message: 'Two-factor sign-in is temporarily unavailable. Please try again.' });
     }
     next(error);
   }
@@ -299,6 +350,9 @@ exports.changePassword = async (req, res, next) => {
         code: 'PASSWORD_TOO_SHORT'
       });
     }
+    if (error.code === 'PASSWORD_POLICY_VIOLATION') {
+      return res.status(400).json({ success: false, message: error.message, code: error.code });
+    }
     next(error);
   }
 };
@@ -338,6 +392,9 @@ exports.resetPassword = async (req, res, next) => {
         message: 'Password must be at least 8 characters',
         code: 'PASSWORD_TOO_SHORT'
       });
+    }
+    if (error.code === 'PASSWORD_POLICY_VIOLATION') {
+      return res.status(400).json({ success: false, message: error.message, code: error.code });
     }
     next(error);
   }
@@ -409,6 +466,10 @@ exports.logout = async (req, res, next) => {
     const token = req.headers.authorization?.split(' ')[1];
 
     if (req.user) {
+      await UserService.recordLoginHistory(req.user, 'logout', {
+        userAgent: req.get('user-agent') || null,
+        ipAddress: req.ip || req.connection?.remoteAddress || null,
+      }, 'success');
       await sessionService.deleteSession(req.user.id, token);
       if (token) {
         await sessionService.blacklistToken(token);
@@ -548,13 +609,15 @@ exports.setupPlatformAdmin = async (req, res, next) => {
       });
     }
 
-    if (password.length < 8) {
+    const passwordError = getPasswordPolicyError(password);
+    if (passwordError?.code === 'PASSWORD_TOO_SHORT') {
       return res.status(400).json({
         success: false,
-        message: 'Password must be at least 8 characters',
-        code: 'PASSWORD_TOO_SHORT'
+        message: passwordError.message,
+        code: passwordError.code
       });
     }
+    if (passwordError) return res.status(400).json({ success: false, message: passwordError.message, code: passwordError.code });
 
     // Check if any platform admin already exists
     const existingAdmin = await prisma.user.findFirst({ where: { role: 'platform_admin' } });

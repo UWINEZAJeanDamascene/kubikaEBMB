@@ -18,9 +18,8 @@ const REFRESH_EXPIRE = config.jwt.refreshExpiresIn;
 
 /**
  * Refresh-token rotation (RFC 6819 style):
- * - Each successful POST /api/auth/refresh issues a NEW refresh_token and invalidates the previous
- *   one by replacing the stored refresh token hash (see refreshWithRotation).
- * - Reusing an old refresh token fails validation and revokes all sessions for that user.
+ * - Each successful POST /api/auth/refresh issues a new refresh token within the same session family.
+ * - Refresh hashes are stored per session, so a detected replay revokes that session family only.
  */
 
 function sha256(plain) {
@@ -36,35 +35,39 @@ function membershipsForUser(user) {
   ];
 }
 
-function signTokenPair(userId, memberships) {
+function signTokenPair(userId, memberships, sessionId = crypto.randomBytes(16).toString('hex')) {
   const access_token = jwt.sign(
-    { id: userId, userId, memberships },
+    { id: userId, userId, memberships, sid: sessionId },
     JWT_SECRET,
     { expiresIn: ACCESS_EXPIRE },
   );
   const refresh_token = jwt.sign(
-    { userId, type: 'refresh', jti: crypto.randomBytes(16).toString('hex') },
+    { userId, type: 'refresh', sid: sessionId, jti: crypto.randomBytes(16).toString('hex') },
     JWT_SECRET,
     { expiresIn: REFRESH_EXPIRE },
   );
-  return { access_token, refresh_token };
+  return { access_token, refresh_token, session_id: sessionId };
 }
 
 class TokenService {
   /**
-   * Build access + refresh JWTs and persist the refresh token hash on the user
-   * row (never store the raw refresh token).
+   * Build an access/refresh pair and persist its refresh hash under this
+   * session family (never store the raw refresh token).
    */
-  static async issueTokensForUser(userId, memberships, additionalUserData = {}) {
-    const pair = signTokenPair(String(userId), memberships);
+  static async issueTokensForUser(userId, memberships, additionalUserData = {}, sessionId = null) {
+    const pair = signTokenPair(String(userId), memberships, sessionId || undefined);
     await prisma.user.update({
       where: { id: String(userId) },
       data: {
         ...additionalUserData,
-        refreshTokenHash: sha256(pair.refresh_token),
+        // New sessions store refresh credentials independently by session ID.
+        // Keep the legacy single-token column empty; it is used only as a
+        // compatibility fallback for refresh tokens issued before this change.
+        refreshTokenHash: null,
         refreshToken: null,
       },
     });
+    await SessionService.storeRefreshTokenForSession(String(userId), pair.session_id, pair.refresh_token);
     return pair;
   }
 
@@ -79,7 +82,15 @@ class TokenService {
       err.code = 'USER_NOT_FOUND';
       throw err;
     }
-    return this.issueTokensForUser(user.id, memberships);
+    const pair = await this.issueTokensForUser(user.id, memberships);
+    await SessionService.createSession(
+      user.id,
+      user.companyId ? String(user.companyId) : null,
+      user.role,
+      pair.access_token,
+      { email: user.email, name: user.name },
+    );
+    return pair;
   }
 
   static _storedRefreshMatches(user, refreshPlain) {
@@ -121,16 +132,28 @@ class TokenService {
       throw err;
     }
 
-    const matches = this._storedRefreshMatches(user, refreshPlain);
+    const sessionRefreshHash = decoded.sid
+      ? await SessionService.getRefreshTokenHashForSession(String(user.id), String(decoded.sid))
+      : null;
+    const matches = decoded.sid
+      ? Boolean(sessionRefreshHash && sha256(refreshPlain) === sessionRefreshHash)
+      : this._storedRefreshMatches(user, refreshPlain);
     if (!matches) {
-      await this.revokeAllForUser(decoded.userId);
+      if (decoded.sid) {
+        await SessionService.revokeSessionFamily(String(user.id), String(decoded.sid));
+      } else if (user.refreshTokenHash || user.refreshToken) {
+        // Legacy tokens used a single account-wide refresh credential. Only
+        // apply replay-wide revocation while that legacy credential remains
+        // active; a previously migrated token must not evict new sessions.
+        await this.revokeAllForUser(decoded.userId);
+      }
       const err = new Error('Invalid refresh token');
       err.code = 'INVALID_REFRESH_TOKEN';
       throw err;
     }
 
     const memberships = membershipsForUser(user);
-    const { access_token, refresh_token } = await this.issueTokensForUser(user.id, memberships);
+    const { access_token, refresh_token } = await this.issueTokensForUser(user.id, memberships, {}, decoded.sid || null);
 
     try {
       await SessionService.registerAccessToken(user.id, access_token);

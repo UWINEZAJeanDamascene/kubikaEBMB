@@ -3,6 +3,7 @@ const { body } = require('express-validator');
 const router = express.Router();
 const {
   login,
+  verifyLoginTwoFactor,
   register,
   refresh,
   getMe,
@@ -21,6 +22,8 @@ const {
 const { protect, authorize } = require('../middleware/auth');
 const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
+const { createRateLimiters } = require('../middleware/redisRateLimiter');
+const authRateLimit = createRateLimiters().auth;
 
 const loginValidation = [
   body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
@@ -40,7 +43,11 @@ const registerValidation = [
 
 // Public routes
 router.post('/register', registerValidation, validateRequest, stripUnvalidatedBody, register);
-router.post('/login', loginValidation, validateRequest, stripUnvalidatedBody, login);
+router.post('/login', authRateLimit, loginValidation, validateRequest, stripUnvalidatedBody, login);
+router.post('/login/2fa', authRateLimit, [
+  body('challengeToken').isLength({ min: 40, max: 100 }).withMessage('Invalid sign-in challenge'),
+  body('token').matches(/^\d{6}$/).withMessage('Enter the 6-digit authenticator code'),
+], validateRequest, stripUnvalidatedBody, verifyLoginTwoFactor);
 router.post('/refresh', body('refresh_token').notEmpty().withMessage('Refresh token required'), validateRequest, stripUnvalidatedBody, refresh);
 router.post('/forgot-password', forgotPassword);
 router.post('/reset-password', resetPassword);

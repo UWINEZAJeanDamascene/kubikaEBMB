@@ -9,6 +9,7 @@ const InvoiceReceiptMetadata = require("../models/InvoiceReceiptMetadata");
 const PDFDocument = require("pdfkit");
 const notificationService = require("../services/notificationHelper");
 const emailService = require("../services/emailService");
+const notificationDeliveryService = require("../services/notificationDeliveryService");
 const Company = require("../models/Company");
 const cacheService = require("../services/cacheService");
 const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
@@ -409,7 +410,7 @@ exports.createInvoice = async (req, res, next) => {
       };
     });
 
-    const invoice = await Invoice.create({
+    let invoice = await Invoice.create({
       company: companyId,
       lines: processedLines,
       items: processedLines, // backwards compat
@@ -444,20 +445,10 @@ exports.createInvoice = async (req, res, next) => {
     }
 
     // Attempt to send invoice email to client if email exists
-    const sendEmailOnCreate = req.body.sendEmail || false;
-    if (sendEmailOnCreate) {
-      try {
-        const company = await Company.findById(companyId);
-        const clientData = await Client.findById(clientId);
-        await emailService.sendInvoiceEmail(invoice, company, clientData);
-        try {
-          await notifyInvoiceSent(companyId, invoice);
-        } catch (e) {
-          console.error("notifyInvoiceSent failed", e);
-        }
-      } catch (emailErr) {
-        console.error("Invoice email error:", emailErr);
-      }
+    try {
+      await notificationDeliveryService.sendInvoiceDelivery(invoice, companyId, { explicit: !!req.body.sendEmail });
+    } catch (emailErr) {
+      console.error("Invoice email error:", emailErr);
     }
 
     // Notify invoice created
@@ -697,8 +688,19 @@ exports.confirmInvoice = async (req, res, next) => {
   try {
     const companyId = String(req.user.company._id || req.user.company.id);
     const userId = String(req.user.id || req.user._id);
+    const beforeConfirmation = await Invoice.findOne({ _id: req.params.id, company: companyId });
+    if (!beforeConfirmation) {
+      return res.status(404).json({ success: false, code: 'INVOICE_NOT_FOUND', message: 'Invoice not found.' });
+    }
     const invoice = await require('../services/invoiceAutoConfirmService')
       .confirmDraftInvoice(companyId, req.params.id, userId);
+    if (beforeConfirmation.status !== 'confirmed' && invoice.status === 'confirmed') {
+      try {
+        await notificationDeliveryService.sendInvoiceDelivery(invoice, companyId);
+      } catch (emailError) {
+        console.error('Automated invoice delivery failed after confirmation:', emailError.message || emailError);
+      }
+    }
     res.json({ success: true, message: 'Invoice confirmed successfully.', data: await hydrateInvoiceRelations(invoice, companyId) });
   } catch (error) {
     if (error.status || error.statusCode) {

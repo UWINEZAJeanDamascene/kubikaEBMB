@@ -352,6 +352,9 @@ const sessionMiddleware = async (req, res, next) => {
         sessionService.extendSession(userId).catch(err => {
           console.error('Failed to extend session:', err.message);
         });
+        sessionService.touchDeviceSession(userId, token).catch(err => {
+          console.error('Failed to update device session activity:', err.message);
+        });
       }
       return next();
     }

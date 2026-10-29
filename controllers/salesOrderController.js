@@ -9,6 +9,7 @@ const Company = require('../models/Company');
 const emailService = require('../services/emailService');
 const EBMProductService = require('../services/ebmProductService');
 const { syncSalesOrderLifecycle } = require('../services/salesOrderLifecycleService');
+const notificationDeliveryService = require('../services/notificationDeliveryService');
 
 const normalizeId = (value) => {
   if (!value) return null;
@@ -347,6 +348,12 @@ exports.createSalesOrder = async (req, res, next) => {
       createdBy: req.user.id,
       clientTin: clientDoc.tin
     });
+
+    try {
+      await notificationDeliveryService.sendLargeOrderAlert(salesOrder, companyId);
+    } catch (alertError) {
+      console.error('[Sales Order Large Order Alert] Failed:', alertError.message || alertError);
+    }
     
     await hydrateSalesOrderRelations(salesOrder);
     

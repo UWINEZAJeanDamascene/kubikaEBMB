@@ -1,5 +1,6 @@
 const { redisClient } = require('../config/redis');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 // Import centralized configuration
 const env = require('../src/config/environment');
@@ -33,25 +34,73 @@ class SessionService {
     return `${SESSION_PREFIX}${TOKENS_LIST_SUFFIX}${userId}`;
   }
 
+  _deviceSessionKey(userId, token) {
+    const tokenId = crypto.createHash('sha256').update(String(token)).digest('hex');
+    return `${SESSION_PREFIX}device:${userId}:${tokenId}`;
+  }
+
+  _refreshSessionKey(userId, sessionId) {
+    return `${SESSION_PREFIX}refresh:${userId}:${sessionId}`;
+  }
+
+  async storeRefreshTokenForSession(userId, sessionId, token) {
+    if (!userId || !sessionId || !token) return false;
+    const decoded = jwt.decode(token);
+    const ttl = decoded?.exp ? Math.max(1, decoded.exp - Math.floor(Date.now() / 1000)) : SESSION_TTL;
+    const hash = crypto.createHash('sha256').update(String(token)).digest('hex');
+    await redisClient.setex(this._refreshSessionKey(userId, sessionId), ttl, hash);
+    return true;
+  }
+
+  async getRefreshTokenHashForSession(userId, sessionId) {
+    if (!userId || !sessionId) return null;
+    return redisClient.get(this._refreshSessionKey(userId, sessionId));
+  }
+
+  async deleteRefreshTokenForSession(userId, sessionId) {
+    if (!userId || !sessionId) return false;
+    await redisClient.del(this._refreshSessionKey(userId, sessionId));
+    return true;
+  }
+
   /**
    * Enforce max concurrent access tokens per user (FIFO eviction of oldest).
    */
   async _registerAccessTokenForConcurrency(userId, token) {
-    if (!SESSION_MAX_CONCURRENT || SESSION_MAX_CONCURRENT < 1) {
-      return;
-    }
     const listKey = this._tokensListKey(userId);
     await redisClient.rpush(listKey, token);
     await redisClient.expire(listKey, SESSION_TTL);
 
-    let len = await redisClient.llen(listKey);
-    while (len > SESSION_MAX_CONCURRENT) {
-      const oldToken = await redisClient.lpop(listKey);
-      if (oldToken) {
-        await redisClient.del(`${SESSION_PREFIX}token:${oldToken}`);
-        await this.blacklistToken(oldToken, tokenBlacklistTtlSeconds(oldToken));
+    // Keep the token index even when concurrency limits are disabled; it is
+    // also the source for the user's device/session list and per-device revoke.
+    if (!SESSION_MAX_CONCURRENT || SESSION_MAX_CONCURRENT < 1) return;
+
+    const currentSessionId = jwt.decode(token)?.sid || null;
+    while (true) {
+      const indexed = await redisClient.lrange(listKey, 0, -1);
+      const families = [];
+      for (const indexedToken of indexed || []) {
+        const decoded = jwt.decode(indexedToken);
+        const familyId = decoded?.sid || crypto.createHash('sha256').update(String(indexedToken)).digest('hex');
+        if (!families.includes(familyId)) families.push(familyId);
       }
-      len = await redisClient.llen(listKey);
+      if (families.length <= SESSION_MAX_CONCURRENT) break;
+      const evictedFamily = families.find((familyId) => familyId !== currentSessionId);
+      if (!evictedFamily) break;
+      const familyTokens = (indexed || []).filter((indexedToken) => {
+        const decoded = jwt.decode(indexedToken);
+        const familyId = decoded?.sid || crypto.createHash('sha256').update(String(indexedToken)).digest('hex');
+        return familyId === evictedFamily;
+      });
+      for (const oldToken of familyTokens) {
+        const blacklisted = await this.blacklistToken(oldToken, tokenBlacklistTtlSeconds(oldToken));
+        if (!blacklisted) throw new Error('Could not revoke an evicted session token');
+        await redisClient.del(`${SESSION_PREFIX}token:${oldToken}`, this._deviceSessionKey(userId, oldToken));
+        await redisClient.lrem(listKey, 0, oldToken);
+      }
+      if (familyTokens.length && jwt.decode(familyTokens[0])?.sid) {
+        await this.deleteRefreshTokenForSession(userId, jwt.decode(familyTokens[0]).sid);
+      }
     }
   }
 
@@ -64,6 +113,36 @@ class SessionService {
     try {
       await redisClient.setex(tokenKey, SESSION_TTL, userId);
       await this._registerAccessTokenForConcurrency(userId, token);
+      const current = await redisClient.get(`${SESSION_PREFIX}${userId}`);
+      const parsed = current ? JSON.parse(current) : {};
+      const decoded = jwt.decode(token);
+      let deviceMetadata = null;
+      if (decoded?.sid) {
+        const indexedTokens = await redisClient.lrange(this._tokensListKey(userId), 0, -1);
+        for (const priorToken of [...new Set(indexedTokens || [])]) {
+          if (priorToken === token || String(jwt.decode(priorToken)?.sid || '') !== String(decoded.sid)) continue;
+          const priorRaw = await redisClient.get(this._deviceSessionKey(userId, priorToken));
+          try {
+            const prior = priorRaw ? JSON.parse(priorRaw) : null;
+            if (prior) {
+              deviceMetadata = prior;
+              break;
+            }
+          } catch (_) { /* ignore stale metadata */ }
+        }
+      }
+      await redisClient.setex(this._deviceSessionKey(userId, token), SESSION_TTL, JSON.stringify({
+        userId: String(userId),
+        companyId: deviceMetadata?.companyId || parsed.companyId || null,
+        role: deviceMetadata?.role || parsed.role || null,
+        email: deviceMetadata?.email || parsed.email || null,
+        name: deviceMetadata?.name || parsed.name || null,
+        userAgent: deviceMetadata?.userAgent || parsed.userAgent || null,
+        ipAddress: deviceMetadata?.ipAddress || parsed.ipAddress || null,
+        createdAt: deviceMetadata?.createdAt || (decoded?.iat ? new Date(decoded.iat * 1000).toISOString() : new Date().toISOString()),
+        lastActivity: new Date().toISOString(),
+        sessionId: decoded?.sid || null,
+      }));
     } catch (error) {
       console.error('Error registering access token:', error);
       throw error;
@@ -97,6 +176,12 @@ class SessionService {
       const tokenKey = `${SESSION_PREFIX}token:${token}`;
       await redisClient.setex(tokenKey, SESSION_TTL, userId);
       await this._registerAccessTokenForConcurrency(userId, token);
+      await redisClient.setex(this._deviceSessionKey(userId, token), SESSION_TTL, JSON.stringify({
+        ...sessionData,
+        userAgent: additionalData.userAgent || null,
+        ipAddress: additionalData.ipAddress || null,
+        sessionId: jwt.decode(token)?.sid || null,
+      }));
 
       console.log(`Session created for user: ${userId}`);
       return sessionData;
@@ -179,6 +264,22 @@ class SessionService {
     }
   }
 
+  async touchDeviceSession(userId, token) {
+    if (!userId || !token) return false;
+    const key = this._deviceSessionKey(userId, token);
+    try {
+      const raw = await redisClient.get(key);
+      if (!raw) return false;
+      const metadata = JSON.parse(raw);
+      metadata.lastActivity = new Date().toISOString();
+      await redisClient.setex(key, SESSION_TTL, JSON.stringify(metadata));
+      return true;
+    } catch (error) {
+      console.error('Could not update device session activity:', error.message || error);
+      return false;
+    }
+  }
+
   /**
    * Delete a session (logout)
    * @param {string} userId - User ID
@@ -189,14 +290,20 @@ class SessionService {
     const listKey = this._tokensListKey(userId);
 
     try {
-      // Delete main session
-      await redisClient.del(sessionKey);
-
       // Delete token mapping if provided
       if (token) {
         const tokenKey = `${SESSION_PREFIX}token:${token}`;
+        const metadataRaw = await redisClient.get(this._deviceSessionKey(userId, token));
+        let metadata = {};
+        try { metadata = metadataRaw ? JSON.parse(metadataRaw) : {}; } catch (_) { metadata = {}; }
+        const sessionId = metadata.sessionId || jwt.decode(token)?.sid;
         await redisClient.del(tokenKey);
+        await redisClient.del(this._deviceSessionKey(userId, token));
+        if (sessionId) await this.deleteRefreshTokenForSession(userId, sessionId);
         await redisClient.lrem(listKey, 1, token);
+        if (!(await redisClient.llen(listKey))) await redisClient.del(sessionKey);
+      } else {
+        await redisClient.del(sessionKey);
       }
 
       console.log(`Session deleted for user: ${userId}`);
@@ -220,6 +327,14 @@ class SessionService {
       if (tokens && tokens.length) {
         for (const t of tokens) {
           await redisClient.del(`${SESSION_PREFIX}token:${t}`);
+          const metadataRaw = await redisClient.get(this._deviceSessionKey(userId, t));
+          try {
+            const metadata = metadataRaw ? JSON.parse(metadataRaw) : null;
+            const sessionId = metadata?.sessionId || jwt.decode(t)?.sid;
+            if (sessionId) await this.deleteRefreshTokenForSession(userId, sessionId);
+          } catch (_) { /* keep revocation of the access token moving */ }
+          await redisClient.del(this._deviceSessionKey(userId, t));
+          await this.blacklistToken(t, tokenBlacklistTtlSeconds(t));
         }
       }
       await redisClient.del(listKey);
@@ -231,6 +346,34 @@ class SessionService {
       console.error('Error deleting all sessions:', error);
       return false;
     }
+  }
+
+  async deleteOtherSessions(userId, currentToken) {
+    const listKey = this._tokensListKey(userId);
+    const tokens = await redisClient.lrange(listKey, 0, -1);
+    const keep = String(currentToken || '');
+    const keepSessionId = keep ? String(jwt.decode(keep)?.sid || '') : '';
+    for (const token of [...new Set(tokens || [])]) {
+      if (token === keep || (keepSessionId && String(jwt.decode(token)?.sid || '') === keepSessionId)) continue;
+      const mappedUserId = await redisClient.get(`${SESSION_PREFIX}token:${token}`);
+      if (String(mappedUserId || '') !== String(userId)) continue;
+      const blacklisted = await this.blacklistToken(token, tokenBlacklistTtlSeconds(token));
+      if (!blacklisted) throw new Error('Could not revoke a session token');
+      const metadataRaw = await redisClient.get(this._deviceSessionKey(userId, token));
+      try {
+        const metadata = metadataRaw ? JSON.parse(metadataRaw) : null;
+        const sessionId = metadata?.sessionId || jwt.decode(token)?.sid;
+        if (sessionId) await this.deleteRefreshTokenForSession(userId, sessionId);
+      } catch (_) { /* continue removing the access token */ }
+      await redisClient.del(`${SESSION_PREFIX}token:${token}`, this._deviceSessionKey(userId, token));
+      await redisClient.lrem(listKey, 0, token);
+    }
+    if (keep && tokens?.includes(keep)) {
+      await redisClient.expire(listKey, SESSION_TTL);
+      return true;
+    }
+    if (!(await redisClient.llen(listKey))) await redisClient.del(`${SESSION_PREFIX}${userId}`);
+    return true;
   }
 
   /**
@@ -292,12 +435,12 @@ class SessionService {
         if (Array.isArray(reply)) {
           cursor = reply[0];
           const keys = reply[1] || [];
-          const sessionKeys = keys.filter(k => !k.includes('token:'));
+          const sessionKeys = keys.filter(k => !k.includes('token:') && !k.includes('tokens:') && !k.includes('device:') && !k.includes('refresh:'));
           count += sessionKeys.length;
         } else if (reply && reply.cursor !== undefined) {
           cursor = reply.cursor;
           const keys = reply.keys || [];
-          const sessionKeys = keys.filter(k => !k.includes('token:'));
+          const sessionKeys = keys.filter(k => !k.includes('token:') && !k.includes('tokens:') && !k.includes('device:') && !k.includes('refresh:'));
           count += sessionKeys.length;
         } else {
           break;
@@ -329,18 +472,98 @@ class SessionService {
       // Get TTL for session
       const ttl = await redisClient.ttl(sessionKey);
       
+      const sessionsById = new Map();
+      for (const token of [...new Set(tokens || [])]) {
+        const mappedUserId = await redisClient.get(`${SESSION_PREFIX}token:${token}`);
+        const decoded = jwt.decode(token);
+        if (String(mappedUserId || '') !== String(userId) || !decoded || (decoded.exp && decoded.exp <= Math.floor(Date.now() / 1000)) || await this.isTokenBlacklisted(token)) continue;
+        const tokenId = crypto.createHash('sha256').update(String(token)).digest('hex');
+        const metadataRaw = await redisClient.get(this._deviceSessionKey(userId, token));
+        let metadata = {};
+        try { metadata = metadataRaw ? JSON.parse(metadataRaw) : {}; } catch { metadata = {}; }
+        const tokenTtl = await redisClient.ttl(`${SESSION_PREFIX}token:${token}`);
+        const stableSessionId = metadata.sessionId || decoded.sid || tokenId;
+        const candidate = {
+          id: stableSessionId,
+          sessionId: decoded.sid || metadata.sessionId || null,
+          role: metadata.role || decoded.memberships?.[0]?.role || null,
+          companyId: metadata.companyId || decoded.memberships?.[0]?.companyId || null,
+          name: metadata.name || null,
+          userAgent: metadata.userAgent || null,
+          ipAddress: metadata.ipAddress || null,
+          createdAt: metadata.createdAt || (decoded.iat ? new Date(decoded.iat * 1000).toISOString() : null),
+          lastActivity: metadata.lastActivity || null,
+          ttlSeconds: tokenTtl > 0 ? tokenTtl : (decoded.exp ? Math.max(0, decoded.exp - Math.floor(Date.now() / 1000)) : 0),
+        };
+        const existing = sessionsById.get(stableSessionId);
+        if (!existing) sessionsById.set(stableSessionId, candidate);
+        else {
+          if (!existing.userAgent && candidate.userAgent) existing.userAgent = candidate.userAgent;
+          if (!existing.ipAddress && candidate.ipAddress) existing.ipAddress = candidate.ipAddress;
+          if (candidate.createdAt && (!existing.createdAt || candidate.createdAt < existing.createdAt)) existing.createdAt = candidate.createdAt;
+          if (candidate.lastActivity && (!existing.lastActivity || candidate.lastActivity > existing.lastActivity)) existing.lastActivity = candidate.lastActivity;
+          existing.ttlSeconds = Math.max(existing.ttlSeconds, candidate.ttlSeconds);
+        }
+      }
+      const activeSessions = [...sessionsById.values()];
+
       return {
-        active: !!session,
+        active: activeSessions.length > 0,
         session: session,
-        tokens: tokens || [],
+        activeSessions,
+        maxConcurrent: SESSION_MAX_CONCURRENT > 0 ? SESSION_MAX_CONCURRENT : null,
         ttlSeconds: ttl > 0 ? ttl : 0,
         lastActivity: session?.lastActivity || null,
         createdAt: session?.createdAt || null
       };
     } catch (error) {
       console.error('Error getting user sessions:', error);
-      return { active: false, session: null, tokens: [], ttlSeconds: 0 };
+      return { active: false, session: null, activeSessions: [], maxConcurrent: SESSION_MAX_CONCURRENT > 0 ? SESSION_MAX_CONCURRENT : null, ttlSeconds: 0 };
     }
+  }
+
+  async revokeUserSession(userId, sessionId) {
+    const listKey = this._tokensListKey(userId);
+    const tokens = await redisClient.lrange(listKey, 0, -1);
+    const token = (tokens || []).find((candidate) => {
+      const decoded = jwt.decode(candidate);
+      const tokenHash = crypto.createHash('sha256').update(String(candidate)).digest('hex');
+      return String(decoded?.sid || '') === String(sessionId) || tokenHash === String(sessionId);
+    });
+    if (!token) return false;
+    const mappedUserId = await redisClient.get(`${SESSION_PREFIX}token:${token}`);
+    if (String(mappedUserId || '') !== String(userId)) return false;
+    const blacklisted = await this.blacklistToken(token, tokenBlacklistTtlSeconds(token));
+    if (!blacklisted) throw new Error('Could not revoke the selected session token');
+    const metadataRaw = await redisClient.get(this._deviceSessionKey(userId, token));
+    let metadata = {};
+    try { metadata = metadataRaw ? JSON.parse(metadataRaw) : {}; } catch (_) { metadata = {}; }
+    const familyId = metadata.sessionId || jwt.decode(token)?.sid;
+    if (familyId) await this.deleteRefreshTokenForSession(userId, familyId);
+    await redisClient.del(`${SESSION_PREFIX}token:${token}`, this._deviceSessionKey(userId, token));
+    await redisClient.lrem(listKey, 0, token);
+    if (familyId) await this.revokeSessionFamily(userId, familyId);
+    const remaining = await redisClient.llen(listKey);
+    if (!remaining) await redisClient.del(`${SESSION_PREFIX}${userId}`);
+    return true;
+  }
+
+  async revokeSessionFamily(userId, sessionId) {
+    if (!userId || !sessionId) return false;
+    const listKey = this._tokensListKey(userId);
+    const tokens = await redisClient.lrange(listKey, 0, -1);
+    for (const candidate of [...new Set(tokens || [])]) {
+      if (String(jwt.decode(candidate)?.sid || '') !== String(sessionId)) continue;
+      const mappedUserId = await redisClient.get(`${SESSION_PREFIX}token:${candidate}`);
+      if (String(mappedUserId || '') !== String(userId)) continue;
+      const blacklisted = await this.blacklistToken(candidate, tokenBlacklistTtlSeconds(candidate));
+      if (!blacklisted) throw new Error('Could not revoke a session token');
+      await redisClient.del(`${SESSION_PREFIX}token:${candidate}`, this._deviceSessionKey(userId, candidate));
+      await redisClient.lrem(listKey, 0, candidate);
+    }
+    await this.deleteRefreshTokenForSession(userId, sessionId);
+    if (!(await redisClient.llen(listKey))) await redisClient.del(`${SESSION_PREFIX}${userId}`);
+    return true;
   }
 
   /**
@@ -357,7 +580,7 @@ class SessionService {
         if (Array.isArray(reply)) {
           cursor = reply[0];
           const keys = reply[1] || [];
-          const sessionKeys = keys.filter(k => !k.includes('token:') && !k.includes('tokens:'));
+          const sessionKeys = keys.filter(k => !k.includes('token:') && !k.includes('tokens:') && !k.includes('device:') && !k.includes('refresh:'));
           
           for (const key of sessionKeys) {
             if (sessions.length >= limit) break;

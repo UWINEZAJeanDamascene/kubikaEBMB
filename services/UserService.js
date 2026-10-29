@@ -16,6 +16,9 @@ const TokenService = require('./tokenService');
 const { notifyUserCreated, notifyPasswordChanged } = require('./notificationHelper');
 const emailService = require('./emailService');
 const { validateConfig: validateEmailConfig } = require('../config/email');
+const { getPasswordPolicyError, passwordChangeRequired } = require('../utils/passwordPolicy');
+const speakeasy = require('speakeasy');
+const { redisClient, isRedisConfigured } = require('../config/redis');
 
 // Import centralized configuration
 const env = require('../src/config/environment');
@@ -27,7 +30,6 @@ if (!config.jwt.secret) {
 }
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOCK_DURATION_MINUTES = 0; // DISABLED: was 30 — re-enable by setting back to 30
-const MIN_PASSWORD_LENGTH = 8;
 
 const USER_ERRORS = {
   EMAIL_ALREADY_REGISTERED: 'EMAIL_ALREADY_REGISTERED',
@@ -36,8 +38,13 @@ const USER_ERRORS = {
   INVALID_REFRESH_TOKEN: 'INVALID_REFRESH_TOKEN',
   CURRENT_PASSWORD_INCORRECT: 'CURRENT_PASSWORD_INCORRECT',
   PASSWORD_TOO_SHORT: 'PASSWORD_TOO_SHORT',
+  PASSWORD_POLICY_VIOLATION: 'PASSWORD_POLICY_VIOLATION',
   INVALID_OR_EXPIRED_TOKEN: 'INVALID_OR_EXPIRED_TOKEN',
   USER_ALREADY_MEMBER: 'USER_ALREADY_MEMBER',
+  TWO_FACTOR_CONFIGURATION_INVALID: 'TWO_FACTOR_CONFIGURATION_INVALID',
+  TWO_FACTOR_CHALLENGE_UNAVAILABLE: 'TWO_FACTOR_CHALLENGE_UNAVAILABLE',
+  INVALID_TWO_FACTOR_CHALLENGE: 'INVALID_TWO_FACTOR_CHALLENGE',
+  INVALID_TWO_FACTOR_CODE: 'INVALID_TWO_FACTOR_CODE',
 };
 
 /** Bcrypt work comparable to real logins, so unknown-email failures do not return much faster than wrong-password. */
@@ -123,9 +130,8 @@ class UserService {
       throw serviceError(USER_ERRORS.EMAIL_ALREADY_REGISTERED);
     }
 
-    if (password.length < MIN_PASSWORD_LENGTH) {
-      throw serviceError(USER_ERRORS.PASSWORD_TOO_SHORT);
-    }
+    const passwordError = getPasswordPolicyError(password);
+    if (passwordError) throw serviceError(passwordError.code, { message: passwordError.message });
 
     const roleDoc = await findSystemRole(role);
 
@@ -154,7 +160,7 @@ class UserService {
    * @throws ACCOUNT_LOCKED when locked_until is in the future
    * Returns access_token and refresh_token
    */
-  static async login(email, password, companyId = null) {
+  static async login(email, password, companyId = null, sessionContext = {}) {
     const user = await prisma.user.findFirst({
       where: {
         email: String(email).toLowerCase(),
@@ -179,7 +185,7 @@ class UserService {
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
-      await UserService._recordFailedLoginAttempt(user);
+      await UserService._recordFailedLoginAttempt(user, sessionContext);
       throw serviceError(USER_ERRORS.INVALID_CREDENTIALS);
     }
 
@@ -195,6 +201,17 @@ class UserService {
       }
     }
 
+    if (user.twoFAEnabled) {
+      if (!user.twoFAConfirmed || !user.twoFASecret) {
+        throw serviceError(USER_ERRORS.TWO_FACTOR_CONFIGURATION_INVALID);
+      }
+      return UserService._createTwoFactorLoginChallenge(user);
+    }
+
+    return UserService._completeLogin(user, sessionContext);
+  }
+
+  static async _completeLogin(user, sessionContext = {}) {
     // Persist the login state and refresh-token hash in one database write.
     // The token service accepts the additional fields so a cold Neon connection
     // is not paid for twice on every successful login.
@@ -209,6 +226,7 @@ class UserService {
         lockedUntil: null,
         lastLogin,
       });
+    await UserService.recordLoginHistory(user, 'login', sessionContext, 'success');
 
     const companyIdStr = user.companyId ? String(user.companyId) : null;
     try {
@@ -217,13 +235,17 @@ class UserService {
         companyIdStr,
         user.role,
         accessToken,
-        { email: user.email, name: user.name }
+        { email: user.email, name: user.name, ...sessionContext }
       );
     } catch (e) {
       console.error('Session creation on login failed (tokens still issued):', e);
     }
 
-    const loginUser = userToApi({ ...user, lastLogin });
+    const loginUser = userToApi({
+      ...user,
+      lastLogin,
+      mustChangePassword: passwordChangeRequired(user),
+    });
     loginUser.permissions = await permissionsForLoginUser(user);
 
     return {
@@ -238,8 +260,107 @@ class UserService {
     };
   }
 
+  /** Keep personal sign-in history useful without allowing audit storage failures to block authentication. */
+  static async recordLoginHistory(user, action, context = {}, status = 'success') {
+    if (!user?.id) return;
+    try {
+      const ActionLog = require('../models/ActionLog');
+      await ActionLog.create({
+        user: String(user.id),
+        company: user.companyId ? String(user.companyId) : null,
+        action,
+        module: 'auth',
+        status,
+        ipAddress: context.ipAddress || null,
+        userAgent: context.userAgent || null,
+        details: {},
+      });
+    } catch (error) {
+      console.error('Failed to record login history:', error?.message || error);
+    }
+  }
+
+  static async _createTwoFactorLoginChallenge(user) {
+    if (!isRedisConfigured()) throw serviceError(USER_ERRORS.TWO_FACTOR_CHALLENGE_UNAVAILABLE);
+    const challengeToken = crypto.randomBytes(32).toString('base64url');
+    const challengeKey = `auth:2fa:login:${crypto.createHash('sha256').update(challengeToken).digest('hex')}`;
+    try {
+      if (typeof redisClient.status === 'string') {
+        await redisClient.set(challengeKey, JSON.stringify({ userId: String(user.id) }), 'EX', 300);
+      } else {
+        await redisClient.set(challengeKey, JSON.stringify({ userId: String(user.id) }), { ex: 300 });
+      }
+    } catch {
+      throw serviceError(USER_ERRORS.TWO_FACTOR_CHALLENGE_UNAVAILABLE);
+    }
+    return { requiresTwoFA: true, challengeToken, expiresIn: 300 };
+  }
+
+  static async verifyLoginTwoFactor(challengeToken, token, sessionContext = {}) {
+    if (!isRedisConfigured()) throw serviceError(USER_ERRORS.TWO_FACTOR_CHALLENGE_UNAVAILABLE);
+    const challengeHash = crypto.createHash('sha256').update(String(challengeToken || '')).digest('hex');
+    const challengeKey = `auth:2fa:login:${challengeHash}`;
+    const attemptsKey = `${challengeKey}:attempts`;
+    const lockKey = `${challengeKey}:verify-lock`;
+    let challengeRaw;
+    try { challengeRaw = await redisClient.get(challengeKey); } catch {
+      throw serviceError(USER_ERRORS.TWO_FACTOR_CHALLENGE_UNAVAILABLE);
+    }
+    if (!challengeRaw) throw serviceError(USER_ERRORS.INVALID_TWO_FACTOR_CHALLENGE);
+    let challenge;
+    try { challenge = JSON.parse(challengeRaw); } catch {
+      throw serviceError(USER_ERRORS.INVALID_TWO_FACTOR_CHALLENGE);
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: challenge.userId },
+      include: { company: true, roles: { include: { role: true } } },
+    });
+    if (!user || !user.isActive || !user.twoFAEnabled || !user.twoFAConfirmed || !user.twoFASecret || (user.lockedUntil && new Date() < user.lockedUntil)) {
+      await redisClient.del(challengeKey, attemptsKey);
+      throw serviceError(USER_ERRORS.INVALID_TWO_FACTOR_CHALLENGE);
+    }
+    if (user.role !== 'platform_admin' && user.companyId) {
+      const company = await prisma.company.findUnique({ where: { id: toIdString(user.companyId) } });
+      if (!company || !company.isActive || company.approvalStatus !== 'approved') {
+        await redisClient.del(challengeKey, attemptsKey);
+        throw serviceError(USER_ERRORS.INVALID_TWO_FACTOR_CHALLENGE);
+      }
+    }
+
+    const verified = /^\d{6}$/.test(String(token || '')) && speakeasy.totp.verify({
+      secret: user.twoFASecret, encoding: 'base32', token: String(token), window: 1,
+    });
+    if (!verified) {
+      const attempts = await redisClient.incr(attemptsKey);
+      if (attempts === 1) await redisClient.expire(attemptsKey, 300);
+      if (attempts >= 5) await redisClient.del(challengeKey, attemptsKey);
+      throw serviceError(USER_ERRORS.INVALID_TWO_FACTOR_CODE);
+    }
+
+    let lockResult;
+    try {
+      if (typeof redisClient.status === 'string') lockResult = await redisClient.set(lockKey, '1', 'EX', 30, 'NX');
+      else lockResult = await redisClient.set(lockKey, '1', { ex: 30, nx: true });
+    } catch { throw serviceError(USER_ERRORS.TWO_FACTOR_CHALLENGE_UNAVAILABLE); }
+    if (lockResult !== 'OK' && lockResult !== true) throw serviceError(USER_ERRORS.INVALID_TWO_FACTOR_CHALLENGE);
+    try {
+      const latest = await redisClient.get(challengeKey);
+      if (latest !== challengeRaw) throw serviceError(USER_ERRORS.INVALID_TWO_FACTOR_CHALLENGE);
+      const replayKey = `auth:2fa:used:${String(user.id)}:${String(token)}`;
+      const replayResult = typeof redisClient.status === 'string'
+        ? await redisClient.set(replayKey, '1', 'EX', 90, 'NX')
+        : await redisClient.set(replayKey, '1', { ex: 90, nx: true });
+      if (replayResult !== 'OK' && replayResult !== true) throw serviceError(USER_ERRORS.INVALID_TWO_FACTOR_CODE);
+      await redisClient.del(challengeKey, attemptsKey);
+      return await UserService._completeLogin(user, sessionContext);
+    } finally {
+      await redisClient.del(lockKey);
+    }
+  }
+
   /** Increment failed attempts and lock the account when the threshold is hit. */
-  static async _recordFailedLoginAttempt(user) {
+  static async _recordFailedLoginAttempt(user, sessionContext = {}) {
     let attempts = user.failedLoginAttempts || 0;
     let lockedUntil = user.lockedUntil;
 
@@ -258,6 +379,7 @@ class UserService {
       where: { id: user.id },
       data: { failedLoginAttempts: attempts, lockedUntil },
     });
+    await UserService.recordLoginHistory(user, 'login_failed', sessionContext, 'failure');
   }
 
   /**
@@ -484,9 +606,8 @@ class UserService {
    * @throws PASSWORD_TOO_SHORT for password under 8 characters
    */
   static async changePassword(userId, currentPassword, newPassword) {
-    if (newPassword.length < MIN_PASSWORD_LENGTH) {
-      throw serviceError(USER_ERRORS.PASSWORD_TOO_SHORT);
-    }
+    const passwordError = getPasswordPolicyError(newPassword);
+    if (passwordError) throw serviceError(passwordError.code, { message: passwordError.message });
 
     const user = await prisma.user.findUnique({ where: { id: toIdString(userId) } });
     if (!user) {
@@ -522,9 +643,8 @@ class UserService {
    * @throws INVALID_OR_EXPIRED_TOKEN for expired reset token
    */
   static async resetPassword(token, newPassword) {
-    if (newPassword.length < MIN_PASSWORD_LENGTH) {
-      throw serviceError(USER_ERRORS.PASSWORD_TOO_SHORT);
-    }
+    const passwordError = getPasswordPolicyError(newPassword);
+    if (passwordError) throw serviceError(passwordError.code, { message: passwordError.message });
 
     const user = await prisma.user.findFirst({
       where: {

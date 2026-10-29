@@ -3,7 +3,6 @@ const Client = require('../models/Client');
 const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
-const Company = require('../models/Company');
 const { BankAccount } = require('../models/BankAccount');
 const TillSession = require('../models/TillSession');
 const { findClaimedRegister, registerClaimRequiredError } = require('../services/posRegisterService');
@@ -36,7 +35,6 @@ const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
 const CurrencyService = require('../services/CurrencyService');
 const cacheService = require('../services/cacheService');
-const emailService = require('../services/emailService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { createHash, randomBytes } = require('crypto');
 const { dbClient } = require('../lib/prisma');
@@ -46,6 +44,7 @@ const EBMSalesService = require('../services/ebmSalesService');
 const { verifyCapability: verifyPosOfflineCapability } = require('../services/posOfflineCapabilityService');
 const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
 const { getWarehouseTransferVisibility } = require('../services/posTransferVisibilityService');
+const notificationDeliveryService = require('../services/notificationDeliveryService');
 
 function hashPosSalePayload(payload) {
   const canonical = { ...(payload || {}) };
@@ -188,22 +187,14 @@ async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payload
   return true;
 }
 
-const sendDirectSaleEmail = async (invoice, companyId) => {
+const sendDirectSaleEmail = async (invoice, companyId, { explicit = false } = {}) => {
   try {
     const config = require('../src/config/environment').getConfig();
-    if (!config.features?.emailNotifications) {
+    if (!config.features?.emailNotifications && !explicit) {
       return;
     }
-
-    const company = await Company.findById(companyId);
-    const client = await Client.findById(invoice.client);
-    
-    const clientEmail = client?.contact?.email || client?.email;
-    if (clientEmail) {
-      // Populate product data for email
-      const invoiceWithProducts = await Invoice.findById(invoice._id).populate('items.product', 'name');
-      await emailService.sendInvoiceEmail(invoiceWithProducts, company, client);
-    }
+    const invoiceWithProducts = await Invoice.findById(invoice._id).populate('items.product', 'name');
+    await notificationDeliveryService.sendInvoiceDelivery(invoiceWithProducts || invoice, companyId, { explicit });
   } catch (err) {
     console.error('[Direct Sale Email] Failed:', err.message);
   }
@@ -1485,10 +1476,12 @@ exports.createDirectSale = async (req, res, next) => {
       EBMSalesService.submitInvoiceAsync(invoice._id, { companyId, modifierUserId: req.user.id || req.user._id });
     }
 
-    // Send email notification
-    const sendEmailOnCreate = req.body.sendEmail || false;
-    if (sendEmailOnCreate) {
-      await sendDirectSaleEmail(invoice, companyId);
+    // Delivery/alert failures are isolated from the already committed sale.
+    await sendDirectSaleEmail(invoice, companyId, { explicit: !!req.body.sendEmail });
+    try {
+      await notificationDeliveryService.sendLargeOrderAlert(invoice, companyId);
+    } catch (alertError) {
+      console.error('[Direct Sale Large Order Alert] Failed:', alertError.message || alertError);
     }
 
     res.status(201).json({

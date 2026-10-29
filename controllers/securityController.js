@@ -3,7 +3,10 @@ const { toIdString } = require('../utils/objectId');
 const ActionLog = require('../models/ActionLog');
 const speakeasy = require('speakeasy');
 const qrcode = require('qrcode');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const sessionService = require('../services/sessionService');
+const { PASSWORD_POLICY, MAX_PASSWORD_AGE_DAYS, isPasswordExpired } = require('../utils/passwordPolicy');
 
 // Generate TOTP secret and QR for user to scan
 exports.setup2FA = async (req, res) => {
@@ -95,7 +98,7 @@ exports.getSecurityOverview = async (req, res) => {
       passwordChangedAt: passwordDate,
 
       // Session info
-      activeSessions: sessionInfo.active ? 1 : 0,
+      activeSessions: (sessionInfo.activeSessions || []).length,
       sessionLastActivity: sessionInfo.lastActivity || null,
       sessionCreatedAt: sessionInfo.createdAt || null,
       sessionTTLSeconds: sessionInfo.ttlSeconds || 0,
@@ -104,14 +107,7 @@ exports.getSecurityOverview = async (req, res) => {
       loginHistoryCount,
 
       // Password policy
-      passwordPolicy: {
-        minLength: 8,
-        requireUppercase: true,
-        requireLowercase: true,
-        requireNumber: true,
-        requireSpecial: false,
-        maxAgeDays: 90
-      }
+      passwordPolicy: PASSWORD_POLICY
     };
 
     res.json({ success: true, data: overview });
@@ -176,34 +172,47 @@ exports.getActiveSessions = async (req, res) => {
   try {
     const userId = req.user.id;
     const sessionInfo = await sessionService.getUserSessions(userId);
-
-    const sessions = [];
-
-    // Current session
-    if (sessionInfo.active && sessionInfo.session) {
-      sessions.push({
-        id: 'current',
-        type: 'current',
-        role: sessionInfo.session.role,
-        companyId: sessionInfo.session.companyId,
-        createdAt: sessionInfo.session.createdAt,
-        lastActivity: sessionInfo.session.lastActivity,
-        ttlSeconds: sessionInfo.ttlSeconds || 0,
-        tokenCount: sessionInfo.tokens ? sessionInfo.tokens.length : 0
-      });
-    }
+    const currentToken = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.slice(7).trim()
+      : req.cookies?.token || '';
+    const currentSessionId = currentToken
+      ? (jwt.decode(currentToken)?.sid || crypto.createHash('sha256').update(currentToken).digest('hex'))
+      : null;
+    const sessions = (sessionInfo.activeSessions || []).map((entry) => ({
+      ...entry,
+      type: entry.id === currentSessionId ? 'current' : 'device',
+      isCurrent: entry.id === currentSessionId,
+    }));
 
     res.json({
       success: true,
       data: {
         sessions,
         totalActive: sessions.length,
-        maxConcurrent: 5
+        maxConcurrent: sessionInfo.maxConcurrent ?? null
       }
     });
   } catch (err) {
     console.error('Active sessions error:', err);
     res.status(500).json({ success: false, message: 'Failed to load active sessions' });
+  }
+};
+
+// @desc    Terminate one other device session for the current user
+// @route   DELETE /api/access/active-sessions/:sessionId
+// @access  Private
+exports.terminateSession = async (req, res) => {
+  try {
+    const sessionId = String(req.params.sessionId || '');
+    if (!/^(?:[a-f0-9]{32}|[a-f0-9]{64})$/i.test(sessionId)) {
+      return res.status(400).json({ success: false, message: 'Invalid session identifier' });
+    }
+    const removed = await sessionService.revokeUserSession(req.user.id, sessionId);
+    if (!removed) return res.status(404).json({ success: false, message: 'Session not found or already terminated' });
+    return res.json({ success: true, message: 'Session terminated' });
+  } catch (err) {
+    console.error('Terminate individual session error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to terminate session' });
   }
 };
 
@@ -213,21 +222,10 @@ exports.getActiveSessions = async (req, res) => {
 exports.terminateAllSessions = async (req, res) => {
   try {
     const userId = req.user.id;
-    const token = req.headers.authorization?.split(' ')[1];
-
-    // Delete all sessions except current token
-    await sessionService.deleteAllSessions(userId);
-
-    // Re-create session for current token if provided
-    if (token) {
-      await sessionService.createSession(
-        userId,
-        req.user.company?._id?.toString() || null,
-        req.user.role,
-        token,
-        { email: req.user.email, name: req.user.name }
-      );
-    }
+    const token = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.slice(7).trim()
+      : req.cookies?.token || '';
+    await sessionService.deleteOtherSessions(userId, token);
 
     res.json({ success: true, message: 'All other sessions terminated' });
   } catch (err) {
@@ -245,16 +243,14 @@ exports.getPasswordStatus = async (req, res) => {
 
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
-    const MAX_PASSWORD_AGE_DAYS = 90;
     let passwordAgeDays = null;
-    let isExpired = false;
 
     // Use passwordChangedAt if set, otherwise fall back to account creation date
     const passwordDate = user.passwordChangedAt || user.createdAt;
     if (passwordDate) {
       passwordAgeDays = Math.floor((Date.now() - passwordDate.getTime()) / (1000 * 60 * 60 * 24));
-      isExpired = passwordAgeDays > MAX_PASSWORD_AGE_DAYS;
     }
+    const isExpired = isPasswordExpired(user);
 
     res.json({
       success: true,

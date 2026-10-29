@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const authData = require('../services/authDataService');
 const { recordUserSessionActivity } = require('../services/userSessionActivity');
 const { prisma } = require('../lib/prisma');
+const { passwordChangeRequired } = require('../utils/passwordPolicy');
 
 // Import centralized configuration
 const env = require('../src/config/environment');
@@ -14,6 +15,24 @@ function entityId(value) {
   if (value._id) return String(value._id);
   if (value.id) return String(value.id);
   return String(value);
+}
+
+function isAllowedDuringPasswordChange(req) {
+  const path = String(req.originalUrl || req.path || '').split('?')[0].replace(/\\/g, '/');
+  const method = String(req.method || '').toUpperCase();
+  const allowed = [
+    ['GET', '/auth/me'],
+    ['PUT', '/auth/change-password'],
+    ['POST', '/auth/logout'],
+    ['POST', '/auth/logout-all'],
+    ['GET', '/access/security-overview'],
+    ['GET', '/access/password-status'],
+    ['GET', '/access/login-history'],
+    ['GET', '/access/active-sessions'],
+    ['POST', '/access/terminate-sessions'],
+  ];
+  return allowed.some(([allowedMethod, suffix]) => method === allowedMethod && path.endsWith(suffix))
+    || (method === 'DELETE' && /\/access\/active-sessions\/[^/]+$/.test(path));
 }
 
 async function loadUserAndCompany(decoded) {
@@ -74,6 +93,14 @@ const protect = async (req, res, next) => {
     }
 
     req.user = user;
+
+    if (passwordChangeRequired(user) && !isAllowedDuringPasswordChange(req)) {
+      return res.status(403).json({
+        success: false,
+        code: 'PASSWORD_CHANGE_REQUIRED',
+        message: 'Your password must be changed before you can continue.',
+      });
+    }
 
     if (user.role === 'platform_admin') {
       req.isPlatformAdmin = true;

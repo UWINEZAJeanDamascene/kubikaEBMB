@@ -5,6 +5,17 @@ const emailService = require('../services/emailService');
 const Invoice = require('../models/Invoice');
 const Company = require('../models/Company');
 const { parseBoundedPage } = require('../utils/querySafety');
+const { dbClient } = require('../lib/prisma');
+
+const notificationTimezone = (() => {
+  const candidate = String(process.env.NOTIFICATION_TIMEZONE || process.env.TZ || 'UTC').trim();
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch (_) {
+    return 'UTC';
+  }
+})();
 
 function getRequestUserId(req) {
   return req.user?._id || req.user?.id;
@@ -19,6 +30,59 @@ function sendMissingContext(res) {
     success: false,
     message: 'Authenticated user or company context is missing'
   });
+}
+
+const MAX_NOTIFICATION_THRESHOLD_INTEGER = '999999999999999';
+
+function parseNotificationThreshold(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (typeof value === 'number' && !Number.isFinite(value)) return null;
+
+  const text = typeof value === 'string' ? value.trim() : String(value);
+  if (!/^(?:\d+)(?:\.\d{1,4})?$/.test(text)) return null;
+
+  const [integerPart] = text.split('.');
+  const normalizedInteger = integerPart.replace(/^0+(?=\d)/, '');
+  if (normalizedInteger.length > MAX_NOTIFICATION_THRESHOLD_INTEGER.length
+    || (normalizedInteger.length === MAX_NOTIFICATION_THRESHOLD_INTEGER.length
+      && normalizedInteger > MAX_NOTIFICATION_THRESHOLD_INTEGER)) return null;
+
+  // Keep decimal input as a string so Prisma's DECIMAL(19,4) receives the
+  // exact validated value instead of a rounded JavaScript floating-point value.
+  return text;
+}
+
+function parsePaymentReminderDays(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (typeof value === 'number' && !Number.isSafeInteger(value)) return null;
+  const text = typeof value === 'string' ? value.trim() : String(value);
+  if (!/^\d{1,3}$/.test(text)) return null;
+  const days = Number(text);
+  return days <= 365 ? days : null;
+}
+
+function normalizeNotificationPhoneList(value, fieldName) {
+  if (!Array.isArray(value)) {
+    return { error: `${fieldName} must be an array of phone numbers.` };
+  }
+  if (value.length > 50) {
+    return { error: `${fieldName} cannot contain more than 50 phone numbers.` };
+  }
+
+  const normalized = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const phone = value[index];
+    if (typeof phone !== 'string' || !phone.trim() || !/^\+?[\d\s().-]+$/.test(phone.trim())) {
+      return { error: `${fieldName}[${index}] must be a valid phone number. Use international format, such as +250788123456.` };
+    }
+    const normalizedPhone = smsService.normalizePhoneNumber(phone.trim());
+    if (!normalizedPhone) {
+      return { error: `${fieldName}[${index}] could not be normalized. Include the country code or configure a default country code.` };
+    }
+    normalized.push(normalizedPhone);
+  }
+
+  return { value: [...new Set(normalized)] };
 }
 
 
@@ -46,7 +110,9 @@ exports.getNotifications = async (req, res, next) => {
           total: 0,
           pages: 0
         },
-        unreadCount: 0
+        unreadCount: 0,
+        typeCounts: {},
+        severityCounts: {}
       });
     }
 
@@ -59,17 +125,35 @@ exports.getNotifications = async (req, res, next) => {
       query.isRead = false;
     }
     
-    const notifications = await Notification.find(query)
-      .sort({ createdAt: -1, _id: -1 })
-      .limit(limit)
-      .skip((page - 1) * limit);
-    
-    const total = await Notification.countDocuments(query);
-    const unreadCount = await Notification.countDocuments({
-      company: companyId,
-      user: userId,
-      isRead: false
-    });
+    const prismaWhere = {
+      companyId: String(companyId),
+      userId: String(userId),
+      ...(unreadOnly === 'true' ? { isRead: false } : {}),
+    };
+    const [notifications, total, unreadCount, groupedCounts] = await Promise.all([
+      Notification.find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit)
+        .skip((page - 1) * limit),
+      Notification.countDocuments(query),
+      Notification.countDocuments({ company: companyId, user: userId, isRead: false }),
+      dbClient().notification.groupBy({
+        by: ['type', 'severity'],
+        where: prismaWhere,
+        // Prisma requires a deterministic order when groupBy uses `take`.
+        // Without it the notifications endpoint rejects the request (500).
+        orderBy: [{ type: 'asc' }, { severity: 'asc' }],
+        _count: { _all: true },
+        take: 500,
+      }),
+    ]);
+    const typeCounts = {};
+    const severityCounts = {};
+    for (const group of groupedCounts) {
+      const count = group._count._all;
+      typeCounts[group.type] = (typeCounts[group.type] || 0) + count;
+      severityCounts[group.severity] = (severityCounts[group.severity] || 0) + count;
+    }
     
     res.json({
       success: true,
@@ -80,7 +164,9 @@ exports.getNotifications = async (req, res, next) => {
         total,
         pages: Math.ceil(total / limit)
       },
-      unreadCount
+      unreadCount,
+      typeCounts,
+      severityCounts,
     });
   } catch (error) {
     next(error);
@@ -263,7 +349,11 @@ exports.getSettings = async (req, res, next) => {
     
     res.json({
       success: true,
-      data: settings
+      data: {
+        ...settings,
+        scheduleTimezone: notificationTimezone,
+        deliveryProviders: getNotificationProviderStatus()
+      }
     });
   } catch (error) {
     next(error);
@@ -287,6 +377,50 @@ exports.updateSettings = async (req, res, next) => {
       preferences,
       criticalAlertPhones
     } = req.body;
+    let normalizedAdminPhones;
+    if (smsNotifications?.adminPhones !== undefined) {
+      const result = normalizeNotificationPhoneList(smsNotifications.adminPhones, 'smsNotifications.adminPhones');
+      if (result.error) {
+        return res.status(400).json({ success: false, code: 'INVALID_NOTIFICATION_PHONE', message: result.error });
+      }
+      normalizedAdminPhones = result.value;
+    }
+    const hasCriticalAlertPhones = Object.prototype.hasOwnProperty.call(req.body, 'criticalAlertPhones');
+    let normalizedCriticalAlertPhones;
+    if (hasCriticalAlertPhones) {
+      const result = normalizeNotificationPhoneList(criticalAlertPhones, 'criticalAlertPhones');
+      if (result.error) {
+        return res.status(400).json({ success: false, code: 'INVALID_NOTIFICATION_PHONE', message: result.error });
+      }
+      normalizedCriticalAlertPhones = result.value;
+    }
+    const hasPreferences = preferences !== undefined;
+    if (hasPreferences && (!preferences || typeof preferences !== 'object' || Array.isArray(preferences))) {
+      return res.status(400).json({ success: false, code: 'INVALID_NOTIFICATION_PREFERENCES', message: 'Notification preferences must be an object.' });
+    }
+    const normalizedPreferences = hasPreferences ? { ...preferences } : undefined;
+
+    if (hasPreferences) {
+      if (preferences.summarySendTime !== undefined
+        && (typeof preferences.summarySendTime !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(preferences.summarySendTime))) {
+        return res.status(400).json({ success: false, code: 'INVALID_SUMMARY_SEND_TIME', message: 'Summary send time must use HH:mm (24-hour) format.' });
+      }
+      for (const field of ['lowStockThreshold', 'largeOrderThreshold']) {
+        if (preferences[field] === undefined) continue;
+        const value = parseNotificationThreshold(preferences[field]);
+        if (value === null) {
+          return res.status(400).json({ success: false, code: 'INVALID_NOTIFICATION_THRESHOLD', message: `${field} must be between 0 and 999999999999999, with no more than 4 decimal places.` });
+        }
+        normalizedPreferences[field] = value;
+      }
+      if (preferences.paymentReminderDays !== undefined) {
+        const days = parsePaymentReminderDays(preferences.paymentReminderDays);
+        if (days === null) {
+          return res.status(400).json({ success: false, code: 'INVALID_PAYMENT_REMINDER_DAYS', message: 'Payment reminder days must be a whole number from 0 to 365.' });
+        }
+        normalizedPreferences.paymentReminderDays = days;
+      }
+    }
     
     let settings = await NotificationSettings.findOne({ company: companyId });
     
@@ -305,48 +439,61 @@ exports.updateSettings = async (req, res, next) => {
     }
     
     if (smsNotifications) {
-      // Normalize and validate admin phone numbers before saving
-      const adminPhones = Array.isArray(smsNotifications.adminPhones)
-        ? smsNotifications.adminPhones
-            .map(p => smsService.normalizePhoneNumber(String(p || '')))
-            .filter(Boolean)
-        : undefined;
-
       settings.smsNotifications = {
         ...settings.smsNotifications,
         ...smsNotifications,
-        ...(adminPhones ? { adminPhones: [...new Set(adminPhones)].slice(0, 50) } : {})
+        ...(normalizedAdminPhones !== undefined ? { adminPhones: normalizedAdminPhones } : {})
       };
     }
     
-    if (preferences) {
+    if (hasPreferences) {
       settings.preferences = {
         ...settings.preferences,
-        ...preferences
+        ...normalizedPreferences
       };
     }
     
-    if (criticalAlertPhones) {
-      // Normalize critical alert phone numbers
-      const critical = Array.isArray(criticalAlertPhones)
-        ? criticalAlertPhones
-            .map(p => smsService.normalizePhoneNumber(String(p || '')))
-            .filter(Boolean)
-        : [];
-
-      settings.criticalAlertPhones = [...new Set(critical)].slice(0, 50);
+    if (hasCriticalAlertPhones) {
+      settings.criticalAlertPhones = normalizedCriticalAlertPhones;
     }
     
     await settings.save();
     
     res.json({
       success: true,
-      data: settings
+      data: {
+        ...settings,
+        scheduleTimezone: notificationTimezone,
+        deliveryProviders: getNotificationProviderStatus()
+      }
     });
   } catch (error) {
     next(error);
   }
 };
+
+// Reports credential/configuration presence only. Connectivity is verified only
+// by sending a test message; never return secret values to the client.
+function getNotificationProviderStatus() {
+  const emailService = require('../services/emailService');
+  const emailConfig = emailService.validateConfig();
+  const smsProvider = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM_NUMBER
+    ? 'Twilio'
+    : process.env.NEXMO_API_KEY && process.env.NEXMO_API_SECRET && process.env.NEXMO_FROM_NUMBER
+      ? 'Vonage'
+      : null;
+
+  return {
+    email: {
+      provider: emailConfig.provider,
+      configured: emailConfig.valid
+    },
+    sms: {
+      provider: smsProvider,
+      configured: Boolean(smsProvider)
+    }
+  };
+}
 
 // @desc    Test email notification
 // @route   POST /api/notifications/test-email

@@ -12,9 +12,99 @@ const { notifyLowStock, notifyOutOfStock } = require('./notificationHelper');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const JournalService = require('./journalService');
 const { dbClient } = require('../lib/prisma');
+const { generateObjectId } = require('../utils/objectId');
 
 const SCHEDULER_PAGE_SIZE = Math.min(100, Math.max(10, Number(process.env.SCHEDULER_PAGE_SIZE || 100)));
 const SCHEDULER_MAX_ROWS = Math.max(SCHEDULER_PAGE_SIZE, Number(process.env.SCHEDULER_MAX_ROWS || 10000));
+const LOW_STOCK_NOTIFICATION_COOLDOWN_HOURS = (() => {
+  const value = Number(process.env.LOW_STOCK_NOTIFICATION_COOLDOWN_HOURS || 24);
+  return Number.isFinite(value) && value > 0 && value <= 720 ? value : 24;
+})();
+const NOTIFICATION_TIMEZONE = (() => {
+  const candidate = String(process.env.NOTIFICATION_TIMEZONE || process.env.TZ || 'UTC').trim();
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch (_) {
+    console.error(`Invalid NOTIFICATION_TIMEZONE "${candidate}"; notification schedules will use UTC.`);
+    return 'UTC';
+  }
+})();
+
+function getScheduleClock(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: NOTIFICATION_TIMEZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23', weekday: 'short',
+  }).formatToParts(date);
+  const value = Object.fromEntries(parts.map(({ type, value: part }) => [type, part]));
+  return {
+    date: `${value.year}-${value.month}-${value.day}`,
+    time: `${value.hour}:${value.minute}`,
+    weekday: value.weekday,
+  };
+}
+
+async function claimSummaryDelivery(settings, kind, dateKey) {
+  const field = kind === 'daily' ? 'lastDailySummaryDate' : 'lastWeeklySummaryDate';
+  const id = String(settings?._id || settings?.id || '');
+  const companyId = String(settings?.company || settings?.companyId || '');
+  if (!id || !companyId) return false;
+  const result = await dbClient().notificationSettings.updateMany({
+    where: {
+      id,
+      companyId,
+      OR: [{ [field]: null }, { [field]: { not: dateKey } }],
+    },
+    data: { [field]: dateKey },
+  });
+  if (result.count === 1) {
+    settings[field] = dateKey;
+    return true;
+  }
+  return false;
+}
+
+async function releaseSummaryDelivery(settings, kind, dateKey) {
+  const field = kind === 'daily' ? 'lastDailySummaryDate' : 'lastWeeklySummaryDate';
+  const id = String(settings?._id || settings?.id || '');
+  const companyId = String(settings?.company || settings?.companyId || '');
+  if (!id || !companyId) return;
+  await dbClient().notificationSettings.updateMany({
+    where: { id, companyId, [field]: dateKey },
+    data: { [field]: null },
+  });
+}
+
+async function claimLowStockAlert(companyId, productId, alertType, now = new Date()) {
+  const identity = { companyId: String(companyId), productId: String(productId), alertType };
+  const cutoff = new Date(now.getTime() - LOW_STOCK_NOTIFICATION_COOLDOWN_HOURS * 60 * 60 * 1000);
+  const updated = await dbClient().stockAlertCooldown.updateMany({
+    where: { ...identity, lastNotifiedAt: { lte: cutoff } },
+    data: { lastNotifiedAt: now },
+  });
+  if (updated.count === 1) return now;
+
+  try {
+    await dbClient().stockAlertCooldown.create({
+      data: { id: generateObjectId(), ...identity, lastNotifiedAt: now },
+    });
+    return now;
+  } catch (error) {
+    // A concurrent worker may have claimed the unique key after updateMany.
+    if (error?.code === 'P2002') return null;
+    throw error;
+  }
+}
+
+async function releaseLowStockAlertClaim(companyId, productId, alertType, claimedAt) {
+  await dbClient().stockAlertCooldown.deleteMany({
+    where: {
+      companyId: String(companyId), productId: String(productId), alertType,
+      lastNotifiedAt: claimedAt,
+    },
+  });
+}
 
 async function fetchPaged(model, filter, configure = (query) => query, pageSize = SCHEDULER_PAGE_SIZE) {
   const rows = [];
@@ -73,7 +163,7 @@ const getNotificationSettings = async (companyId) => {
 };
 
 // Get admin users with phones for SMS
-const getAdminPhones = async (companyId) => {
+const getAdminPhones = async (companyId, existingSettings) => {
   const admins = await fetchPaged(User, {
     company: companyId,
     role: 'admin',
@@ -81,13 +171,22 @@ const getAdminPhones = async (companyId) => {
   }, (query) => query.select('phone'));
 
   const phones = admins.map(a => a.phone).filter(Boolean);
-  const settings = await getNotificationSettings(companyId);
+  const settings = existingSettings || await getNotificationSettings(companyId);
   
   if (settings?.smsNotifications?.adminPhones?.length > 0) {
     return [...new Set([...phones, ...settings.smsNotifications.adminPhones])];
   }
   
   return phones;
+};
+
+const getCriticalAlertPhones = async (companyId, existingSettings) => {
+  const settings = existingSettings || await getNotificationSettings(companyId);
+  const configured = (settings?.criticalAlertPhones || [])
+    .map((phone) => smsService.normalizePhoneNumber(String(phone || '')))
+    .filter(Boolean);
+  // Keep legacy delivery to company admins until a dedicated list is configured.
+  return configured.length ? [...new Set(configured)] : getAdminPhones(companyId, settings);
 };
 
 // ============================================
@@ -109,7 +208,7 @@ const companies = await fetchPaged(Company, {});
         continue;
       }
 
-      const daysBefore = settings?.preferences?.paymentReminderDays || 3;
+      const daysBefore = Number(settings?.preferences?.paymentReminderDays ?? 3);
       const now = new Date();
       const target = new Date(now.getTime() + daysBefore * 24 * 60 * 60 * 1000);
 
@@ -143,7 +242,11 @@ const companies = await fetchPaged(Company, {});
       });
       
       if (settings?.smsNotifications?.enabled && overdueInvoices.length > 0) {
-        const phones = await getAdminPhones(company._id);
+        const [adminPhones, criticalPhones] = await Promise.all([
+          getAdminPhones(company._id, settings),
+          getCriticalAlertPhones(company._id, settings),
+        ]);
+        const phones = [...new Set([...adminPhones, ...criticalPhones])];
         if (phones.length > 0) {
           for (const inv of overdueInvoices.slice(0, 3)) { // Limit to 3 SMS
             await smsService.sendPaymentOverdueSMS(inv, company, phones);
@@ -165,11 +268,11 @@ async function checkLowStock() {
   
   try {
 const companies = await fetchPaged(Company, {});
-    const threshold = process.env.LOW_STOCK_THRESHOLD || 10;
+    const threshold = Number(process.env.LOW_STOCK_THRESHOLD || 10);
 
     for (const company of companies) {
       const settings = await getNotificationSettings(company._id);
-      const companyThreshold = settings?.preferences?.lowStockThreshold || threshold;
+      const companyThreshold = Number(settings?.preferences?.lowStockThreshold ?? threshold);
 
       // Find low stock products
       // Use `defaultWarehouse` field (if present) instead of `warehouse` which is not in the schema
@@ -178,22 +281,74 @@ const companies = await fetchPaged(Company, {});
         currentStock: { $lte: companyThreshold },
       }, (query) => query.populate('company'));
 
-      const criticalPhones = settings?.smsNotifications?.enabled
-        ? await getAdminPhones(company._id)
-        : [];
+      // A recovered product starts a new alert lifecycle if it becomes low again.
+      const lowProductIds = products.map((product) => String(product._id));
+      await dbClient().stockAlertCooldown.deleteMany({
+        where: lowProductIds.length
+          ? { companyId: String(company._id), productId: { notIn: lowProductIds } }
+          : { companyId: String(company._id) },
+      });
+      const outOfStockIds = products
+        .filter((product) => Number(product.currentStock) <= 0)
+        .map((product) => String(product._id));
+      await dbClient().stockAlertCooldown.deleteMany({
+        where: {
+          companyId: String(company._id),
+          alertType: outOfStockIds.length ? 'low_stock' : 'out_of_stock',
+          ...(outOfStockIds.length ? { productId: { in: outOfStockIds } } : {}),
+        },
+      });
+      const lowStockIds = products
+        .filter((product) => Number(product.currentStock) > 0)
+        .map((product) => String(product._id));
+      if (lowStockIds.length) {
+        await dbClient().stockAlertCooldown.deleteMany({
+          where: {
+            companyId: String(company._id),
+            productId: { in: lowStockIds },
+            alertType: 'out_of_stock',
+          },
+        });
+      }
+
+      const [adminPhones, criticalPhones] = settings?.smsNotifications?.enabled
+        ? await Promise.all([
+          getAdminPhones(company._id, settings),
+          getCriticalAlertPhones(company._id, settings),
+        ])
+        : [[], []];
+      const criticalOnly = settings?.smsNotifications?.criticalOnly !== false;
       for (const p of products) {
         const isCritical = p.currentStock <= Math.floor(companyThreshold / 2);
+        const alertType = p.currentStock <= 0 ? 'out_of_stock' : 'low_stock';
         
         // Create in-app database notification
+        let alertClaimedAt = null;
         try {
-          if (p.currentStock === 0) {
-            await notifyOutOfStock(company._id, p);
+          alertClaimedAt = await claimLowStockAlert(company._id, p._id, alertType);
+          if (alertClaimedAt && p.currentStock <= 0) {
+            const notifications = await notifyOutOfStock(company._id, p);
+            if (notifications.length === 0) {
+              await releaseLowStockAlertClaim(company._id, p._id, alertType, alertClaimedAt);
+              alertClaimedAt = null;
+            }
             console.log(`🔔 In-app notification created: ${p.name} is out of stock`);
-          } else {
-            await notifyLowStock(company._id, p, p.currentStock);
+          } else if (alertClaimedAt) {
+            const notifications = await notifyLowStock(company._id, p, p.currentStock);
+            if (notifications.length === 0) {
+              await releaseLowStockAlertClaim(company._id, p._id, alertType, alertClaimedAt);
+              alertClaimedAt = null;
+            }
             console.log(`🔔 In-app notification created: ${p.name} is low stock (${p.currentStock})`);
           }
         } catch (err) {
+          if (alertClaimedAt) {
+            try {
+              await releaseLowStockAlertClaim(company._id, p._id, alertType, alertClaimedAt);
+            } catch (releaseError) {
+              console.error('Failed to release low-stock alert claim:', releaseError);
+            }
+          }
           console.error('Failed to create in-app notification:', err);
         }
         
@@ -208,9 +363,17 @@ const companies = await fetchPaged(Company, {});
           }
         }
         
-        // Send SMS for critical stock
-        if (criticalPhones.length > 0 && isCritical) {
-          await smsService.sendLowStockCriticalSMS(p, company, criticalPhones);
+        // Respect the company preference: criticalOnly=true sends only severe
+        // alerts; false also sends ordinary low-stock alerts.
+        const smsRecipients = isCritical
+          ? [...new Set([...adminPhones, ...criticalPhones])]
+          : adminPhones;
+        if (smsRecipients.length > 0 && (!criticalOnly || isCritical)) {
+          try {
+            await smsService.sendLowStockAlertSMS(p, company, smsRecipients, isCritical);
+          } catch (err) {
+            console.error('Failed to send low-stock SMS for product', p._id, err);
+          }
         }
       }
     }
@@ -237,6 +400,10 @@ const companies = await fetchPaged(Company, {});
         continue;
       }
 
+      const clock = getScheduleClock();
+      const sendTime = String(settings.preferences?.summarySendTime || '09:00');
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(sendTime) || clock.time < sendTime) continue;
+
       // Get stats
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
       
@@ -249,7 +416,7 @@ const companies = await fetchPaged(Company, {});
       ] = await Promise.all([
         Invoice.countDocuments({ company: company._id, createdAt: { $gte: since } }),
         Invoice.countDocuments({ company: company._id, status: 'confirmed', createdAt: { $gte: since } }),
-        Product.countDocuments({ company: company._id, currentStock: { $lte: Number(process.env.LOW_STOCK_THRESHOLD || 5) } }),
+        Product.countDocuments({ company: company._id, currentStock: { $lte: Number(settings.preferences?.lowStockThreshold ?? process.env.LOW_STOCK_THRESHOLD ?? 5) } }),
         Invoice.countDocuments({ 
           company: company._id, 
           dueDate: { $lt: new Date() },
@@ -268,11 +435,20 @@ const companies = await fetchPaged(Company, {});
         topProducts: topProducts.map(p => ({ name: p.name, quantity: p.currentStock }))
       };
 
+      if (!(await claimSummaryDelivery(settings, 'daily', clock.date))) continue;
+
       try {
-        await emailService.sendDailySummaryEmail(company, stats);
+        const delivered = await emailService.sendDailySummaryEmail(company, stats);
+        if (delivered === false) {
+          await releaseSummaryDelivery(settings, 'daily', clock.date);
+          continue;
+        }
         console.log(`📧 Daily summary sent for company ${company.name}`);
       } catch (err) {
         console.error('Failed to send daily summary for company', company._id, err);
+        await releaseSummaryDelivery(settings, 'daily', clock.date).catch((releaseError) => {
+          console.error('Could not release daily-summary delivery claim:', releaseError.message || releaseError);
+        });
       }
     }
   } catch (err) {
@@ -298,6 +474,10 @@ const companies = await fetchPaged(Company, {});
         continue;
       }
 
+      const clock = getScheduleClock();
+      const sendTime = String(settings.preferences?.summarySendTime || '09:00');
+      if (clock.weekday !== 'Mon' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(sendTime) || clock.time < sendTime) continue;
+
       // Get stats for last 7 days
       const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
       
@@ -314,7 +494,7 @@ const companies = await fetchPaged(Company, {});
           _sum: { totalAmount: true },
         }),
         require('../models/Purchase').countDocuments({ company: company._id, createdAt: { $gte: since } }),
-        Product.countDocuments({ company: company._id, currentStock: { $lte: Number(process.env.LOW_STOCK_THRESHOLD || 5) } }),
+        Product.countDocuments({ company: company._id, currentStock: { $lte: Number(settings.preferences?.lowStockThreshold ?? process.env.LOW_STOCK_THRESHOLD ?? 5) } }),
         // Category breakdown (simplified)
         dbClient().product.groupBy({
           by: ['categoryId'],
@@ -336,11 +516,20 @@ const companies = await fetchPaged(Company, {});
         }))
       };
 
+      if (!(await claimSummaryDelivery(settings, 'weekly', clock.date))) continue;
+
       try {
-        await emailService.sendWeeklySummaryEmail(company, stats);
+        const delivered = await emailService.sendWeeklySummaryEmail(company, stats);
+        if (delivered === false) {
+          await releaseSummaryDelivery(settings, 'weekly', clock.date);
+          continue;
+        }
         console.log(`📧 Weekly summary sent for company ${company.name}`);
       } catch (err) {
         console.error('Failed to send weekly summary for company', company._id, err);
+        await releaseSummaryDelivery(settings, 'weekly', clock.date).catch((releaseError) => {
+          console.error('Could not release weekly-summary delivery claim:', releaseError.message || releaseError);
+        });
       }
     }
   } catch (err) {
@@ -465,10 +654,10 @@ function startScheduler() {
     cron.schedule('0 * * * *', sendPaymentReminders),
     // Low stock check - every 2 hours
     cron.schedule('0 */2 * * *', checkLowStock),
-    // Daily summary - every day at 9 AM
-    cron.schedule('0 9 * * *', sendDailySummaryReports),
-    // Weekly summary - every Monday at 9 AM
-    cron.schedule('0 9 * * 1', sendWeeklySummaryReports),
+    // Company-specific summary time. Database claims make each report at most
+    // once per local day even if scheduler ticks or worker instances overlap.
+    cron.schedule('* * * * *', sendDailySummaryReports, { timezone: NOTIFICATION_TIMEZONE }),
+    cron.schedule('* * * * 1', sendWeeklySummaryReports, { timezone: NOTIFICATION_TIMEZONE }),
     // Automatic depreciation - every day at 1 AM
     cron.schedule('0 1 * * *', runAutomaticDepreciation),
   ];
