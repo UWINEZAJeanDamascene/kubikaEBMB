@@ -4,6 +4,7 @@ const router = express.Router();
 const companyController = require('../controllers/companyController');
 const { uploadFor } = require('../middleware/upload');
 const { protect, authorize } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const { attachCompanyId } = require('../middleware/companyContext');
 const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
@@ -47,7 +48,11 @@ router.use(protect);
  * Current user's company — must be before /:id routes
  */
 router.get('/me', companyController.getMyCompany);
-router.put('/me', companyController.updateMyCompany);
+router.put(
+  '/me',
+  requirePermissionOrRoles('settings', 'update', ['admin']),
+  companyController.updateMyCompany
+);
 
 /**
  * Platform admin — literal paths before /:id

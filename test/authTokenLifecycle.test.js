@@ -4,6 +4,7 @@ jest.mock('jsonwebtoken', () => ({
 }));
 
 jest.mock('../services/authDataService', () => ({
+  applyCompanyRoleOverrides: jest.fn(async (user) => user),
   findUserById: jest.fn(),
   findCompanyById: jest.fn(),
 }));
@@ -93,7 +94,10 @@ describe('authentication token lifecycle', () => {
       memberships: [],
     });
 
-    const req = { body: { email: 'user@example.com', password: 'correct-password' } };
+    const req = {
+      body: { email: 'user@example.com', password: 'correct-password' },
+      get: jest.fn(() => undefined),
+    };
     const res = response();
     const next = jest.fn();
 

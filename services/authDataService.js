@@ -8,6 +8,43 @@ const { prisma } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
 const { userToApi, companyToApi, roleToApi } = require('../utils/authMappers');
 
+async function applyCompanyRoleOverrides(user) {
+  if (!user) return user;
+
+  const companyId = toIdString(user.companyId || user.company?._id || user.company?.id || user.company || null);
+  if (!companyId) return user;
+
+  let roles = Array.isArray(user.roles) ? user.roles : [];
+  let roleIds = roles.map((entry) => entry?.role?.id).filter(Boolean);
+  if (!roleIds.length && user.role && !['admin', 'platform_admin'].includes(user.role)) {
+    const legacyRole = await prisma.role.findFirst({
+      where: { name: user.role, isSystemRole: true },
+    });
+    if (legacyRole) {
+      roles = [{ role: legacyRole }];
+      roleIds = [legacyRole.id];
+    }
+  }
+  if (!roleIds.length) return user;
+
+  const overrides = await prisma.rolePermissionOverride.findMany({
+    where: { companyId, roleId: { in: roleIds } },
+    select: { roleId: true, permissions: true },
+  });
+  if (!overrides.length) return roles === user.roles ? user : { ...user, roles };
+
+  const permissionsByRoleId = new Map(overrides.map((override) => [override.roleId, override.permissions]));
+  return {
+    ...user,
+    roles: roles.map((entry) => {
+      const permissions = entry?.role && permissionsByRoleId.get(entry.role.id);
+      return permissions
+        ? { ...entry, role: { ...entry.role, permissions } }
+        : entry;
+    }),
+  };
+}
+
 /**
  * Load a user for login: includes company + roles, and keeps the password
  * hash on the returned object so compareUserPassword can verify it.
@@ -21,7 +58,8 @@ async function findUserByEmailForLogin(email) {
     },
   });
   if (!user) return null;
-  return { ...userToApi(user), password: user.password };
+  const effectiveUser = await applyCompanyRoleOverrides(user);
+  return { ...userToApi(effectiveUser), password: user.password };
 }
 
 async function findUserById(id, options = {}) {
@@ -35,7 +73,8 @@ async function findUserById(id, options = {}) {
     include: Object.keys(include).length ? include : undefined,
   });
   if (!user) return null;
-  const mapped = userToApi(user);
+  const effectiveUser = options.populateRoles ? await applyCompanyRoleOverrides(user) : user;
+  const mapped = userToApi(effectiveUser);
   if (options.includePassword) {
     mapped.password = user.password;
   }
@@ -104,6 +143,7 @@ function toPublicUser(user) {
 }
 
 module.exports = {
+  applyCompanyRoleOverrides,
   findUserByEmailForLogin,
   findUserById,
   findCompanyById,

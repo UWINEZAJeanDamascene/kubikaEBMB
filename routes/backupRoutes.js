@@ -15,28 +15,29 @@ const {
   getBackupStats
 } = require('../controllers/backupController');
 const { protect, authorize } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 
 // All routes require authentication
 router.use(protect);
 
 // Get backups list
-router.get('/', getBackups);
+router.get('/', requirePermissionOrRoles('settings', 'read', ['admin']), getBackups);
 
 // Get backup statistics
-router.get('/stats', getBackupStats);
+router.get('/stats', requirePermissionOrRoles('settings', 'read', ['admin']), getBackupStats);
 
 // Get available point-in-time recovery points
-router.get('/points-in-time', getPointsInTime);
-router.get('/snapshots', getSnapshots);
+router.get('/points-in-time', requirePermissionOrRoles('settings', 'read', ['admin']), getPointsInTime);
+router.get('/snapshots', requirePermissionOrRoles('settings', 'read', ['admin']), getSnapshots);
 
 // Get backup settings
-router.get('/settings', getBackupSettings);
+router.get('/settings', requirePermissionOrRoles('settings', 'read', ['admin']), getBackupSettings);
 
 // Update backup settings
 router.put('/settings', authorize('admin', 'superadmin'), updateBackupSettings);
 
 // Get single backup
-router.get('/:id', getBackup);
+router.get('/:id', requirePermissionOrRoles('settings', 'read', ['admin']), getBackup);
 
 // Create new backup
 router.post('/', authorize('admin', 'superadmin'), createBackup);

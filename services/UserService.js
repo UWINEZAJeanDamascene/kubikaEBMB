@@ -10,6 +10,7 @@ const bcrypt = require('bcryptjs');
 const { prisma } = require('../lib/prisma');
 const { generateObjectId, toIdString } = require('../utils/objectId');
 const { userToApi } = require('../utils/authMappers');
+const { applyCompanyRoleOverrides } = require('./authDataService');
 const passwordUtils = require('../utils/passwordUtils');
 const SessionService = require('./sessionService');
 const TokenService = require('./tokenService');
@@ -212,6 +213,7 @@ class UserService {
   }
 
   static async _completeLogin(user, sessionContext = {}) {
+    user = await applyCompanyRoleOverrides(user);
     // Persist the login state and refresh-token hash in one database write.
     // The token service accepts the additional fields so a cold Neon connection
     // is not paid for twice on every successful login.
@@ -720,7 +722,7 @@ class UserService {
    * Get user by ID (with computed flat permissions array)
    */
   static async getUserById(userId) {
-    const user = await prisma.user.findUnique({
+    let user = await prisma.user.findUnique({
       where: { id: toIdString(userId) },
       include: {
         company: true,
@@ -730,6 +732,7 @@ class UserService {
     if (!user) {
       throw new Error('User not found');
     }
+    user = await applyCompanyRoleOverrides(user);
 
     const userObj = userToApi(user);
 

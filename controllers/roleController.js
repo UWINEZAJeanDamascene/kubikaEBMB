@@ -21,8 +21,44 @@ function requestCompanyId(req) {
   return toIdString(company?._id || company?.id || company || null);
 }
 
+function effectiveCompanyId(req, requestedCompanyId) {
+  if (isPlatformAdmin(req)) {
+    return toIdString(requestedCompanyId || req.get?.('x-company-id') || req.headers?.['x-company-id'] || null);
+  }
+  return requestCompanyId(req);
+}
+
 function isPlatformAdmin(req) {
   return req.user?.role === 'platform_admin';
+}
+
+async function roleWithCompanyOverride(role, companyId) {
+  if (!role || !role.isSystemRole || !companyId) return role;
+  const override = await prisma.rolePermissionOverride.findUnique({
+    where: { companyId_roleId: { companyId, roleId: role.id } },
+    select: { permissions: true },
+  });
+  return override
+    ? { ...role, permissions: override.permissions, hasCompanyOverride: true }
+    : { ...role, hasCompanyOverride: false };
+}
+
+async function rolesWithCompanyOverrides(roles, companyId) {
+  if (!companyId) return roles.map((role) => ({ ...role, hasCompanyOverride: false }));
+  const systemRoleIds = roles.filter((role) => role.isSystemRole).map((role) => role.id);
+  if (!systemRoleIds.length) return roles.map((role) => ({ ...role, hasCompanyOverride: false }));
+
+  const overrides = await prisma.rolePermissionOverride.findMany({
+    where: { companyId, roleId: { in: systemRoleIds } },
+    select: { roleId: true, permissions: true },
+  });
+  const overrideByRoleId = new Map(overrides.map((override) => [override.roleId, override.permissions]));
+  return roles.map((role) => {
+    const permissions = role.isSystemRole ? overrideByRoleId.get(role.id) : undefined;
+    return permissions
+      ? { ...role, permissions, hasCompanyOverride: true }
+      : { ...role, hasCompanyOverride: false };
+  });
 }
 
 function visibleRoleWhere(req, id) {
@@ -106,9 +142,7 @@ exports.getRoles = async (req, res, next) => {
   try {
     // Tenant admins may only list their own roles and the shared system roles.
     // Only a platform admin may choose a tenant through the query string.
-    const companyId = isPlatformAdmin(req)
-      ? toIdString(req.query.company_id || null)
-      : requestCompanyId(req);
+    const companyId = effectiveCompanyId(req, req.query.company_id);
 
     // System roles have companyId null; include the company's custom roles when known
     const where = companyId
@@ -126,9 +160,13 @@ exports.getRoles = async (req, res, next) => {
       }),
     ]);
 
+    const effectiveRoles = await rolesWithCompanyOverrides(roles, companyId);
     res.json({
       success: true,
-      data: roles.map(roleToApi),
+      data: effectiveRoles.map((role) => ({
+        ...roleToApi(role),
+        has_company_override: Boolean(role.hasCompanyOverride),
+      })),
       count: roles.length,
       pagination: paginationMeta(page, limit, total),
     });
@@ -153,9 +191,10 @@ exports.getRoleById = async (req, res, next) => {
       });
     }
 
+    const effectiveRole = await roleWithCompanyOverride(role, effectiveCompanyId(req));
     res.json({
       success: true,
-      data: roleToApi(role)
+      data: { ...roleToApi(effectiveRole), has_company_override: Boolean(effectiveRole.hasCompanyOverride) }
     });
   } catch (error) {
     next(error);
@@ -181,13 +220,15 @@ exports.getRolePermissions = async (req, res, next) => {
       });
     }
 
+    const effectiveRole = await roleWithCompanyOverride(role, effectiveCompanyId(req));
     res.json({
       success: true,
       data: {
-        role_id: role.id,
-        role_name: role.name,
-        is_system_role: role.isSystemRole,
-        permissions: role.permissions
+        role_id: effectiveRole.id,
+        role_name: effectiveRole.name,
+        is_system_role: effectiveRole.isSystemRole,
+        has_company_override: Boolean(effectiveRole.hasCompanyOverride),
+        permissions: effectiveRole.permissions
       }
     });
   } catch (error) {
@@ -365,6 +406,107 @@ exports.updateRole = async (req, res, next) => {
       data: roleToApi(updated),
       message: 'Role updated successfully'
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.updateRolePermissionOverride = async (req, res, next) => {
+  try {
+    const roleId = toIdString(req.params.id);
+    const companyId = effectiveCompanyId(req, req.body.company_id);
+    if (!companyId) {
+      return res.status(400).json({
+        success: false,
+        error: 'COMPANY_REQUIRED',
+        message: 'A company context is required to customize a system role',
+      });
+    }
+
+    const role = await prisma.role.findFirst({
+      where: { id: roleId, isSystemRole: true },
+    });
+    if (!role) {
+      return res.status(404).json({
+        success: false,
+        error: 'SYSTEM_ROLE_NOT_FOUND',
+        message: 'System role not found',
+      });
+    }
+
+    if (!Array.isArray(req.body.permissions)) {
+      return res.status(400).json({
+        success: false,
+        error: 'VALIDATION_ERROR',
+        message: 'Permissions must be an array',
+      });
+    }
+
+    const normalizedPermissions = normalizePermissions(req.body.permissions);
+    if (!isPlatformAdmin(req) && hasWildcardGrant(normalizedPermissions)) {
+      return res.status(400).json({
+        success: false,
+        error: 'WILDCARD_PERMISSION_FORBIDDEN',
+        message: 'Company role overrides must use specific resource permissions.',
+      });
+    }
+    if (!isPlatformAdmin(req)) {
+      const unknownPermissions = unregisteredPermissionPairs(normalizedPermissions, role.permissions || []);
+      if (unknownPermissions.length) {
+        return res.status(400).json({
+          success: false,
+          error: 'PERMISSION_NOT_IN_CATALOG',
+          message: 'Choose permissions from the current system permission catalog.',
+          details: unknownPermissions,
+        });
+      }
+    }
+
+    await prisma.rolePermissionOverride.upsert({
+      where: { companyId_roleId: { companyId, roleId } },
+      create: { companyId, roleId, permissions: normalizedPermissions },
+      update: { permissions: normalizedPermissions },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        ...roleToApi({ ...role, permissions: normalizedPermissions }),
+        has_company_override: true,
+      },
+      message: 'Company role permissions updated successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.deleteRolePermissionOverride = async (req, res, next) => {
+  try {
+    const roleId = toIdString(req.params.id);
+    const companyId = effectiveCompanyId(req, req.body?.company_id);
+    if (!companyId) {
+      return res.status(400).json({
+        success: false,
+        error: 'COMPANY_REQUIRED',
+        message: 'A company context is required to restore system role permissions',
+      });
+    }
+
+    const role = await prisma.role.findFirst({
+      where: { id: roleId, isSystemRole: true },
+      select: { id: true },
+    });
+    if (!role) {
+      return res.status(404).json({
+        success: false,
+        error: 'SYSTEM_ROLE_NOT_FOUND',
+        message: 'System role not found',
+      });
+    }
+
+    await prisma.rolePermissionOverride.deleteMany({ where: { companyId, roleId } });
+    res.json({ success: true, message: 'Company role permissions restored to system defaults' });
   } catch (error) {
     next(error);
   }

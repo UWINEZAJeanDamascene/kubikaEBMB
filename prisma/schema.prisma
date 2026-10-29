@@ -829,6 +829,7 @@ model Company {
   reorderPoints               ReorderPoint[]
   reportSnapshots             ReportSnapshot[]
   roles                       Role[]
+  rolePermissionOverrides    RolePermissionOverride[]
   salaryHistories             SalaryHistory[]
   salesOrders                 SalesOrder[]
   sequences                   SequenceCounter[]
@@ -952,9 +953,24 @@ model Role {
   updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
   company      Company?   @relation(fields: [companyId], references: [id])
   users        UserRole[]
+  permissionOverrides RolePermissionOverride[]
 
   @@index([companyId, name])
   @@map("roles")
+}
+
+model RolePermissionOverride {
+  companyId  String   @map("company_id") @db.Char(24)
+  roleId     String   @map("role_id") @db.Char(24)
+  permissions Json   @default("[]")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  role       Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([companyId, roleId])
+  @@index([roleId])
+  @@map("role_permission_overrides")
 }
 
 model UserRole {

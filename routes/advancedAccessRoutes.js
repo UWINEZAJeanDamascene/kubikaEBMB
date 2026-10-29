@@ -9,6 +9,8 @@ const {
   getPermissionCatalog,
   getRolePermissions,
   updateRole, 
+  updateRolePermissionOverride,
+  deleteRolePermissionOverride,
   deleteRole 
 } = require('../controllers/roleController');
 const { 
@@ -61,6 +63,8 @@ router.post('/roles', authorize('platform_admin', 'admin'), createRole);
 router.get('/roles/permission-catalog', authorize('platform_admin', 'admin'), getPermissionCatalog);
 router.get('/roles/:id', authorize('platform_admin', 'admin'), getRoleById);
 router.get('/roles/:id/permissions', authorize('platform_admin', 'admin'), getRolePermissions);
+router.put('/roles/:id/override', authorize('platform_admin', 'admin'), updateRolePermissionOverride);
+router.delete('/roles/:id/override', authorize('platform_admin', 'admin'), deleteRolePermissionOverride);
 router.put('/roles/:id', authorize('platform_admin', 'admin'), updateRole);
 router.delete('/roles/:id', authorize('platform_admin', 'admin'), deleteRole);
 
