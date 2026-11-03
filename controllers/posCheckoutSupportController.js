@@ -15,13 +15,14 @@ function companyAndUser(req) {
 exports.getCheckoutRequest = async (req, res, next) => {
   try {
     const { companyId } = companyAndUser(req);
+    const cashierId = String(req.posAuthContext?.session.userId || req.user?.id || req.user?._id || '');
     const requestKey = String(req.params.requestKey || '').trim();
     if (!VALID_REQUEST_KEY.test(requestKey)) {
       return res.status(400).json({ success: false, code: 'POS_IDEMPOTENCY_KEY_INVALID', message: 'Checkout request key is invalid.' });
     }
     const rows = await dbClient().$queryRawUnsafe(
-      'SELECT r.request_key, r.created_by_id, u.name AS cashier_name, r.status, r.created_at, r.invoice_id, i.reference_no, i.customer_name, i.total_amount, i.status AS invoice_status, i.invoice_date FROM pos_sale_requests r LEFT JOIN users u ON u.id = r.created_by_id LEFT JOIN invoices i ON i.id = r.invoice_id AND i.company_id = r.company_id WHERE r.company_id = $1 AND r.request_key = $2 LIMIT 1',
-      companyId, requestKey,
+      'SELECT r.request_key, r.created_by_id, u.name AS cashier_name, r.status, r.created_at, r.invoice_id, i.reference_no, i.customer_name, i.total_amount, i.status AS invoice_status, i.invoice_date FROM pos_sale_requests r LEFT JOIN users u ON u.id = r.created_by_id AND u.company_id = r.company_id LEFT JOIN invoices i ON i.id = r.invoice_id AND i.company_id = r.company_id WHERE r.company_id = $1 AND r.request_key = $2 AND r.created_by_id = $3 LIMIT 1',
+      companyId, requestKey, cashierId,
     );
     const row = rows[0];
     if (!row) return res.status(404).json({ success: false, code: 'POS_CHECKOUT_REQUEST_NOT_FOUND', message: 'No server checkout record exists for this key.' });
@@ -51,6 +52,9 @@ exports.getCheckoutRequest = async (req, res, next) => {
 exports.recoverCheckoutRequest = async (req, res, next) => {
   try {
     const { companyId, userId } = companyAndUser(req);
+    if (req.posAuthContext && String(req.posAuthContext.session.userId) !== userId) {
+      return res.status(403).json({ success: false, code: 'POS_SESSION_IDENTITY_MISMATCH', message: 'Sign in to this till again.' });
+    }
     const requestKey = String(req.params.requestKey || '').trim();
     const requestData = req.body.requestData;
     const shouldSendEmail = req.body.shouldSendEmail === true;
@@ -81,6 +85,12 @@ exports.recoverCheckoutRequest = async (req, res, next) => {
         const error = new Error('The conflicting checkout key no longer exists. Retry the original saved sale once to re-check its state.');
         error.statusCode = 409;
         error.code = 'POS_CHECKOUT_REQUEST_NOT_FOUND';
+        throw error;
+      }
+      if (String(existing.created_by_id).trim() !== userId) {
+        const error = new Error('Only the cashier who started this checkout can request its recovery.');
+        error.statusCode = 403;
+        error.code = 'POS_CHECKOUT_RECOVERY_CASHIER_MISMATCH';
         throw error;
       }
       const sameCashier = String(existing.created_by_id).trim() === userId;

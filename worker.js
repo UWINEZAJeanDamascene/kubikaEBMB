@@ -48,9 +48,11 @@ async function startWorker() {
   startSafely('prepaid-expense-amortizations', () => require('./services/prepaidExpenseScheduler').startScheduler());
   startSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').startScheduler());
   startSafely('ebm-retry', () => require('./services/ebmRetryJob').startRetryJob());
+  startSafely('pos-ebm-v2-sweeper', () => require('./services/posEbmV2RetryJob').start());
   startSafely('report-snapshots', () => require('./services/reportSchedulerService').initializeScheduler());
   startSafely('tenant-backups', () => require('./services/backupScheduler').startScheduler());
   startSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').startMonitoringScheduler());
+  startSafely('pos-print-maintenance', () => require('./services/posPrintMaintenanceService').startPrintMaintenance());
 
   // BullMQ job system. It was previously started only inside the web process's
   // disabled `if (false && ...)` block, so it has been running nowhere.
@@ -116,12 +118,14 @@ async function shutdown(signal) {
       try { fn(); } catch (e) { console.warn(`[worker] Error stopping ${label}:`, e.message || e); }
     };
     stopSafely('ebm-retry', () => require('./services/ebmRetryJob').stopRetryJob());
+    stopSafely('pos-ebm-v2-sweeper', () => require('./services/posEbmV2RetryJob').stop());
     stopSafely('report-snapshots', () => require('./services/reportSchedulerService').stopScheduler());
     stopSafely('tenant-backups', () => require('./services/backupScheduler').stopScheduler());
     stopSafely('notifications', () => require('./services/notificationScheduler').stopScheduler());
     stopSafely('prepaid-expense-amortizations', () => require('./services/prepaidExpenseScheduler').stopScheduler());
     stopSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').stopScheduler());
     stopSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').stopMonitoringScheduler());
+    stopSafely('pos-print-maintenance', () => require('./services/posPrintMaintenanceService').stopPrintMaintenance());
     // closeWorkers() is async; awaiting it lets in-flight jobs finish rather
     // than being killed mid-write.
     try {

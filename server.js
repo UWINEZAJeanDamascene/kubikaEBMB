@@ -320,6 +320,8 @@ async function initializeServer() {
 
   // Logging
   if (NODE_ENV === 'development') {
+    morgan.token('url', (req) => String(req.originalUrl || req.url || '')
+      .replace(/(\/api(?:\/v1)?\/public\/pos\/receipts\/)[^/?]+/gi, '$1[redacted]'));
     app.use(morgan('dev'));
   }
 
@@ -344,6 +346,7 @@ async function initializeServer() {
   apiRouter.use('/categories', require('./routes/categoryRoutes'));
   apiRouter.use('/suppliers', require('./routes/supplierRoutes'));
   apiRouter.use('/clients', require('./routes/clientRoutes'));
+  apiRouter.use('/customers', require('./routes/customerMasterRoutes'));
   apiRouter.use('/stock', require('./routes/stockRoutes'));
   apiRouter.use('/stock/warehouses', require('./routes/warehouseRoutes'));
   apiRouter.use('/stock/advanced', require('./routes/advancedStockRoutes'));
@@ -353,6 +356,7 @@ async function initializeServer() {
   apiRouter.use('/sales-invoices', require('./routes/invoiceRoutes'));
   apiRouter.use('/purchases', require('./routes/purchaseRoutes'));
   apiRouter.use('/pos', require('./routes/posRoutes'));
+  apiRouter.use('/public/pos/receipts', require('./routes/publicReceiptRoutes'));
   apiRouter.use('/sales-legacy', require('./routes/salesLegacyRoutes'));
   apiRouter.use('/tills', require('./routes/tillRoutes'));
   apiRouter.use('/reports/daily', require('./routes/dailyReportsRoutes'));

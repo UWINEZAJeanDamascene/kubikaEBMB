@@ -85,6 +85,26 @@ describe('authentication token lifecycle', () => {
     }));
   });
 
+  test('does not accept a register-bound POS session token as an ERP back-office token', async () => {
+    const invalid = new Error('invalid signature');
+    invalid.name = 'JsonWebTokenError';
+    jwt.verify.mockImplementation(() => { throw invalid; });
+
+    const req = { headers: { authorization: 'Bearer register-bound-pos-session' }, cookies: {} };
+    const res = response();
+    const next = jest.fn();
+
+    await protect(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.body).toEqual(expect.objectContaining({
+      success: false,
+      code: 'TOKEN_INVALID',
+    }));
+    expect(authData.findUserById).not.toHaveBeenCalled();
+  });
+
   test('login returns the newly issued user and refresh pair', async () => {
     UserService.login.mockResolvedValue({
       access_token: 'fresh-access-token',

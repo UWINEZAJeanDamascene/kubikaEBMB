@@ -1,5 +1,5 @@
 const SYSTEM_ROLE_NAMES = new Set([
-  'admin', 'platform_admin', 'manager', 'stock_manager', 'sales', 'accountant',
+  'admin', 'platform_admin', 'owner', 'manager', 'stock_manager', 'sales', 'cashier', 'supervisor', 'store_manager', 'accountant',
   'purchaser', 'viewer', 'warehouse_manager', 'warehouse', 'staff', 'super_admin',
 ]);
 

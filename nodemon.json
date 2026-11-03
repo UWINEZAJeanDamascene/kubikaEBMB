@@ -1,0 +1,30 @@
+{
+  "watch": [
+    "server.js",
+    "worker.js",
+    "controllers",
+    "services",
+    "middleware",
+    "routes",
+    "lib",
+    "utils",
+    "jobs",
+    "models",
+    "config",
+    "prisma"
+  ],
+  "ignore": [
+    "node_modules/**",
+    "downloads/**",
+    "uploads/**",
+    "storage/**",
+    "logs/**",
+    "tmp/**",
+    "coverage/**",
+    "*.zip",
+    "*.exe",
+    "*.log"
+  ],
+  "ext": "js,json,prisma",
+  "delay": 250
+}

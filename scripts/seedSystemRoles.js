@@ -8,7 +8,57 @@ require('dotenv').config();
 const { prisma, connectPrisma, disconnectPrisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 
+const CASHIER_POS_ROLE_PERMISSIONS = [
+  { resource: 'pos.till', actions: ['sell', 'cash_move', 'close_shift', 'discount', 'receive_account_payment', 'open_shift'] },
+  { resource: 'products', actions: ['read'] },
+  { resource: 'clients', actions: ['read', 'create'] },
+];
+const SUPERVISOR_POS_ROLE_PERMISSIONS = [
+  ...CASHIER_POS_ROLE_PERMISSIONS,
+  { resource: 'pos.till', actions: ['refund', 'void', 'no_sale', 'reprint', 'credit_sell'] },
+  { resource: 'pos.admin', actions: ['shifts', 'approvals'] },
+];
+const STORE_MANAGER_POS_ROLE_PERMISSIONS = [
+  ...SUPERVISOR_POS_ROLE_PERMISSIONS,
+  { resource: 'pos.admin', actions: ['view', 'reports', 'cashiers', 'registers', 'printers', 'settings', 'shifts', 'approvals', 'audit'] },
+  { resource: 'tills', actions: ['read', 'create'] },
+  // Registers are assigned to the shop's active branch/warehouse records.
+  { resource: 'warehouses', actions: ['read'] },
+  { resource: 'ebm', actions: ['read'] },
+  { resource: 'pos.shift', actions: ['settings'] },
+  { resource: 'pos.payment', actions: ['settings', 'manual_confirm'] },
+  { resource: 'pos.giftcard', actions: ['manage'] },
+];
+const OWNER_POS_ROLE_PERMISSIONS = [
+  ...STORE_MANAGER_POS_ROLE_PERMISSIONS,
+  { resource: 'pos.admin', actions: ['roles'] },
+];
+
 const systemRoles = [
+  {
+    name: 'cashier',
+    description: 'POS cashier access: sell, manage drawer movements, discounts within limits, and close own shift',
+    is_system_role: true,
+    permissions: CASHIER_POS_ROLE_PERMISSIONS,
+  },
+  {
+    name: 'supervisor',
+    description: 'POS supervisor access with sensitive till approvals and shift review',
+    is_system_role: true,
+    permissions: SUPERVISOR_POS_ROLE_PERMISSIONS,
+  },
+  {
+    name: 'owner',
+    description: 'POS owner access including roles, printers, and all POS settings',
+    is_system_role: true,
+    permissions: OWNER_POS_ROLE_PERMISSIONS,
+  },
+  {
+    name: 'store_manager',
+    description: 'POS manager with full Back Office access except POS role administration',
+    is_system_role: true,
+    permissions: STORE_MANAGER_POS_ROLE_PERMISSIONS,
+  },
   {
     name: 'platform_admin',
     description: 'Platform administrator with full system access',
@@ -28,7 +78,7 @@ const systemRoles = [
   },
   {
     name: 'manager',
-    description: 'Manager with access to manage teams and operations',
+    description: 'Manager with full POS Back Office access except POS role administration, plus team operations',
     is_system_role: true,
     permissions: [
       { resource: 'products', actions: ['read', 'create', 'update'] },
@@ -38,7 +88,8 @@ const systemRoles = [
       { resource: 'projects', actions: ['read', 'create', 'update', 'close', 'reopen'] },
       { resource: 'payroll', actions: ['read', 'create', 'update'] },
       { resource: 'credit_notes', actions: ['read', 'create', 'update', 'delete', 'approve'] },
-      { resource: 'reports', actions: ['read'] }
+      { resource: 'reports', actions: ['read'] },
+      ...STORE_MANAGER_POS_ROLE_PERMISSIONS,
     ]
   },
   {

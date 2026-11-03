@@ -89,6 +89,87 @@ describe('RRA refund reason code selection', () => {
   });
 });
 
+describe('V2 fiscal tender mapping', () => {
+  const mappingDatabase = (payments, settings = null) => ({
+    posPayment: { findMany: jest.fn().mockResolvedValue(payments) },
+    posEbmSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+  });
+
+  it('uses the configured documented mapping for the largest split tender', async () => {
+    const db = mappingDatabase([
+      { method: 'CASH', amount: 500 },
+      { method: 'CARD', amount: 1200 },
+    ]);
+    await expect(EBMSalesService.__test__.resolveV2TenderCode('sale-1', 'company-1', db)).resolves.toBe('05');
+  });
+
+  it.each(['BANK_TRANSFER', 'GIFT_CARD', 'STORE_CREDIT', 'LOYALTY_POINTS'])
+    ('blocks V2 fiscal submission for unmapped tender %s', async (method) => {
+      const db = mappingDatabase([{ method, amount: 100 }]);
+      await expect(EBMSalesService.__test__.resolveV2TenderCode('sale-1', 'company-1', db))
+        .rejects.toMatchObject({ code: 'EBM_V2_TENDER_UNMAPPED', message: 'This payment method is not available yet.' });
+    });
+
+  it('does not fall back for an unknown V2 payment enum', async () => {
+    const db = mappingDatabase([{ method: 'FUTURE_METHOD', amount: 100 }]);
+    await expect(EBMSalesService.__test__.resolveV2TenderCode('sale-1', 'company-1', db))
+      .rejects.toMatchObject({ code: 'EBM_V2_TENDER_INVALID' });
+  });
+
+  it('prepares a journal-matched fiscal payload with the customer TIN before dispatch', async () => {
+    const invoice = makeInvoice({
+      _id: 'sale-v2-000000000000000001',
+      company: 'company-1',
+      status: 'fully_paid',
+      posOrigin: true,
+      client: { type: 'individual', name: 'Test customer', taxId: '123456789' },
+      createdBy: { name: 'Registrar', email: 'registrar@example.rw' },
+      lines: [{ ...BASE_LINE, warehouse: 'warehouse-1' }],
+    });
+    const query = {
+      populate: jest.fn().mockReturnThis(),
+      then: (resolve, reject) => Promise.resolve(invoice).then(resolve, reject),
+    };
+    const invoiceFind = jest.spyOn(Invoice, 'findOne').mockReturnValue(query);
+    const companyFind = jest.spyOn(Company, 'findById').mockReturnValue({ lean: jest.fn().mockResolvedValue(COMPANY) });
+    const warehouseFind = jest.spyOn(Warehouse, 'findOne').mockReturnValue({ lean: jest.fn().mockResolvedValue({ _id: 'warehouse-1', rraBranchId: '00' }) });
+    const ensureNumbers = jest.spyOn(EBMFiscalSequenceService, 'ensureSalesNumbers').mockResolvedValue({});
+    const ebmEnabled = jest.spyOn(EBMQueueService, 'assertEbmEnabled').mockResolvedValue(true);
+    const User = require('../models/User');
+    const userFind = jest.spyOn(User, 'findOne').mockReturnValue({ lean: jest.fn().mockResolvedValue({ name: 'Cashier', email: 'cashier@example.rw' }) });
+    const db = mappingDatabase([{ method: 'CASH', amount: 21.77 }]);
+
+    try {
+      const prepared = await EBMSalesService.prepareV2SaleSubmission(invoice._id, {
+        companyId: 'company-1',
+        modifierUserId: 'cashier-00000000000000000001',
+        db,
+        salesAccountCode: '4000',
+        taxAccountCode: '2200',
+        journalLines: [
+          { accountCode: '4000', credit: 18.45 },
+          { accountCode: '2200', credit: 3.32 },
+        ],
+      });
+      expect(prepared.payload).toMatchObject({
+        custTin: '123456789',
+        pmtTyCd: '01',
+        totTaxblAmt: '18.45',
+        totTaxAmt: '3.32',
+        totAmt: '21.77',
+      });
+      expect(prepared.payload.receipt.custTin).toBe('123456789');
+    } finally {
+      invoiceFind.mockRestore();
+      companyFind.mockRestore();
+      warehouseFind.mockRestore();
+      ensureNumbers.mockRestore();
+      ebmEnabled.mockRestore();
+      userFind.mockRestore();
+    }
+  });
+});
+
 const BASE_LINE = {
   qty: '2.00',
   unitPrice: '10.25',

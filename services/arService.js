@@ -4,6 +4,7 @@ const ARReceiptAllocation = require("../models/ARReceiptAllocation");
 const ARBadDebtWriteoff = require("../models/ARBadDebtWriteoff");
 const Invoice = require("../models/Invoice");
 const Client = require("../models/Client");
+const ARTransactionLedger = require("../models/ARTransactionLedger");
 const JournalService = require("./journalService");
 const periodService = require("./periodService");
 const cacheService = require("./cacheService");
@@ -26,37 +27,60 @@ class ARService {
     const today = new Date(asOf.getFullYear(), asOf.getMonth(), asOf.getDate());
     const params = [String(companyId), today];
     const clientClause = clientId
-      ? (() => { params.push(String(clientId)); return `AND i.client_id = $${params.length}`; })()
+      ? (() => { params.push(String(clientId)); return `AND c.id = $${params.length}`; })()
       : '';
+    const invoiceClientClause = clientId ? `AND i.client_id = $${params.length}` : '';
 
     const rows = await dbClient().$queryRawUnsafe(`
       WITH invoice_balances AS (
         SELECT i.client_id,
-               c.name AS client_name,
-               c.code AS client_code,
                GREATEST(i.amount_outstanding, 0)::double precision AS balance,
                COALESCE(i.due_date, i.invoice_date)::date AS due_date
           FROM invoices i
-          JOIN clients c ON c.id = i.client_id
+          JOIN clients c ON c.id = i.client_id AND c.company_id = i.company_id
          WHERE i.company_id = $1
            AND i.status IN ('sent', 'confirmed', 'partially_paid')
-           ${clientClause}
-         GROUP BY i.id, i.client_id, c.name, c.code, i.amount_outstanding,
-                  i.due_date, i.invoice_date
-      ), eligible AS (
-        SELECT * FROM invoice_balances WHERE balance > 0
+           ${invoiceClientClause}
+         GROUP BY i.id, i.client_id, i.amount_outstanding, i.due_date, i.invoice_date
+      ), invoice_aging AS (
+        SELECT client_id,
+               COALESCE(SUM(CASE WHEN due_date >= $2::date THEN balance ELSE 0 END), 0)::double precision AS current,
+               COALESCE(SUM(CASE WHEN due_date BETWEEN ($2::date - INTERVAL '30 days') AND ($2::date - INTERVAL '1 day') THEN balance ELSE 0 END), 0)::double precision AS "1-30",
+               COALESCE(SUM(CASE WHEN due_date BETWEEN ($2::date - INTERVAL '60 days') AND ($2::date - INTERVAL '31 days') THEN balance ELSE 0 END), 0)::double precision AS "31-60",
+               COALESCE(SUM(CASE WHEN due_date BETWEEN ($2::date - INTERVAL '90 days') AND ($2::date - INTERVAL '61 days') THEN balance ELSE 0 END), 0)::double precision AS "61-90",
+               COALESCE(SUM(CASE WHEN due_date < ($2::date - INTERVAL '90 days') THEN balance ELSE 0 END), 0)::double precision AS "90+",
+               COALESCE(SUM(balance), 0)::double precision AS invoice_total
+          FROM invoice_balances
+         WHERE balance > 0
+         GROUP BY client_id
       )
-      SELECT client_id AS "clientId",
-             client_name AS "clientName",
-             client_code AS "clientCode",
-             COALESCE(SUM(CASE WHEN due_date >= $2::date THEN balance ELSE 0 END), 0)::double precision AS current,
-             COALESCE(SUM(CASE WHEN due_date BETWEEN ($2::date - INTERVAL '30 days') AND ($2::date - INTERVAL '1 day') THEN balance ELSE 0 END), 0)::double precision AS "1-30",
-             COALESCE(SUM(CASE WHEN due_date BETWEEN ($2::date - INTERVAL '60 days') AND ($2::date - INTERVAL '31 days') THEN balance ELSE 0 END), 0)::double precision AS "31-60",
-             COALESCE(SUM(CASE WHEN due_date BETWEEN ($2::date - INTERVAL '90 days') AND ($2::date - INTERVAL '61 days') THEN balance ELSE 0 END), 0)::double precision AS "61-90",
-             COALESCE(SUM(CASE WHEN due_date < ($2::date - INTERVAL '90 days') THEN balance ELSE 0 END), 0)::double precision AS "90+"
-        FROM eligible
-       GROUP BY client_id, client_name, client_code
-       ORDER BY SUM(balance) DESC, client_id`, ...params);
+      SELECT c.id AS "clientId",
+             c.name AS "clientName",
+             c.code AS "clientCode",
+             COALESCE(a.current, 0) + GREATEST(
+               COALESCE(c.outstanding_balance, 0)::double precision - COALESCE(a.invoice_total, 0),
+               0::double precision
+             ) AS current,
+             COALESCE(a."1-30", 0) AS "1-30",
+             COALESCE(a."31-60", 0) AS "31-60",
+             COALESCE(a."61-90", 0) AS "61-90",
+             COALESCE(a."90+", 0) AS "90+"
+        FROM clients c
+        LEFT JOIN invoice_aging a ON a.client_id = c.id
+       WHERE c.company_id = $1
+         ${clientClause}
+         AND (COALESCE(a.invoice_total, 0) > 0 OR COALESCE(c.outstanding_balance, 0) > 0)
+       ORDER BY (
+         COALESCE(a.current, 0)
+         + GREATEST(
+           COALESCE(c.outstanding_balance, 0)::double precision - COALESCE(a.invoice_total, 0),
+           0::double precision
+         )
+         + COALESCE(a."1-30", 0)
+         + COALESCE(a."31-60", 0)
+         + COALESCE(a."61-90", 0)
+         + COALESCE(a."90+", 0)
+       ) DESC, c.id`, ...params);
 
     const data = rows.map((row) => {
       const current = Number(row.current || 0);
@@ -269,6 +293,15 @@ class ARService {
     };
     if (startDate || endDate) receiptQuery.receiptDate = dateFilter;
     const receipts = await ARReceipt.find(receiptQuery).sort({ receiptDate: 1 });
+    const openingBalanceQuery = {
+      client: clientId,
+      company: companyId,
+      transactionType: 'opening_balance',
+      sourceType: 'opening_ar',
+    };
+    if (startDate || endDate) openingBalanceQuery.transactionDate = dateFilter;
+    const openingBalances = await ARTransactionLedger.find(openingBalanceQuery)
+      .sort({ transactionDate: 1, createdAt: 1 });
 
     const receiptIds = receipts.map((r) => r._id);
     const allocations = receiptIds.length
@@ -355,9 +388,46 @@ class ARService {
       });
     }
 
+    for (const openingBalance of openingBalances) {
+      const amount = money(openingBalance.amount);
+      if (amount <= 0) continue;
+      ledgerEvents.push({
+        sortDate: new Date(openingBalance.transactionDate || openingBalance.createdAt || 0),
+        date: openingBalance.transactionDate || openingBalance.createdAt,
+        reference: openingBalance.referenceNo || openingBalance.sourceReference || 'OPENING BALANCE',
+        description: openingBalance.description || `Opening AR balance for ${client.name}`,
+        debit: openingBalance.direction === 'decrease' ? 0 : amount,
+        credit: openingBalance.direction === 'decrease' ? amount : 0,
+        type: 'opening_balance',
+        sourceId: String(openingBalance._id),
+      });
+    }
+
+    const invoiceOutstandingTotal = invoices.reduce((sum, invoice) => sum + invoiceOutstanding(invoice), 0);
+    const representedOpeningBalance = openingBalances.reduce((sum, openingBalance) => (
+      sum + (openingBalance.direction === 'decrease' ? -money(openingBalance.amount) : money(openingBalance.amount))
+    ), 0);
+    const unrepresentedOpeningBalance = startDate || endDate
+      ? 0
+      : Math.max(0, money(client.outstandingBalance) - invoiceOutstandingTotal - representedOpeningBalance);
+    if (unrepresentedOpeningBalance > 0.005) {
+      ledgerEvents.push({
+        sortDate: new Date(client.createdAt || 0),
+        date: client.createdAt || null,
+        reference: 'OPENING BALANCE',
+        description: `Imported opening balance for ${client.name}`,
+        debit: unrepresentedOpeningBalance,
+        credit: 0,
+        type: 'opening_balance',
+        sourceId: null,
+      });
+    }
+
     ledgerEvents.sort((a, b) => {
       const diff = a.sortDate.getTime() - b.sortDate.getTime();
       if (diff !== 0) return diff;
+      if (a.type === 'opening_balance' && b.type !== 'opening_balance') return -1;
+      if (b.type === 'opening_balance' && a.type !== 'opening_balance') return 1;
       if (a.type === 'invoice' && b.type !== 'invoice') return -1;
       if (b.type === 'invoice' && a.type !== 'invoice') return 1;
       return 0;
@@ -410,7 +480,9 @@ class ARService {
     const totalPaidFromReceipts = mappedReceipts.reduce((sum, rec) => sum + rec.amount, 0);
     const totalPaidFromInvoices = mappedInvoices.reduce((sum, inv) => sum + inv.paid, 0);
     const totalPaid = totalPaidFromReceipts + (legacyPaymentTotal > 0 ? legacyPaymentTotal : (totalPaidFromReceipts > 0 ? 0 : totalPaidFromInvoices));
-    const totalOutstanding = mappedInvoices.reduce((sum, inv) => sum + inv.balance, 0);
+    const totalOutstanding = startDate || endDate
+      ? mappedInvoices.reduce((sum, inv) => sum + inv.balance, 0)
+      : Math.max(money(client.outstandingBalance), mappedInvoices.reduce((sum, inv) => sum + inv.balance, 0));
 
     return {
       success: true,

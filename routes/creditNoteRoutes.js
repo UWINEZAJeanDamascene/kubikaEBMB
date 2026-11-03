@@ -3,6 +3,7 @@ const router = express.Router();
 const { protect } = require('../middleware/auth');
 const { requireAssignedPermissions: requirePermission } = require('../middleware/posAuthorization');
 const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
+const { requirePosSession, requirePermission: requirePosPermission } = require('../middleware/posAuthMiddleware');
 const CreditNote = require('../models/CreditNote');
 const controller = require('../controllers/creditNoteController');
 
@@ -16,9 +17,39 @@ router.use(protect);
 // GET /api/credit-notes/:id - Full credit note with lines and journal entries
 // DELETE /api/credit-notes/:id - Delete draft credit notes
 
+const requireSamePosCashier = (req, res, next) => requirePosSession()(req, res, () => {
+  const posUser = req.posAuthContext?.user;
+  const companyId = String(req.posAuthContext?.company?.id || '');
+  if (!posUser?.id || !companyId) {
+    return res.status(401).json({ success: false, code: 'POS_SESSION_REQUIRED', message: 'Sign in to this till before continuing.' });
+  }
+
+  // POS session identity is authoritative for cashier actions. The ERP token
+  // is still checked by `protect` and requirePosSession enforces same-company
+  // access, but an administrator's ERP login must not impersonate the cashier
+  // selected by PIN on the register. Credit-note controllers use req.user for
+  // actor attribution, so bind that actor to the verified POS session here.
+  req.user = {
+    ...req.user,
+    id: String(posUser.id),
+    _id: String(posUser.id),
+    companyId,
+    company: { ...(req.user?.company || {}), id: companyId, _id: companyId },
+  };
+  return requirePosPermission('pos.till.sell')(req, res, next);
+});
+
+function authorizeCreditNoteDraft(req, res, next) {
+  // A POS-origin draft does not post a refund, change stock, or reverse the
+  // journal. It may be prepared from a signed-in till; confirmation below
+  // still requires the one-use manager approval consumed by the controller.
+  if (req.body?.posOrigin === true) return requireSamePosCashier(req, res, next);
+  return requirePermission('credit_notes', 'create')(req, res, next);
+}
+
 router.route('/')
   .get(requirePermission('credit_notes', 'read'), controller.getCreditNotes)
-  .post(requirePermission('credit_notes', 'create'), controller.createCreditNote);
+  .post(authorizeCreditNoteDraft, controller.createCreditNote);
 
 router.route('/:id')
   .get(requirePermission('credit_notes', 'read'), controller.getCreditNote)
@@ -32,7 +63,8 @@ async function authorizeCreditNoteConfirmation(req, res, next) {
   try {
     const note = await CreditNote.findOne({ _id: req.params.id, company: req.user.company._id }).select('posOrigin').lean();
     if (!note) return next();
-    const action = note.posOrigin ? 'create' : 'approve';
+    if (note.posOrigin) return requireSamePosCashier(req, res, next);
+    const action = 'approve';
     const roles = await resolveUserRoles(req.user);
     if (!roles.some((role) => PermissionService.check(role, 'credit_notes', action))) {
       return res.status(403).json({ success: false, error: 'FORBIDDEN', message: 'Your role cannot request this credit note confirmation.' });

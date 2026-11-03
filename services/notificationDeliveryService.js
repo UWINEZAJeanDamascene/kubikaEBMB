@@ -6,7 +6,7 @@ const emailService = require('./emailService');
 const smsService = require('./smsService');
 const { notifyInvoiceSent } = require('./notificationHelper');
 
-async function sendInvoiceDelivery(invoice, companyId, { explicit = false } = {}) {
+async function sendInvoiceDelivery(invoice, companyId, { explicit = false, requireDigitalReceiptConsent = true } = {}) {
   const settings = await NotificationSettings.getOrCreateForCompany(companyId);
   const automatic = settings.emailNotifications?.enabled === true
     && settings.emailNotifications?.invoiceDelivery === true
@@ -17,6 +17,9 @@ async function sendInvoiceDelivery(invoice, companyId, { explicit = false } = {}
     Company.findById(companyId),
     Client.findOne({ _id: invoice.client, company: companyId }),
   ]);
+  if (requireDigitalReceiptConsent && client?.digitalReceiptConsent !== true) {
+    return { sent: false, reason: 'digital_receipt_consent_required' };
+  }
   const clientEmail = client?.contact?.email || client?.email || invoice.customerEmail;
   if (!clientEmail) return { sent: false, reason: 'missing_customer_email' };
 

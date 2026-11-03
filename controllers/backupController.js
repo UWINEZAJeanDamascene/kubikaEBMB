@@ -15,6 +15,7 @@ const { google } = require('googleapis');
 const { notifyBackupSuccess, notifyBackupFailed } = require('../services/notificationHelper');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../lib/prisma');
+const { assertFiscalReferencesSafeForRestore } = require('../services/ebmBackupRestoreGuard');
 
 // Derive coverage from Prisma's generated schema, not a stale manual allowlist.
 // Tenant tables need a direct company/companyId scalar for safe scoping. The
@@ -775,6 +776,11 @@ const performRestore = async (backupId, companyId, userId) => {
     // abort the transaction so Postgres rolls the whole thing back.
     const restoredCounts = [];
     await runInTransaction(async (tx) => {
+      // Protect signed fiscal history before the full-tenant replacement starts.
+      // Prisma-derived relation ordering inserts referenced submissions before
+      // reprints and deletes those children before their submissions.
+      await assertFiscalReferencesSafeForRestore(tx, companyId, archivedByName);
+
       const companySnapshot = restoreScalarTypes(COMPANY_MODEL, backupData.company);
       delete companySnapshot.id;
       await tx.company.update({ where: { id: companyId }, data: companySnapshot });
@@ -806,6 +812,11 @@ const performRestore = async (backupId, companyId, userId) => {
         const rows = collection.data.map((archivedRecord) => {
           const record = restoreScalarTypes(model, archivedRecord);
           record[model.ownerField] = companyId;
+          // Receipt copies created before reprint reasons were required remain
+          // restorable; make their missing historical context explicit.
+          if (model.name === 'PosEbmReceiptReprint' && !String(record.reason || '').trim()) {
+            record.reason = '[Legacy reprint: reason was not recorded]';
+          }
           for (const relation of nullableRelations) {
             const deferred = {};
             for (const field of relation.fields) {

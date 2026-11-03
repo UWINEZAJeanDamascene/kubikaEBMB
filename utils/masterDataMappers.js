@@ -186,6 +186,10 @@ function clientToApi(row) {
     code: row.code,
     type: row.type ?? 'individual',
     contact: row.contact ?? {},
+    phoneNormalized: row.phoneNormalized ?? null,
+    phoneNeedsReview: Boolean(row.phoneNeedsReview),
+    isWalkIn: Boolean(row.isWalkIn),
+    mergedIntoClientId: row.mergedIntoClientId ?? null,
     salesArea: row.salesArea ?? null,
     salesRepId: row.salesRepId ?? null,
     region: row.region ?? null,
@@ -195,6 +199,10 @@ function clientToApi(row) {
     ebmTinVerification: row.ebmTinVerification ?? null,
     paymentTerms: row.paymentTerms ?? 'cash',
     creditLimit: decimalToNumber(row.creditLimit, 0),
+    creditAccountStatus: row.creditAccountStatus ?? 'ACTIVE',
+    creditTermsDays: Number(row.creditTermsDays ?? 30),
+    marketingConsent: Boolean(row.marketingConsent),
+    digitalReceiptConsent: Boolean(row.digitalReceiptConsent),
     outstandingBalance: decimalToNumber(row.outstandingBalance, 0),
     totalPurchases: decimalToNumber(row.totalPurchases, 0),
     lastPurchaseDate: row.lastPurchaseDate ?? null,
@@ -229,6 +237,10 @@ const CLIENT_INPUT_MAP = {
   ebmTinVerification: 'ebmTinVerification',
   paymentTerms: 'paymentTerms',
   creditLimit: 'creditLimit',
+  creditAccountStatus: 'creditAccountStatus',
+  creditTermsDays: 'creditTermsDays',
+  marketingConsent: 'marketingConsent',
+  digitalReceiptConsent: 'digitalReceiptConsent',
   outstandingBalance: 'outstandingBalance',
   totalPurchases: 'totalPurchases',
   lastPurchaseDate: 'lastPurchaseDate',
@@ -254,6 +266,8 @@ async function clientTranslateCreate(data) {
     ...clientInputToPrisma(data),
     code,
     contact: data.contact || {},
+    phoneNormalized: normalizeClientPhone(data.contact?.phone),
+    phoneNeedsReview: false,
     isActive: data.isActive !== false,
     customFields: data.customFields || {},
     ebmBranchCustomers: data.ebmBranchCustomers || [],
@@ -263,7 +277,20 @@ async function clientTranslateCreate(data) {
 function clientTranslateUpdate(update = {}) {
   const data = clientInputToPrisma(mergeUpdatePayload(update));
   if (data.code) data.code = String(data.code).toUpperCase();
+  if (Object.prototype.hasOwnProperty.call(data, 'contact')) {
+    data.phoneNormalized = normalizeClientPhone(data.contact?.phone);
+    data.phoneNeedsReview = false;
+  }
   return data;
+}
+
+function normalizeClientPhone(value) {
+  if (value == null || String(value).trim() === '') return null;
+  const digits = String(value).replace(/\D/g, '');
+  if (/^0\d{9}$/.test(digits)) return `+250${digits.slice(1)}`;
+  if (/^250\d{9}$/.test(digits)) return `+${digits}`;
+  if (/^\d{9}$/.test(digits)) return `+250${digits}`;
+  throw new Error('Enter a valid Rwanda phone number before saving this customer.');
 }
 
 function supplierToApi(row) {

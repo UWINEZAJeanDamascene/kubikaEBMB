@@ -378,6 +378,7 @@ exports.getSalesChart = async (req, res, next) => {
       WHERE company_id = ${toIdString(companyId)}
         AND invoice_date >= ${startDate}
         AND status <> 'cancelled'
+        AND status <> 'PENDING_PAYMENT'
       GROUP BY DATE_TRUNC(${bucket}, invoice_date)
       ORDER BY DATE_TRUNC(${bucket}, invoice_date)
     `;

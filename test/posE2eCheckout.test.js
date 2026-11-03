@@ -17,8 +17,12 @@ jest.mock('../models/StockBatch', () => ({ find: jest.fn() }));
 jest.mock('../models/InventoryBatch', () => ({ find: jest.fn() }));
 jest.mock('../services/transactionService', () => ({ runInTransaction: jest.fn() }));
 jest.mock('../services/posRegisterService', () => ({
-  findClaimedRegister: jest.fn(async (_companyId, registerId) => ({ _id: registerId, code: registerId })),
-  registerClaimRequiredError: () => Object.assign(new Error('Register claim required'), { statusCode: 403 }),
+  findClaimedRegister: jest.fn(async (_companyId, registerId) => ({
+    id: '888888888888888888888888',
+    _id: registerId,
+    code: registerId,
+  })),
+  registerClaimRequiredError: () => Object.assign(new Error('Register claim required'), { statusCode: 403, code: 'POS_REGISTER_CLAIM_REQUIRED' }),
 }));
 jest.mock('../services/inventoryService', () => ({
   consume: jest.fn(),
@@ -34,8 +38,23 @@ jest.mock('../services/journalService', () => ({
 jest.mock('../services/CurrencyService', () => ({ getCompanyBase: jest.fn() }));
 jest.mock('../services/cacheService', () => ({ bumpCompanyFinancialCaches: jest.fn() }));
 jest.mock('../services/emailService', () => ({ sendInvoiceEmail: jest.fn() }));
-jest.mock('../services/ebmService', () => ({ getConfig: jest.fn(() => ({ mode: 'mock' })) }));
-jest.mock('../services/ebmSalesService', () => ({ submitInvoiceAsync: jest.fn() }));
+jest.mock('../services/ebmService', () => ({
+  getConfig: jest.fn(() => ({ mode: 'mock' })),
+  VSDC_ENDPOINTS: { SAVE_SALES: '/saveSales' },
+}));
+jest.mock('../services/ebmSalesService', () => ({
+  submitInvoiceAsync: jest.fn(),
+  prepareV2SaleSubmission: jest.fn(),
+}));
+jest.mock('../services/posPaymentService', () => ({
+  getPaymentSettings: jest.fn().mockResolvedValue({ paymentFlow: 'LEGACY', registerPaymentFlowOverrides: {} }),
+  resolvePaymentFlow: jest.fn(() => 'LEGACY'),
+  resolveEnabledMethods: jest.fn(() => ['CASH', 'MTN_MOMO', 'AIRTEL_MONEY']),
+}));
+jest.mock('../services/posAuditService', () => ({
+  writePosAuditLog: jest.fn().mockResolvedValue(undefined),
+  requestIp: jest.fn(() => '127.0.0.1'),
+}));
 jest.mock('../controllers/posManagerApprovalController', () => ({
   consumeApproval: jest.fn(),
   hashPayload: jest.fn((payload) => JSON.stringify(payload || {})),
@@ -60,8 +79,14 @@ const JournalService = require('../services/journalService');
 const CurrencyService = require('../services/CurrencyService');
 const cacheService = require('../services/cacheService');
 const { consumeApproval } = require('../controllers/posManagerApprovalController');
+const { findClaimedRegister } = require('../services/posRegisterService');
+const { writePosAuditLog } = require('../services/posAuditService');
+const posPaymentService = require('../services/posPaymentService');
 const { dbClient } = require('../lib/prisma');
-const { createDirectSale } = require('../controllers/salesLegacyController');
+const { createDirectSale, getCheckoutPaymentFlow } = require('../controllers/salesLegacyController');
+const posPaymentsV2Controller = require('../controllers/posPaymentsV2Controller');
+const ebmService = require('../services/ebmService');
+const EBMSalesService = require('../services/ebmSalesService');
 const { issueCapability } = require('../services/posOfflineCapabilityService');
 const {
   IDS,
@@ -82,6 +107,27 @@ function stockLevelRows(qtyOnHand = 50, qtyReserved = 0) {
     qty_on_hand: qtyOnHand,
     qty_reserved: qtyReserved,
   }];
+}
+
+function emptyCheckoutDb() {
+  return {
+    stockBatch: { groupBy: jest.fn().mockResolvedValue([]) },
+    $queryRawUnsafe: checkoutQueryMock(),
+  };
+}
+
+function checkoutQueryMock(initialImplementation = async () => []) {
+  const query = jest.fn();
+  const setImplementation = query.mockImplementation.bind(query);
+  query.mockImplementation = (implementation) => setImplementation(async (sql, ...params) => {
+    const result = await implementation(sql, ...params);
+    if (!result?.length && String(sql).includes('FROM "pos_shifts"')) {
+      return [{ id: '777777777777777777777778', openedById: IDS.cashier }];
+    }
+    return result;
+  });
+  query.mockImplementation(initialImplementation);
+  return query;
 }
 
 function buildInvoiceDoc(overrides = {}) {
@@ -134,10 +180,16 @@ function stubHappyPathDeps({ stockMatchedCount = 1, momoBank = null } = {}) {
   consumeApproval.mockResolvedValue(IDS.approval);
 
   const db = {
+    stockBatch: { groupBy: jest.fn().mockResolvedValue([]) },
+    invoiceLine: { findMany: jest.fn().mockResolvedValue([]) },
+    posCustomerCreditLedger: { create: jest.fn().mockResolvedValue({ id: 'credit-ledger-1' }) },
     // SELECT replay → empty; INSERT reservation → claimed row.
-    $queryRawUnsafe: jest.fn(async (sql) => {
+    $queryRawUnsafe: checkoutQueryMock(async (sql) => {
       if (String(sql).includes('INSERT INTO pos_sale_requests')) {
         return [{ requestKey: 'claimed' }];
+      }
+      if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
+        return [{ id: 'loyalty-wallet-id', balance: 1 }];
       }
       return [];
     }),
@@ -151,25 +203,44 @@ function stubHappyPathDeps({ stockMatchedCount = 1, momoBank = null } = {}) {
 describe('POS E2E — checkout (sales-legacy)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    const paymentService = require('../services/posPaymentService');
+    paymentService.getPaymentSettings.mockResolvedValue({
+      paymentFlow: 'LEGACY',
+      registerPaymentFlowOverrides: {},
+    });
+    paymentService.resolvePaymentFlow.mockReturnValue('LEGACY');
   });
 
   test('rejects checkout when no open till exists for the register', async () => {
     CurrencyService.getCompanyBase.mockResolvedValue('RWF');
     TillSession.findOne.mockResolvedValue(null);
-    dbClient.mockReturnValue({ $queryRawUnsafe: jest.fn().mockResolvedValue([]) });
+    dbClient.mockReturnValue(emptyCheckoutDb());
     const res = mockRes();
     await createDirectSale(makeReq({ body: checkoutBody() }), res, jest.fn());
     expect(res.statusCode).toBe(400);
-    expect(res.body.message).toMatch(/Till session is required/i);
+    expect(res.body.code).toBe('POS_SHIFT_REQUIRED');
+    expect(res.body.message).toMatch(/Open this register shift/i);
+  });
+
+  test('rejects checkout from an unpaired device before reading or creating a sale', async () => {
+    findClaimedRegister.mockResolvedValueOnce(null);
+    const next = jest.fn();
+    const res = mockRes();
+    await createDirectSale(makeReq({ body: checkoutBody() }), res, next);
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 403, code: 'POS_REGISTER_CLAIM_REQUIRED' }));
+    expect(TillSession.findOne).not.toHaveBeenCalled();
+    expect(Invoice.create).not.toHaveBeenCalled();
+    expect(runInTransaction).not.toHaveBeenCalled();
   });
 
   test('blocks card tender until a terminal is configured', async () => {
     CurrencyService.getCompanyBase.mockResolvedValue('RWF');
-    TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open' });
+    TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open', openedBy: IDS.cashier });
     Warehouse.findOne.mockResolvedValue({ _id: IDS.warehouse });
     Product.find.mockReturnValue(leanFind([catalogProduct()]));
     StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows()) });
-    dbClient.mockReturnValue({ $queryRawUnsafe: jest.fn().mockResolvedValue([]) });
+    dbClient.mockReturnValue(emptyCheckoutDb());
 
     const res = mockRes();
     await createDirectSale(makeReq({
@@ -183,11 +254,14 @@ describe('POS E2E — checkout (sales-legacy)', () => {
 
   test('requires a manager approval for discounts / price overrides', async () => {
     CurrencyService.getCompanyBase.mockResolvedValue('RWF');
-    TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open' });
+    TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open', openedBy: IDS.cashier });
     Warehouse.findOne.mockResolvedValue({ _id: IDS.warehouse });
     Product.find.mockReturnValue(leanFind([catalogProduct()]));
     StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows()) });
-    dbClient.mockReturnValue({ $queryRawUnsafe: jest.fn().mockResolvedValue([]) });
+    dbClient.mockReturnValue({
+      stockBatch: { groupBy: jest.fn().mockResolvedValue([]) },
+      $queryRawUnsafe: jest.fn().mockResolvedValue([]),
+    });
 
     const res = mockRes();
     await createDirectSale(makeReq({
@@ -203,6 +277,13 @@ describe('POS E2E — checkout (sales-legacy)', () => {
 
   test('cash checkout posts stock, journals, and till cash activity', async () => {
     const { invoice, db } = stubHappyPathDeps();
+    const shiftId = '777777777777777777777778';
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      return [];
+    });
+
     const res = mockRes();
 
     await createDirectSale(makeReq({
@@ -214,9 +295,24 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.data).toBe(invoice);
     expect(res.body.changeDue).toBe(0);
+    expect(db.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('"opened_by" AS "openedById"'),
+      IDS.company,
+      '888888888888888888888888',
+    );
     expect(StockLevel.updateMany).toHaveBeenCalled();
     expect(inventoryService.consume).toHaveBeenCalled();
     expect(JournalService.createEntriesAtomic).toHaveBeenCalled();
+    expect(findClaimedRegister).toHaveBeenCalledWith(IDS.company, IDS.registerId, IDS.deviceId);
+    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('shift_id = $5, cashier_id = $6'),
+      IDS.till,
+      '',
+      IDS.invoice,
+      IDS.company,
+      shiftId,
+      IDS.cashier,
+    );
     expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
       expect.stringContaining('UPDATE till_sessions SET expected_cash'),
       1180,
@@ -225,6 +321,611 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       IDS.till,
       IDS.cashier,
     );
+  });
+
+  test('V2 checkout stores a pending invoice without stock, journal, or till-cash side effects', async () => {
+    const { db } = stubHappyPathDeps();
+    const shiftId = '777777777777777777777778';
+    const paymentSettings = require('../services/posPaymentService');
+    paymentSettings.resolvePaymentFlow.mockReturnValueOnce('PAYMENTS_V2');
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      return [];
+    });
+
+    const req = makeReq({
+      body: checkoutBody({ paymentAmount: 0 }),
+      headers: { 'Idempotency-Key': 'idem-key-abcdefghij' },
+    });
+    req.posPaymentFlow = 'PAYMENTS_V2';
+    const res = mockRes();
+
+    await createDirectSale(req, res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.body.paymentRequired).toBe(true);
+    expect(Invoice.create).toHaveBeenCalledWith([expect.objectContaining({
+      status: 'PENDING_PAYMENT',
+      amountPaid: 0,
+      amountOutstanding: 1180,
+      stockDeducted: false,
+      autoConfirm: false,
+      registerId: '888888888888888888888888',
+      shiftId,
+      cashierId: IDS.cashier,
+      posCheckoutPayload: expect.objectContaining({ items: expect.any(Array) }),
+    })], expect.objectContaining({ session: null }));
+    expect(StockLevel.updateMany).not.toHaveBeenCalled();
+    expect(inventoryService.consume).not.toHaveBeenCalled();
+    expect(JournalService.createEntriesAtomic).not.toHaveBeenCalled();
+    expect(db.$executeRawUnsafe).not.toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE till_sessions SET expected_cash'),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  test('V2 completion reuses the pending invoice and posts revenue plus COGS in one journal entry', async () => {
+    const { invoice, db } = stubHappyPathDeps();
+    const shiftId = '777777777777777777777778';
+    require('../services/posPaymentService').resolvePaymentFlow.mockReturnValueOnce('PAYMENTS_V2');
+    const client = {
+      _id: IDS.client,
+      name: 'Existing customer',
+      totalPurchases: 0,
+      outstandingBalance: 0,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    invoice.status = 'PENDING_PAYMENT';
+    invoice.amountPaid = 0;
+    invoice.amountOutstanding = 1180;
+    invoice.registerId = '888888888888888888888888';
+    invoice.shiftId = shiftId;
+    invoice.cashierId = IDS.cashier;
+    invoice.ebm = { paymentFlow: 'PAYMENTS_V2' };
+    Client.findOne.mockResolvedValue(client);
+    Invoice.findOne.mockReturnValue({
+      session: jest.fn().mockResolvedValue(invoice),
+    });
+    db.invoiceLine.findMany.mockResolvedValue([{
+      productId: IDS.product,
+      qty: 1,
+      unitPrice: 1000,
+      discountPct: 0,
+      taxRate: 18,
+      lineSubtotal: 1000,
+      lineTax: 180,
+      lineTotal: 1180,
+      warehouseId: IDS.warehouse,
+      serialNumbers: [],
+    }]);
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('pos_completion_key')) return [{ status: 'PENDING_PAYMENT', completionKey: null }];
+      if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
+      if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
+        return [{ id: 'loyalty-wallet-id', balance: 10 }];
+      }
+      return [];
+    });
+    JournalService.createEntriesAtomic.mockResolvedValue([{ _id: 'je-v2-combined' }]);
+    const req = makeReq({
+      body: checkoutBody({
+        clientId: IDS.client,
+        payments: [{ paymentMethod: 'cash', amount: 1180 }],
+        paymentAmount: 0,
+      }),
+    });
+    req.posPaymentFlow = 'PAYMENTS_V2';
+    req.posV2Completion = { invoiceId: IDS.invoice, completionKey: 'complete-key-0001' };
+    const res = mockRes();
+
+    await createDirectSale(req, res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(Invoice.create).not.toHaveBeenCalled();
+    expect(JournalService.createEntriesAtomic).toHaveBeenCalledTimes(1);
+    const entries = JournalService.createEntriesAtomic.mock.calls[0][2];
+    expect(entries).toHaveLength(1);
+    expect(entries[0].sourceType).toBe('invoice');
+    expect(entries[0].lines).toEqual(expect.arrayContaining([
+      expect.objectContaining({ accountCode: '4000', credit: 1000 }),
+      expect.objectContaining({ accountCode: '5000', debit: 400 }),
+      expect.objectContaining({ accountCode: '1400', credit: 400 }),
+    ]));
+    expect(invoice.revenueJournalEntry).toBe('je-v2-combined');
+    expect(invoice.cogsJournalEntry).toBeNull();
+    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('SET pos_completion_key = $1, pos_checkout_payload = NULL'),
+      'complete-key-0001',
+      IDS.invoice,
+      IDS.company,
+    );
+  });
+
+  test('V2 credit completion updates the customer balance and posts to the existing AR ledger', async () => {
+    const { invoice, db } = stubHappyPathDeps();
+    const shiftId = '777777777777777777777778';
+    const paymentSettings = require('../services/posPaymentService');
+    paymentSettings.resolvePaymentFlow.mockReturnValueOnce('PAYMENTS_V2');
+    const client = {
+      _id: IDS.client,
+      name: 'Account Customer',
+      totalPurchases: 0,
+      outstandingBalance: 0,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    db.arTransactionLedger = { create: jest.fn().mockResolvedValue({ id: 'ar-ledger-row' }) };
+    invoice.status = 'PENDING_PAYMENT';
+    invoice.amountPaid = 0;
+    invoice.amountOutstanding = 1180;
+    invoice.registerId = '888888888888888888888888';
+    invoice.shiftId = shiftId;
+    invoice.cashierId = IDS.cashier;
+    invoice.ebm = { paymentFlow: 'PAYMENTS_V2' };
+    Client.findOne.mockResolvedValue(client);
+    Invoice.findOne.mockReturnValue({
+      session: jest.fn().mockResolvedValue(invoice),
+    });
+    db.invoiceLine.findMany.mockResolvedValue([{
+      productId: IDS.product,
+      qty: 1,
+      unitPrice: 1000,
+      discountPct: 0,
+      taxRate: 18,
+      lineSubtotal: 1000,
+      lineTax: 180,
+      lineTotal: 1180,
+      warehouseId: IDS.warehouse,
+      serialNumbers: [],
+    }]);
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('SELECT credit_limit')) {
+        return [{ credit_limit: '500', outstanding_balance: '100', code: 'ACCOUNT-1' }];
+      }
+      if (String(sql).includes('COALESCE(SUM(amount_outstanding)')) return [{ overdueAmount: '0' }];
+      if (String(sql).includes('pos_completion_key')) return [{ status: 'PENDING_PAYMENT', completionKey: null }];
+      if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
+      if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
+        return [{ id: 'loyalty-wallet-id', balance: 10 }];
+      }
+      return [];
+    });
+    JournalService.createEntriesAtomic.mockResolvedValue([{ _id: 'je-v2-credit' }]);
+    const req = makeReq({
+      body: checkoutBody({
+        clientId: IDS.client,
+        payments: [{ paymentMethod: 'cash', amount: 780 }],
+        paymentAmount: 0,
+      }),
+    });
+    req.posPaymentFlow = 'PAYMENTS_V2';
+    req.posV2Completion = {
+      invoiceId: IDS.invoice,
+      completionKey: 'complete-credit-0001',
+      creditAmount: 400,
+      creditPaymentIds: ['credit-payment-id'],
+    };
+    const res = mockRes();
+
+    await createDirectSale(req, res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(client.outstandingBalance).toBe(500);
+    expect(db.arTransactionLedger.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        clientId: IDS.client,
+        invoiceId: IDS.invoice,
+        transactionType: 'invoice_created',
+        amount: 400,
+        direction: 'increase',
+        clientBalanceAfter: 500,
+        journalEntryId: 'je-v2-credit',
+        metadata: { paymentFlow: 'PAYMENTS_V2', paymentIds: ['credit-payment-id'] },
+      }),
+    });
+    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining("'partially_paid'"),
+      'complete-credit-0001',
+      IDS.invoice,
+      IDS.company,
+    );
+  });
+
+  test('V2 credit completion requires manager approval when credit exceeds the limit', async () => {
+    const { invoice, db } = stubHappyPathDeps();
+    const paymentSettings = require('../services/posPaymentService');
+    paymentSettings.resolvePaymentFlow.mockReturnValueOnce('PAYMENTS_V2');
+    paymentSettings.getPaymentSettings
+      .mockResolvedValueOnce({
+        paymentFlow: 'PAYMENTS_V2',
+        allowOverCreditLimit: true,
+      })
+      .mockResolvedValueOnce({
+        paymentFlow: 'PAYMENTS_V2',
+        allowOverCreditLimit: true,
+      });
+    const client = {
+      _id: IDS.client,
+      name: 'Account Customer',
+      totalPurchases: 0,
+      outstandingBalance: 0,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    db.arTransactionLedger = { create: jest.fn().mockResolvedValue({ id: 'ar-ledger-row' }) };
+    invoice.status = 'PENDING_PAYMENT';
+    invoice.amountPaid = 0;
+    invoice.amountOutstanding = 1180;
+    invoice.registerId = '888888888888888888888888';
+    invoice.shiftId = '777777777777777777777778';
+    invoice.cashierId = IDS.cashier;
+    invoice.ebm = { paymentFlow: 'PAYMENTS_V2' };
+    Client.findOne.mockResolvedValue(client);
+    Invoice.findOne.mockReturnValue({ session: jest.fn().mockResolvedValue(invoice) });
+    db.invoiceLine.findMany.mockResolvedValue([{
+      productId: IDS.product,
+      qty: 1,
+      unitPrice: 1000,
+      discountPct: 0,
+      taxRate: 18,
+      lineSubtotal: 1000,
+      lineTax: 180,
+      lineTotal: 1180,
+      warehouseId: IDS.warehouse,
+      serialNumbers: [],
+    }]);
+    db.posApproval = {
+      findFirst: jest.fn().mockResolvedValue({
+        id: 'approval-1',
+        approvedBy: 'manager-1',
+      }),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    };
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('SELECT credit_limit')) {
+        return [{ credit_limit: '300', outstanding_balance: '100', code: 'ACCOUNT-1' }];
+      }
+      if (String(sql).includes('COALESCE(SUM(amount_outstanding)')) return [{ overdueAmount: '0' }];
+      if (String(sql).includes('pos_completion_key')) return [{ status: 'PENDING_PAYMENT', completionKey: null }];
+      if (String(sql).includes('FROM "pos_shifts"')) return [{ id: '777777777777777777777778', openedById: IDS.cashier }];
+      if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
+        return [{ id: 'loyalty-wallet-id', balance: 10 }];
+      }
+      return [];
+    });
+    JournalService.createEntriesAtomic.mockResolvedValue([{ _id: 'je-v2-credit' }]);
+    const req = makeReq({
+      body: checkoutBody({
+        clientId: IDS.client,
+        payments: [{ paymentMethod: 'cash', amount: 780 }],
+        paymentAmount: 0,
+      }),
+      headers: { 'x-pos-approval-token': 'one-use-credit-approval' },
+    });
+    req.posPaymentFlow = 'PAYMENTS_V2';
+    req.posV2Completion = {
+      invoiceId: IDS.invoice,
+      completionKey: 'complete-credit-0002',
+      creditAmount: 400,
+      creditPaymentIds: ['credit-payment-id'],
+      creditApprovalToken: 'one-use-credit-approval',
+      creditOverrideReason: 'Manager-approved credit exception',
+    };
+    const res = mockRes();
+
+    await createDirectSale(req, res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(db.posCustomerCreditLedger.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ entryType: 'CHARGE', direction: 'increase', invoiceId: IDS.invoice }),
+    }));
+    expect(db.posApproval.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        action: 'CREDIT_OVER_LIMIT',
+        context: { equals: {
+          saleId: IDS.invoice,
+          clientId: IDS.client,
+          creditAmount: 400,
+          creditLimit: 300,
+          outstandingBalance: 100,
+          reason: 'Manager-approved credit exception',
+        } },
+      }),
+    }));
+    expect(db.posApproval.updateMany).toHaveBeenCalled();
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'APPROVAL_USED',
+      metadata: expect.objectContaining({ action: 'CREDIT_OVER_LIMIT', approvedBy: 'manager-1' }),
+    }), db);
+  });
+
+  test('V2 gift card completion posts the liability tender without debiting the card a second time', async () => {
+    const { invoice, db } = stubHappyPathDeps();
+    const shiftId = '777777777777777777777778';
+    require('../services/posPaymentService').resolvePaymentFlow.mockReturnValueOnce('PAYMENTS_V2');
+    const client = {
+      _id: IDS.client,
+      name: 'Gift card customer',
+      totalPurchases: 0,
+      outstandingBalance: 0,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    invoice.status = 'PENDING_PAYMENT';
+    invoice.amountPaid = 0;
+    invoice.amountOutstanding = 1180;
+    invoice.currencyCode = 'RWF';
+    invoice.registerId = '888888888888888888888888';
+    invoice.shiftId = shiftId;
+    invoice.cashierId = IDS.cashier;
+    invoice.ebm = { paymentFlow: 'PAYMENTS_V2' };
+    Client.findOne.mockResolvedValue(client);
+    Invoice.findOne.mockReturnValue({ session: jest.fn().mockResolvedValue(invoice) });
+    db.invoiceLine.findMany.mockResolvedValue([{
+      productId: IDS.product,
+      qty: 1,
+      unitPrice: 1000,
+      discountPct: 0,
+      taxRate: 18,
+      lineSubtotal: 1000,
+      lineTax: 180,
+      lineTotal: 1180,
+      warehouseId: IDS.warehouse,
+      serialNumbers: [],
+    }]);
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('FROM pos_stored_value_ledger l')) {
+        return [{ id: 'redemption-ledger', accountId: 'gift-card-account', amount: '1180', reference: 'EF01' }];
+      }
+      if (String(sql).includes('pos_completion_key')) return [{ status: 'PENDING_PAYMENT', completionKey: null }];
+      if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
+      if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
+        return [{ id: 'loyalty-wallet-id', balance: 10 }];
+      }
+      return [];
+    });
+    JournalService.createEntriesAtomic.mockResolvedValue([{ _id: 'je-v2-gift-card' }]);
+    const req = makeReq({
+      body: checkoutBody({
+        clientId: IDS.client,
+        payments: [{
+          paymentMethod: 'gift_card',
+          amount: 1180,
+          reference: 'EF01',
+          storedValueAccountId: 'gift-card-account',
+          posPaymentId: 'gift-card-payment',
+        }],
+        paymentAmount: 0,
+      }),
+    });
+    req.posPaymentFlow = 'PAYMENTS_V2';
+    req.posV2Completion = {
+      invoiceId: IDS.invoice,
+      completionKey: 'complete-gift-0001',
+      storedValuePaymentIds: ['gift-card-payment'],
+    };
+    const res = mockRes();
+
+    await createDirectSale(req, res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(JournalService.createEntriesAtomic).toHaveBeenCalledTimes(1);
+    const entries = JournalService.createEntriesAtomic.mock.calls[0][2];
+    expect(entries).toHaveLength(1);
+    expect(entries[0].lines).toEqual(expect.arrayContaining([
+      expect.objectContaining({ accountCode: '2850', debit: 1180, credit: 0 }),
+      expect.objectContaining({ accountCode: '4000', credit: 1000 }),
+      expect.objectContaining({ accountCode: '5000', debit: 400 }),
+      expect.objectContaining({ accountCode: '1400', credit: 400 }),
+    ]));
+    expect(db.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('pos_payment_id = $3'),
+      IDS.company,
+      'gift-card-account',
+      'gift-card-payment',
+      IDS.invoice,
+    );
+    const redemptionValidationQuery = db.$queryRawUnsafe.mock.calls
+      .map(([sql]) => String(sql))
+      .find((sql) => sql.includes('pos_payment_id = $3'));
+    expect(redemptionValidationQuery).toContain('JOIN pos_payments');
+    expect(redemptionValidationQuery).toContain('p.company_id = l.company_id');
+    expect(redemptionValidationQuery).toContain('AND NOT EXISTS');
+    expect(db.$queryRawUnsafe).not.toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE pos_stored_value_accounts SET balance = balance -'),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  test('V2 gift-card completion retries concurrently after failure with one journal, stock deduction, and EBM dispatch', async () => {
+    const { db } = stubHappyPathDeps();
+    const completionKey = 'complete-retry-giftcard-0001';
+    const shiftId = '777777777777777777777778';
+    const registerId = '888888888888888888888888';
+    db.posRegister = { findFirst: jest.fn().mockResolvedValue({ id: registerId, companyId: IDS.company }) };
+    db.posShift = { findFirst: jest.fn().mockResolvedValue({ id: shiftId, companyId: IDS.company, registerId }) };
+    db.ebmSubmissionQueue = {
+      findFirst: jest.fn().mockResolvedValue(null),
+      create: jest.fn(async ({ data }) => data),
+    };
+    db.ebmAlert = { create: jest.fn().mockResolvedValue({ id: 'ebm-alert-retry' }) };
+    const cashierId = IDS.cashier;
+    const posPayment = {
+      id: 'gift-card-payment-retry',
+      companyId: IDS.company,
+      saleId: IDS.invoice,
+      method: 'GIFT_CARD',
+      amount: 1180,
+      reference: 'EF01',
+      status: 'SUCCESS',
+    };
+    const pendingInvoice = {
+      id: IDS.invoice,
+      status: 'PENDING_PAYMENT',
+      totalAmount: 1180,
+      shiftId,
+      registerId,
+      cashierId,
+      tillSessionId: IDS.till,
+      clientId: IDS.client,
+      posCheckoutPayload: {
+        warehouseId: IDS.warehouse,
+        items: [saleLine()],
+      },
+      posCompletionKey: null,
+    };
+    const completionState = { status: 'PENDING_PAYMENT', completionKey: null };
+    db.invoice = { findFirst: jest.fn().mockResolvedValue(pendingInvoice) };
+    db.posPayment = {
+      findFirst: jest.fn().mockResolvedValue(null),
+      findMany: jest.fn().mockResolvedValue([posPayment]),
+    };
+    db.posShift = { findFirst: jest.fn().mockResolvedValue({ id: shiftId, companyId: IDS.company, registerId }) };
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      const query = String(sql);
+      if (query.includes('SELECT l.account_id AS "accountId"')) {
+        return [{ accountId: 'gift-card-account', reference: 'EF01', codeSuffix: 'EF01', amount: '1180' }];
+      }
+      if (query.includes('SELECT l.id, l.amount::text AS amount')) {
+        return [{ id: 'redemption-ledger', accountId: 'gift-card-account', amount: '1180', reference: 'EF01' }];
+      }
+      if (query.includes('pos_completion_key')) return [completionState];
+      if (query.includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
+      if (query.includes('INSERT INTO pos_stored_value_accounts')) {
+        return [{ id: 'loyalty-wallet-id', balance: 10 }];
+      }
+      return [];
+    });
+    db.$executeRawUnsafe.mockImplementation(async (sql, completionKey) => {
+      if (String(sql).includes('UPDATE invoices SET pos_completion_key')) {
+        completionState.status = 'fully_paid';
+        completionState.completionKey = completionKey;
+      }
+      return 1;
+    });
+    const paymentService = require('../services/posPaymentService');
+    paymentService.getPaymentSettings.mockResolvedValue({
+      paymentFlow: 'PAYMENTS_V2',
+      registerPaymentFlowOverrides: {},
+    });
+    paymentService.resolvePaymentFlow.mockReturnValue('PAYMENTS_V2');
+    ebmService.getConfig.mockReturnValue({ mode: 'sandbox' });
+    EBMSalesService.prepareV2SaleSubmission.mockResolvedValue({ payload: { invoiceNo: 'INV-GIFT-RETRY' } });
+    const stockState = { warehouseQuantity: 50, productQuantity: 50, committedJournals: 0 };
+    StockLevel.updateMany.mockImplementation(async (_filter, update) => {
+      stockState.warehouseQuantity += update.$inc.qty_on_hand;
+      return { matchedCount: 1 };
+    });
+    Product.bulkWrite.mockImplementation(async (operations) => {
+      stockState.productQuantity += operations.reduce(
+        (sum, operation) => sum + operation.updateOne.update.$inc.currentStock,
+        0,
+      );
+    });
+    JournalService.createEntriesAtomic
+      .mockRejectedValueOnce(new Error('forced journal failure'))
+      .mockImplementation(async () => {
+        stockState.committedJournals += 1;
+        return [{ _id: 'je-v2-gift-card-retry' }];
+      });
+    const initialStock = { ...stockState };
+    let transactionTail = Promise.resolve();
+    runInTransaction.mockImplementation(async (operation) => {
+      const previousTransaction = transactionTail;
+      let releaseTransaction;
+      transactionTail = new Promise((resolve) => { releaseTransaction = resolve; });
+      await previousTransaction;
+      const transactionSnapshot = { ...stockState };
+      const completionSnapshot = { ...completionState };
+      try {
+        return await operation({});
+      } catch (error) {
+        Object.assign(stockState, transactionSnapshot);
+        Object.assign(completionState, completionSnapshot);
+        throw error;
+      } finally {
+        releaseTransaction();
+      }
+    });
+    const invoiceDoc = buildInvoiceDoc({
+      _id: IDS.invoice,
+      referenceNo: 'INV-GIFT-RETRY',
+      grandTotal: 1180,
+      totalAmount: 1180,
+      amountPaid: 0,
+      amountOutstanding: 1180,
+      currencyCode: 'RWF',
+      registerId,
+      shiftId,
+      cashierId,
+      tillSessionId: IDS.till,
+      client: IDS.client,
+      status: 'PENDING_PAYMENT',
+      ebm: { paymentFlow: 'PAYMENTS_V2' },
+    });
+    invoiceDoc.save.mockImplementation(async () => {
+      completionState.status = invoiceDoc.status;
+    });
+    Invoice.findOne.mockImplementation(() => ({
+      session: jest.fn().mockResolvedValue(invoiceDoc),
+      populate: jest.fn().mockResolvedValue(invoiceDoc),
+    }));
+    Client.findOne.mockResolvedValue({
+      _id: IDS.client,
+      name: 'Gift card customer',
+      totalPurchases: 0,
+      outstandingBalance: 0,
+      save: jest.fn().mockResolvedValue(undefined),
+    });
+    db.invoiceLine.findMany.mockResolvedValue([{
+      productId: IDS.product,
+      qty: 1,
+      unitPrice: 1000,
+      discountPct: 0,
+      taxRate: 18,
+      lineSubtotal: 1000,
+      lineTax: 180,
+      lineTotal: 1180,
+      warehouseId: IDS.warehouse,
+      serialNumbers: [],
+    }]);
+    const req = makeReq({
+      headers: { 'Idempotency-Key': completionKey },
+      params: { saleId: IDS.invoice },
+    });
+    req.posAuthContext = {
+      company: { id: IDS.company },
+      register: { id: registerId, code: IDS.registerId, claimedDeviceId: IDS.deviceId },
+      user: { id: cashierId, name: 'Cashier' },
+      session: { id: 'pos-session-retry', companyId: IDS.company, registerId },
+    };
+    req.posPermissions = ['pos.payment.take', 'pos.credit.sell', 'pos.giftcard.redeem'];
+    const failed = mockRes();
+    const next = (error) => { if (error) throw error; };
+
+    await posPaymentsV2Controller.completeSale(req, failed, next);
+    const retried = [mockRes(), mockRes()];
+    await Promise.all(retried.map((res) => posPaymentsV2Controller.completeSale(req, res, next)));
+
+    expect(failed.statusCode).toBe(503);
+    expect(failed.body.code).toBe('POS_ACCOUNTING_POST_FAILED');
+    expect(retried.map((res) => res.statusCode).sort()).toEqual([200, 201]);
+    expect(retried.every((res) => res.body.success)).toBe(true);
+    expect(retried.filter((res) => res.body.replayed === true)).toHaveLength(1);
+    expect(retried.map((res) => res.body.data._id)).toEqual([IDS.invoice, IDS.invoice]);
+    expect(retried[0].body.data).toBe(retried[1].body.data);
+    expect(req.posV2Completion.completionKey).toBe(completionKey);
+    expect(JournalService.createEntriesAtomic).toHaveBeenCalledTimes(2);
+    expect(stockState).toEqual({
+      warehouseQuantity: initialStock.warehouseQuantity - 1,
+      productQuantity: initialStock.productQuantity - 1,
+      committedJournals: 1,
+    });
+    expect(EBMSalesService.submitInvoiceAsync).toHaveBeenCalledTimes(1);
   });
 
   test('rejects client prices that do not match the warehouse-assigned price list', async () => {
@@ -306,9 +1007,12 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       save: jest.fn().mockResolvedValue(undefined),
     };
     Client.findOne.mockResolvedValue(client);
-    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+    db.$queryRawUnsafe.mockImplementation(async (sql, ...params) => {
       if (String(sql).includes('SELECT credit_limit')) return [{ credit_limit: '1000', outstanding_balance: '100' }];
       if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
+        return [{ id: 'loyalty-wallet-id', balance: params[4] }];
+      }
       return [];
     });
     const res = mockRes();
@@ -324,11 +1028,11 @@ describe('POS E2E — checkout (sales-legacy)', () => {
 
   test('mobile money checkout requires a payment reference and bank account', async () => {
     CurrencyService.getCompanyBase.mockResolvedValue('RWF');
-    TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open' });
+    TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open', openedBy: IDS.cashier });
     Warehouse.findOne.mockResolvedValue({ _id: IDS.warehouse });
     Product.find.mockReturnValue(leanFind([catalogProduct()]));
     StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows()) });
-    dbClient.mockReturnValue({ $queryRawUnsafe: jest.fn().mockResolvedValue([]) });
+    dbClient.mockReturnValue(emptyCheckoutDb());
 
     const missingRef = mockRes();
     await createDirectSale(makeReq({
@@ -362,6 +1066,91 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       company: IDS.company,
       isActive: true,
     }));
+  });
+
+  test('legacy tills retain the current direct-sale checkout behavior', async () => {
+    stubHappyPathDeps();
+    posPaymentService.resolvePaymentFlow.mockReturnValue('LEGACY');
+    const res = mockRes();
+
+    await createDirectSale(makeReq({
+      body: checkoutBody({ paymentMethod: 'cash', paymentAmount: 1180 }),
+      headers: { 'Idempotency-Key': 'legacy-flow-key-1234' },
+    }), res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(Invoice.create).toHaveBeenCalledTimes(1);
+    expect(posPaymentService.getPaymentSettings).toHaveBeenCalledWith(IDS.company);
+  });
+
+  test('rejects legacy direct-sale requests for V2 tills before creating a sale', async () => {
+    stubHappyPathDeps();
+    posPaymentService.resolvePaymentFlow.mockReturnValue('PAYMENTS_V2');
+    const res = mockRes();
+
+    await createDirectSale(makeReq({
+      body: checkoutBody({ paymentMethod: 'cash', paymentAmount: 1180 }),
+      headers: { 'Idempotency-Key': 'v2-legacy-key-1234' },
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({
+      success: false,
+      code: 'POS_PAYMENT_V2_REQUIRED',
+      message: 'This till uses the new payment flow. Please use the payment screen.',
+    });
+    expect(Invoice.create).not.toHaveBeenCalled();
+    expect(runInTransaction).not.toHaveBeenCalled();
+  });
+
+  test('switching a register setting back to LEGACY restores direct-sale checkout', async () => {
+    stubHappyPathDeps();
+    posPaymentService.resolvePaymentFlow
+      .mockReturnValueOnce('PAYMENTS_V2')
+      .mockReturnValueOnce('LEGACY');
+    const blocked = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({ paymentMethod: 'cash', paymentAmount: 1180 }),
+      headers: { 'Idempotency-Key': 'switch-v2-key-1234' },
+    }), blocked, jest.fn());
+    expect(blocked.statusCode).toBe(409);
+
+    stubHappyPathDeps();
+    const restored = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({ paymentMethod: 'cash', paymentAmount: 1180 }),
+      headers: { 'Idempotency-Key': 'switch-legacy-key-1234' },
+    }), restored, (err) => { throw err; });
+
+    expect(restored.statusCode).toBe(201);
+    expect(Invoice.create).toHaveBeenCalledTimes(1);
+  });
+
+  test('checkout payment-flow lookup is scoped to the claimed company register', async () => {
+    const otherCompanyId = 'cccccccccccccccccccccccc';
+    posPaymentService.getPaymentSettings.mockResolvedValue({
+      paymentFlow: 'LEGACY',
+      manualMobileMoneyMode: 'VERIFY',
+      manualMobileMoneyReceivers: { MTN_MOMO: '*182*8#' },
+    });
+    posPaymentService.resolvePaymentFlow.mockReturnValue('PAYMENTS_V2');
+    const res = mockRes();
+    const next = jest.fn();
+
+    await getCheckoutPaymentFlow(makeReq({
+      query: { registerId: 'REG-1', deviceId: 'device-1' },
+      user: { id: IDS.cashier, company: { _id: otherCompanyId } },
+    }), res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(posPaymentService.getPaymentSettings).toHaveBeenCalledWith(otherCompanyId);
+    expect(findClaimedRegister).toHaveBeenCalledWith(otherCompanyId, 'REG-1', 'device-1');
+    expect(res.body.data).toMatchObject({
+      paymentFlow: 'PAYMENTS_V2',
+      methods: ['CASH', 'MTN_MOMO', 'AIRTEL_MONEY'],
+      manualMobileMoneyMode: 'VERIFY',
+      manualMobileMoneyReceivers: { MTN_MOMO: '*182*8#' },
+    });
   });
 
   test('discounted checkout consumes the one-use manager approval', async () => {
@@ -512,11 +1301,11 @@ describe('POS E2E — checkout (sales-legacy)', () => {
 
   test('preflight rejects when available warehouse stock is insufficient', async () => {
     CurrencyService.getCompanyBase.mockResolvedValue('RWF');
-    TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open' });
+    TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open', openedBy: IDS.cashier });
     Warehouse.findOne.mockResolvedValue({ _id: IDS.warehouse });
     Product.find.mockReturnValue(leanFind([catalogProduct()]));
     StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows(0, 0)) });
-    dbClient.mockReturnValue({ $queryRawUnsafe: jest.fn().mockResolvedValue([]) });
+    dbClient.mockReturnValue(emptyCheckoutDb());
 
     const res = mockRes();
     await createDirectSale(makeReq({ body: checkoutBody() }), res, jest.fn());

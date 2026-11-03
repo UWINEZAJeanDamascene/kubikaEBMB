@@ -332,29 +332,54 @@ exports.getCurrentReceivables = async (req, res, next) => {
     // aggregate them in Postgres instead of deriving them from the page.
     const { dbClient } = require('../lib/prisma');
     const params = [String(companyId)];
-    let clientPredicate = '';
-    if (clientId) {
-      params.push(String(clientId));
-      clientPredicate = ` AND i.client_id = $${params.length}`;
-    }
-    const whereSql = `i.company_id = $1 AND i.status IN ('sent', 'confirmed', 'partially_paid') AND i.amount_outstanding > 0${clientPredicate}`;
+    if (clientId) params.push(String(clientId));
+    const clientPredicate = clientId ? `AND c.id = $2` : '';
+    const invoiceClientPredicate = clientId ? `AND i.client_id = $2` : '';
+    const receivablesCte = `
+      WITH invoice_totals AS (
+        SELECT i.client_id,
+               COALESCE(SUM(i.amount_outstanding), 0) AS invoice_outstanding,
+               COUNT(*)::int AS invoice_count,
+               COALESCE(SUM(CASE WHEN i.due_date < NOW() THEN i.amount_outstanding ELSE 0 END), 0) AS overdue_amount,
+               COUNT(*) FILTER (WHERE i.due_date < NOW())::int AS overdue_count
+          FROM invoices i
+         WHERE i.company_id = $1
+           AND i.status IN ('sent', 'confirmed', 'partially_paid')
+           AND i.amount_outstanding > 0
+           ${invoiceClientPredicate}
+         GROUP BY i.client_id
+      ), client_balances AS (
+        SELECT c.id AS "_id", c.name, c.code,
+               COALESCE(i.invoice_outstanding, 0) + GREATEST(
+                 COALESCE(c.outstanding_balance, 0) - COALESCE(i.invoice_outstanding, 0),
+                 0
+               ) AS total_outstanding,
+               COALESCE(i.invoice_count, 0)::int AS invoice_count,
+               COALESCE(i.overdue_amount, 0) AS overdue_amount,
+               COALESCE(i.overdue_count, 0)::int AS overdue_count
+          FROM clients c
+          LEFT JOIN invoice_totals i ON i.client_id = c.id
+         WHERE c.company_id = $1
+           ${clientPredicate}
+           AND (COALESCE(i.invoice_outstanding, 0) > 0 OR COALESCE(c.outstanding_balance, 0) > 0)
+      )`;
     const [summaryRows, clientRows] = await Promise.all([
       dbClient().$queryRawUnsafe(
-        `SELECT COALESCE(SUM(i.amount_outstanding), 0)::text AS "totalOutstanding",
-                COUNT(*)::int AS "totalInvoices",
-                COALESCE(SUM(CASE WHEN i.due_date < NOW() THEN i.amount_outstanding ELSE 0 END), 0)::text AS "overdueAmount",
-                COUNT(*) FILTER (WHERE i.due_date < NOW())::int AS "overdueCount"
-           FROM invoices i WHERE ${whereSql}`,
+        `${receivablesCte}
+         SELECT COALESCE(SUM(total_outstanding), 0)::text AS "totalOutstanding",
+                COALESCE(SUM(invoice_count), 0)::int AS "totalInvoices",
+                COALESCE(SUM(overdue_amount), 0)::text AS "overdueAmount",
+                COALESCE(SUM(overdue_count), 0)::int AS "overdueCount"
+           FROM client_balances`,
         ...params,
       ),
       dbClient().$queryRawUnsafe(
-        `SELECT i.client_id AS "_id", c.name, c.code,
-                COALESCE(SUM(i.amount_outstanding), 0)::text AS "totalOutstanding",
-                COUNT(*)::int AS "invoiceCount"
-           FROM invoices i JOIN clients c ON c.id = i.client_id
-          WHERE ${whereSql}
-          GROUP BY i.client_id, c.name, c.code
-          ORDER BY SUM(i.amount_outstanding) DESC
+        `${receivablesCte}
+         SELECT "_id", name, code,
+                total_outstanding::text AS "totalOutstanding",
+                invoice_count AS "invoiceCount"
+           FROM client_balances
+          ORDER BY total_outstanding DESC, "_id"
           LIMIT 10`,
         ...params,
       ),

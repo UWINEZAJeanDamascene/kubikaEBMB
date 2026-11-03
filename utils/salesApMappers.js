@@ -215,6 +215,8 @@ function invoiceToApi(row) {
     posOrigin: Boolean(row.posOrigin),
     tillSessionId: row.tillSessionId ?? null,
     registerId: row.registerId ?? null,
+    shiftId: row.shiftId ?? null,
+    cashierId: row.cashierId ?? null,
     badDebtWrittenOff: Boolean(row.badDebtWrittenOff),
     writtenOffAt: row.writtenOffAt ?? null,
     writtenOffBy: row.writtenOffById ?? null,
@@ -299,6 +301,7 @@ async function invoiceTranslateCreate(data) {
       projectId: line.projectId || line.project_id ? toIdString(line.projectId || line.project_id) : null,
       qtyCredited: line.qtyCredited ?? 0,
       qtyDelivered: line.qtyDelivered ?? 0,
+      serialNumbers: Array.isArray(line.serialNumbers) ? line.serialNumbers : [],
     };
   });
 
@@ -335,6 +338,11 @@ async function invoiceTranslateCreate(data) {
     deliveryNoteId: data.deliveryNote ? toIdString(data.deliveryNote) : null,
     status: data.status || 'draft',
     posOrigin: data.posOrigin === true,
+    tillSessionId: data.tillSessionId ? toIdString(data.tillSessionId) : null,
+    shiftId: data.shiftId ? toIdString(data.shiftId) : null,
+    cashierId: data.cashierId ? toIdString(data.cashierId) : null,
+    registerId: data.registerId ? String(data.registerId) : null,
+    posCheckoutPayload: data.posCheckoutPayload ?? undefined,
     currencyCode: data.currencyCode || data.currency || 'RWF',
     exchangeRate: data.exchangeRate ?? 1,
     subtotal: moneyStr(subtotal),

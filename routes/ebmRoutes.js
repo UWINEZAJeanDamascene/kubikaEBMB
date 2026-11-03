@@ -2,6 +2,9 @@ const express = require('express');
 const { body, param, query } = require('express-validator');
 const router = express.Router();
 const ebmController = require('../controllers/ebmController');
+const posFiscalReconciliationController = require('../controllers/posFiscalReconciliationController');
+const posEbmManagerController = require('../controllers/posEbmManagerController');
+const posManagerApprovalController = require('../controllers/posManagerApprovalController');
 const { protect } = require('../middleware/auth');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const { attachCompanyId } = require('../middleware/companyContext');
@@ -115,6 +118,19 @@ router.get(
   ebmController.listUnmatchedPurchases,
 );
 router.get('/queue', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.listSubmissionQueue);
+router.get('/pos-settings', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), posEbmManagerController.getSettings);
+router.patch('/pos-settings', requirePermissionOrRoles('ebm', 'update', ['admin']), posEbmManagerController.updateSettings);
+router.get('/queue/v2', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), posEbmManagerController.list);
+router.get('/queue/v2/review', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.listV2FiscalReviewQueue);
+router.get('/queue/v2/unsent', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), posFiscalReconciliationController.unsent);
+router.get('/queue/v2/refunds/:creditNoteId', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), posEbmManagerController.refundLookup);
+router.post('/queue/v2/refunds/:creditNoteId/retry', requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']), posEbmManagerController.retryRefund);
+router.get('/queue/v2/:id/receipt', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), posEbmManagerController.receipt);
+router.post('/queue/v2/:id/reprint', requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']), param('id').isMongoId(), validateRequest, posEbmManagerController.reprint);
+router.get('/queue/v2/:id', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), posEbmManagerController.detail);
+router.post('/queue/v2/:id/retry', requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']), posEbmManagerController.retry);
+router.post('/queue/v2/:id/manager-approval', requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']), posManagerApprovalController.createApproval);
+router.get('/pos-reconciliation/daily', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), posFiscalReconciliationController.daily);
 router.get('/alerts', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.listAlerts);
 
 router.post(
@@ -294,6 +310,20 @@ router.get(
   '/queue/:id',
   requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']),
   ebmController.getSubmissionQueueItem,
+);
+
+router.post(
+  '/queue/:id/v2/resolve',
+  requirePermissionOrRoles('ebm', 'update', ['admin', 'stock_manager']),
+  param('id').isMongoId(),
+  body('resolution').isIn(['CONFIRMED_SIGNED', 'CONFIRMED_NOT_RECEIVED']),
+  body('reason').isString().trim().isLength({ min: 10, max: 1000 }),
+  body('evidenceNote').if((value, { req }) => req.body.resolution === 'CONFIRMED_SIGNED').isString().trim().isLength({ min: 10, max: 2000 }),
+  body('managerApprovalId').if((value, { req }) => req.body.resolution === 'CONFIRMED_SIGNED').isMongoId(),
+  body('receiptData').if((value, { req }) => req.body.resolution === 'CONFIRMED_SIGNED').isObject(),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.resolveV2FiscalQueueItem,
 );
 
 router.post(

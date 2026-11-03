@@ -1,4 +1,3 @@
-const crypto = require('crypto');
 const { dbClient } = require('../lib/prisma');
 const { runInTransaction } = require('../services/transactionService');
 const JournalService = require('../services/journalService');
@@ -9,32 +8,55 @@ const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { generateObjectId } = require('../utils/objectId');
 const CurrencyService = require('../services/CurrencyService');
 const { findClaimedRegister } = require('../services/posRegisterService');
+const {
+  normalizeStoredValueCode,
+  hashStoredValueCode,
+  generateStoredValueCode,
+} = require('../services/posStoredValueCodeService');
 
 const roundMoney = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
-const normalizeCode = (value) => String(value || '').replace(/\s+/g, '').toUpperCase();
-const hashCode = (value) => crypto.createHash('sha256').update(normalizeCode(value)).digest('hex');
-const generatedCode = () => `KB-${crypto.randomBytes(12).toString('hex').toUpperCase()}`;
 
 exports.lookup = async (req, res) => {
   try {
     const companyId = String(req.user.company._id);
     const clientId = String(req.query.clientId || '');
-    const code = normalizeCode(req.query.code);
+    const code = normalizeStoredValueCode(req.query.code);
     const kind = String(req.query.kind || '').toLowerCase();
     if (kind === 'loyalty') {
       if (!/^[a-f\d]{24}$/i.test(clientId)) return res.status(400).json({ success: false, message: 'Select a registered customer to check loyalty credit.' });
-      const rows = await dbClient().$queryRawUnsafe(
-        'SELECT id, balance, currency_code AS "currencyCode" FROM pos_stored_value_accounts WHERE company_id = $1 AND client_id = $2 AND kind = \'loyalty\' AND is_active = TRUE LIMIT 1',
-        companyId, clientId,
-      );
-      return res.json({ success: true, data: { kind, balance: Number(rows[0]?.balance || 0), currencyCode: rows[0]?.currencyCode || (await CurrencyService.getCompanyBase(companyId)) } });
+      const [wallets, pointRows, settings] = await Promise.all([
+        dbClient().$queryRawUnsafe(
+          `SELECT a.currency_code AS "currencyCode", COALESCE(SUM(a.balance), 0)::numeric AS balance
+             FROM pos_stored_value_accounts a
+             JOIN clients c ON c.id = a.client_id AND c.company_id = a.company_id
+            WHERE a.company_id = $1 AND (c.id = $2 OR c.merged_into_client_id = $2) AND a.kind = 'loyalty' AND a.is_active = TRUE
+            GROUP BY a.currency_code ORDER BY a.currency_code`,
+          companyId, clientId,
+        ),
+        dbClient().$queryRawUnsafe(
+          `SELECT COALESCE(SUM(l.points), 0)::int AS balance
+             FROM pos_customer_loyalty_ledger l
+             JOIN clients c ON c.id = l.client_id AND c.company_id = l.company_id
+            WHERE l.company_id = $1 AND (c.id = $2 OR c.merged_into_client_id = $2)`,
+          companyId, clientId,
+        ),
+        dbClient().systemSettings.findUnique({ where: { companyId }, select: { posLoyaltySettings: true } }),
+      ]);
+      const currencyCode = await CurrencyService.getCompanyBase(companyId);
+      const selectedWallet = wallets.find((row) => String(row.currencyCode).toUpperCase() === String(currencyCode).toUpperCase());
+      const pointValueRwf = Number(settings?.posLoyaltySettings?.pointValueRwf ?? 1);
+      return res.json({ success: true, data: {
+        kind, balance: Number(selectedWallet?.balance || 0), currencyCode,
+        wallets: wallets.map((row) => ({ currencyCode: row.currencyCode, balance: Number(row.balance || 0) })),
+        pointBalance: Number(pointRows[0]?.balance || 0), pointValueRwf,
+      } });
     }
     if (!['gift_card', 'store_credit'].includes(kind) || code.length < 8 || code.length > 80) {
       return res.status(400).json({ success: false, message: 'Enter a valid gift card or store credit code.' });
     }
     const rows = await dbClient().$queryRawUnsafe(
       'SELECT id, kind, balance, currency_code AS "currencyCode", code_suffix AS "codeSuffix", client_id AS "clientId", expires_at AS "expiresAt" FROM pos_stored_value_accounts WHERE company_id = $1 AND code_hash = $2 AND kind = $3 AND is_active = TRUE LIMIT 1',
-      companyId, hashCode(code), kind,
+      companyId, hashStoredValueCode(code), kind,
     );
     const account = rows[0];
     if (!account || account.expiresAt && new Date(account.expiresAt) <= new Date()) return res.status(404).json({ success: false, message: 'Stored value account was not found or has expired.' });
@@ -60,7 +82,7 @@ exports.issue = async (req, res) => {
     const client = clientId ? await Client.findOne({ _id: clientId, company: companyId, isActive: true }) : null;
     if (clientId && !client) return res.status(404).json({ success: false, message: 'Customer was not found.' });
 
-    const code = kind === 'gift_card' ? generatedCode() : generatedCode();
+    const code = generateStoredValueCode();
     const accountId = generateObjectId();
     const entryId = generateObjectId();
     const actorId = String(req.user.id);
@@ -96,7 +118,7 @@ exports.issue = async (req, res) => {
     await runInTransaction(async (session) => {
       await dbClient().$executeRawUnsafe(
         'INSERT INTO pos_stored_value_accounts (id, company_id, client_id, kind, code_hash, code_suffix, currency_code, balance, is_active, created_by_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)',
-        accountId, companyId, clientId, kind, hashCode(code), code.slice(-4), currencyCode, amount, actorId,
+        accountId, companyId, clientId, kind, hashStoredValueCode(code), code.slice(-4), currencyCode, amount, actorId,
       );
       await dbClient().$executeRawUnsafe(
         'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, kind, entry_type, amount, balance_after, reference, notes, created_by_id, created_at) VALUES ($1, $2, $3, $4, \'issue\', $5, $5, $6, $7, $8, CURRENT_TIMESTAMP)',

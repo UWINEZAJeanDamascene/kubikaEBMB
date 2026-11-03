@@ -5,12 +5,26 @@ const { generateObjectId } = require('../utils/objectId');
 const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
 
 const ACTIONS = {
-  discount: { resource: 'sales_invoices', permission: 'approve' },
-  void: { resource: 'sales_invoices', permission: 'delete' },
-  refund: { resource: 'credit_notes', permission: 'approve' },
+  discount: { resource: 'pos.till', permission: 'discount' },
+  DISCOUNT_OVER_LIMIT: { resource: 'pos.till', permission: 'discount' },
+  PRICE_OVERRIDE: { resource: 'pos.till', permission: 'discount' },
+  void: { resource: 'pos.till', permission: 'void' },
+  VOID_LINE: { resource: 'pos.till', permission: 'void' },
+  VOID_SALE: { resource: 'pos.till', permission: 'void' },
+  refund: { resource: 'pos.till', permission: 'refund' },
+  REFUND: { resource: 'pos.till', permission: 'refund' },
   till_force_close: { resource: 'tills', permission: 'close' },
   till_large_variance_close: { resource: 'tills', permission: 'close' },
+  no_sale: { resource: 'pos.till', permission: 'no_sale' },
+  NO_SALE: { resource: 'pos.till', permission: 'no_sale' },
   checkout_recovery: { resource: 'sales_invoices', permission: 'approve' },
+  CANCEL_PAID_SALE: { resource: 'pos.till', permission: 'refund' },
+  REMOVE_PAYMENT: { resource: 'pos.till', permission: 'refund' },
+  FISCAL_RECEIPT_ENTRY: { resource: 'sales_invoices', permission: 'approve' },
+  CLOSE_WITH_UNSENT_RECEIPTS: { resource: 'sales_invoices', permission: 'approve' },
+  CREDIT_WRITEOFF: { resource: 'sales_invoices', permission: 'approve' },
+  CREDIT_ADJUST: { resource: 'sales_invoices', permission: 'approve' },
+  CREDIT_REFUND: { resource: 'sales_invoices', permission: 'approve' },
 };
 
 const hashPayload = (payload) => createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
@@ -116,6 +130,22 @@ exports.createApproval = async (req, res, next) => {
           success: false,
           code: 'POS_TILL_LARGE_VARIANCE_APPROVAL_INVALID',
           message: 'This approval requires your own open till, a counted amount at or above the configured manager threshold, and a reason of at least 10 characters.',
+        });
+      }
+    }
+    if (action === 'no_sale') {
+      tillSessionId = String(payload?.tillSessionId || subjectId || '');
+      const activeTill = tillSessionId && String(subjectId || '') === tillSessionId
+        ? await prisma.tillSession.findFirst({
+          where: { id: tillSessionId, companyId, openedById: cashierId, status: 'open' },
+          select: { id: true },
+        })
+        : null;
+      if (!activeTill) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_TILL_NO_SALE_INVALID',
+          message: 'A no-sale drawer opening requires your own active till.',
         });
       }
     }
@@ -245,3 +275,4 @@ exports.consumeApproval = async ({ approvalId, companyId, cashierId, action, sub
 };
 
 exports.hashPayload = hashPayload;
+exports.ACTIONS = ACTIONS;

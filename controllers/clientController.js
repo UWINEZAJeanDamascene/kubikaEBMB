@@ -3,6 +3,8 @@ const Invoice = require('../models/Invoice');
 const CreditNote = require('../models/CreditNote');
 const ARReceipt = require('../models/ARReceipt');
 const EBMBranchService = require('../services/ebmBranchService');
+const { writePosAuditLog } = require('../services/posAuditService');
+const { prisma } = require('../lib/prisma');
 function sanitizeClientBody(body = {}) {
   const {
     registerWithEbmBranch,
@@ -79,8 +81,8 @@ exports.getClients = async (req, res, next) => {
     }
 
     const CLIENT_LIST_SELECT = req.query.forPicker === '1'
-      ? '_id name code contact type isActive taxId paymentTerms creditLimit outstandingBalance'
-      : '_id name code type contact isActive creditLimit outstandingBalance totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
+      ? '_id name code contact type isActive taxId paymentTerms creditLimit outstandingBalance creditAccountStatus creditTermsDays'
+      : '_id name code type contact isActive creditLimit outstandingBalance creditAccountStatus creditTermsDays totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
 
     const total = await Client.countDocuments(query);
     const clients = await Client.find(query)
@@ -154,6 +156,9 @@ exports.createClient = async (req, res, next) => {
       ...(ebmBranchCustomer ? { ebmBranchCustomer } : {})
     });
   } catch (error) {
+    if (error?.code === 'P2002' && String(error?.meta?.target || '').includes('phone_normalized')) {
+      return res.status(409).json({ success: false, code: 'CUSTOMER_PHONE_IN_USE', message: 'That phone number is already used by a customer in this company.' });
+    }
     // Handle duplicate key error more gracefully
     if (error.code === 11000) {
       const field = Object.keys(error.keyPattern)[0];
@@ -179,6 +184,23 @@ exports.createClient = async (req, res, next) => {
 exports.updateClient = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const existing = await Client.findOne({ _id: req.params.id, company: companyId });
+    if (!existing) return res.status(404).json({ success: false, message: 'Client not found' });
+    if (existing.isWalkIn || existing.mergedIntoClientId) {
+      return res.status(409).json({ success: false, code: 'CUSTOMER_PROTECTED', message: 'This customer record cannot be edited.' });
+    }
+    const creditFieldsChanged = ['creditLimit', 'creditTermsDays', 'creditAccountStatus']
+      .some((field) => Object.prototype.hasOwnProperty.call(req.body || {}, field));
+    const creditSettings = creditFieldsChanged ? {
+      status: String(req.body.creditAccountStatus ?? existing.creditAccountStatus ?? 'ACTIVE').toUpperCase(),
+      limit: Number(req.body.creditLimit ?? existing.creditLimit ?? 0),
+      termsDays: Number(req.body.creditTermsDays ?? existing.creditTermsDays ?? 30),
+    } : null;
+    if (creditSettings && (!['ACTIVE', 'ON_HOLD', 'CLOSED'].includes(creditSettings.status)
+      || !Number.isFinite(creditSettings.limit) || creditSettings.limit < 0
+      || !Number.isInteger(creditSettings.termsDays) || creditSettings.termsDays < 0 || creditSettings.termsDays > 3650)) {
+      return res.status(400).json({ success: false, code: 'CREDIT_ACCOUNT_SETTINGS_INVALID', message: 'Use an active, on-hold, or closed status, a non-negative limit, and payment terms from 0 to 3650 days.' });
+    }
     const client = await Client.findOneAndUpdate(
       { _id: req.params.id, company: companyId },
       sanitizeClientBody(req.body),
@@ -193,6 +215,45 @@ exports.updateClient = async (req, res, next) => {
         success: false,
         message: 'Client not found'
       });
+    }
+
+    if (creditSettings) {
+      await writePosAuditLog({
+        companyId: String(companyId), userId: String(req.user.id || req.user._id), event: 'POS_CREDIT_ACCOUNT_UPDATED',
+        metadata: {
+          clientId: String(client._id || client.id),
+          before: { status: existing.creditAccountStatus || 'ACTIVE', creditLimit: Number(existing.creditLimit || 0), creditTermsDays: Number(existing.creditTermsDays ?? 30) },
+          after: { status: creditSettings.status, creditLimit: creditSettings.limit, creditTermsDays: creditSettings.termsDays },
+        },
+      });
+    }
+
+    const consentFields = ['marketingConsent', 'digitalReceiptConsent'];
+    const changedConsent = consentFields.reduce((changes, field) => {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, field)
+        && Boolean(existing[field]) !== Boolean(client[field])) {
+        changes[field] = { before: Boolean(existing[field]), after: Boolean(client[field]) };
+      }
+      return changes;
+    }, {});
+    if (Object.keys(changedConsent).length) {
+      await writePosAuditLog({
+        companyId: String(companyId), userId: String(req.user.id || req.user._id), event: 'CUSTOMER_CONSENT_UPDATED',
+        metadata: { clientId: String(client._id || client.id), changes: changedConsent },
+      });
+    }
+    if (changedConsent.digitalReceiptConsent?.before === true && changedConsent.digitalReceiptConsent.after === false) {
+      const invoices = await prisma.invoice.findMany({
+        where: { companyId: String(companyId), clientId: String(client._id || client.id) },
+        select: { id: true },
+      });
+      const invoiceIds = invoices.map((invoice) => invoice.id);
+      if (invoiceIds.length) {
+        await prisma.posPublicReceiptToken.updateMany({
+          where: { companyId: String(companyId), invoiceId: { in: invoiceIds }, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+      }
     }
 
     const ebmBranchCustomer = await trySaveClientBranchCustomer({
@@ -211,6 +272,9 @@ exports.updateClient = async (req, res, next) => {
       ...(ebmBranchCustomer ? { ebmBranchCustomer } : {})
     });
   } catch (error) {
+    if (error?.code === 'P2002' && String(error?.meta?.target || '').includes('phone_normalized')) {
+      return res.status(409).json({ success: false, code: 'CUSTOMER_PHONE_IN_USE', message: 'That phone number is already used by a customer in this company.' });
+    }
     next(error);
   }
 };
@@ -287,19 +351,16 @@ exports.verifyClientTin = async (req, res, next) => {
 exports.deleteClient = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
-    // Check if client has invoices before deleting
-    const Invoice = require('../models/Invoice');
-    const invoiceCount = await Invoice.countDocuments({ client: req.params.id, company: companyId });
-    
-    if (invoiceCount > 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot delete client with existing invoices'
-      });
+    const existing = await Client.findOne({ _id: req.params.id, company: companyId });
+    if (!existing) return res.status(404).json({ success: false, message: 'Client not found' });
+    if (existing.isWalkIn || existing.mergedIntoClientId) {
+      return res.status(409).json({ success: false, code: 'CUSTOMER_PROTECTED', message: 'This customer record cannot be deleted.' });
     }
-    
-    const client = await Client.findOneAndDelete({ _id: req.params.id, company: companyId });
+    const client = await Client.findOneAndUpdate(
+      { _id: req.params.id, company: companyId },
+      { isActive: false },
+      { new: true, runValidators: true },
+    );
 
     if (!client) {
       return res.status(404).json({
@@ -310,7 +371,7 @@ exports.deleteClient = async (req, res, next) => {
 
     res.json({
       success: true,
-      message: 'Client deleted successfully'
+      message: 'Client deactivated successfully'
     });
   } catch (error) {
     next(error);
@@ -408,6 +469,10 @@ exports.toggleClientStatus = async (req, res, next) => {
       });
     }
 
+    if (client.isWalkIn || client.mergedIntoClientId) {
+      return res.status(409).json({ success: false, code: 'CUSTOMER_PROTECTED', message: 'This customer record cannot be deactivated.' });
+    }
+
     client.isActive = !client.isActive;
     await client.save();
 
@@ -446,8 +511,8 @@ exports.getClientsWithStats = async (req, res, next) => {
     }
 
     const CLIENT_LIST_SELECT = req.query.forPicker === '1'
-      ? '_id name code contact type isActive taxId paymentTerms creditLimit outstandingBalance'
-      : '_id name code type contact isActive creditLimit outstandingBalance totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
+      ? '_id name code contact type isActive taxId paymentTerms creditLimit outstandingBalance creditAccountStatus creditTermsDays'
+      : '_id name code type contact isActive creditLimit outstandingBalance creditAccountStatus creditTermsDays totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
 
     const total = await Client.countDocuments(query);
     const clients = await Client.find(query)

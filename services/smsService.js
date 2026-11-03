@@ -16,6 +16,60 @@ const getNexmoConfig = () => ({
   fromNumber: process.env.NEXMO_FROM_NUMBER
 });
 
+const sendViaTwilioWhatsApp = async (to, message) => {
+  const config = getTwilioConfig();
+  const fromNumber = process.env.TWILIO_WHATSAPP_FROM_NUMBER;
+  if (!config.accountSid || !config.authToken || !fromNumber) {
+    return { success: false, error: 'Twilio WhatsApp not configured' };
+  }
+  const normalizedPhone = normalizePhoneNumber(to);
+  if (!normalizedPhone) return { success: false, error: 'Invalid phone number' };
+  const whatsappFrom = String(fromNumber).startsWith('whatsapp:')
+    ? String(fromNumber)
+    : `whatsapp:${String(fromNumber).replace(/\s/g, '')}`;
+
+  try {
+    const response = await axios.post(
+      `https://api.twilio.com/2010-04-01/Accounts/${config.accountSid}/Messages.json`,
+      new URLSearchParams({
+        To: `whatsapp:${normalizedPhone}`,
+        From: whatsappFrom,
+        Body: message
+      }),
+      { auth: { username: config.accountSid, password: config.authToken } }
+    );
+    return { success: true, messageId: response.data.sid };
+  } catch (error) {
+    return { success: false, error: error.response?.data || error.message };
+  }
+};
+
+const sendViaMetaWhatsApp = async (to, message) => {
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!phoneNumberId || !accessToken) {
+    return { success: false, error: 'WhatsApp provider not configured' };
+  }
+  const normalizedPhone = normalizePhoneNumber(to);
+  if (!normalizedPhone) return { success: false, error: 'Invalid phone number' };
+  try {
+    const response = await axios.post(
+      `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: normalizedPhone.replace(/^\+/, ''),
+        type: 'text',
+        text: { preview_url: false, body: message }
+      },
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+    );
+    return { success: true, messageId: response.data?.messages?.[0]?.id || null };
+  } catch (error) {
+    return { success: false, error: error.response?.data || error.message };
+  }
+};
+
 // Normalize phone number to E.164 format
 // Uses DEFAULT_COUNTRY_CODE env var if provided (e.g. '1' for US)
 const normalizePhoneNumber = (phone) => {
@@ -75,12 +129,12 @@ const sendViaTwilio = async (to, message) => {
       }
     );
     
-    console.log(`📱 SMS sent via Twilio to: ${to}`);
+    console.log('SMS accepted by Twilio.');
     return { success: true, messageId: response.data.sid };
   } catch (error) {
     // Prefer returning Twilio's structured error when available
     const twErr = error.response && error.response.data ? error.response.data : null;
-    console.error('Twilio SMS error:', twErr || error.message);
+    console.error('Twilio SMS request failed.', error.response?.status || '');
     return { success: false, error: twErr || error.message };
   }
 };
@@ -104,13 +158,13 @@ const sendViaNexmo = async (to, message) => {
     });
     
     if (response.data.messages[0].status === '0') {
-      console.log(`📱 SMS sent via Nexmo to: ${to}`);
+      console.log('SMS accepted by Nexmo.');
       return { success: true, messageId: response.data.messages[0]['message-id'] };
     } else {
       throw new Error(response.data.messages[0]['error-text']);
     }
   } catch (error) {
-    console.error('Nexmo SMS error:', error.message);
+    console.error('Nexmo SMS request failed.');
     return { success: false, error: error.message };
   }
 };
@@ -128,7 +182,7 @@ const sendSMS = async (to, message) => {
   }
 
   // Try Twilio first
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM_NUMBER) {
     return sendViaTwilio(normalizedPhone, message);
   }
   
@@ -137,9 +191,21 @@ const sendSMS = async (to, message) => {
     return sendViaNexmo(normalizedPhone, message);
   }
   
-  // Log only (no provider configured)
-  console.log(`📱 SMS would be sent to ${normalizedPhone}: ${message.substring(0, 50)}...`);
+  // Do not log customer phone numbers or receipt content when delivery is not configured.
   return { success: false, error: 'No SMS provider configured' };
+};
+
+const sendWhatsApp = async (to, message) => {
+  if (!to || !message) return { success: false, error: 'Missing phone number or message' };
+  const normalizedPhone = normalizePhoneNumber(to);
+  if (!normalizedPhone) return { success: false, error: 'Invalid phone number' };
+  if (process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN) {
+    return sendViaMetaWhatsApp(normalizedPhone, message);
+  }
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_WHATSAPP_FROM_NUMBER) {
+    return sendViaTwilioWhatsApp(normalizedPhone, message);
+  }
+  return { success: false, error: 'No WhatsApp provider configured' };
 };
 
 // ============================================
@@ -216,6 +282,7 @@ const sendSecurityAlertSMS = async (alert, company, phoneNumbers) => {
 
 module.exports = {
   sendSMS,
+  sendWhatsApp,
   normalizePhoneNumber,
   // Critical event notifications
   sendLowStockCriticalSMS,

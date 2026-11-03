@@ -56,6 +56,27 @@ describe('EBM operation prerequisite checks', () => {
     );
   });
 
+  it('keeps legacy resolved_at untouched when a V2 fiscal response is submitted', async () => {
+    const queue = require('../models/EBMSubmissionQueue');
+    const EBMQueueService = require('../services/ebmQueueService');
+    queue.findOneAndUpdate.mockResolvedValue({ ebmStatus: 'submitted' });
+
+    await EBMQueueService.markSubmitted({
+      companyId: 'company-1',
+      documentType: 'pos',
+      documentId: 'sale-1',
+      endpoint: '/transactions/saveSales',
+      environment: 'sandbox',
+      payload: { invcNo: 1 },
+      fiscalResponse: { resultCd: '000' },
+      v2: true,
+    });
+
+    const update = queue.findOneAndUpdate.mock.calls[0][1].$set;
+    expect(update.ebmStatus).toBe('submitted');
+    expect(update.resolvedAt).toBeUndefined();
+  });
+
   it('marks a sales retry as in-flight before sending it', async () => {
     const queue = require('../models/EBMSubmissionQueue');
     const EBMQueueService = require('../services/ebmQueueService');

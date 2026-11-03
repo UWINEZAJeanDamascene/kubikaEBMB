@@ -10,8 +10,10 @@ jest.mock('../models/TillSession', () => ({
 }));
 jest.mock('../lib/prisma', () => ({
   prisma: {
+    $queryRawUnsafe: jest.fn().mockResolvedValue([]),
     user: { findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn() },
-    tillSession: { findMany: jest.fn() },
+    tillSession: { findFirst: jest.fn(), findMany: jest.fn() },
+    posRegister: { findFirst: jest.fn() },
     posManagerApproval: { create: jest.fn(), findMany: jest.fn() },
     product: { findMany: jest.fn() },
   },
@@ -70,6 +72,7 @@ describe('POS E2E — till open / close / variance', () => {
     jest.clearAllMocks();
     resolveUserRoles.mockResolvedValue([{ name: 'sales', is_system_role: true }]);
     PermissionService.check.mockReturnValue(false);
+    prisma.posRegister.findFirst.mockResolvedValue({ name: 'Front counter' });
   });
 
   test('opens a till with opening float for a free register', async () => {
@@ -91,6 +94,7 @@ describe('POS E2E — till open / close / variance', () => {
     await openTill(makeReq({
       body: {
         registerId: IDS.registerId,
+        deviceId: IDS.deviceId,
         registerName: 'Front counter',
         openingFloat: 5000,
       },
@@ -110,7 +114,7 @@ describe('POS E2E — till open / close / variance', () => {
     TillSession.findOne.mockResolvedValueOnce({ _id: IDS.till, status: 'open' });
     const res = mockRes();
     await openTill(makeReq({
-      body: { registerId: IDS.registerId, registerName: 'Front counter', openingFloat: 0 },
+      body: { registerId: IDS.registerId, deviceId: IDS.deviceId, registerName: 'Front counter', openingFloat: 0 },
     }), res, jest.fn());
     expect(res.statusCode).toBe(409);
     expect(res.body.code).toBe('POS_REGISTER_ALREADY_OPEN');
@@ -130,6 +134,7 @@ describe('POS E2E — till open / close / variance', () => {
     await closeTill(makeReq({
       body: {
         registerId: IDS.registerId,
+        deviceId: IDS.deviceId,
         registerName: 'Front counter',
         closingCount: 9500,
         closeNotes: '',
@@ -149,6 +154,7 @@ describe('POS E2E — till open / close / variance', () => {
     await closeTill(makeReq({
       body: {
         registerId: IDS.registerId,
+        deviceId: IDS.deviceId,
         registerName: 'Front counter',
         closingCount: 9500,
         closeNotes: 'Short drawer — counted twice',
@@ -176,6 +182,7 @@ describe('POS E2E — till open / close / variance', () => {
           cash_activity: [{ type: 'cash_sale', amount: 150 }],
           status: 'open',
         }])
+        .mockResolvedValueOnce([])
         .mockResolvedValueOnce([{ manager_id: `${IDS.manager} ` }]),
       user: { findFirst: jest.fn() },
       tillSession: {
@@ -404,6 +411,11 @@ describe('POS E2E — void and refund gates', () => {
   });
 
   test('POS refund requires manager approval inside the refund transaction', async () => {
+    prisma.tillSession.findFirst.mockResolvedValue({ id: IDS.till, registerId: IDS.registerId });
+    dbClient.mockReturnValue({
+      $queryRawUnsafe: jest.fn().mockResolvedValue([]),
+      $queryRaw: jest.fn().mockResolvedValue([{ payments: [] }]),
+    });
     CreditNote.findOne.mockResolvedValue({
       _id: IDS.creditNote,
       status: 'confirmed',
@@ -427,7 +439,7 @@ describe('POS E2E — void and refund gates', () => {
     const next = jest.fn();
     await recordRefund(makeReq({
       params: { id: IDS.creditNote },
-      body: { amount: 1180, paymentMethod: 'cash' },
+      body: { amount: 1180, paymentMethod: 'cash', idempotencyKey: 'pos-refund-denied-1' },
     }), res, next);
 
     expect(consumeApproval).toHaveBeenCalledWith(expect.objectContaining({
@@ -444,7 +456,40 @@ describe('POS E2E — void and refund gates', () => {
     }));
   });
 
+  test('POS credit-note payout requires a client idempotency key', async () => {
+    CreditNote.findOne.mockResolvedValue({
+      _id: IDS.creditNote, status: 'confirmed', posOrigin: true, totalAmount: 1180,
+      amountRefunded: 0, amountAvailableAsCredit: 1180, amountAppliedToAR: 0,
+      amountRefundedFromCredit: 0, amountRefundedFromAR: 0, payments: [],
+    });
+    const res = mockRes();
+    await recordRefund(makeReq({ params: { id: IDS.creditNote }, body: { amount: 100, paymentMethod: 'cash' } }), res, jest.fn());
+    expect(res.statusCode).toBe(400);
+    expect(res.body.code).toBe('POS_REFUND_IDEMPOTENCY_KEY_REQUIRED');
+    expect(runInTransaction).not.toHaveBeenCalled();
+  });
+
+  test('POS credit-note payout replays an identical idempotency key without posting another journal', async () => {
+    const note = {
+      _id: IDS.creditNote, status: 'partially_refunded', posOrigin: true, totalAmount: 1180,
+      amountRefunded: 100, amountAvailableAsCredit: 1180, amountAppliedToAR: 0,
+      amountRefundedFromCredit: 100, amountRefundedFromAR: 0,
+      payments: [{ idempotencyKey: 'refund-replay-0001', amount: 100, paymentMethod: 'cash', reference: 'till-1' }],
+    };
+    const fresh = { ...note };
+    CreditNote.findOne.mockResolvedValueOnce(note).mockResolvedValueOnce(fresh);
+    const res = mockRes();
+    await recordRefund(makeReq({
+      params: { id: IDS.creditNote },
+      body: { amount: 100, paymentMethod: 'cash', reference: 'till-1', idempotencyKey: 'refund-replay-0001' },
+    }), res, (error) => { throw error; });
+    expect(res.body).toMatchObject({ success: true, replayed: true, data: fresh });
+    expect(runInTransaction).not.toHaveBeenCalled();
+    expect(JournalService.createEntry).not.toHaveBeenCalled();
+  });
+
   test('approved POS cash refund records the refund and posts its journal atomically', async () => {
+    prisma.tillSession.findFirst.mockResolvedValue({ id: IDS.till, registerId: IDS.registerId });
     const note = {
       _id: IDS.creditNote,
       status: 'confirmed',
@@ -464,13 +509,17 @@ describe('POS E2E — void and refund gates', () => {
     JournalService.createEntry.mockResolvedValue({ _id: 'je-refund' });
     JournalService.createDebitLine.mockImplementation((accountCode, amount, description) => ({ accountCode, debit: amount, description }));
     JournalService.createCreditLine.mockImplementation((accountCode, amount, description) => ({ accountCode, credit: amount, description }));
-    dbClient.mockReturnValue({ $queryRaw: jest.fn().mockResolvedValue([{ id: IDS.creditNote }]) });
+    dbClient.mockReturnValue({
+      $queryRawUnsafe: jest.fn().mockResolvedValue([{ id: '555555555555555555555555' }]),
+      $queryRaw: jest.fn().mockResolvedValue([{ id: IDS.creditNote }]),
+      $executeRawUnsafe: jest.fn().mockResolvedValue(1),
+    });
     runInTransaction.mockImplementation(async (operation) => operation(null));
 
     const res = mockRes();
     await recordRefund(makeReq({
       params: { id: IDS.creditNote },
-      body: { amount: 1180, paymentMethod: 'cash', reference: 'CASH-REFUND-1', posManagerApprovalId: IDS.approval },
+      body: { amount: 1180, paymentMethod: 'cash', reference: 'CASH-REFUND-1', idempotencyKey: 'pos-refund-approved-1', posManagerApprovalId: IDS.approval },
     }), res, (err) => { throw err; });
 
     expect(res.statusCode).toBe(200);

@@ -86,7 +86,7 @@ class SalesDashboardService {
       where: {
         companyId: cid,
         invoiceDate: { gte: qStart, lte: qEnd },
-        status: { not: 'draft' }
+        status: { notIn: ['draft', 'PENDING_PAYMENT'] }
       },
       _count: true,
       _sum: { totalAmount: true, amountPaid: true, amountOutstanding: true }
@@ -154,7 +154,7 @@ class SalesDashboardService {
       by: ['clientId'],
       where: {
         companyId: cid,
-        status: { notIn: ['draft', 'cancelled'] }
+        status: { notIn: ['draft', 'cancelled', 'PENDING_PAYMENT'] }
       },
       _sum: { totalAmount: true, amountPaid: true },
       _count: true,
@@ -243,7 +243,7 @@ class SalesDashboardService {
       where: {
         companyId: cid,
         invoiceDate: { gte: qStart, lte: qEnd },
-        status: { notIn: ['draft', 'cancelled'] }
+        status: { notIn: ['draft', 'cancelled', 'PENDING_PAYMENT'] }
       },
       _sum: { totalAmount: true, amountPaid: true }
     })

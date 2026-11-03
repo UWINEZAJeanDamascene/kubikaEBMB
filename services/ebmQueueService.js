@@ -139,6 +139,7 @@ async function markSubmitted({
   prerequisiteOperationKey = null,
   payload = {},
   fiscalResponse = null,
+  v2 = false,
 }) {
   assertCredentialEndpointNotQueued(endpoint);
   await assertEbmEnabled(companyId, { operationName: 'EBM submission result' });
@@ -161,7 +162,7 @@ async function markSubmitted({
         ...(fiscalResponse ? { fiscalResponse } : {}),
         ebmStatus: 'submitted',
         lastError: { message: null, code: null, status: null, response: null },
-        resolvedAt: new Date(),
+        ...(v2 ? {} : { resolvedAt: new Date() }),
         isRetryable: false,
       },
     },
@@ -647,6 +648,16 @@ async function checkPrerequisite(record) {
 }
 
 async function resetForManualRetry(queueId, companyId) {
+  const v2Item = await require('../lib/prisma').dbClient().ebmSubmissionQueue.findFirst({
+    where: { id: String(queueId), companyId: String(companyId), documentType: 'pos', registerId: { not: null }, salesTyCd: 'N', rcptTyCd: 'S' },
+    select: { id: true },
+  });
+  if (v2Item) {
+    const error = new Error('V2 fiscal submissions must use the V2 manager review and one-time resend controls.');
+    error.code = 'EBM_V2_MANAGER_ACTION_REQUIRED';
+    error.statusCode = 409;
+    throw error;
+  }
   const item = await EBMSubmissionQueue.findOne({ _id: queueId, companyId });
   if (!item) return null;
   if (item.lastError?.outcomeUnknown === true || [

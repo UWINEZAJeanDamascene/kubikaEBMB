@@ -32,5 +32,4 @@ router.put(
   requireLaborCostingAccess,
   laborCostingSettingsController.updateLaborCostingSettings,
 )
-
 module.exports = router

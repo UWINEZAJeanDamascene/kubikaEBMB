@@ -12,6 +12,7 @@ const { prisma } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
 const { roleToApi } = require('../utils/authMappers');
 const { registerPermission, registerPermissionList } = require('../utils/permissionCatalog');
+const { getPosPermissionAliases } = require('../utils/posPermissionCompatibility');
 
 const LEGACY_RESOURCE_ALIASES = {
   payroll: new Set(['payroll_runs']),
@@ -29,6 +30,18 @@ class PermissionService {
    * @returns {boolean} - True if permission is granted, false otherwise
    */
   static check(role, resource, action) {
+    const aliases = getPosPermissionAliases(resource, action)?.rbac;
+    if (aliases?.length) {
+      // New grants are authoritative after the permission migration. Keep the
+      // narrow legacy fallback so deployments can roll out the migration
+      // independently without dropping existing role access.
+      return this.checkDirect(role, resource, action) || aliases.some(([legacyResource, legacyAction]) =>
+        this.checkDirect(role, legacyResource, legacyAction));
+    }
+    return this.checkDirect(role, resource, action);
+  }
+
+  static checkDirect(role, resource, action) {
     if (!role || !role.permissions || !Array.isArray(role.permissions)) {
       return false;
     }

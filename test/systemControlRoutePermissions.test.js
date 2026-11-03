@@ -40,6 +40,13 @@ function routeHandlers(router, path, method) {
 }
 
 describe('System Control backend permissions', () => {
+  it('restricts company-user role recovery to platform administrators', () => {
+    const policies = routeHandlers(companyRouter, '/:id/users/:userId/role', 'patch')
+      .map((handler) => handler.rolePolicy)
+      .filter(Boolean);
+    expect(policies).toContainEqual(['platform_admin']);
+  });
+
   it.each(['/', '/stats', '/points-in-time', '/snapshots', '/settings', '/:id'])(
     'requires settings read access for backup endpoint GET %s',
     (path) => {

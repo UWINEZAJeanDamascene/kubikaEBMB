@@ -356,6 +356,18 @@ exports.createCreditNote = async (req, res, next) => {
         .status(404)
         .json({ success: false, message: "Invoice not found" });
 
+    if (req.body.posOrigin === true) {
+      const { getPaymentSettings } = require('../services/posPaymentService');
+      const returnWindowDays = (await getPaymentSettings(String(companyId))).posReturnWindowDays;
+      const invoiceDate = new Date(invoice.invoiceDate || invoice.createdAt || invoice.date);
+      if (returnWindowDays === 0 || !Number.isFinite(invoiceDate.getTime())
+        || Date.now() - invoiceDate.getTime() > returnWindowDays * 86400000) {
+        return res.status(409).json({ success: false, code: 'POS_REFUND_WINDOW_EXPIRED', message: returnWindowDays === 0
+          ? 'POS refunds are disabled by the return-window setting.'
+          : `This sale is outside the ${returnWindowDays}-day return window. Ask a manager to review it.` });
+      }
+    }
+
     const payload = {
       ...req.body,
       company: companyId,
@@ -868,7 +880,24 @@ exports.recordRefund = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Select a supported refund payment method.' });
     }
 
+    const idempotencyKey = String(req.get?.('Idempotency-Key') || req.headers?.['idempotency-key'] || req.body.idempotencyKey || '').trim();
+    if (note.posOrigin && !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,99}$/.test(idempotencyKey)) {
+      return res.status(400).json({ success: false, code: 'POS_REFUND_IDEMPOTENCY_KEY_REQUIRED', message: 'Provide an Idempotency-Key between 8 and 100 supported characters for this POS refund.' });
+    }
+
     const payments = Array.isArray(note.payments) ? note.payments : [];
+    const refundReference = String(reference || '').trim();
+    if (idempotencyKey) {
+      const prior = payments.find((payment) => payment.idempotencyKey === idempotencyKey);
+      if (prior) {
+        if (Number(prior.amount) !== refundAmount || prior.paymentMethod !== normalizedMethod
+          || String(prior.reference || '') !== refundReference) {
+          return res.status(409).json({ success: false, code: 'POS_REFUND_IDEMPOTENCY_CONFLICT', message: 'This Idempotency-Key was already used for a different refund.' });
+        }
+        const updatedNote = await CreditNote.findOne({ _id: req.params.id, company: companyId });
+        return res.json({ success: true, replayed: true, data: updatedNote });
+      }
+    }
     const previouslyRefunded = Number(note.amountRefunded)
       || payments.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0);
     const creditTotal = Number(note.totalAmount || note.grandTotal || 0);
@@ -916,8 +945,31 @@ exports.recordRefund = async (req, res, next) => {
 
     const { runInTransaction } = require('../services/transactionService');
     const { dbClient } = require('../lib/prisma');
+    const { lockOpenPosShiftForRegisterCode } = require('../services/posShiftLinkService');
     const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
-    await runInTransaction(async () => {
+    const refundResult = await runInTransaction(async () => {
+      if (note.posOrigin) {
+        const locked = await dbClient().$queryRaw`
+          SELECT payments FROM credit_notes
+          WHERE id = ${String(note._id)} AND company_id = ${String(companyId)}
+          FOR UPDATE`;
+        const lockedPayments = Array.isArray(locked?.[0]?.payments) ? locked[0].payments : [];
+        const prior = lockedPayments.find((payment) => payment.idempotencyKey === idempotencyKey);
+        if (prior) {
+          if (Number(prior.amount) !== refundAmount || prior.paymentMethod !== normalizedMethod
+            || String(prior.reference || '') !== refundReference) {
+            throw Object.assign(new Error('This Idempotency-Key was already used for a different refund.'), { code: 'POS_REFUND_IDEMPOTENCY_CONFLICT', statusCode: 409 });
+          }
+          return { replayed: true };
+        }
+      }
+      const activePosShift = refundTill
+        ? await lockOpenPosShiftForRegisterCode(
+          dbClient(),
+          String(companyId),
+          String(refundTill.registerId || ''),
+        )
+        : null;
       if (note.posOrigin) {
         await consumePosManagerApproval({
           approvalId: req.body.posManagerApprovalId,
@@ -970,14 +1022,17 @@ exports.recordRefund = async (req, res, next) => {
       });
 
       const refundPayment = {
+        creditNoteId: String(note._id),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
         amount: refundAmount,
         paymentMethod: normalizedMethod,
-        reference: String(reference || '').trim() || null,
+        reference: refundReference || null,
         refundedBy: req.user.id,
         refundedAt: refundDate,
         bankAccountId: bankAccount?._id || null,
         tillSessionId: refundTill?.id || null,
         registerId: refundTill?.registerId || null,
+        ...(activePosShift ? { shiftId: activePosShift } : {}),
         journalEntryId: journalEntry?._id || null,
         arAmount: refundFromAR,
         customerCreditAmount: refundFromCustomerCredit,
@@ -1068,10 +1123,11 @@ exports.recordRefund = async (req, res, next) => {
           journalEntryId: journalEntry._id,
         });
       }
+      return { replayed: false };
     });
 
     const updatedNote = await CreditNote.findOne({ _id: req.params.id, company: companyId });
-    res.json({ success: true, data: updatedNote });
+    res.json({ success: true, replayed: refundResult?.replayed === true, data: updatedNote });
   } catch (err) {
     next(err);
   }
@@ -1214,6 +1270,23 @@ exports.confirmCreditNote = async (req, res, next) => {
       });
     }
 
+    if (creditNote.posOrigin) {
+      const { getPaymentSettings } = require('../services/posPaymentService');
+      const returnWindowDays = (await getPaymentSettings(String(companyId))).posReturnWindowDays;
+      const invoiceDate = new Date(invoice.invoiceDate || invoice.createdAt);
+      if (returnWindowDays === 0 || !Number.isFinite(invoiceDate.getTime())
+        || Date.now() - invoiceDate.getTime() > returnWindowDays * 86400000) {
+        return res.status(409).json({ success: false, code: 'POS_REFUND_WINDOW_EXPIRED', message: returnWindowDays === 0
+          ? 'POS refunds are disabled by the return-window setting.'
+          : `This sale is outside the ${returnWindowDays}-day return window. Ask a manager to review it.` });
+      }
+      const till = await require('../lib/prisma').prisma.tillSession.findFirst({
+        where: { companyId: String(companyId), openedById: String(req.user.id), status: 'open' },
+        select: { id: true },
+      });
+      if (!till) return res.status(409).json({ success: false, code: 'POS_REFUND_SHIFT_CLOSED', message: 'Open your till shift before confirming a refund.' });
+    }
+
     // Invoice must be confirmed, partially_paid, or fully_paid
     const validInvoiceStatuses = ["confirmed", "partially_paid", "fully_paid"];
     console.log("DEBUG: invoice.status =", invoice.status);
@@ -1339,6 +1412,23 @@ exports.confirmCreditNote = async (req, res, next) => {
       }
       if (trackingType === 'batch' && !line.batchId) {
         return res.status(422).json({ success: false, code: 'ERR_BATCH_REQUIRED', message: `Select the returned batch for ${product.name}.` });
+      }
+    }
+
+    let preparedV2Refund = null;
+    let v2RefundOutboxId = null;
+    if (creditNote.posOrigin) {
+      try {
+        preparedV2Refund = await EBMSalesService.prepareV2RefundSubmission(creditNote._id, {
+          companyId,
+          refundRsnCd: req.body.refundRsnCd || req.body.rfdRsnCd || creditNote.ebm?.rfdRsnCd,
+          modifierUserId: req.user.id || req.user._id,
+        });
+      } catch (error) {
+        return res.status(error.statusCode || 409).json({
+          success: false, code: error.code || 'POS_FISCAL_REFUND_NOT_READY',
+          message: error.message || 'The fiscal refund is not ready.',
+        });
       }
     }
 
@@ -1572,6 +1662,18 @@ exports.confirmCreditNote = async (req, res, next) => {
 
       // Credit notes use Sales Returns account (4100), not Sales Revenue (4000)
       // Sales Returns is a contra-revenue account that increases with debit
+      // A confirmed POS return also removes the unused portion of wallet credit
+      // earned on the source sale. This ledger movement shares this transaction.
+      let loyaltyRewardReversal = { amount: 0, unreversedSpentAmount: 0 };
+      if (creditNote.posOrigin) {
+        const { reverseSaleRewardForCreditNote } = require('../services/posLoyaltyCreditService');
+        loyaltyRewardReversal = await reverseSaleRewardForCreditNote(dbClient(), {
+          companyId,
+          saleId: String(invoice._id),
+          creditNoteId: String(creditNote._id),
+          actorId: req.user.id,
+        });
+      }
       let salesReturnsAccount = DEFAULT_ACCOUNTS.salesReturns;
       if (lineArray[0] && lineArray[0].product) {
         const firstProduct = await Product.findById(
@@ -1625,6 +1727,19 @@ exports.confirmCreditNote = async (req, res, next) => {
           description: narration,
           debit: 0,
           credit: amountAvailableAsCredit,
+        }] : []),
+        ...(loyaltyRewardReversal.amount > 0 ? [{
+          accountCode: await JournalService.getMappedAccountCode(companyId, 'sales', 'customerAdvances', DEFAULT_ACCOUNTS.customerAdvances || '2860'),
+          accountName: 'Customer Deposits and Advances',
+          description: `Reverse unused POS loyalty credit for ${creditNote.referenceNo || creditNote.creditNoteNumber}`,
+          debit: loyaltyRewardReversal.amount,
+          credit: 0,
+        }, {
+          accountCode: await JournalService.getMappedAccountCode(companyId, 'sales', 'salesReturns', DEFAULT_ACCOUNTS.salesReturns || '4100'),
+          accountName: 'Sales Returns',
+          description: `Reverse POS loyalty reward expense for ${creditNote.referenceNo || creditNote.creditNoteNumber}`,
+          debit: 0,
+          credit: loyaltyRewardReversal.amount,
         }] : []),
       ];
 
@@ -1760,12 +1875,27 @@ exports.confirmCreditNote = async (req, res, next) => {
       creditNote.confirmedBy = req.user.id;
       creditNote.confirmedAt = new Date();
       creditNote.stockReversed = isGoodsReturn && lineArray.some((line) => line.product?.isStockable === true);
+      if (preparedV2Refund) {
+        creditNote.ebm = {
+          ...(creditNote.ebm && typeof creditNote.ebm === 'object' ? creditNote.ebm : {}),
+          ebmStatus: 'pending', salesTyCd: 'N', rcptTyCd: 'R',
+          orgRcptNo: preparedV2Refund.payload.orgRcptNo,
+          rfdRsnCd: preparedV2Refund.payload.rfdRsnCd,
+          salesPayload: preparedV2Refund.payload,
+        };
+      }
 
       console.log(
         "DEBUG: Saving credit note with new status:",
         creditNote.status,
       );
       await creditNote.save({ session });
+      if (preparedV2Refund) {
+        const queued = await require('../services/posEbmV2RefundService').createV2RefundOutbox(
+          dbClient(), preparedV2Refund, { userId: req.user.id || req.user._id },
+        );
+        v2RefundOutboxId = String(queued.id);
+      }
       console.log("DEBUG: Credit note saved successfully");
     });
 
@@ -1781,12 +1911,13 @@ exports.confirmCreditNote = async (req, res, next) => {
     const refundRsnCd =
       req.body.refundRsnCd || req.body.rfdRsnCd || creditNote.ebm?.rfdRsnCd;
     let responseNote = creditNote;
-    if (refundRsnCd) {
+    if (refundRsnCd || v2RefundOutboxId) {
       try {
         responseNote = await EBMSalesService.submitCreditNote(creditNote._id, {
           companyId,
           refundRsnCd,
           modifierUserId: req.user.id || req.user._id,
+          ...(v2RefundOutboxId ? { outboxId: v2RefundOutboxId } : {}),
         });
         await responseNote.populate(
           "lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry",

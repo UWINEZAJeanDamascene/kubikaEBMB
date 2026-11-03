@@ -691,6 +691,46 @@ exports.listSubmissionQueue = async (req, res, next) => {
   }
 };
 
+exports.listV2FiscalReviewQueue = async (req, res, next) => {
+  try {
+    const companyId = getCompanyId(req);
+    const rows = await require('../services/posEbmV2RecoveryService').listReviewQueue(companyId, req.query.limit);
+    res.json({ success: true, data: rows });
+  } catch (error) { next(error); }
+};
+
+exports.resolveV2FiscalQueueItem = async (req, res, next) => {
+  try {
+    const companyId = getCompanyId(req);
+    const userId = String(req.user?.id || req.user?._id || '');
+    const recovery = require('../services/posEbmV2RecoveryService');
+    const resolution = String(req.body.resolution || '').trim().toUpperCase();
+    let item;
+    if (resolution === 'CONFIRMED_NOT_RECEIVED') {
+      item = await recovery.resolveAsNotReceived({ companyId, id: req.params.id, userId, reason: req.body.reason });
+      const service = require('../services/ebmSalesService');
+      if (item.documentType === 'creditNote') {
+        service.submitCreditNoteAsync(item.documentId, { companyId, modifierUserId: item.cashierId, outboxId: item.id });
+      } else {
+        service.submitInvoiceAsync(item.documentId, { companyId, modifierUserId: item.cashierId, outboxId: item.id });
+      }
+      return res.json({ success: true, message: 'The manager-authorized single resend is queued.', data: item });
+    }
+    if (resolution === 'CONFIRMED_SIGNED') {
+      item = await recovery.resolveAsSignedByManager({
+        companyId, id: req.params.id, userId,
+        receiptData: req.body.receiptData,
+        evidenceNote: req.body.evidenceNote,
+        reason: req.body.reason,
+        managerApprovalId: req.body.managerApprovalId,
+      });
+      await require('../services/ebmSalesService').applyResolvedV2Receipt(item.documentId, companyId, item.id);
+      return res.json({ success: true, message: 'The fiscal receipt data was saved for manager review.', data: item });
+    }
+    return res.status(400).json({ success: false, code: 'EBM_V2_RESOLUTION_INVALID', message: 'Choose confirmed signed or confirmed not received.' });
+  } catch (error) { next(error); }
+};
+
 exports.getSubmissionQueueItem = async (req, res, next) => {
   try {
     const companyId = getCompanyId(req);
@@ -751,6 +791,14 @@ exports.bulkRetryQueueItems = async (req, res, next) => {
 exports.markQueueItemResolved = async (req, res, next) => {
   try {
     const companyId = getCompanyId(req);
+    const v2Item = await require('../lib/prisma').prisma.ebmSubmissionQueue.findFirst({
+      where: { id: String(req.params.id), companyId: String(companyId), documentType: 'pos', registerId: { not: null }, salesTyCd: 'N', rcptTyCd: 'S' },
+      select: { id: true },
+    });
+    if (v2Item) return res.status(409).json({
+      success: false, code: 'EBM_V2_MANAGER_ACTION_REQUIRED',
+      message: 'Use the V2 manager review action to record the RRA outcome.',
+    });
     const unknownOutcomeCodes = [
       'EBM_SALES_OUTCOME_UNKNOWN',
       'EBM_PURCHASE_OUTCOME_UNKNOWN',

@@ -19,6 +19,11 @@ const { buildLineInclude } = require('../utils/salesApCommon');
 const { makeCompatModel } = require('../utils/prismaCompat');
 
 describe('Phase 5+6 sales/AP mappers', () => {
+  test('includes digital receipt consent when an invoice client is populated for a receipt', () => {
+    const include = buildLineInclude()([{ path: 'client', select: 'name contact digitalReceiptConsent' }]);
+    expect(include.client.select).toEqual({ id: true, name: true, contact: true, digitalReceiptConsent: true });
+  });
+
   test('preserves delivery note line tax snapshots through database mapping', async () => {
     const source = {
       id: 'dn1',

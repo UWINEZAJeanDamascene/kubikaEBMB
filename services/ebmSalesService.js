@@ -22,9 +22,16 @@ const EBMFiscalSequenceService = require("./ebmFiscalSequenceService");
 const EBMTinService = require("./ebmCustomerTinService");
 const { extractSaveSalesFiscalData, mapVsdcErrorCode, sanitizeForEndpoint } = require("../utils/vsdcPayloadSanitizer");
 const { formatVsdcDate, VSDC_ENDPOINTS } = require("./ebmService");
+const { getPosEbmSettings } = require('./posEbmSettingsService');
+const { getActiveTx } = require('../lib/txContext');
+const { createHash } = require('crypto');
 const Decimal = require('@prisma/client').Prisma.Decimal;
 
 const SUCCESS_RESULT = "000";
+// The v1.0.5 response table labels 881–884 as client data validation errors.
+// All other non-success V2 responses are treated as ambiguous until RRA confirms
+// which response codes guarantee that nothing was recorded.
+const V2_DOCUMENTED_VALIDATION_CODES = new Set(['881', '882', '883', '884']);
 
 function assertStockDependentAccepted(result, label) {
   if (result?.submitted === false) {
@@ -426,9 +433,9 @@ async function resolveSalesStatusCode(companyId) {
   return String(approved[0].code);
 }
 
-async function resolveHeaderCodes(invoice, companyId, { forceNormalSale = false, refundAfterSale = false } = {}) {
+async function resolveHeaderCodes(invoice, companyId, { forceNormalSale = false, refundAfterSale = false, v2PaymentCode = null } = {}) {
   assertStandardSalesOperation(invoice, { refundAfterSale });
-  const paymentCode = await resolvePaymentCode(invoice, companyId);
+  const paymentCode = v2PaymentCode || await resolvePaymentCode(invoice, companyId);
   const expectedReceiptCode = refundAfterSale ? REFUND_AFTER_SALE_RECEIPT_CODE : STANDARD_SALE_RECEIPT_CODE;
   const receiptCode = await findCode(companyId, {
     codeClass: RRA_CODE_CLASS_IDS.SALES_RECEIPT_TYPE,
@@ -774,6 +781,7 @@ async function buildSalesTrnPayload(invoice, company, branch, options = {}) {
   const headerCodes = await resolveHeaderCodes(invoice, companyId, {
     forceNormalSale: options.forceNormalSale === true,
     refundAfterSale: options.refundAfterSale === true,
+    v2PaymentCode: options.v2PaymentCode || null,
   });
   const cfmDt = formatSalesDate(invoice.confirmedAt, 'invoice confirmation time');
   const salesDt = formatSalesDate(invoice.invoiceDate, 'invoice sale date', true);
@@ -933,6 +941,315 @@ async function preflightSalesSubmission(invoice, company, branch, options = {}) 
   return true;
 }
 
+function normalizeFiscalAmount(value) {
+  const amount = Number(value?.toString?.() ?? value);
+  return Number.isFinite(amount) ? Math.round((amount + Number.EPSILON) * 100) / 100 : NaN;
+}
+
+async function resolveV2TenderCode(invoiceId, companyId, db = getActiveTx() || require('../lib/prisma').prisma) {
+  const payments = await db.posPayment.findMany({
+    where: { companyId: String(companyId), saleId: String(invoiceId), status: 'SUCCESS' },
+    select: { method: true, amount: true },
+  });
+  if (!payments.length) throw sourceFieldError('EBM_V2_TENDER_MISSING', 'The completed POS sale has no successful payment records for fiscal submission.');
+  const methodMap = {
+    CASH: 'CASH', CREDIT: 'CREDIT', CARD: 'CARD', MTN_MOMO: 'MTN_MOMO',
+    AIRTEL_MONEY: 'AIRTEL_MONEY', BANK_TRANSFER: 'BANK_TRANSFER',
+    GIFT_CARD: 'GIFT_CARD', STORE_CREDIT: 'STORE_CREDIT', LOYALTY_POINTS: 'LOYALTY_POINTS',
+  };
+  const settings = await getPosEbmSettings(db, companyId);
+  const tenders = payments.map((payment) => ({
+    method: methodMap[String(payment.method)],
+    amount: Number(payment.amount),
+  }));
+  if (tenders.some((tender) => !tender.method || !Number.isFinite(tender.amount) || tender.amount <= 0)) {
+    throw sourceFieldError('EBM_V2_TENDER_INVALID', 'A successful POS payment has an invalid fiscal tender method or amount.');
+  }
+  // v1.0.5 has one payment-type field. The approved provisional policy uses
+  // the largest tender and preserves all payment rows locally on the sale.
+  const selected = tenders.reduce((largest, tender) => tender.amount > largest.amount ? tender : largest);
+  const code = settings.tenderMappings?.[selected.method];
+  if (!code) throw sourceFieldError('EBM_V2_TENDER_UNMAPPED', 'This payment method is not available yet.');
+  const resolved = await findCode(companyId, {
+    codeClass: RRA_CODE_CLASS_IDS.PAYMENT_METHOD,
+    requestedCode: String(code),
+    requiredFor: `POS payment method ${selected.method}`,
+  });
+  return resolved;
+}
+
+/** Build the immutable V2 fiscal payload while the completed sale transaction is still open. */
+async function prepareV2SaleSubmission(invoiceId, {
+  companyId,
+  modifierUserId = null,
+  db = getActiveTx() || require('../lib/prisma').prisma,
+  journalLines = [],
+  salesAccountCode = null,
+  taxAccountCode = null,
+} = {}) {
+  if (!companyId) throw sourceFieldError('EBM_COMPANY_CONTEXT_REQUIRED', 'Company context is required for fiscal sale preparation.');
+  const invoice = await Invoice.findOne({ _id: invoiceId, company: companyId })
+    .populate('client').populate('deliveryNote').populate('lines.product').populate('createdBy');
+  if (!invoice) throw sourceFieldError('EBM_INVOICE_NOT_FOUND', 'The completed sale could not be loaded for fiscal preparation.');
+  await EBMQueueService.assertEbmEnabled(companyId, { operationName: 'Fiscal sale submission' });
+  const company = await Company.findById(companyId).lean();
+  if (!company) throw sourceFieldError('EBM_COMPANY_NOT_FOUND', 'The company could not be loaded for fiscal preparation.');
+  const tin = getTin(company);
+  if (!tin) throw sourceFieldError('EBM_TIN_MISSING', 'Company TIN is required for EBM sales submission.');
+  const branch = await resolveBranch(invoice, companyId);
+  assertFiscalSaleEligible(invoice);
+  assertCustomerPurchaseCode(invoice);
+  await EBMFiscalSequenceService.ensureSalesNumbers(
+    invoice, companyId, branch.rraBranchId,
+    async (updates) => {
+      const patch = {};
+      for (const [key, value] of Object.entries(updates || {})) patch[key.startsWith('ebm.') ? key.slice(4) : key] = value;
+      return mergeInvoiceEbm(invoice._id, companyId, patch);
+    },
+  );
+  const pmtTyCd = await resolveV2TenderCode(invoice._id, companyId, db);
+  const payload = await buildSalesTrnPayload(invoice, company, branch, {
+    forceNormalSale: true,
+    modifierUserId,
+    v2PaymentCode: pmtTyCd,
+  });
+  const journalCredit = (accountCode) => journalLines
+    .filter((line) => String(line.accountCode || '') === String(accountCode || ''))
+    .reduce((sum, line) => sum + normalizeFiscalAmount(line.credit || 0), 0);
+  const journalNet = journalCredit(salesAccountCode);
+  const journalTax = journalCredit(taxAccountCode);
+  if (!Number.isFinite(journalNet) || !Number.isFinite(journalTax)
+    || normalizeFiscalAmount(payload.totTaxblAmt) !== normalizeFiscalAmount(journalNet)
+    || normalizeFiscalAmount(payload.totTaxAmt) !== normalizeFiscalAmount(journalTax)
+    || normalizeFiscalAmount(payload.totAmt) !== normalizeFiscalAmount(journalNet + journalTax)) {
+    throw sourceFieldError('EBM_V2_JOURNAL_TOTAL_MISMATCH', 'The fiscal totals do not match the completed sale journal.');
+  }
+  const customerTin = getCustomerTin(invoice);
+  if (String(invoice.client?.type || '').toLowerCase() === 'company' && !customerTin) {
+    throw sourceFieldError('EBM_V2_CUSTOMER_TIN_REQUIRED', 'Add the customer tax identification number before fiscal submission.');
+  }
+  if (customerTin && payload.custTin !== String(customerTin)) {
+    throw sourceFieldError('EBM_V2_CUSTOMER_TIN_MISMATCH', 'Customer TIN could not be included in the fiscal payload.');
+  }
+  return { payload, branchId: String(branch._id || branch.id || '') };
+}
+
+async function submitPreparedV2Outbox(invoice, companyId, outbox, payload, branchId) {
+  const recovery = require('./posEbmV2RecoveryService');
+  if (String(ebmService.getConfig()?.mode || '') !== String(outbox.environment || '')) {
+    console.warn('[EBMSales V2] Outbox environment does not match the active VSDC environment; submission remains queued.', { submissionId: outbox.id });
+    return invoice;
+  }
+  const claim = await recovery.claimForSend(companyId, outbox.id);
+  if (!claim) return invoice;
+  const sent = await recovery.markRequestSent(companyId, outbox.id, claim.leaseToken);
+  if (!sent) throw sourceFieldError('EBM_V2_REQUEST_CLAIM_LOST', 'The fiscal submission lease changed before sending.');
+  try {
+    const response = await ebmService.saveSales(payload);
+    if (String(response?.resultCd || '') !== SUCCESS_RESULT) {
+      const message = String(response?.resultMsg || 'VSDC returned a response that needs manager review.');
+      if (V2_DOCUMENTED_VALIDATION_CODES.has(String(response?.resultCd || ''))) {
+        const transitioned = await recovery.markPermanentFailure(companyId, outbox.id, claim.leaseToken, response?.raw || response);
+        if (transitioned) await mergeInvoiceEbm(invoice._id, companyId, {
+          fiscalQueueStatus: 'permanent_rejection', fiscalDataSource: null,
+          fiscalLastError: message, fiscalLastErrorCode: String(response?.resultCd || ''),
+        });
+      } else {
+        const reviewed = await recovery.markNeedsReview(companyId, outbox.id, claim.leaseToken, message, response?.raw || response);
+        if (reviewed?.ebmStatus === 'failed' && !reviewed.signedAt) await mergeInvoiceEbm(invoice._id, companyId, {
+          fiscalQueueStatus: 'needs_review', fiscalDataSource: null,
+          fiscalLastError: message, fiscalLastErrorCode: 'EBM_V2_NEEDS_REVIEW',
+        });
+      }
+      return invoice;
+    }
+    const recorded = await recovery.acceptSignedResponse(companyId, outbox.id, claim.leaseToken, response.raw || response);
+    if (!recorded.accepted) {
+      if (recorded.reason === 'already_resolved') {
+        console.warn('[EBMSales V2] A late signed response arrived after a manager resolution; preserved the manager resolution.', { submissionId: outbox.id });
+        return invoice;
+      }
+      throw new Error('The VSDC response could not be accepted into the fiscal outbox.');
+    }
+    const submitted = await applySuccess(invoice._id, companyId, response, payload);
+    if (!submitted) throw new Error('Signed VSDC response could not be applied to the POS sale.');
+    await mergeInvoiceEbm(invoice._id, companyId, {
+      fiscalQueueStatus: 'submitted', fiscalDataSource: 'VSDC_RESPONSE', fiscalLastError: null, fiscalLastErrorCode: null,
+    });
+    const applied = await require('./ebmQueueService').markSalesSourceApplied({
+      companyId, documentType: 'pos', documentId: invoice._id,
+      endpoint: VSDC_ENDPOINTS.SAVE_SALES,
+      operationKey: outbox.operationKey || 'default', environment: outbox.environment,
+    });
+    if (!applied) throw new Error('Signed VSDC source checkpoint could not be recorded.');
+    void (async () => {
+      try {
+        const stockResult = await require('./ebmStockService').submitStockForInvoice(invoice._id, { companyId, branchId });
+        assertStockDependentAccepted(stockResult, 'Invoice');
+        const complete = await require('./ebmQueueService').markSalesDependentsDispatched({
+          companyId, documentType: 'pos', documentId: invoice._id,
+          endpoint: VSDC_ENDPOINTS.SAVE_SALES,
+          operationKey: outbox.operationKey || 'default', environment: outbox.environment,
+        });
+        if (!complete) throw new Error('Accepted VSDC stock dependent checkpoint could not be recorded.');
+      } catch (error) {
+        console.error('[EBMSales V2] Accepted sale stock reporting remains pending:', error.message);
+      }
+    })();
+    return submitted;
+  } catch (error) {
+    if (recovery.transportProvesNonDelivery(error)) {
+      const retried = await recovery.scheduleTransportRetry(companyId, outbox.id, claim.leaseToken, error);
+      if (retried?.ebmStatus === 'pending' && !retried.signedAt) await mergeInvoiceEbm(invoice._id, companyId, {
+        fiscalQueueStatus: 'retry_wait', fiscalDataSource: null,
+        fiscalLastError: String(error.message || 'Connection failed before delivery.'),
+        fiscalLastErrorCode: String(error.code || 'EBM_V2_TRANSPORT_NOT_DELIVERED'),
+      });
+    } else {
+      const reviewed = await recovery.markNeedsReview(companyId, outbox.id, claim.leaseToken,
+        `The VSDC outcome is unknown or the response could not be safely classified. ${String(error?.message || '').slice(0, 700)}`,
+        error?.response?.data || null,
+      );
+      if (reviewed?.ebmStatus === 'failed' && !reviewed.signedAt) await mergeInvoiceEbm(invoice._id, companyId, {
+        fiscalQueueStatus: 'needs_review', fiscalDataSource: null,
+        fiscalLastError: String(error.message || 'VSDC outcome is unknown.'),
+        fiscalLastErrorCode: String(error.code || 'EBM_V2_NEEDS_REVIEW'),
+      });
+    }
+    console.error('[EBMSales V2] Submission outcome persisted to the V2 recovery queue:', error.message);
+    return invoice;
+  }
+}
+
+async function submitPreparedV2RefundOutbox(note, companyId, outbox) {
+  const db = require('../lib/prisma').prisma;
+  const recovery = require('./posEbmV2RecoveryService');
+  const guard = require('./posEbmTenantGuard');
+  if (String(ebmService.getConfig()?.mode || '') !== String(outbox.environment || '')) return note;
+  await guard.assertPosEbmRefundContext(db, {
+    companyId, submissionId: outbox.id, creditNoteId: note._id,
+    originalSubmissionId: outbox.originalSubmissionId, registerId: outbox.registerId, shiftId: outbox.shiftId,
+  });
+  if (outbox.signedAt || outbox.ebmStatus === 'submitted') return applyResolvedV2Receipt(note._id, companyId, outbox.id);
+  const payload = outbox.payload;
+  const digest = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  if (digest !== outbox.requestPayloadHash || payload?.salesTyCd !== 'N' || payload?.rcptTyCd !== 'R'
+    || !payload?.orgRcptNo || !payload?.orgInvcNo || !payload?.rfdRsnCd) {
+    throw sourceFieldError('EBM_V2_REFUND_PAYLOAD_INVALID', 'The saved fiscal refund failed its integrity check. A manager must review this refund.');
+  }
+  const claim = await recovery.claimForSend(companyId, outbox.id);
+  if (!claim) return note;
+  if (!await recovery.markRequestSent(companyId, outbox.id, claim.leaseToken)) {
+    throw sourceFieldError('EBM_V2_REQUEST_CLAIM_LOST', 'The fiscal refund lease changed before sending.');
+  }
+  try {
+    const response = await ebmService.saveSales(payload);
+    if (String(response?.resultCd || '') !== SUCCESS_RESULT) {
+      const errorText = String(response?.resultMsg || 'VSDC returned a response that needs manager review.');
+      if (V2_DOCUMENTED_VALIDATION_CODES.has(String(response?.resultCd || ''))) {
+        await recovery.markPermanentFailure(companyId, outbox.id, claim.leaseToken, response?.raw || response);
+      } else {
+        await recovery.markNeedsReview(companyId, outbox.id, claim.leaseToken, errorText, response?.raw || response);
+      }
+      await CreditNote.updateOne({ _id: String(note._id), company: String(companyId) }, { $set: {
+        'ebm.ebmStatus': V2_DOCUMENTED_VALIDATION_CODES.has(String(response?.resultCd || '')) ? 'failed' : 'failed',
+        'ebm.lastError': errorText, 'ebm.lastErrorCode': String(response?.resultCd || 'EBM_V2_NEEDS_REVIEW'),
+      } });
+      return note;
+    }
+    const recorded = await recovery.acceptSignedResponse(companyId, outbox.id, claim.leaseToken, response.raw || response);
+    if (!recorded.accepted) {
+      if (recorded.reason === 'already_resolved') return note;
+      throw new Error('The VSDC refund response could not be accepted into the fiscal outbox.');
+    }
+    const submitted = await applyCreditNoteSuccess(note._id, companyId, response, payload);
+    if (!submitted) throw new Error('The signed VSDC refund could not be applied to its credit note.');
+    await db.ebmSubmissionQueue.updateMany({
+      where: { id: String(outbox.id), companyId: String(companyId), signedAt: { not: null }, sourceAppliedAt: null },
+      data: { sourceAppliedAt: new Date() },
+    });
+    void (async () => {
+      try {
+        const stockResult = await require('./ebmStockService').submitStockForCreditNote(note._id, { companyId, branchId: outbox.payload?.bhfId });
+        assertStockDependentAccepted(stockResult, 'Credit-note');
+        await db.ebmSubmissionQueue.updateMany({
+          where: { id: String(outbox.id), companyId: String(companyId), signedAt: { not: null }, dependentsDispatchedAt: null },
+          data: { dependentsDispatchedAt: new Date() },
+        });
+      } catch (error) { console.error('[EBMSales V2 refund] Stock reporting remains pending:', error.message); }
+    })();
+    return submitted;
+  } catch (error) {
+    if (recovery.transportProvesNonDelivery(error)) {
+      const retried = await recovery.scheduleTransportRetry(companyId, outbox.id, claim.leaseToken, error);
+      if (retried?.ebmStatus === 'pending' && !retried.signedAt) await CreditNote.updateOne({ _id: String(note._id), company: String(companyId) }, { $set: {
+        'ebm.ebmStatus': 'pending', 'ebm.lastError': String(error.message || 'Connection failed before delivery.'),
+        'ebm.lastErrorCode': String(error.code || 'EBM_V2_TRANSPORT_NOT_DELIVERED'),
+      } });
+    } else {
+      const reviewed = await recovery.markNeedsReview(companyId, outbox.id, claim.leaseToken,
+        `The VSDC refund outcome is unknown or could not be safely classified. ${String(error?.message || '').slice(0, 700)}`,
+        error?.response?.data || null,
+      );
+      if (reviewed?.ebmStatus === 'failed' && !reviewed.signedAt) await CreditNote.updateOne({ _id: String(note._id), company: String(companyId) }, { $set: {
+        'ebm.ebmStatus': 'failed', 'ebm.lastError': String(error.message || 'VSDC outcome is unknown.'),
+        'ebm.lastErrorCode': String(error.code || 'EBM_V2_NEEDS_REVIEW'),
+      } });
+    }
+    return note;
+  }
+}
+
+async function applyResolvedV2Receipt(invoiceId, companyId, outboxId) {
+  const db = require('../lib/prisma').prisma;
+  const outbox = await db.ebmSubmissionQueue.findFirst({ where: { id: String(outboxId), companyId: String(companyId), documentId: String(invoiceId), signedAt: { not: null } } });
+  if (!outbox?.fiscalResponse) throw sourceFieldError('EBM_V2_SIGNED_RESPONSE_MISSING', 'The signed receipt data is not available for the sale.');
+  if (outbox.documentType === 'creditNote') {
+    await require('./posEbmTenantGuard').assertPosEbmRefundContext(db, {
+      companyId, submissionId: outbox.id, creditNoteId: outbox.documentId,
+      originalSubmissionId: outbox.originalSubmissionId, registerId: outbox.registerId, shiftId: outbox.shiftId,
+    });
+    const note = await CreditNote.findOne({ _id: String(invoiceId), company: String(companyId) }).populate('invoice client lines.product items.product');
+    if (!note) throw sourceFieldError('EBM_V2_REFUND_NOTE_MISSING', 'The credit note for this fiscal refund could not be found.');
+    let applied = note;
+    if (!outbox.sourceAppliedAt) {
+      applied = await applyCreditNoteSuccess(invoiceId, companyId, outbox.fiscalResponse, outbox.payload);
+      if (!applied) throw sourceFieldError('EBM_V2_SOURCE_RECOVERY_FAILED', 'The signed fiscal refund could not be applied to the credit note.');
+      await db.ebmSubmissionQueue.updateMany({ where: { id: String(outbox.id), companyId: String(companyId), signedAt: { not: null }, sourceAppliedAt: null }, data: { sourceAppliedAt: new Date() } });
+    }
+    if (!outbox.dependentsDispatchedAt) {
+      const stockResult = await require('./ebmStockService').submitStockForCreditNote(invoiceId, { companyId, branchId: outbox.payload?.bhfId });
+      assertStockDependentAccepted(stockResult, 'Credit-note');
+      await db.ebmSubmissionQueue.updateMany({ where: { id: String(outbox.id), companyId: String(companyId), signedAt: { not: null }, dependentsDispatchedAt: null }, data: { dependentsDispatchedAt: new Date() } });
+    }
+    return applied;
+  }
+  let applied = null;
+  const queueIdentity = {
+    companyId, documentType: 'pos', documentId: invoiceId, endpoint: outbox.endpoint,
+    operationKey: outbox.operationKey || 'default', environment: outbox.environment,
+  };
+  if (!outbox.sourceAppliedAt) {
+    applied = await applySuccess(invoiceId, companyId, outbox.fiscalResponse, outbox.payload);
+    if (!applied) throw sourceFieldError('EBM_V2_SOURCE_RECOVERY_FAILED', 'The signed receipt could not be applied to the sale record.');
+    const marked = await require('./ebmQueueService').markSalesSourceApplied(queueIdentity);
+    if (!marked) throw sourceFieldError('EBM_V2_SOURCE_RECOVERY_FAILED', 'The signed receipt source checkpoint could not be recorded.');
+  }
+  await mergeInvoiceEbm(invoiceId, companyId, {
+    fiscalQueueStatus: 'submitted', fiscalDataSource: outbox.fiscalDataSource,
+    fiscalLastError: null, fiscalLastErrorCode: null,
+  });
+  if (!outbox.dependentsDispatchedAt) {
+    const invoice = applied || await Invoice.findOne({ _id: invoiceId, company: companyId });
+    const branch = await resolveBranch(invoice, companyId);
+    const stockResult = await require('./ebmStockService').submitStockForInvoice(invoiceId, { companyId, branchId: branch.rraBranchId });
+    assertStockDependentAccepted(stockResult, 'Invoice');
+    const dispatched = await require('./ebmQueueService').markSalesDependentsDispatched(queueIdentity);
+    if (!dispatched) throw sourceFieldError('EBM_V2_DEPENDENT_RECOVERY_FAILED', 'The signed receipt stock checkpoint could not be recorded.');
+  }
+  return applied || Invoice.findOne({ _id: invoiceId, company: companyId });
+}
+
 async function buildRefundPayload(
   note,
   originalInvoice,
@@ -958,6 +1275,7 @@ async function buildRefundPayload(
   const payload = await buildSalesTrnPayload(note, company, branch, {
     modifierUserId: options.modifierUserId,
     refundAfterSale: true,
+    v2PaymentCode: options.v2PaymentCode || null,
   });
   const refundReasonCode = await resolveRefundReasonCode(
     note.company || company._id,
@@ -968,6 +1286,65 @@ async function buildRefundPayload(
   payload.rfdRsnCd = refundReasonCode;
   payload.remark = note.reason || note.notes || "Refund after sale";
   return payload;
+}
+
+async function prepareV2RefundSubmission(noteId, { companyId, refundRsnCd = null, modifierUserId = null } = {}) {
+  const db = require('../lib/prisma').prisma;
+  const note = await CreditNote.findOne({ _id: String(noteId), company: String(companyId) })
+    .populate('invoice client lines.product items.product createdBy');
+  if (!note || !note.posOrigin) return null;
+  const invoiceId = String(note.invoice?._id || note.invoice || '');
+  const originalSubmission = await db.ebmSubmissionQueue.findFirst({
+    where: {
+      companyId: String(companyId), documentType: 'pos', documentId: invoiceId,
+      registerId: { not: null }, salesTyCd: 'N', rcptTyCd: 'S',
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!originalSubmission) return null; // Keep non-V2/legacy credit notes on their existing path.
+  if (!originalSubmission.signedAt || !originalSubmission.fiscalDataSource || originalSubmission.ebmStatus !== 'submitted') {
+    throw sourceFieldError('EBM_V2_ORIGINAL_RECEIPT_NOT_SIGNED', 'The original receipt has not been confirmed yet.');
+  }
+  const signedReceipt = extractSaveSalesFiscalData(originalSubmission.fiscalResponse);
+  if (!signedReceipt.rcptNo) {
+    throw sourceFieldError('EBM_V2_ORIGINAL_SIGNED_FIELDS_MISSING', 'The original signed receipt number is missing. Ask a manager to review the original sale.');
+  }
+  await require('./posEbmTenantGuard').assertPosEbmTenantContext(db, {
+    companyId, submissionId: originalSubmission.id, invoiceId,
+    registerId: originalSubmission.registerId, shiftId: originalSubmission.shiftId,
+  });
+  const originalInvoice = await Invoice.findOne({ _id: invoiceId, company: String(companyId) })
+    .populate('lines.product').lean();
+  if (!originalInvoice) throw sourceFieldError('EBM_V2_REFUND_ORIGINAL_MISSING', 'The original sale for this refund could not be found.');
+  if (String(originalInvoice.ebm?.rcptNo || '') !== String(signedReceipt.rcptNo)) {
+    throw sourceFieldError('EBM_V2_ORIGINAL_RECEIPT_MISMATCH', 'The original signed receipt does not match the sale record. Ask a manager to review this refund.');
+  }
+  const company = await Company.findById(companyId).lean();
+  if (!company) throw sourceFieldError('EBM_COMPANY_NOT_FOUND', 'The company for this refund could not be found.');
+  const branch = await resolveBranch(note, companyId);
+  await EBMFiscalSequenceService.ensureSalesNumbers(note, companyId, branch.rraBranchId, (updates) => CreditNote.updateOne(
+    { _id: note._id, company: String(companyId), 'ebm.ebmStatus': { $ne: 'submitted' } }, { $set: updates },
+  ));
+  const refreshedNote = await CreditNote.findOne({ _id: String(note._id), company: String(companyId) })
+    .populate('invoice client lines.product items.product createdBy');
+  const originalTenderCode = String(originalSubmission.payload?.pmtTyCd || '').trim();
+  if (!/^\d{2}$/.test(originalTenderCode)) {
+    throw sourceFieldError('EBM_V2_REFUND_TENDER_UNAVAILABLE', 'The original receipt has no valid fiscal payment method. Ask a manager to review this refund.');
+  }
+  const payload = await buildRefundPayload(refreshedNote, originalInvoice, company, branch, {
+    refundRsnCd: refundRsnCd || refreshedNote.ebm?.rfdRsnCd,
+    modifierUserId,
+    v2PaymentCode: originalTenderCode,
+  });
+  return {
+    noteId: String(refreshedNote._id), companyId: String(companyId), invoiceId,
+    originalSubmissionId: String(originalSubmission.id), originalSubmission,
+    registerId: originalSubmission.registerId, shiftId: originalSubmission.shiftId,
+    cashierId: originalSubmission.cashierId || modifierUserId || null,
+    environment: originalSubmission.environment, payload,
+    requestPayloadHash: createHash('sha256').update(JSON.stringify(payload)).digest('hex'),
+    branchId: branch.rraBranchId,
+  };
 }
 
 async function mergeInvoiceEbm(invoiceId, companyId, ebmPatch) {
@@ -1220,7 +1597,7 @@ async function submitInvoiceVariant(invoiceId, companyId, variant = {}) {
 
 async function submitCreditNote(
   noteId,
-  { companyId, branchId = null, refundRsnCd = null, modifierUserId = null } = {},
+  { companyId, branchId = null, refundRsnCd = null, modifierUserId = null, outboxId = null } = {},
 ) {
   if (!companyId) {
     const error = new Error('Authenticated company context is required for credit-note fiscal submission.');
@@ -1240,6 +1617,20 @@ async function submitCreditNote(
     error.code = "EBM_CREDIT_NOTE_NOT_FOUND";
     error.retryable = false;
     throw error;
+  }
+  if (outboxId) {
+    const db = require('../lib/prisma').prisma;
+    const outbox = await db.ebmSubmissionQueue.findFirst({ where: {
+      id: String(outboxId), companyId: String(companyId), documentType: 'creditNote',
+      documentId: String(noteId), salesTyCd: 'N', rcptTyCd: 'R', originalSubmissionId: { not: null },
+    } });
+    if (!outbox) throw sourceFieldError('EBM_V2_REFUND_OUTBOX_NOT_FOUND', 'The saved V2 fiscal refund was not found for this credit note.');
+    await require('./posEbmTenantGuard').assertPosEbmRefundContext(db, {
+      companyId, submissionId: outbox.id, creditNoteId: noteId,
+      originalSubmissionId: outbox.originalSubmissionId, registerId: outbox.registerId, shiftId: outbox.shiftId,
+    });
+    if (outbox.signedAt || outbox.ebmStatus === 'submitted') return applyResolvedV2Receipt(note._id, companyId, outbox.id);
+    return submitPreparedV2RefundOutbox(note, companyId, outbox);
   }
   if (note.ebm?.ebmStatus === "submitted") return note;
   if (!ebmService.isMockMode()) {
@@ -1424,7 +1815,7 @@ async function submitCreditNote(
   }
 }
 
-async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserAcceptance = null, modifierUserId = null } = {}) {
+async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserAcceptance = null, modifierUserId = null, outboxId = null } = {}) {
   if (!companyId) {
     const error = new Error('Authenticated company context is required for fiscal sales submission.');
     error.code = 'EBM_COMPANY_CONTEXT_REQUIRED';
@@ -1444,7 +1835,7 @@ async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserA
     throw error;
   }
 
-  if (invoice.ebm?.ebmStatus === "submitted") return invoice;
+  if (!outboxId && invoice.ebm?.ebmStatus === "submitted") return invoice;
   if (purchaserAcceptance !== null && !['Y', 'N'].includes(String(purchaserAcceptance).trim().toUpperCase())) {
     const error = new Error('Purchaser acceptance must be explicitly recorded as Y or N.');
     error.code = 'EBM_PURCHASER_ACCEPTANCE_INVALID';
@@ -1480,7 +1871,7 @@ async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserA
   const branch = await resolveBranch(invoice, companyId, branchId);
   await preflightSalesSubmission(invoice, company, branch, { forceNormalSale: true, modifierUserId });
   if (purchaserAcceptance !== null) await invoice.save();
-  if (shouldVerifyCustomerTin(invoice)) {
+  if (!outboxId && shouldVerifyCustomerTin(invoice)) {
     await EBMTinService.verifyInvoiceCustomerTin(companyId, invoice._id, { branchId: branch.rraBranchId });
     const verified = await Invoice.findOne({ _id: invoice._id, company: companyId })
       .populate("client")
@@ -1492,7 +1883,7 @@ async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserA
       invoice.ebm = verified.ebm;
     }
   }
-  await EBMFiscalSequenceService.ensureSalesNumbers(
+  if (!outboxId) await EBMFiscalSequenceService.ensureSalesNumbers(
     invoice,
     companyId,
     branch.rraBranchId,
@@ -1504,22 +1895,61 @@ async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserA
       return mergeInvoiceEbm(invoice._id, companyId, patch);
     },
   );
-  await markPending(invoice._id, companyId);
+  if (!outboxId) await markPending(invoice._id, companyId);
   let payload = null;
   let remoteAccepted = false;
   let submissionStarted = false;
   let acceptedQueueRecord = null;
   let acceptedResponse = null;
   let queueRecord = null;
+  let v2Outbox = null;
 
   try {
-    payload = await buildSalesTrnPayload(invoice, company, branch, { forceNormalSale: true, modifierUserId });
+    if (outboxId) {
+      const db = require('../lib/prisma').prisma;
+      v2Outbox = await db.ebmSubmissionQueue.findFirst({
+        where: {
+          id: String(outboxId), companyId: String(companyId), documentType: 'pos',
+          documentId: String(invoiceId), endpoint: VSDC_ENDPOINTS.SAVE_SALES,
+        },
+      });
+      if (!v2Outbox) throw sourceFieldError('EBM_V2_OUTBOX_NOT_FOUND', 'The saved V2 fiscal submission was not found for this sale.');
+      if (v2Outbox.salesTyCd !== STANDARD_SALE_TRANSACTION_CODE
+        || v2Outbox.rcptTyCd !== STANDARD_SALE_RECEIPT_CODE) {
+        throw sourceFieldError('EBM_V2_OUTBOX_RECEIPT_TYPE_INVALID', 'This V2 sale has an unsupported fiscal receipt type and cannot be submitted.');
+      }
+      if (v2Outbox.ebmStatus === 'failed' || !v2Outbox.requestPayloadHash) {
+        throw sourceFieldError('EBM_V2_OUTBOX_PREPARATION_FAILED', 'The fiscal payload could not be prepared. A manager must review this sale before a receipt can be issued.');
+      }
+      payload = v2Outbox.payload;
+      const calculatedHash = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+      if (calculatedHash !== v2Outbox.requestPayloadHash) {
+        throw sourceFieldError('EBM_V2_OUTBOX_HASH_MISMATCH', 'The saved fiscal payload failed its integrity check. A manager must review this sale.');
+      }
+      await require('../services/posEbmTenantGuard').assertPosEbmTenantContext(db, {
+        companyId,
+        submissionId: v2Outbox.id,
+        invoiceId,
+        registerId: v2Outbox.registerId,
+        shiftId: v2Outbox.shiftId,
+      });
+      if (v2Outbox.signedAt || v2Outbox.ebmStatus === 'submitted') {
+        if (v2Outbox.fiscalResponse && (!v2Outbox.sourceAppliedAt || !v2Outbox.dependentsDispatchedAt)) {
+          return applyResolvedV2Receipt(invoice._id, companyId, v2Outbox.id);
+        }
+        return invoice;
+      }
+      return submitPreparedV2Outbox(invoice, companyId, v2Outbox, payload, branch.rraBranchId);
+    } else {
+      payload = await buildSalesTrnPayload(invoice, company, branch, { forceNormalSale: true, modifierUserId });
+    }
     queueRecord = {
       companyId,
       documentType: invoice.source === "pos" ? "pos" : "invoice",
       documentId: invoice._id,
       endpoint: VSDC_ENDPOINTS.SAVE_SALES,
       correlationId: `sales:${invoice._id}`,
+      ...(v2Outbox ? { environment: v2Outbox.environment, operationKey: v2Outbox.operationKey } : {}),
       payload,
     };
     const operation = await EBMQueueService.beginOperation(queueRecord);
@@ -1533,6 +1963,19 @@ async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserA
       throw error;
     }
     submissionStarted = true;
+    if (v2Outbox) {
+      const timeoutMs = Math.max(1000, Number(ebmService.getConfig()?.timeoutMs || 30000));
+      const requestSentAt = new Date();
+      const leaseExpiresAt = new Date(requestSentAt.getTime() + timeoutMs + 15000);
+      const claim = await require('../lib/prisma').prisma.ebmSubmissionQueue.updateMany({
+        where: {
+          id: String(v2Outbox.id), companyId: String(companyId), ebmStatus: 'submitting',
+          signedAt: null,
+        },
+        data: { requestSentAt, leaseExpiresAt },
+      });
+      if (claim.count !== 1) throw sourceFieldError('EBM_V2_OUTBOX_CLAIM_LOST', 'The fiscal submission is no longer available to send. A manager must review it.');
+    }
     const response = await ebmService.saveSales(payload);
     if (response.resultCd !== SUCCESS_RESULT) {
       const error = new Error(
@@ -1550,6 +1993,13 @@ async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserA
     });
     if (!acceptedQueueRecord) {
       throw new Error('RRA accepted the sale but its fiscal response could not be durably recorded.');
+    }
+    if (v2Outbox) {
+      const signed = await require('../lib/prisma').prisma.ebmSubmissionQueue.updateMany({
+        where: { id: String(v2Outbox.id), companyId: String(companyId), signedAt: null },
+        data: { signedAt: new Date(), fiscalDataSource: 'VSDC_RESPONSE', leaseExpiresAt: null },
+      });
+      if (signed.count !== 1) throw new Error('RRA accepted the sale but signed fiscal metadata could not be durably recorded.');
     }
     const submitted = await applySuccess(
       invoice._id,
@@ -1668,14 +2118,26 @@ function submitInvoiceAsync(invoiceId, options = {}) {
   });
 }
 
+function submitCreditNoteAsync(noteId, options = {}) {
+  setImmediate(() => {
+    submitCreditNote(noteId, options).catch((error) => {
+      console.error('[EBMSales] Async fiscal refund submission failed:', error.message);
+    });
+  });
+}
+
 module.exports = {
   buildSalesTrnPayload,
+  prepareV2SaleSubmission,
+  prepareV2RefundSubmission,
+  applyResolvedV2Receipt,
   buildRefundPayload,
   markPending,
   markCreditNotePending,
   submitInvoice,
   submitInvoiceVariant,
   submitInvoiceAsync,
+  submitCreditNoteAsync,
   submitCreditNote,
   resolveBranch,
   preflightSalesSubmission,
@@ -1686,5 +2148,6 @@ module.exports = {
     formatSalesDate,
     preflightSalesSubmission,
     resolveRefundReasonCode,
+    resolveV2TenderCode,
   },
 };

@@ -1,0 +1,17 @@
+﻿{
+    "version":  "0.1.0",
+    "releaseDateUtc":  "2026-11-01T19:30:57.3096097Z",
+    "hardwareValidation":  {
+                               "productionCertificate":  "not-provided",
+                               "windowsSdk":  "available",
+                               "simulatedTcp9100":  "passed",
+                               "physicalDrawers":  "pending",
+                               "physicalPrinters":  "pending"
+                           },
+    "sha256":  "bc5ee539b6b14e024d2fbca59a8380b1c8d9ea6a01d9632a460993b34b6df785",
+    "setup":  "KubikaPrintAgent-0.1.0-setup.exe",
+    "signed":  false,
+    "package":  "KubikaPrintAgent-0.1.0-portable.zip",
+    "setupSha256":  "52ec8df68e300e06deea85267280ea972a63f859740f058dd71e9a138a6a1924",
+    "winswSha256":  "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
+}

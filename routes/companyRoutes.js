@@ -99,6 +99,7 @@ router.put(
 router.put('/:id/platform-access', authorize('platform_admin'), companyController.updatePlatformAccess);
 router.post('/:id/payment-reminder', authorize('platform_admin'), companyController.sendPaymentReminder);
 router.get('/:id/users', authorize('platform_admin'), companyController.getCompanyUsers);
+router.patch('/:id/users/:userId/role', authorize('platform_admin'), companyController.changeCompanyUserRole);
 router.post('/:id/users/:userId/impersonate', authorize('platform_admin'), companyController.impersonateUser);
 router.post('/:id/users/:userId/force-password-reset', authorize('platform_admin'), companyController.forcePasswordReset);
 

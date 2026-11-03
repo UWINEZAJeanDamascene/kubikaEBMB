@@ -610,6 +610,7 @@ async function runOnce() {
     const due = await EBMSubmissionQueue.find({
       ebmStatus: 'pending',
       isRetryable: true,
+      registerId: null,
       nextRetryAt: { $lte: new Date() },
       $expr: { $lt: ['$retryCount', EBMQueueService.getMaxRetries()] },
     })
@@ -620,6 +621,7 @@ async function runOnce() {
         $in: SAVE_SALES_ENDPOINTS,
       },
       ebmStatus: 'submitted',
+      registerId: null,
       fiscalResponse: { $ne: null },
       $or: [
         { sourceAppliedAt: null },
@@ -650,6 +652,7 @@ async function runOnce() {
         $in: SAVE_SALES_ENDPOINTS,
       },
       ebmStatus: 'submitting',
+      registerId: null,
       lastAttemptAt: { $lte: new Date(Date.now() - getIntervalMs()) },
     })
       .sort({ lastAttemptAt: 1 })

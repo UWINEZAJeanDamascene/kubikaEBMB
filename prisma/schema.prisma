@@ -312,6 +312,19 @@ model SystemSettings {
   posOfflineMaxHours                 Int      @default(24) @map("pos_offline_max_hours")
   posOfflineQueueLimit               Float    @default(1000000) @map("pos_offline_queue_limit")
   posNegativeStockEscalationDays     Int      @default(3) @map("pos_negative_stock_escalation_days")
+  posIdleLockMinutes                 Int      @default(5) @map("pos_idle_lock_minutes")
+  posSingleRegisterSession           Boolean  @default(true) @map("pos_single_register_session")
+  posRolePermissions                 Json     @default("{}") @map("pos_role_permissions")
+  posCashAccountability              String   @default("REGISTER") @map("pos_cash_accountability") @db.VarChar(16)
+  posCashDenominations               Json     @default("[5000,2000,1000,500,100,50]") @map("pos_cash_denominations")
+  posDefaultFloat                    Int?     @map("pos_default_float")
+  posVarianceTolerance               Int      @default(500) @map("pos_variance_tolerance")
+  posVarianceApprovalLimit           Int      @default(5000) @map("pos_variance_approval_limit")
+  posCashOutApprovalLimit            Int      @default(50000) @map("pos_cash_out_approval_limit")
+  posDrawerWarnAmount                Int?     @map("pos_drawer_warn_amount")
+  posReceiptSettings                 Json     @default("{\"paperWidth\":80,\"columns\":42,\"showCashier\":true,\"showCustomer\":true,\"showSku\":false,\"showBarcode\":false,\"headerNote\":\"\",\"footerNote\":\"Thank you for shopping with us.\",\"returnPolicy\":\"\",\"logoUrl\":\"\",\"autoPrintOnSale\":false,\"digitalReceiptsEnabled\":true,\"digitalReceiptExpiryDays\":30}") @map("pos_receipt_settings")
+  posLoyaltySettings                 Json     @default("{\"pointValueRwf\":1}") @map("pos_loyalty_settings")
+  posHeldSalesOnClose                String   @default("WARN") @map("pos_held_sales_on_close") @db.VarChar(16)
   lastUpdatedBy                      String?  @map("last_updated_by") @db.Char(24)
   createdAt                          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt                          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -760,6 +773,8 @@ model Company {
   categories                  Category[]
   chartOfAccounts             ChartOfAccount[]
   clients                     Client[]
+  posCustomerLoyaltyLedger    PosCustomerLoyaltyLedger[]
+  posCustomerCreditLedger     PosCustomerCreditLedger[]
   createdBy                   User?                       @relation("CompanyCreatedBy", fields: [createdById], references: [id])
   companyUsers                CompanyUser[]
   creditNotes                 CreditNote[]
@@ -778,6 +793,9 @@ model Company {
   ebmNotices                  EbmNotice[]
   ebmSequences                EbmSequenceCounter[]
   ebmSubmissionQueues         EbmSubmissionQueue[]
+  posEbmSettings              PosEbmSettings?
+  ebmReceiptReprints          PosEbmReceiptReprint[]
+  posPublicReceiptTokens      PosPublicReceiptToken[]
   ebmSyncStates               EbmSyncState[]
   ebmTins                     EbmTin[]
   ebmUnmatchedPurchases       EbmUnmatchedPurchase[]
@@ -829,7 +847,7 @@ model Company {
   reorderPoints               ReorderPoint[]
   reportSnapshots             ReportSnapshot[]
   roles                       Role[]
-  rolePermissionOverrides    RolePermissionOverride[]
+  rolePermissionOverrides     RolePermissionOverride[]
   salaryHistories             SalaryHistory[]
   salesOrders                 SalesOrder[]
   sequences                   SequenceCounter[]
@@ -846,10 +864,30 @@ model Company {
   taxes                       Tax[]
   tillSessions                TillSession[]
   posRegisters                PosRegister[]
+  posNonPostingDocuments      PosNonPostingDocument[]
+  posPrintPairingCodes        PosPrintPairingCode[]
+  posPrintAgents              PosPrintAgent[]
+  posPrintPrinters            PosPrintPrinter[]
+  posPrintJobs                PosPrintJob[]
+  posShifts                   PosShift[]
+  posShiftCorrectionReports   PosShiftCorrectionReport[]
+  posCashMovements            PosCashMovement[]
+  posZReports                 PosZReport[]
+  posUserCredentials          PosUserCredential[]
+  posRegisterAccess           PosRegisterAccess[]
+  posSessions                 PosSession[]
+  posApprovals                PosApproval[]
+  posAuditLogs                PosAuditLog[]
   posPromotions               PosPromotion[]
   posStoredValueAccounts      PosStoredValueAccount[]
   posStoredValueLedger        PosStoredValueLedger[]
+  posPayments                 PosPayment[]
+  posPaymentAttempts          PosPaymentAttempt[]
+  posProviderEvents           PosProviderEvent[]
+  posPaymentRefunds           PosPaymentRefund[]
+  posPaymentSettings          PosPaymentSettings?
   posManagerApprovals         PosManagerApproval[]
+  posApprovalRequests         PosApprovalRequest[]
   posHeldSales                PosHeldSale[]
   priceLists                  PriceList[]
   priceListItems              PriceListItem[]
@@ -890,51 +928,73 @@ model EbmSequenceCounter {
 }
 
 model User {
-  id                   String          @id @db.Char(24)
-  name                 String
-  email                String
-  password             String
-  refreshToken         String?         @map("refresh_token")
-  refreshTokenHash     String?         @map("refresh_token_hash")
-  companyId            String?         @map("company_id") @db.Char(24)
-  role                 String          @default("viewer")
-  departmentId         String?         @map("department_id") @db.Char(24)
-  branchId             String?         @map("branch_id") @db.Char(24)
-  ebmBranchUsers       Json            @default("[]") @map("ebm_branch_users")
-  isActive             Boolean         @default(true) @map("is_active")
-  lastLogin            DateTime?       @map("last_login") @db.Timestamptz(3)
-  createdById          String?         @map("created_by") @db.Char(24)
-  mustChangePassword   Boolean         @default(false) @map("must_change_password")
-  passwordChangedAt    DateTime?       @map("password_changed_at") @db.Timestamptz(3)
-  tempPassword         Boolean         @default(false) @map("temp_password")
-  avatar               String?
-  phone                String?
-  jobTitle             String?         @map("job_title")
-  bio                  String?
-  twoFAEnabled         Boolean         @default(false) @map("two_fa_enabled")
-  twoFASecret          String?         @map("two_fa_secret")
-  twoFAConfirmed       Boolean         @default(false) @map("two_fa_confirmed")
-  ipWhitelist          String[]        @default([]) @map("ip_whitelist")
-  failedLoginAttempts  Int             @default(0) @map("failed_login_attempts")
-  lockedUntil          DateTime?       @map("locked_until") @db.Timestamptz(3)
-  passwordResetToken   String?         @map("password_reset_token")
-  passwordResetExpires DateTime?       @map("password_reset_expires") @db.Timestamptz(3)
-  createdAt            DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt            DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
-  actionLogs           ActionLog[]
-  auditLogs            AuditLog[]
-  createdCompanies     Company[]       @relation("CompanyCreatedBy")
-  companyUsers         CompanyUser[]
-  notifications        Notification[]
-  refreshTokens        RefreshToken[]
-  tillSessions         TillSession[]
-  createdPosHeldSales  PosHeldSale[]
-  roles                UserRole[]
-  sessions             UserSession[]
-  company              Company?        @relation(fields: [companyId], references: [id])
-  createdBy            User?           @relation("UserCreatedBy", fields: [createdById], references: [id])
-  createdUsers         User[]          @relation("UserCreatedBy")
-  projectMemberships   ProjectMember[]
+  id                          String                     @id @db.Char(24)
+  name                        String
+  email                       String
+  password                    String
+  refreshToken                String?                    @map("refresh_token")
+  refreshTokenHash            String?                    @map("refresh_token_hash")
+  companyId                   String?                    @map("company_id") @db.Char(24)
+  role                        String                     @default("viewer")
+  departmentId                String?                    @map("department_id") @db.Char(24)
+  branchId                    String?                    @map("branch_id") @db.Char(24)
+  ebmBranchUsers              Json                       @default("[]") @map("ebm_branch_users")
+  isActive                    Boolean                    @default(true) @map("is_active")
+  lastLogin                   DateTime?                  @map("last_login") @db.Timestamptz(3)
+  createdById                 String?                    @map("created_by") @db.Char(24)
+  mustChangePassword          Boolean                    @default(false) @map("must_change_password")
+  passwordChangedAt           DateTime?                  @map("password_changed_at") @db.Timestamptz(3)
+  tempPassword                Boolean                    @default(false) @map("temp_password")
+  avatar                      String?
+  phone                       String?
+  jobTitle                    String?                    @map("job_title")
+  bio                         String?
+  twoFAEnabled                Boolean                    @default(false) @map("two_fa_enabled")
+  twoFASecret                 String?                    @map("two_fa_secret")
+  twoFAConfirmed              Boolean                    @default(false) @map("two_fa_confirmed")
+  ipWhitelist                 String[]                   @default([]) @map("ip_whitelist")
+  failedLoginAttempts         Int                        @default(0) @map("failed_login_attempts")
+  lockedUntil                 DateTime?                  @map("locked_until") @db.Timestamptz(3)
+  passwordResetToken          String?                    @map("password_reset_token")
+  passwordResetExpires        DateTime?                  @map("password_reset_expires") @db.Timestamptz(3)
+  createdAt                   DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                   DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  actionLogs                  ActionLog[]
+  auditLogs                   AuditLog[]
+  createdCompanies            Company[]                  @relation("CompanyCreatedBy")
+  companyUsers                CompanyUser[]
+  notifications               Notification[]
+  refreshTokens               RefreshToken[]
+  tillSessions                TillSession[]
+  posUserCredentials          PosUserCredential[]
+  posRegisterAccess           PosRegisterAccess[]
+  posSessions                 PosSession[]               @relation("PosSessionUser")
+  posRequestedApprovals       PosApproval[]              @relation("PosApprovalRequestedBy")
+  posApprovedApprovals        PosApproval[]              @relation("PosApprovalApprovedBy")
+  posApprovalRequestsCreated  PosApprovalRequest[]       @relation("PosApprovalRequestCashier")
+  posApprovalRequestsDecided  PosApprovalRequest[]       @relation("PosApprovalRequestDecisionBy")
+  posApprovalRequestsAssigned PosApprovalRequest[]       @relation("PosApprovalRequestAssignedManager")
+  posAuditLogs                PosAuditLog[]
+  openedPosShifts             PosShift[]                 @relation("PosShiftOpenedBy")
+  closedPosShifts             PosShift[]                 @relation("PosShiftClosedBy")
+  approvedPosShifts           PosShift[]                 @relation("PosShiftApprovedBy")
+  createdPosShiftCorrections  PosShiftCorrectionReport[] @relation("PosShiftCorrectionReportCreatedBy")
+  createdPosPrintPairingCodes PosPrintPairingCode[]      @relation("PosPrintPairingCodeCreator")
+  createdPosPrintJobs         PosPrintJob[]              @relation("PosPrintJobCreator")
+  performedPosCashMovements   PosCashMovement[]          @relation("PosCashMovementPerformedBy")
+  approvedPosCashMovements    PosCashMovement[]          @relation("PosCashMovementApprovedBy")
+  posShiftInvoices            Invoice[]                  @relation("PosInvoiceCashier")
+  posPayments                 PosPayment[]               @relation("PosPaymentCashier")
+  confirmedPosPayments        PosPayment[]               @relation("PosPaymentConfirmedBy")
+  reconciledPosPayments       PosPayment[]               @relation("PosPaymentReconciledBy")
+  approvedPosPaymentRefunds   PosPaymentRefund[]         @relation("PosPaymentRefundApprovedBy")
+  createdPosHeldSales         PosHeldSale[]
+  roles                       UserRole[]
+  sessions                    UserSession[]
+  company                     Company?                   @relation(fields: [companyId], references: [id])
+  createdBy                   User?                      @relation("UserCreatedBy", fields: [createdById], references: [id])
+  createdUsers                User[]                     @relation("UserCreatedBy")
+  projectMemberships          ProjectMember[]
 
   @@unique([companyId, email])
   @@index([email])
@@ -943,16 +1003,16 @@ model User {
 }
 
 model Role {
-  id           String     @id @db.Char(24)
-  companyId    String?    @map("company_id") @db.Char(24)
-  name         String
-  description  String?
-  isSystemRole Boolean    @default(false) @map("is_system_role")
-  permissions  Json       @default("[]")
-  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
-  company      Company?   @relation(fields: [companyId], references: [id])
-  users        UserRole[]
+  id                  String                   @id @db.Char(24)
+  companyId           String?                  @map("company_id") @db.Char(24)
+  name                String
+  description         String?
+  isSystemRole        Boolean                  @default(false) @map("is_system_role")
+  permissions         Json                     @default("[]")
+  createdAt           DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company             Company?                 @relation(fields: [companyId], references: [id])
+  users               UserRole[]
   permissionOverrides RolePermissionOverride[]
 
   @@index([companyId, name])
@@ -960,13 +1020,13 @@ model Role {
 }
 
 model RolePermissionOverride {
-  companyId  String   @map("company_id") @db.Char(24)
-  roleId     String   @map("role_id") @db.Char(24)
-  permissions Json   @default("[]")
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
-  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  role       Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  companyId   String   @map("company_id") @db.Char(24)
+  roleId      String   @map("role_id") @db.Char(24)
+  permissions Json     @default("[]")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  role        Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
 
   @@id([companyId, roleId])
   @@index([roleId])
@@ -1141,20 +1201,41 @@ model TillSession {
 
 /// Company-managed POS registers with a short-lived one-time device claim code.
 model PosRegister {
-  id              String    @id @db.Char(24)
-  companyId       String    @map("company_id") @db.Char(24)
-  code            String    @db.VarChar(80)
-  name            String    @db.VarChar(120)
-  location        String?   @db.VarChar(160)
-  isActive        Boolean   @default(true) @map("is_active")
-  claimedDeviceId String?   @map("claimed_device_id") @db.VarChar(80)
-  claimedAt       DateTime? @map("claimed_at") @db.Timestamptz(3)
-  claimCodeHash   String?   @map("claim_code_hash") @db.VarChar(64)
-  claimExpiresAt  DateTime? @map("claim_expires_at") @db.Timestamptz(3)
-  createdById     String?   @map("created_by_id") @db.Char(24)
-  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
-  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  id                     String                     @id @db.Char(24)
+  companyId              String                     @map("company_id") @db.Char(24)
+  branchId               String?                    @map("branch_id") @db.Char(24)
+  code                   String                     @db.VarChar(80)
+  name                   String                     @db.VarChar(120)
+  location               String?                    @db.VarChar(160)
+  isActive               Boolean                    @default(true) @map("is_active")
+  claimedDeviceId        String?                    @map("claimed_device_id") @db.VarChar(80)
+  claimedAt              DateTime?                  @map("claimed_at") @db.Timestamptz(3)
+  claimCodeHash          String?                    @map("claim_code_hash") @db.VarChar(64)
+  claimExpiresAt         DateTime?                  @map("claim_expires_at") @db.Timestamptz(3)
+  claimCodeUsedAt        DateTime?                  @map("claim_code_used_at") @db.Timestamptz(3)
+  trainingMode           Boolean                    @default(false) @map("training_mode")
+  deviceTokenHash        String?                    @unique @map("device_token_hash") @db.VarChar(64)
+  lastSeenAt             DateTime?                  @map("last_seen_at") @db.Timestamptz(3)
+  createdById            String?                    @map("created_by_id") @db.Char(24)
+  createdAt              DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company                Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  access                 PosRegisterAccess[]
+  sessions               PosSession[]
+  approvals              PosApproval[]
+  auditLogs              PosAuditLog[]
+  shifts                 PosShift[]
+  cashMovements          PosCashMovement[]
+  zReports               PosZReport[]
+  shiftCorrectionReports PosShiftCorrectionReport[]
+  payments               PosPayment[]
+  ebmSubmissionQueues    EbmSubmissionQueue[]       @relation("EbmSubmissionRegister")
+  ebmReceiptReprints     PosEbmReceiptReprint[]
+  nonPostingDocuments    PosNonPostingDocument[]
+  printPairingCodes      PosPrintPairingCode[]
+  printAgents            PosPrintAgent[]
+  printJobs              PosPrintJob[]
+  approvalRequests       PosApprovalRequest[]
 
   @@unique([companyId, code])
   @@unique([companyId, claimedDeviceId])
@@ -1162,25 +1243,389 @@ model PosRegister {
   @@map("pos_registers")
 }
 
+model PosPrintPairingCode {
+  id          String         @id @db.Char(24)
+  companyId   String         @map("company_id") @db.Char(24)
+  registerId  String?        @map("register_id") @db.Char(24)
+  name        String         @db.VarChar(120)
+  codeHash    String         @unique @map("code_hash") @db.Char(64)
+  createdById String         @map("created_by_id") @db.Char(24)
+  expiresAt   DateTime       @map("expires_at") @db.Timestamptz(3)
+  usedAt      DateTime?      @map("used_at") @db.Timestamptz(3)
+  usedAgentId String?        @map("used_agent_id") @db.Char(24)
+  revokedAt   DateTime?      @map("revoked_at") @db.Timestamptz(3)
+  createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  company     Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register    PosRegister?   @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  createdBy   User           @relation("PosPrintPairingCodeCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  usedAgent   PosPrintAgent? @relation("PosPrintPairingCodeUsedAgent", fields: [usedAgentId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, registerId, expiresAt])
+  @@map("pos_print_pairing_codes")
+}
+
+model PosPrintAgent {
+  id               String                @id @db.Char(24)
+  companyId        String                @map("company_id") @db.Char(24)
+  registerId       String?               @map("register_id") @db.Char(24)
+  name             String                @db.VarChar(120)
+  deviceId         String                @map("device_id") @db.VarChar(80)
+  status           String                @default("pending") @db.VarChar(20)
+  accessTokenHash  String                @unique @map("access_token_hash") @db.Char(64)
+  refreshTokenHash String                @unique @map("refresh_token_hash") @db.Char(64)
+  accessExpiresAt  DateTime              @map("access_expires_at") @db.Timestamptz(3)
+  platform         String                @default("windows") @db.VarChar(20)
+  version          String?               @db.VarChar(40)
+  lastSeenAt       DateTime?             @map("last_seen_at") @db.Timestamptz(3)
+  lastError        String?               @map("last_error")
+  revokedAt        DateTime?             @map("revoked_at") @db.Timestamptz(3)
+  createdAt        DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company          Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register         PosRegister?          @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  usedPairingCodes PosPrintPairingCode[] @relation("PosPrintPairingCodeUsedAgent")
+  printers         PosPrintPrinter[]
+  jobs             PosPrintJob[]
+
+  @@unique([companyId, deviceId])
+  @@index([companyId, registerId, status])
+  @@map("pos_print_agents")
+}
+
+model PosPrintPrinter {
+  id            String        @id @db.Char(24)
+  companyId     String        @map("company_id") @db.Char(24)
+  agentId       String        @map("agent_id") @db.Char(24)
+  name          String        @db.VarChar(160)
+  transport     String        @db.VarChar(30)
+  address       String        @db.VarChar(255)
+  paperWidthMm  Int           @default(80) @map("paper_width_mm")
+  columns       Int           @default(42)
+  drawerEnabled Boolean       @default(false) @map("drawer_enabled")
+  drawerPin     Int           @default(2) @map("drawer_pin")
+  pulseOnMs     Int           @default(25) @map("pulse_on_ms")
+  pulseOffMs    Int           @default(500) @map("pulse_off_ms")
+  isDefault     Boolean       @default(false) @map("is_default")
+  status        String        @default("unknown") @db.VarChar(30)
+  lastError     String?       @map("last_error")
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company       Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  agent         PosPrintAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  jobs          PosPrintJob[]
+
+  @@unique([agentId, name, transport, address])
+  @@index([agentId, isDefault])
+  @@map("pos_print_printers")
+}
+
+model PosPrintJob {
+  id                  String           @id @db.Char(24)
+  companyId           String           @map("company_id") @db.Char(24)
+  registerId          String           @map("register_id") @db.Char(24)
+  agentId             String?          @map("agent_id") @db.Char(24)
+  printerId           String?          @map("printer_id") @db.Char(24)
+  jobType             String           @map("job_type") @db.VarChar(40)
+  status              String           @default("queued") @db.VarChar(20)
+  idempotencyKey      String           @map("idempotency_key") @db.VarChar(160)
+  payloadJson         Json             @map("payload_json")
+  payloadHash         String           @map("payload_hash") @db.Char(64)
+  copyRequired        Boolean          @default(false) @map("copy_required")
+  attemptCount        Int              @default(0) @map("attempt_count")
+  maxAttempts         Int              @default(8) @map("max_attempts")
+  leaseTimeoutSeconds Int              @default(30) @map("lease_timeout_seconds")
+  leaseTokenHash      String?          @map("lease_token_hash") @db.Char(64)
+  leasedUntil         DateTime?        @map("leased_until") @db.Timestamptz(3)
+  availableAt         DateTime         @default(now()) @map("available_at") @db.Timestamptz(3)
+  transmittedAt       DateTime?        @map("transmitted_at") @db.Timestamptz(3)
+  confirmedAt         DateTime?        @map("confirmed_at") @db.Timestamptz(3)
+  acknowledgedAt      DateTime?        @map("acknowledged_at") @db.Timestamptz(3)
+  lastError           String?          @map("last_error")
+  expiresAt           DateTime         @map("expires_at") @db.Timestamptz(3)
+  createdById         String?          @map("created_by_id") @db.Char(24)
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company             Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register            PosRegister      @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  agent               PosPrintAgent?   @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  printer             PosPrintPrinter? @relation(fields: [printerId], references: [id], onDelete: SetNull)
+  createdBy           User?            @relation("PosPrintJobCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId, registerId, status])
+  @@index([agentId, status, availableAt])
+  @@index([expiresAt], map: "pos_print_jobs_expiry_idx")
+  @@map("pos_print_jobs")
+}
+
+model PosShift {
+  id                  String                     @id @db.Char(24)
+  companyId           String                     @map("company_id") @db.Char(24)
+  registerId          String                     @map("register_id") @db.Char(24)
+  shiftNumber         Int                        @map("shift_number")
+  status              PosShiftStatus             @default(open)
+  openedById          String                     @map("opened_by") @db.Char(24)
+  openedAt            DateTime                   @default(now()) @map("opened_at") @db.Timestamptz(3)
+  openingFloat        Int                        @map("opening_float")
+  openingCount        Json?                      @map("opening_count")
+  closedById          String?                    @map("closed_by") @db.Char(24)
+  closedAt            DateTime?                  @map("closed_at") @db.Timestamptz(3)
+  countedCash         Int?                       @map("counted_cash")
+  closingCount        Json?                      @map("closing_count")
+  expectedCash        Int?                       @map("expected_cash")
+  difference          Int?
+  differenceReason    String?                    @map("difference_reason")
+  approvedById        String?                    @map("approved_by") @db.Char(24)
+  journalEntryId      String?                    @map("journal_entry_id") @db.Char(24)
+  idempotencyKey      String?                    @map("idempotency_key") @db.VarChar(100)
+  closeIdempotencyKey String?                    @map("close_idempotency_key") @db.VarChar(100)
+  closePayloadHash    String?                    @map("close_payload_hash") @db.Char(64)
+  handoverFromShiftId String?                    @map("handover_from_shift_id") @db.Char(24)
+  handoverPayloadHash String?                    @map("handover_payload_hash") @db.Char(64)
+  note                String?
+  company             Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register            PosRegister                @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  openedBy            User                       @relation("PosShiftOpenedBy", fields: [openedById], references: [id], onDelete: Restrict)
+  closedBy            User?                      @relation("PosShiftClosedBy", fields: [closedById], references: [id], onDelete: SetNull)
+  approvedBy          User?                      @relation("PosShiftApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  cashMovements       PosCashMovement[]
+  zReport             PosZReport?
+  correctionReports   PosShiftCorrectionReport[]
+  invoices            Invoice[]
+  payments            PosPayment[]
+  ebmSubmissionQueues EbmSubmissionQueue[]       @relation("EbmSubmissionShift")
+
+  @@unique([registerId, shiftNumber])
+  @@unique([companyId, idempotencyKey])
+  @@unique([companyId, closeIdempotencyKey])
+  @@index([companyId, registerId, status])
+  @@map("pos_shifts")
+}
+
+model PosCashMovement {
+  id             String              @id @db.Char(24)
+  companyId      String              @map("company_id") @db.Char(24)
+  shiftId        String              @map("shift_id") @db.Char(24)
+  registerId     String              @map("register_id") @db.Char(24)
+  type           PosCashMovementType
+  amount         Int
+  reasonCode     String              @map("reason_code") @db.VarChar(40)
+  note           String?
+  performedById  String              @map("performed_by") @db.Char(24)
+  approvedById   String?             @map("approved_by") @db.Char(24)
+  journalEntryId String?             @map("journal_entry_id") @db.Char(24)
+  idempotencyKey String?             @map("idempotency_key") @db.VarChar(100)
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  shift          PosShift            @relation(fields: [shiftId], references: [id], onDelete: Restrict)
+  register       PosRegister         @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  performedBy    User                @relation("PosCashMovementPerformedBy", fields: [performedById], references: [id], onDelete: Restrict)
+  approvedBy     User?               @relation("PosCashMovementApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([shiftId, createdAt])
+  @@index([companyId, registerId, createdAt])
+  @@map("pos_cash_movements")
+}
+
+model PosZReport {
+  id                String                     @id @db.Char(24)
+  companyId         String                     @map("company_id") @db.Char(24)
+  registerId        String                     @map("register_id") @db.Char(24)
+  shiftId           String                     @unique @map("shift_id") @db.Char(24)
+  zNumber           Int                        @map("z_number")
+  snapshot          Json
+  generatedAt       DateTime                   @default(now()) @map("generated_at") @db.Timestamptz(3)
+  printCount        Int                        @default(0) @map("print_count")
+  company           Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register          PosRegister                @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  shift             PosShift                   @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  correctionReports PosShiftCorrectionReport[]
+
+  @@unique([companyId, registerId, zNumber])
+  @@map("pos_z_reports")
+}
+
+model PosShiftCorrectionReport {
+  id                       String      @id @db.Char(24)
+  companyId                String      @map("company_id") @db.Char(24)
+  registerId               String      @map("register_id") @db.Char(24)
+  shiftId                  String      @map("shift_id") @db.Char(24)
+  originalZReportId        String      @map("original_z_report_id") @db.Char(24)
+  correctionNumber         Int         @map("correction_number")
+  correctionType           String      @map("correction_type") @db.VarChar(16)
+  idempotencyKey           String      @map("idempotency_key") @db.VarChar(100)
+  priorCloseIdempotencyKey String?     @map("prior_close_idempotency_key") @db.VarChar(100)
+  payloadHash              String      @map("payload_hash") @db.Char(64)
+  snapshot                 Json
+  journalEntryId           String?     @map("journal_entry_id") @db.Char(24)
+  createdById              String      @map("created_by_id") @db.Char(24)
+  createdAt                DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  company                  Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register                 PosRegister @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  shift                    PosShift    @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  originalZReport          PosZReport  @relation(fields: [originalZReportId], references: [id], onDelete: Cascade)
+  createdBy                User        @relation("PosShiftCorrectionReportCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, idempotencyKey])
+  @@unique([companyId, priorCloseIdempotencyKey], map: "pos_shift_correction_reports_company_id_prior_close_idempotency")
+  @@unique([shiftId, correctionNumber])
+  @@index([companyId, registerId, createdAt], map: "pos_shift_correction_reports_company_id_register_id_created_at_")
+  @@index([shiftId, createdAt])
+  @@map("pos_shift_correction_reports")
+}
+
+model PosUserCredential {
+  id           String    @id @db.Char(24)
+  companyId    String    @map("company_id") @db.Char(24)
+  userId       String    @map("user_id") @db.Char(24)
+  pinHash      String    @map("pin_hash") @db.VarChar(255)
+  failedCount  Int       @default(0) @map("failed_count")
+  lockedUntil  DateTime? @map("locked_until") @db.Timestamptz(3)
+  pinChangedAt DateTime  @default(now()) @map("pin_changed_at") @db.Timestamptz(3)
+  mustChange   Boolean   @default(false) @map("must_change")
+  company      Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, userId])
+  @@index([companyId, lockedUntil])
+  @@map("pos_user_credentials")
+}
+
+model PosRegisterAccess {
+  id                String      @id @db.Char(24)
+  companyId         String      @map("company_id") @db.Char(24)
+  registerId        String      @map("register_id") @db.Char(24)
+  userId            String      @map("user_id") @db.Char(24)
+  failedPinAttempts Int         @default(0) @map("failed_pin_attempts")
+  pinLockedUntil    DateTime?   @map("pin_locked_until") @db.Timestamptz(3)
+  shiftDays         Json        @default("[]") @map("shift_days")
+  shiftStartTime    String?     @map("shift_start_time") @db.VarChar(5)
+  shiftEndTime      String?     @map("shift_end_time") @db.VarChar(5)
+  company           Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register          PosRegister @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([registerId, userId])
+  @@index([companyId, userId])
+  @@index([companyId, registerId, pinLockedUntil])
+  @@map("pos_register_access")
+}
+
+model PosSession {
+  id             String           @id @db.Char(24)
+  companyId      String           @map("company_id") @db.Char(24)
+  registerId     String           @map("register_id") @db.Char(24)
+  userId         String           @map("user_id") @db.Char(24)
+  status         PosSessionStatus @default(active)
+  startedAt      DateTime         @default(now()) @map("started_at") @db.Timestamptz(3)
+  lastActivityAt DateTime         @default(now()) @map("last_activity_at") @db.Timestamptz(3)
+  lockedAt       DateTime?        @map("locked_at") @db.Timestamptz(3)
+  endedAt        DateTime?        @map("ended_at") @db.Timestamptz(3)
+  endReason      String?          @map("end_reason") @db.VarChar(24)
+  company        Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register       PosRegister      @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  user           User             @relation("PosSessionUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, registerId, status])
+  @@index([companyId, userId, status])
+  @@index([companyId, lastActivityAt])
+  @@map("pos_sessions")
+}
+
+model PosApproval {
+  id          String      @id @db.Char(24)
+  companyId   String      @map("company_id") @db.Char(24)
+  registerId  String      @map("register_id") @db.Char(24)
+  requestedBy String      @map("requested_by") @db.Char(24)
+  approvedBy  String      @map("approved_by") @db.Char(24)
+  action      String      @db.VarChar(40)
+  context     Json?
+  tokenHash   String      @unique @map("token_hash") @db.VarChar(64)
+  expiresAt   DateTime    @map("expires_at") @db.Timestamptz(3)
+  usedAt      DateTime?   @map("used_at") @db.Timestamptz(3)
+  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  company     Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register    PosRegister @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  requester   User        @relation("PosApprovalRequestedBy", fields: [requestedBy], references: [id], onDelete: Cascade)
+  approver    User        @relation("PosApprovalApprovedBy", fields: [approvedBy], references: [id], onDelete: Cascade)
+
+  @@index([companyId, registerId, action, expiresAt])
+  @@index([companyId, requestedBy, createdAt])
+  @@map("pos_approvals")
+}
+
+model PosAuditLog {
+  id         String       @id @db.Char(24)
+  companyId  String       @map("company_id") @db.Char(24)
+  registerId String?      @map("register_id") @db.Char(24)
+  userId     String?      @map("user_id") @db.Char(24)
+  event      String       @db.VarChar(64)
+  metadata   Json?
+  ip         String?      @db.VarChar(45)
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  company    Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register   PosRegister? @relation(fields: [registerId], references: [id], onDelete: SetNull)
+  user       User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, createdAt])
+  @@index([companyId, registerId, createdAt])
+  @@map("pos_audit_logs")
+}
+
 /// Short-lived, one-use, second-person approval for sensitive POS operations.
 model PosManagerApproval {
-  id            String       @id @db.Char(24)
-  companyId     String       @map("company_id") @db.Char(24)
-  cashierId     String       @map("cashier_id") @db.Char(24)
-  managerId     String       @map("manager_id") @db.Char(24)
-  tillSessionId String?      @map("till_session_id") @db.Char(24)
-  action        String       @db.VarChar(20)
-  subjectId     String?      @map("subject_id") @db.Char(24)
-  payloadHash   String       @map("payload_hash") @db.VarChar(64)
-  expiresAt     DateTime     @map("expires_at") @db.Timestamptz(3)
-  usedAt        DateTime?    @map("used_at") @db.Timestamptz(3)
-  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
-  company       Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  tillSession   TillSession? @relation(fields: [tillSessionId], references: [id], onDelete: SetNull)
+  id                    String               @id @db.Char(24)
+  companyId             String               @map("company_id") @db.Char(24)
+  cashierId             String               @map("cashier_id") @db.Char(24)
+  managerId             String               @map("manager_id") @db.Char(24)
+  tillSessionId         String?              @map("till_session_id") @db.Char(24)
+  action                String               @db.VarChar(32)
+  subjectId             String?              @map("subject_id") @db.Char(24)
+  payloadHash           String               @map("payload_hash") @db.VarChar(64)
+  expiresAt             DateTime             @map("expires_at") @db.Timestamptz(3)
+  usedAt                DateTime?            @map("used_at") @db.Timestamptz(3)
+  createdAt             DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  company               Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  tillSession           TillSession?         @relation(fields: [tillSessionId], references: [id], onDelete: SetNull)
+  fiscalEntryQueueItems EbmSubmissionQueue[] @relation("EbmManualEntryApproval")
+  approvalRequest       PosApprovalRequest?  @relation("PosApprovalRequestManagerApproval")
 
   @@index([companyId, cashierId, action, expiresAt])
   @@index([companyId, subjectId, action])
   @@map("pos_manager_approvals")
+}
+
+/// Cashier requests awaiting a manager decision in the POS Back Office.
+model PosApprovalRequest {
+  id                String    @id @db.Char(24)
+  companyId         String    @map("company_id") @db.Char(24)
+  registerId        String    @map("register_id") @db.Char(24)
+  cashierId         String    @map("cashier_id") @db.Char(24)
+  tillSessionId     String?   @map("till_session_id") @db.Char(24)
+  action            String    @db.VarChar(32)
+  subjectId         String?   @map("subject_id") @db.Char(24)
+  payload           Json
+  payloadHash       String    @map("payload_hash") @db.VarChar(64)
+  status            String    @default("PENDING") @db.VarChar(16)
+  decisionById      String?   @map("decision_by_id") @db.Char(24)
+  assignedManagerId String?   @map("assigned_manager_id") @db.Char(24)
+  decisionReason    String?   @map("decision_reason") @db.VarChar(500)
+  decisionAt        DateTime? @map("decision_at") @db.Timestamptz(3)
+  managerApprovalId String?   @unique @map("manager_approval_id") @db.Char(24)
+  expiresAt         DateTime  @map("expires_at") @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  company           Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register          PosRegister @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  cashier           User      @relation("PosApprovalRequestCashier", fields: [cashierId], references: [id], onDelete: Cascade)
+  decisionBy        User?     @relation("PosApprovalRequestDecisionBy", fields: [decisionById], references: [id], onDelete: SetNull)
+  assignedManager   User?     @relation("PosApprovalRequestAssignedManager", fields: [assignedManagerId], references: [id], onDelete: SetNull)
+  managerApproval   PosManagerApproval? @relation("PosApprovalRequestManagerApproval", fields: [managerApprovalId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, status, createdAt])
+  @@index([companyId, registerId, createdAt])
+  @@index([companyId, assignedManagerId, status, createdAt], map: "pos_appr_req_company_mgr_status_created_idx")
+  @@map("pos_approval_requests")
 }
 
 /// Manager-approved POS promotion rules with explicit validity windows.
@@ -1231,24 +1676,169 @@ model PosStoredValueAccount {
 }
 
 model PosStoredValueLedger {
-  id           String                @id @db.Char(24)
-  companyId    String                @map("company_id") @db.Char(24)
-  accountId    String                @map("account_id") @db.Char(24)
-  invoiceId    String?               @map("invoice_id") @db.Char(24)
-  kind         String                @db.VarChar(20)
-  entryType    String                @map("entry_type") @db.VarChar(20)
-  amount       Decimal               @db.Decimal(19, 2)
-  balanceAfter Decimal               @map("balance_after") @db.Decimal(19, 2)
-  reference    String?               @db.VarChar(120)
-  notes        String?
-  createdById  String?               @map("created_by_id") @db.Char(24)
-  createdAt    DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
-  company      Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  account      PosStoredValueAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  id             String                   @id @db.Char(24)
+  companyId      String                   @map("company_id") @db.Char(24)
+  accountId      String                   @map("account_id") @db.Char(24)
+  posPaymentId   String?                  @map("pos_payment_id") @db.Char(24)
+  idempotencyKey String?                  @map("idempotency_key") @db.VarChar(100)
+  operationType  PosStoredValueOperation? @map("operation_type")
+  invoiceId      String?                  @map("invoice_id") @db.Char(24)
+  kind           String                   @db.VarChar(20)
+  entryType      String                   @map("entry_type") @db.VarChar(20)
+  amount         Decimal                  @db.Decimal(19, 2)
+  balanceAfter   Decimal                  @map("balance_after") @db.Decimal(19, 2)
+  reference      String?                  @db.VarChar(120)
+  notes          String?
+  createdById    String?                  @map("created_by_id") @db.Char(24)
+  createdAt      DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  account        PosStoredValueAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  posPayment     PosPayment?              @relation(fields: [posPaymentId], references: [id], onDelete: Restrict)
 
+  @@unique([companyId, idempotencyKey])
   @@index([companyId, accountId, createdAt(sort: Desc)])
   @@index([companyId, invoiceId])
+  @@index([companyId, posPaymentId])
   @@map("pos_stored_value_ledger")
+}
+
+model PosPayment {
+  id                   String                          @id @db.Char(24)
+  companyId            String                          @map("company_id") @db.Char(24)
+  saleId               String                          @map("sale_id") @db.Char(24)
+  shiftId              String                          @map("shift_id") @db.Char(24)
+  registerId           String                          @map("register_id") @db.Char(24)
+  cashierId            String                          @map("cashier_id") @db.Char(24)
+  method               PosPaymentMethod
+  status               PosPaymentStatus                @default(PENDING)
+  amount               Int
+  tendered             Int?
+  changeGiven          Int?                            @map("change_given")
+  reference            String?
+  customerId           String?                         @map("customer_id") @db.Char(24)
+  providerName         String?                         @map("provider_name")
+  providerTxId         String?                         @map("provider_tx_id")
+  normalizedReference  String?                         @map("normalized_reference") @db.VarChar(160)
+  payerPhone           String?                         @map("payer_phone")
+  externalRef          String?                         @map("external_ref")
+  reconciliationStatus PosPaymentReconciliationStatus? @map("reconciliation_status")
+  confirmedAt          DateTime?                       @map("confirmed_at") @db.Timestamptz(3)
+  confirmedById        String?                         @map("confirmed_by_id") @db.Char(24)
+  reconciledAt         DateTime?                       @map("reconciled_at") @db.Timestamptz(3)
+  reconciledById       String?                         @map("reconciled_by_id") @db.Char(24)
+  note                 String?
+  idempotencyKey       String                          @map("idempotency_key") @db.VarChar(100)
+  createdAt            DateTime                        @default(now()) @map("created_at") @db.Timestamptz(3)
+  completedAt          DateTime?                       @map("completed_at") @db.Timestamptz(3)
+  company              Company                         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  sale                 Invoice                         @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  shift                PosShift                        @relation(fields: [shiftId], references: [id], onDelete: Restrict)
+  register             PosRegister                     @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  cashier              User                            @relation("PosPaymentCashier", fields: [cashierId], references: [id], onDelete: Restrict)
+  confirmedBy          User?                           @relation("PosPaymentConfirmedBy", fields: [confirmedById], references: [id], onDelete: SetNull)
+  reconciledBy         User?                           @relation("PosPaymentReconciledBy", fields: [reconciledById], references: [id], onDelete: SetNull)
+  customer             Client?                         @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  attempts             PosPaymentAttempt[]
+  providerEvents       PosProviderEvent[]
+  refunds              PosPaymentRefund[]
+  storedValueLedger    PosStoredValueLedger[]
+
+  @@unique([companyId, idempotencyKey])
+  @@unique([companyId, externalRef])
+  @@unique([companyId, method, normalizedReference])
+  @@index([companyId, saleId])
+  @@index([companyId, shiftId, method, status])
+  @@index([companyId, registerId, createdAt])
+  @@index([companyId, method, reconciliationStatus, createdAt], map: "pos_payments_company_id_method_reconciliation_status_created_at")
+  @@index([companyId, cashierId, createdAt])
+  @@map("pos_payments")
+}
+
+model PosPaymentAttempt {
+  id             String     @id @db.Char(24)
+  companyId      String     @map("company_id") @db.Char(24)
+  paymentId      String     @map("payment_id") @db.Char(24)
+  attemptNo      Int        @map("attempt_no")
+  providerStatus String?    @map("provider_status")
+  requestedAt    DateTime   @default(now()) @map("requested_at") @db.Timestamptz(3)
+  expiresAt      DateTime   @map("expires_at") @db.Timestamptz(3)
+  lastCheckedAt  DateTime?  @map("last_checked_at") @db.Timestamptz(3)
+  rawResponse    Json?      @map("raw_response")
+  company        Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  payment        PosPayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, paymentId, attemptNo])
+  @@index([companyId, paymentId, expiresAt])
+  @@map("pos_payment_attempts")
+}
+
+/// The unmatched-event partial unique index is maintained in the migration SQL.
+model PosProviderEvent {
+  id               String      @id @db.Char(24)
+  companyId        String?     @map("company_id") @db.Char(24)
+  provider         String      @db.VarChar(32)
+  eventKey         String      @map("event_key") @db.VarChar(160)
+  payload          Json
+  signatureOk      Boolean     @map("signature_ok")
+  matchedPaymentId String?     @map("matched_payment_id") @db.Char(24)
+  processedAt      DateTime?   @map("processed_at") @db.Timestamptz(3)
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  company          Company?    @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  matchedPayment   PosPayment? @relation(fields: [matchedPaymentId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, companyId, eventKey])
+  @@index([companyId, provider, createdAt])
+  @@index([companyId, matchedPaymentId])
+  @@map("pos_provider_events")
+}
+
+model PosPaymentRefund {
+  id             String                 @id @db.Char(24)
+  companyId      String                 @map("company_id") @db.Char(24)
+  paymentId      String                 @map("payment_id") @db.Char(24)
+  saleId         String                 @map("sale_id") @db.Char(24)
+  method         PosPaymentMethod
+  amount         Int
+  status         PosPaymentRefundStatus @default(PENDING)
+  reason         String
+  approvedById   String?                @map("approved_by") @db.Char(24)
+  providerTxId   String?                @map("provider_tx_id")
+  idempotencyKey String                 @map("idempotency_key") @db.VarChar(100)
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  payment        PosPayment             @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  sale           Invoice                @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  approvedBy     User?                  @relation("PosPaymentRefundApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId, saleId, createdAt])
+  @@index([companyId, paymentId, status])
+  @@map("pos_payment_refunds")
+}
+
+model PosPaymentSettings {
+  companyId                    String                     @id @map("company_id") @db.Char(24)
+  enabledMethods               Json                       @map("enabled_methods")
+  registerOverrides            Json                       @default("{}") @map("register_overrides")
+  paymentFlow                  PosPaymentFlow             @default(LEGACY) @map("payment_flow")
+  registerPaymentFlowOverrides Json                       @default("{}") @map("register_payment_flow_overrides")
+  pendingSaleExpiryPolicy      PosPendingSaleExpiryPolicy @default(SHIFT_CLOSE) @map("pending_sale_expiry_policy")
+  pendingSaleMaxAgeHours       Int?                       @map("pending_sale_max_age_hours")
+  paidSaleRefundApprovalAmount Int                        @default(20000) @map("paid_sale_refund_approval_amount")
+  paidSaleRefundApprovalCount  Int                        @default(3) @map("paid_sale_refund_approval_count")
+  posReturnWindowDays          Int                        @default(30) @map("pos_return_window_days")
+  momoTimeoutSec               Int                        @default(120) @map("momo_timeout_sec")
+  cashRounding                 Int?                       @map("cash_rounding")
+  allowOverCreditLimit         Boolean                    @default(false) @map("allow_over_credit_limit")
+  bankTransferNeedsConfirm     Boolean                    @default(true) @map("bank_transfer_needs_confirm")
+  providerEnvironment          PosPaymentEnvironment      @default(sandbox) @map("provider_environment")
+  manualMobileMoneyMode        PosManualMobileMoneyMode   @default(VERIFY) @map("manual_mobile_money_mode")
+  manualMobileMoneyReceivers   Json                       @default("{}") @map("manual_mobile_money_receivers")
+  /// Stores encrypted provider credentials. Never return or log this field.
+  providerConfig               Json?                      @map("provider_config")
+  company                      Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@map("pos_payment_settings")
 }
 
 /// Customer prepayments recognised as revenue over time. `recognitions` holds the
@@ -1432,51 +2022,125 @@ model PriceListItem {
 }
 
 model Client {
-  id                  String                @id @db.Char(24)
-  companyId           String                @map("company_id") @db.Char(24)
-  name                String
-  code                String
-  type                ClientType            @default(individual)
-  contact             Json                  @default("{}")
-  salesArea           String?               @map("sales_area")
-  salesRepId          String?               @map("sales_rep_id")
-  region              String?
-  industry            String?
-  registrationDate    DateTime?             @map("registration_date") @db.Timestamptz(3)
-  taxId               String?               @map("tax_id")
-  ebmTinVerification  Json?                 @map("ebm_tin_verification")
-  paymentTerms        PaymentTerms          @default(cash) @map("payment_terms")
-  creditLimit         Decimal               @default(0) @map("credit_limit") @db.Decimal(19, 4)
-  outstandingBalance  Decimal               @default(0) @map("outstanding_balance") @db.Decimal(19, 4)
-  totalPurchases      Decimal               @default(0) @map("total_purchases") @db.Decimal(19, 4)
-  lastPurchaseDate    DateTime?             @map("last_purchase_date") @db.Timestamptz(3)
-  notes               String?
-  isActive            Boolean               @default(true) @map("is_active")
-  createdById         String?               @map("created_by") @db.Char(24)
-  customFields        Json                  @default("{}") @map("custom_fields")
-  ebmBranchCustomers  Json                  @default("[]") @map("ebm_branch_customers")
-  createdAt           DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt           DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
-  arBadDebtWriteoffs  ArBadDebtWriteoff[]
-  arReceipts          ARReceipt[]
-  arTransactionLedger ArTransactionLedger[]
-  company             Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  creditNotes         CreditNote[]
-  deliveryNotes       DeliveryNote[]
-  invoices            Invoice[]
-  pickPacks           PickPack[]
-  quotations          Quotation[]
-  recurringInvoices   RecurringInvoice[]
-  salesOrders         SalesOrder[]
+  id                    String                     @id @db.Char(24)
+  companyId             String                     @map("company_id") @db.Char(24)
+  name                  String
+  code                  String
+  type                  ClientType                 @default(individual)
+  contact               Json                       @default("{}")
+  phoneNormalized       String?                    @map("phone_normalized") @db.VarChar(16)
+  phoneNeedsReview      Boolean                    @default(false) @map("phone_needs_review")
+  address               String?
+  groupTag              String?                    @map("group_tag") @db.VarChar(80)
+  marketingConsent      Boolean                    @default(false) @map("marketing_consent")
+  digitalReceiptConsent Boolean                    @default(false) @map("digital_receipt_consent")
+  isWalkIn              Boolean                    @default(false) @map("is_walk_in")
+  mergedIntoClientId    String?                    @map("merged_into_client_id") @db.Char(24)
+  mergedAt              DateTime?                  @map("merged_at") @db.Timestamptz(3)
+  mergedById            String?                    @map("merged_by_id") @db.Char(24)
+  salesArea             String?                    @map("sales_area")
+  salesRepId            String?                    @map("sales_rep_id")
+  region                String?
+  industry              String?
+  registrationDate      DateTime?                  @map("registration_date") @db.Timestamptz(3)
+  taxId                 String?                    @map("tax_id")
+  ebmTinVerification    Json?                      @map("ebm_tin_verification")
+  paymentTerms          PaymentTerms               @default(cash) @map("payment_terms")
+  creditLimit           Decimal                    @default(0) @map("credit_limit") @db.Decimal(19, 4)
+  outstandingBalance    Decimal                    @default(0) @map("outstanding_balance") @db.Decimal(19, 4)
+  creditAccountStatus   String                     @default("ACTIVE") @map("credit_account_status") @db.VarChar(16)
+  creditTermsDays       Int                        @default(30) @map("credit_terms_days")
+  totalPurchases        Decimal                    @default(0) @map("total_purchases") @db.Decimal(19, 4)
+  lastPurchaseDate      DateTime?                  @map("last_purchase_date") @db.Timestamptz(3)
+  notes                 String?
+  isActive              Boolean                    @default(true) @map("is_active")
+  createdById           String?                    @map("created_by") @db.Char(24)
+  customFields          Json                       @default("{}") @map("custom_fields")
+  ebmBranchCustomers    Json                       @default("[]") @map("ebm_branch_customers")
+  createdAt             DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  arBadDebtWriteoffs    ArBadDebtWriteoff[]
+  arReceipts            ARReceipt[]
+  arTransactionLedger   ArTransactionLedger[]
+  company               Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  creditNotes           CreditNote[]
+  deliveryNotes         DeliveryNote[]
+  invoices              Invoice[]
+  loyaltyLedger         PosCustomerLoyaltyLedger[]
+  creditLedger          PosCustomerCreditLedger[]
+  mergedInto            Client?                    @relation("ClientMerge", fields: [mergedIntoClientId], references: [id], onDelete: Cascade)
+  mergedSources         Client[]                   @relation("ClientMerge")
+  posPayments           PosPayment[]
+  pickPacks             PickPack[]
+  quotations            Quotation[]
+  recurringInvoices     RecurringInvoice[]
+  salesOrders           SalesOrder[]
 
   @@unique([companyId, code])
+  @@unique([companyId, id], map: "clients_company_id_id_key")
+  @@unique([companyId, phoneNormalized], map: "clients_company_phone_normalized_key")
   @@index([companyId])
   @@index([companyId, isActive])
+  @@index([companyId, isWalkIn], map: "clients_company_is_walk_in_idx")
+  @@index([companyId, phoneNeedsReview], map: "clients_company_phone_needs_review_idx")
+  @@index([companyId, mergedIntoClientId], map: "clients_company_merged_into_idx")
   @@index([companyId, name])
   @@index([companyId, isActive, name, id], map: "products_company_active_name_id_idx")
   @@index([name(ops: raw("gin_trgm_ops"))], map: "clients_name_trgm_idx", type: Gin)
   @@index([code(ops: raw("gin_trgm_ops"))], map: "clients_code_trgm_idx", type: Gin)
   @@map("clients")
+}
+
+/// Append-only operational points history. Values are signed point deltas.
+model PosCustomerLoyaltyLedger {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  clientId       String   @map("client_id") @db.Char(24)
+  entryType      String   @map("entry_type") @db.VarChar(16)
+  points         Int
+  balanceAfter   Int      @map("balance_after")
+  invoiceId      String?  @map("invoice_id") @db.Char(24)
+  reason         String?  @db.VarChar(500)
+  createdById    String   @map("created_by_id") @db.Char(24)
+  idempotencyKey String   @map("idempotency_key") @db.VarChar(120)
+  requestHash    String   @map("request_hash") @db.Char(64)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  client         Client   @relation(fields: [companyId, clientId], references: [companyId, id], onDelete: Cascade, map: "pos_customer_loyalty_ledger_client_id_fkey")
+
+  @@unique([companyId, idempotencyKey], map: "pos_customer_loyalty_ledger_company_idempotency_key")
+  @@index([companyId, clientId, createdAt(sort: Desc)], map: "pos_customer_loyalty_ledger_company_client_created_idx")
+  @@index([companyId, invoiceId], map: "pos_customer_loyalty_ledger_company_invoice_idx")
+  @@map("pos_customer_loyalty_ledger")
+}
+
+/// Append-only customer-account history. The ledger is operationally linked to
+/// existing AR invoices and receipts, while AR posting remains authoritative.
+model PosCustomerCreditLedger {
+  id             String    @id @db.Char(24)
+  companyId      String    @map("company_id") @db.Char(24)
+  clientId       String    @map("client_id") @db.Char(24)
+  entryType      String    @map("entry_type") @db.VarChar(20)
+  direction      String    @db.VarChar(8)
+  amount         Decimal   @db.Decimal(19, 4)
+  balanceAfter   Decimal   @map("balance_after") @db.Decimal(19, 4)
+  invoiceId      String?   @map("invoice_id") @db.Char(24)
+  receiptId      String?   @map("receipt_id") @db.Char(24)
+  dueDate        DateTime? @map("due_date") @db.Timestamptz(3)
+  reason         String?   @db.VarChar(500)
+  createdById    String    @map("created_by_id") @db.Char(24)
+  idempotencyKey String    @map("idempotency_key") @db.VarChar(120)
+  requestHash    String    @map("request_hash") @db.Char(64)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  client         Client    @relation(fields: [companyId, clientId], references: [companyId, id], onDelete: Cascade, map: "pos_customer_credit_ledger_client_id_fkey")
+
+  @@unique([companyId, idempotencyKey], map: "pos_customer_credit_ledger_company_idempotency_key")
+  @@index([companyId, clientId, createdAt(sort: Desc)], map: "pos_customer_credit_ledger_company_client_created_idx")
+  @@index([companyId, dueDate], map: "pos_customer_credit_ledger_company_due_date_idx")
+  @@index([companyId, invoiceId], map: "pos_customer_credit_ledger_company_invoice_idx")
+  @@index([companyId, receiptId], map: "pos_customer_credit_ledger_company_receipt_idx")
+  @@map("pos_customer_credit_ledger")
 }
 
 model Supplier {
@@ -2424,7 +3088,12 @@ model Invoice {
   status                   String                   @default("draft")
   posOrigin                Boolean                  @default(false) @map("pos_origin")
   tillSessionId            String?                  @map("till_session_id") @db.Char(24)
+  shiftId                  String?                  @map("shift_id") @db.Char(24)
+  cashierId                String?                  @map("cashier_id") @db.Char(24)
   registerId               String?                  @map("register_id")
+  posCheckoutPayload       Json?                    @map("pos_checkout_payload")
+  posCompletionKey         String?                  @map("pos_completion_key") @db.VarChar(100)
+  posCancellationKey       String?                  @map("pos_cancellation_key") @db.VarChar(100)
   currencyCode             String                   @default("RWF") @map("currency_code")
   exchangeRate             Decimal                  @default(1) @map("exchange_rate") @db.Decimal(19, 6)
   subtotal                 Decimal                  @default(0) @db.Decimal(19, 2)
@@ -2465,13 +3134,23 @@ model Invoice {
   creditNotes              CreditNote[]
   lines                    InvoiceLine[]
   receiptMetadata          InvoiceReceiptMetadata[]
+  ebmReceiptReprints       PosEbmReceiptReprint[]
+  posPublicReceiptTokens   PosPublicReceiptToken[]
   client                   Client                   @relation(fields: [clientId], references: [id])
   company                  Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  shift                    PosShift?                @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  cashier                  User?                    @relation("PosInvoiceCashier", fields: [cashierId], references: [id], onDelete: SetNull)
+  posPayments              PosPayment[]
+  posPaymentRefunds        PosPaymentRefund[]
 
   @@unique([companyId, referenceNo])
+  @@unique([companyId, posCompletionKey])
+  @@unique([companyId, posCancellationKey])
   @@index([companyId, status, dueDate])
   @@index([companyId, invoiceDate(sort: Desc)])
   @@index([companyId, tillSessionId, invoiceDate(sort: Desc)], map: "invoices_company_till_session_invoice_date_idx")
+  @@index([companyId, shiftId])
+  @@index([companyId, cashierId, invoiceDate(sort: Desc)])
   @@index([companyId, clientId, status])
   @@index([companyId, badDebtWrittenOff], map: "invoices_company_bad_debt_idx")
   @@map("invoices")
@@ -2479,55 +3158,59 @@ model Invoice {
 
 /// Fiscal receipt details returned by the EBM/SDC device for a confirmed invoice.
 model InvoiceReceiptMetadata {
-  id               String    @id @db.Char(24)
-  companyId        String    @map("company_id") @db.Char(24)
-  invoiceId        String    @map("invoice_id") @db.Char(24)
-  sdcId            String?   @map("sdc_id")
-  receiptNumber    String?   @map("receipt_number")
-  receiptSignature String?   @map("receipt_signature")
-  internalData     String?   @map("internal_data")
-  mrcCode          String?   @map("mrc_code")
-  deviceId         String?   @map("device_id")
-  fiscalDate       DateTime? @map("fiscal_date") @db.Timestamptz(3)
-  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
-  company          Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  invoice          Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  id               String              @id @db.Char(24)
+  companyId        String              @map("company_id") @db.Char(24)
+  invoiceId        String              @map("invoice_id") @db.Char(24)
+  sdcId            String?             @map("sdc_id")
+  receiptNumber    String?             @map("receipt_number")
+  receiptSignature String?             @map("receipt_signature")
+  internalData     String?             @map("internal_data")
+  mrcCode          String?             @map("mrc_code")
+  deviceId         String?             @map("device_id")
+  fiscalDate       DateTime?           @map("fiscal_date") @db.Timestamptz(3)
+  submissionId     String?             @map("submission_id") @db.Char(24)
+  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company          Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoice          Invoice             @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  submission       EbmSubmissionQueue? @relation(fields: [submissionId], references: [id], onDelete: Restrict)
 
+  @@unique([companyId, submissionId])
   @@index([companyId, invoiceId])
   @@index([companyId, receiptNumber])
   @@map("invoice_receipt_metadata")
 }
 
 model InvoiceLine {
-  id           String     @id @db.Char(24)
-  companyId    String     @map("company_id") @db.Char(24)
-  invoiceId    String     @map("invoice_id") @db.Char(24)
-  lineOrder    Int        @default(0) @map("line_order")
-  lineId       String?    @map("line_id") @db.Char(24)
-  productId    String     @map("product_id") @db.Char(24)
-  productName  String?    @map("product_name")
-  productCode  String?    @map("product_code")
-  description  String?
-  qty          Decimal    @db.Decimal(19, 4)
-  qtyDelivered Decimal    @default(0) @map("qty_delivered") @db.Decimal(19, 4)
-  unit         String?
-  unitPrice    Decimal    @map("unit_price") @db.Decimal(19, 6)
-  discountPct  Decimal    @default(0) @map("discount_pct") @db.Decimal(19, 4)
-  taxRate      Decimal    @default(0) @map("tax_rate") @db.Decimal(19, 4)
-  taxCode      String     @default("A") @map("tax_code")
-  lineSubtotal Decimal    @default(0) @map("line_subtotal") @db.Decimal(19, 2)
-  lineTax      Decimal    @default(0) @map("line_tax") @db.Decimal(19, 2)
-  lineTotal    Decimal    @default(0) @map("line_total") @db.Decimal(19, 2)
-  unitCost     Decimal    @default(0) @map("unit_cost") @db.Decimal(19, 6)
-  cogsAmount   Decimal    @default(0) @map("cogs_amount") @db.Decimal(19, 2)
-  warehouseId  String?    @map("warehouse_id") @db.Char(24)
-  projectId    String?    @map("project_id") @db.Char(24)
-  qtyCredited  Decimal    @default(0) @map("qty_credited") @db.Decimal(19, 4)
-  invoice      Invoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
-  product      Product    @relation(fields: [productId], references: [id])
-  warehouse    Warehouse? @relation(fields: [warehouseId], references: [id])
-  project      Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  id            String     @id @db.Char(24)
+  companyId     String     @map("company_id") @db.Char(24)
+  invoiceId     String     @map("invoice_id") @db.Char(24)
+  lineOrder     Int        @default(0) @map("line_order")
+  lineId        String?    @map("line_id") @db.Char(24)
+  productId     String     @map("product_id") @db.Char(24)
+  productName   String?    @map("product_name")
+  productCode   String?    @map("product_code")
+  description   String?
+  qty           Decimal    @db.Decimal(19, 4)
+  qtyDelivered  Decimal    @default(0) @map("qty_delivered") @db.Decimal(19, 4)
+  unit          String?
+  unitPrice     Decimal    @map("unit_price") @db.Decimal(19, 6)
+  discountPct   Decimal    @default(0) @map("discount_pct") @db.Decimal(19, 4)
+  taxRate       Decimal    @default(0) @map("tax_rate") @db.Decimal(19, 4)
+  taxCode       String     @default("A") @map("tax_code")
+  lineSubtotal  Decimal    @default(0) @map("line_subtotal") @db.Decimal(19, 2)
+  lineTax       Decimal    @default(0) @map("line_tax") @db.Decimal(19, 2)
+  lineTotal     Decimal    @default(0) @map("line_total") @db.Decimal(19, 2)
+  unitCost      Decimal    @default(0) @map("unit_cost") @db.Decimal(19, 6)
+  cogsAmount    Decimal    @default(0) @map("cogs_amount") @db.Decimal(19, 2)
+  warehouseId   String?    @map("warehouse_id") @db.Char(24)
+  projectId     String?    @map("project_id") @db.Char(24)
+  qtyCredited   Decimal    @default(0) @map("qty_credited") @db.Decimal(19, 4)
+  serialNumbers Json       @default("[]") @map("serial_numbers")
+  invoice       Invoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product       Product    @relation(fields: [productId], references: [id])
+  warehouse     Warehouse? @relation(fields: [warehouseId], references: [id])
+  project       Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
 
   @@index([invoiceId])
   @@index([companyId, productId])
@@ -2775,6 +3458,8 @@ model ARReceipt {
   currencyCode          String                @default("RWF") @map("currency_code")
   exchangeRate          Decimal               @default(1) @map("exchange_rate") @db.Decimal(19, 6)
   reference             String?
+  posIdempotencyKey     String?               @map("pos_idempotency_key") @db.VarChar(100)
+  posRefundIdempotencyKey String?             @map("pos_refund_idempotency_key") @db.VarChar(100)
   status                String                @default("draft")
   journalEntryId        String?               @map("journal_entry_id") @db.Char(24)
   reverseJournalEntryId String?               @map("reverse_journal_entry_id") @db.Char(24)
@@ -2794,6 +3479,8 @@ model ARReceipt {
   company               Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
   @@unique([companyId, referenceNo])
+  @@unique([companyId, posIdempotencyKey], map: "ar_receipts_company_pos_idempotency_key")
+  @@unique([companyId, posRefundIdempotencyKey], map: "ar_receipts_company_pos_refund_idempotency_key")
   @@index([bankAccountId])
   @@index([companyId, clientId])
   @@index([companyId, receiptDate])
@@ -5140,8 +5827,8 @@ model EbmImportedItem {
   updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
   company             Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
-  @@unique([companyId, branchId, mode, sourceItemKey])
-  @@index([companyId, mode, confirmationStatus, importDate(sort: Desc)])
+  @@unique([companyId, branchId, mode, sourceItemKey], map: "ebm_imported_items_company_branch_mode_source_item_key_key")
+  @@index([companyId, mode, confirmationStatus, importDate(sort: Desc)], map: "ebm_imported_items_company_mode_confirmation_status_import_date")
   @@index([companyId, itemCode])
   @@map("ebm_imported_items")
 }
@@ -5168,47 +5855,175 @@ model EbmUnmatchedPurchase {
   updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
   company            Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
-  @@unique([companyId, mode, branchId, supplierTin, sellerInvoiceNo])
+  @@unique([companyId, mode, branchId, supplierTin, sellerInvoiceNo], map: "ebm_unmatched_purchases_company_id_mode_branch_id_supplier_tin_")
   @@index([companyId, mode, branchId])
   @@index([companyId, mode, status, pulledAt(sort: Desc)])
   @@map("ebm_unmatched_purchases")
 }
 
 model EbmSubmissionQueue {
-  id                       String     @id @db.Char(24)
-  companyId                String     @map("company_id") @db.Char(24)
-  documentType             String     @map("document_type")
-  documentId               String     @map("document_id") @db.Char(24)
+  id                       String                   @id @db.Char(24)
+  companyId                String                   @map("company_id") @db.Char(24)
+  documentType             String                   @map("document_type")
+  documentId               String                   @map("document_id") @db.Char(24)
+  originalSubmissionId     String?                  @map("original_submission_id") @db.Char(24)
   endpoint                 String
-  operationKey             String     @default("default") @map("operation_key")
-  correlationId            String?    @map("correlation_id")
-  environment              String     @default("legacy-unknown")
-  prerequisiteType         String?    @map("prerequisite_type")
-  prerequisiteEndpoint     String?    @map("prerequisite_endpoint")
-  prerequisiteOperationKey String?    @map("prerequisite_operation_key")
+  operationKey             String                   @default("default") @map("operation_key")
+  correlationId            String?                  @map("correlation_id")
+  environment              String                   @default("legacy-unknown")
+  prerequisiteType         String?                  @map("prerequisite_type")
+  prerequisiteEndpoint     String?                  @map("prerequisite_endpoint")
+  prerequisiteOperationKey String?                  @map("prerequisite_operation_key")
   payload                  Json
-  fiscalResponse           Json?      @map("fiscal_response")
-  sourceAppliedAt          DateTime?  @map("source_applied_at") @db.Timestamptz(3)
-  dependentsDispatchedAt   DateTime?  @map("dependents_dispatched_at") @db.Timestamptz(3)
-  ebmStatus                String     @default("pending") @map("ebm_status")
-  retryCount               Int        @default(0) @map("retry_count")
-  maxRetries               Int        @default(5) @map("max_retries")
-  nextRetryAt              DateTime?  @default(now()) @map("next_retry_at") @db.Timestamptz(3)
-  lastAttemptAt            DateTime?  @map("last_attempt_at") @db.Timestamptz(3)
-  lastError                Json       @default("{}") @map("last_error")
-  attempts                 Json       @default("[]")
-  isRetryable              Boolean    @default(true) @map("is_retryable")
-  resolvedAt               DateTime?  @map("resolved_at") @db.Timestamptz(3)
-  createdAt                DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt                DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  fiscalResponse           Json?                    @map("fiscal_response")
+  sourceAppliedAt          DateTime?                @map("source_applied_at") @db.Timestamptz(3)
+  dependentsDispatchedAt   DateTime?                @map("dependents_dispatched_at") @db.Timestamptz(3)
+  ebmStatus                String                   @default("pending") @map("ebm_status")
+  retryCount               Int                      @default(0) @map("retry_count")
+  maxRetries               Int                      @default(5) @map("max_retries")
+  nextRetryAt              DateTime?                @default(now()) @map("next_retry_at") @db.Timestamptz(3)
+  lastAttemptAt            DateTime?                @map("last_attempt_at") @db.Timestamptz(3)
+  lastError                Json                     @default("{}") @map("last_error")
+  attempts                 Json                     @default("[]")
+  isRetryable              Boolean                  @default(true) @map("is_retryable")
+  resolvedAt               DateTime?                @map("resolved_at") @db.Timestamptz(3)
+  registerId               String?                  @map("register_id") @db.Char(24)
+  shiftId                  String?                  @map("shift_id") @db.Char(24)
+  cashierId                String?                  @map("cashier_id") @db.Char(24)
+  salesTyCd                String?                  @map("sales_ty_cd") @db.VarChar(1)
+  rcptTyCd                 String?                  @map("rcpt_ty_cd") @db.VarChar(1)
+  requestPayloadHash       String?                  @map("request_payload_hash") @db.Char(64)
+  requestSentAt            DateTime?                @map("request_sent_at") @db.Timestamptz(3)
+  signedAt                 DateTime?                @map("signed_at") @db.Timestamptz(3)
+  fiscalDataSource         String?                  @map("fiscal_data_source") @db.VarChar(20)
+  managerEvidenceNote      String?                  @map("manager_evidence_note")
+  secondApproverId         String?                  @map("second_approver_id") @db.Char(24)
+  managerApprovalId        String?                  @map("manager_approval_id") @db.Char(24)
+  leaseExpiresAt           DateTime?                @map("lease_expires_at") @db.Timestamptz(3)
+  leaseToken               String?                  @map("lease_token") @db.Uuid
+  resolution               String?                  @db.VarChar(32)
+  resolutionReason         String?                  @map("resolution_reason")
+  resolvedById             String?                  @map("resolved_by_id") @db.Char(24)
+  v2ResolvedAt             DateTime?                @map("v2_resolved_at") @db.Timestamptz(3)
+  resendAuthorizedAt       DateTime?                @map("resend_authorized_at") @db.Timestamptz(3)
+  resendAuthorizedBy       String?                  @map("resend_authorized_by") @db.Char(24)
+  resendConsumedAt         DateTime?                @map("resend_consumed_at") @db.Timestamptz(3)
+  createdAt                DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(3)
   alerts                   EbmAlert[]
-  company                  Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  company                  Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register                 PosRegister?             @relation("EbmSubmissionRegister", fields: [registerId], references: [id], onDelete: Restrict)
+  shift                    PosShift?                @relation("EbmSubmissionShift", fields: [shiftId], references: [id], onDelete: Restrict)
+  managerApproval          PosManagerApproval?      @relation("EbmManualEntryApproval", fields: [managerApprovalId], references: [id], onDelete: Restrict)
+  receiptMetadata          InvoiceReceiptMetadata[]
+  receiptReprints          PosEbmReceiptReprint[]
+  originalSubmission       EbmSubmissionQueue?      @relation("EbmOriginalSubmission", fields: [originalSubmissionId], references: [id], onDelete: Restrict)
+  refundSubmissions        EbmSubmissionQueue[]     @relation("EbmOriginalSubmission")
 
   @@unique([companyId, documentType, documentId, endpoint, operationKey, environment])
+  @@unique([companyId, documentType, documentId, salesTyCd, rcptTyCd], map: "ebm_submission_queues_receipt_type_key")
   @@index([companyId, documentType])
   @@index([companyId, documentId])
   @@index([ebmStatus, isRetryable, nextRetryAt])
+  @@index([companyId, shiftId, ebmStatus])
+  @@index([companyId, registerId])
+  @@index([companyId, originalSubmissionId])
+  @@index([ebmStatus, leaseExpiresAt])
   @@map("ebm_submission_queues")
+}
+
+enum PosEbmShiftClosePolicy {
+  WARN
+  REQUIRE_APPROVAL
+  BLOCK
+}
+
+/// Company-scoped POS fiscal policy. Runtime defaults mirror these defaults when no row exists.
+model PosEbmSettings {
+  id                               String                 @id @db.Char(24)
+  companyId                        String                 @unique @map("company_id") @db.Char(24)
+  signatureWaitTimeoutSeconds      Int                    @default(10) @map("signature_wait_timeout_seconds")
+  queueWhenUnavailable             Boolean                @default(false) @map("queue_when_unavailable")
+  offlineSubmissionDeadlineMinutes Int?                   @map("offline_submission_deadline_minutes")
+  copyReceiptSubmitToVsdc          Boolean                @default(false) @map("copy_receipt_submit_to_vsdc")
+  tenderMappings                   Json                   @default("{\"CASH\":\"01\",\"CREDIT\":\"02\",\"CARD\":\"05\",\"MTN_MOMO\":\"06\",\"AIRTEL_MONEY\":\"06\"}") @map("tender_mappings")
+  splitTenderPolicy                String                 @default("LARGEST_TENDER_PROVISIONAL") @map("split_tender_policy")
+  roundingPolicy                   String                 @default("NONE") @map("rounding_policy")
+  shiftCloseFiscalPolicy           PosEbmShiftClosePolicy @default(REQUIRE_APPROVAL) @map("shift_close_fiscal_policy")
+  policyStatuses                   Json                   @default("{\"saleBeforeSignature\":\"PROVISIONAL\",\"offlineQueue\":\"PROVISIONAL\",\"copySubmission\":\"PROVISIONAL\",\"refundBeforeSignature\":\"PROVISIONAL\",\"unknownOutcome\":\"PROVISIONAL\",\"tenderMappings\":\"PROVISIONAL\",\"splitTender\":\"PROVISIONAL\",\"rounding\":\"PROVISIONAL\",\"shiftClose\":\"PROVISIONAL\"}") @map("policy_statuses")
+  createdAt                        DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                        DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company                          Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@map("pos_ebm_settings")
+}
+
+model PosEbmReceiptReprint {
+  id             String             @id @db.Char(24)
+  companyId      String             @map("company_id") @db.Char(24)
+  invoiceId      String             @map("invoice_id") @db.Char(24)
+  submissionId   String             @map("submission_id") @db.Char(24)
+  registerId     String?            @map("register_id") @db.Char(24)
+  actorUserId    String             @map("actor_user_id") @db.Char(24)
+  copyNumber     Int                @map("copy_number")
+  reason         String             @db.VarChar(500)
+  idempotencyKey String             @map("idempotency_key") @db.VarChar(100)
+  createdAt      DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoice        Invoice            @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  submission     EbmSubmissionQueue @relation(fields: [submissionId], references: [id], onDelete: Restrict)
+  register       PosRegister?       @relation(fields: [registerId], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, idempotencyKey])
+  @@unique([companyId, invoiceId, copyNumber])
+  @@index([companyId, invoiceId, createdAt])
+  @@map("pos_ebm_receipt_reprints")
+}
+
+/// Public digital receipt links. Only a SHA-256 hash is stored; the bearer
+/// token is returned once to the authorized user and is never persisted.
+model PosPublicReceiptToken {
+  id            String    @id @db.Char(24)
+  companyId     String    @map("company_id") @db.Char(24)
+  invoiceId     String    @map("invoice_id") @db.Char(24)
+  tokenHash     String    @unique(map: "pos_public_receipt_tokens_token_hash_key") @map("token_hash") @db.Char(64)
+  expiresAt     DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt     DateTime? @map("revoked_at") @db.Timestamptz(3)
+  firstViewedAt DateTime? @map("first_viewed_at") @db.Timestamptz(3)
+  lastViewedAt  DateTime? @map("last_viewed_at") @db.Timestamptz(3)
+  viewCount     Int       @default(0) @map("view_count")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  company       Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoice       Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, invoiceId, createdAt])
+  @@index([companyId, expiresAt, revokedAt])
+  @@map("pos_public_receipt_tokens")
+}
+
+/// Informational POS documents. These never enter sale, journal, stock, fiscal,
+/// or shift-total workflows.
+model PosNonPostingDocument {
+  id                 String      @id @db.Char(24)
+  companyId          String      @map("company_id") @db.Char(24)
+  registerId         String      @map("register_id") @db.Char(24)
+  createdById        String      @map("created_by_id") @db.Char(24)
+  documentNumber     String      @map("document_number") @db.VarChar(80)
+  documentType       String      @map("document_type") @db.VarChar(20)
+  status             String      @default("open") @db.VarChar(20)
+  documentData       Json        @map("document_data")
+  totalAmount        Decimal     @default(0) @map("total_amount") @db.Decimal(19, 2)
+  conversionKey      String?     @unique @map("conversion_key") @db.VarChar(100)
+  convertedInvoiceId String?     @unique @map("converted_invoice_id") @db.Char(24)
+  convertedAt        DateTime?   @map("converted_at") @db.Timestamptz(3)
+  createdAt          DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company            Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register           PosRegister @relation(fields: [registerId], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, documentNumber])
+  @@index([companyId, registerId, documentType, status, createdAt(sort: Desc)])
+  @@map("pos_non_posting_documents")
 }
 
 model EbmAlert {
@@ -5554,6 +6369,89 @@ enum EbmSequenceType {
 enum TillSessionStatus {
   open
   closed
+}
+
+enum PosSessionStatus {
+  active
+  locked
+  ended
+}
+
+enum PosShiftStatus {
+  open
+  closed
+  reopened
+}
+
+enum PosCashMovementType {
+  cash_in
+  cash_out
+  safe_drop
+  REFUND
+}
+
+enum PosPaymentMethod {
+  CASH
+  MTN_MOMO
+  AIRTEL_MONEY
+  CARD
+  BANK_TRANSFER
+  CREDIT
+  GIFT_CARD
+  STORE_CREDIT
+  LOYALTY_POINTS
+}
+
+enum PosPaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CANCELLED
+  EXPIRED
+  VOIDED
+  PENDING_VERIFICATION
+  UNMATCHED_SUCCESS
+}
+
+enum PosPaymentRefundStatus {
+  PENDING
+  DONE
+  MANUAL_DUE
+  FAILED
+}
+
+enum PosPaymentReconciliationStatus {
+  UNMATCHED
+  MATCHED
+  MISSING
+  DISPUTED
+}
+
+enum PosManualMobileMoneyMode {
+  INSTANT
+  VERIFY
+}
+
+enum PosPaymentEnvironment {
+  sandbox
+  production
+}
+
+enum PosPaymentFlow {
+  LEGACY
+  PAYMENTS_V2
+}
+
+enum PosPendingSaleExpiryPolicy {
+  SHIFT_CLOSE
+}
+
+enum PosStoredValueOperation {
+  ISSUE
+  LOAD
+  REDEEM
+  REFUND
+  ADJUST
 }
 
 enum ClientType {

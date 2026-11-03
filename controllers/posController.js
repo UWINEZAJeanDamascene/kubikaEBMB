@@ -1,7 +1,12 @@
 const Invoice = require('../models/Invoice');
 const Company = require('../models/Company');
 const ebmService = require('../services/ebmService');
+const { prisma } = require('../lib/prisma');
 const slowQueryMonitor = require('../utils/slowQueryMonitor');
+const { requestIp } = require('../services/posAuditService');
+const { createReceiptCopy } = require('../services/posReceiptReprintService');
+const { buildPosReceiptDocument } = require('../services/posReceiptDocumentService');
+const { resolveReceiptSettings } = require('../services/posReceiptSettingsService');
 const {
   extractPayloadTotals,
   formatReceiptDate,
@@ -115,19 +120,69 @@ exports.getReceipt = async (req, res, next) => {
     }
 
     const invoice = await timedQuery('pos_getReceipt_invoice', () => Invoice.findOne({ _id: invoiceId, company: companyId })
-      .populate('client', 'name contact code taxId type')
+      .populate('client', 'name contact code taxId type digitalReceiptConsent')
       .populate('createdBy', 'name email')
       .populate('lines.product', 'name sku unit ebm'));
 
     if (!invoice) return res.status(404).json({ success: false, message: 'Sale not found' });
 
-    const company = await timedQuery('pos_getReceipt_company', () => Company.findById(companyId).lean());
-    const fiscalMode = String(invoice.ebm?.fiscalEnvironment || invoice.ebm?.environment || invoice.ebm?.mode || ebmService.getConfig().mode || '').toLowerCase();
-    const qrPng = fiscalMode === 'production' && invoice.ebm?.ebmStatus === 'submitted'
-      ? await generateQrPng(invoice.ebm, { width: 110 })
+    const [company, tillSettings] = await Promise.all([
+      timedQuery('pos_getReceipt_company', () => Company.findById(companyId).lean()),
+      timedQuery('pos_getReceipt_settings', () => prisma.$queryRaw`SELECT "pos_receipt_settings" AS settings FROM "system_settings" WHERE "company_id" = ${String(companyId)} LIMIT 1`),
+    ]);
+    // V2 queue status is the source of truth for what the cashier should see
+    // while a signature is pending or held for review. Legacy invoice.ebm
+    // remains the fallback for LEGACY registers.
+    const v2Submission = req.receiptSubmission || await prisma.ebmSubmissionQueue.findFirst({
+      where: {
+        companyId: String(companyId), documentType: 'pos', documentId: String(invoiceId),
+        salesTyCd: 'N', rcptTyCd: 'S', registerId: { not: null },
+      },
+      orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }],
+    });
+    const reprintSubmission = v2Submission?.signedAt && v2Submission?.fiscalDataSource && v2Submission?.ebmStatus === 'submitted'
+      ? v2Submission : null;
+    const register = v2Submission?.registerId
+      ? await prisma.posRegister.findFirst({
+        where: { id: String(v2Submission.registerId), companyId: String(companyId) },
+        select: { name: true, branchId: true },
+      })
+      : null;
+    const { extractSaveSalesFiscalData } = require('../utils/vsdcPayloadSanitizer');
+    const signedFiscalData = reprintSubmission ? extractSaveSalesFiscalData(reprintSubmission.fiscalResponse) : null;
+    const storedSignedEbm = reprintSubmission ? {
+      ...(invoice.ebm || {}),
+      ebmStatus: 'submitted',
+      salesPayload: reprintSubmission.payload,
+      fiscalDataSource: reprintSubmission.fiscalDataSource,
+      v2SubmissionId: reprintSubmission.id,
+      environment: reprintSubmission.environment,
+      fiscalEnvironment: reprintSubmission.environment,
+      rcptNo: signedFiscalData.rcptNo,
+      curRcptNo: signedFiscalData.curRcptNo,
+      totRcptNo: signedFiscalData.totRcptNo,
+      rptNo: signedFiscalData.rptNo,
+      rcptDt: signedFiscalData.rcptDt,
+      rcptSign: signedFiscalData.rcptSign,
+      intrlData: signedFiscalData.intrlData,
+      sdcId: signedFiscalData.sdcId,
+      mrcNo: signedFiscalData.mrcNo,
+    } : v2Submission ? {
+      ...(invoice.ebm || {}),
+      ebmStatus: v2Submission.ebmStatus,
+      environment: v2Submission.environment,
+      fiscalEnvironment: v2Submission.environment,
+      fiscalDataSource: v2Submission.fiscalDataSource || null,
+      v2SubmissionId: v2Submission.id,
+      salesPayload: v2Submission.payload,
+      fiscalError: v2Submission.lastError || null,
+    } : invoice.ebm;
+    const fiscalMode = String(storedSignedEbm?.fiscalEnvironment || storedSignedEbm?.environment || storedSignedEbm?.mode || ebmService.getConfig().mode || '').toLowerCase();
+    const qrPng = fiscalMode === 'production' && storedSignedEbm?.ebmStatus === 'submitted'
+      ? await generateQrPng(storedSignedEbm, { width: 110 })
       : null;
     const data = invoice.toObject({ virtuals: true });
-    data.ebm = data.ebm || {};
+    data.ebm = storedSignedEbm || {};
     data.ebm.environment = data.ebm.fiscalEnvironment || data.ebm.environment || fiscalMode || null;
     data.ebm.fiscalEnvironment = data.ebm.fiscalEnvironment || fiscalMode || null;
     const ebmStatus = data.ebm.ebmStatus || 'not_submitted';
@@ -140,8 +195,22 @@ exports.getReceipt = async (req, res, next) => {
         ? company.address
         : [company?.address?.street, company?.address?.city, company?.address?.country].filter(Boolean).join(', '),
       phone: company?.phone || '',
+      logo: company?.logo_url || '',
     };
+    data.receiptSettings = resolveReceiptSettings(
+      tillSettings?.[0]?.settings,
+      register?.branchId || invoice.warehouseId || null,
+    );
+    data.receiptSettings.logoUrl ||= data.companyReceipt.logo;
     data.receiptPrintedAt = new Date();
+    data.copyAvailable = Boolean(reprintSubmission?.signedAt && reprintSubmission?.fiscalDataSource && signedFiscalData?.rcptSign && signedFiscalData?.rcptNo);
+    data.receiptCopy = req.receiptCopy ? {
+      isCopy: true,
+      label: 'COPY',
+      copyNumber: Number(req.receiptCopy.copyNumber),
+      printedAt: req.receiptCopy.createdAt,
+      replayed: Boolean(req.receiptCopyReplay),
+    } : null;
     data.discountAmount = Number(data.totalDiscount) || 0;
     data.discountAmountRwf = formatRwf(data.discountAmount);
     data.promotionLabel = data.posPromotion?.name || data.posPromotion?.code || null;
@@ -150,7 +219,7 @@ exports.getReceipt = async (req, res, next) => {
       const fiscalLine = data.ebm?.salesPayload?.itemList?.[index] || {};
       const itemName = line.product?.name || line.productName || line.description || 'Item';
       return {
-        itemName,
+        itemName: (reprintSubmission && fiscalLine.itemNm) || itemName,
         itemCode: fiscalLine.itemCd || line.productCode || line.product?.sku || null,
         taxClassCode: fiscalLine.itemClsCd || line.product?.ebm?.itemClsCd || null,
         barcode: fiscalLine.bcd || line.product?.barcode || null,
@@ -165,15 +234,15 @@ exports.getReceipt = async (req, res, next) => {
         insuranceName: fiscalLine.isrccNm || null,
         insuranceRate: fiscalLine.isrccRt ?? null,
         insuranceAmount: fiscalLine.isrccAmt ?? null,
-        quantity: line.quantity || line.qty || 0,
+        quantity: reprintSubmission && fiscalLine.qty != null ? fiscalLine.qty : (line.quantity || line.qty || 0),
         unit: getReceiptUnit(itemName, line.unit || line.product?.unit),
-        unitPriceRwf: formatRwf(line.unitPrice),
+        unitPriceRwf: formatRwf(reprintSubmission && fiscalLine.prc != null ? fiscalLine.prc : line.unitPrice),
         taxType: tax.taxTyCd,
         taxRate: fiscalLine.taxRt ?? line.taxRate ?? null,
         taxTypeLabel: tax.taxTypeLabel,
-        taxableAmountRwf: tax.taxableAmount == null ? 'Not recorded' : formatRwf(tax.taxableAmount),
-        vatAmountRwf: tax.vatAmount == null ? 'Not recorded' : formatRwf(tax.vatAmount),
-        lineTotalRwf: tax.lineTotal == null ? 'Not recorded' : formatRwf(tax.lineTotal),
+        taxableAmountRwf: reprintSubmission && fiscalLine.taxblAmt != null ? formatRwf(fiscalLine.taxblAmt) : (tax.taxableAmount == null ? 'Not recorded' : formatRwf(tax.taxableAmount)),
+        vatAmountRwf: reprintSubmission && fiscalLine.taxAmt != null ? formatRwf(fiscalLine.taxAmt) : (tax.vatAmount == null ? 'Not recorded' : formatRwf(tax.vatAmount)),
+        lineTotalRwf: reprintSubmission && fiscalLine.totAmt != null ? formatRwf(fiscalLine.totAmt) : (tax.lineTotal == null ? 'Not recorded' : formatRwf(tax.lineTotal)),
       };
     });
     const salesPayload = data.ebm.salesPayload || {};
@@ -198,6 +267,10 @@ exports.getReceipt = async (req, res, next) => {
       totalVatRwf: formatRwf(totals.totTaxAmt),
       grandTotalRwf: formatRwf(totals.totAmt),
     };
+    const recordedChangePayments = (data.payments || []).filter((payment) => payment.changeGiven != null);
+    const recordedChange = recordedChangePayments.length
+      ? recordedChangePayments.reduce((sum, payment) => sum + (Number(payment.changeGiven) || 0), 0)
+      : null;
     data.paymentReceipt = {
       methods: (data.payments || []).filter((payment) => Number(payment.amount) > 0).map((payment) => ({
         method: String(payment.paymentMethod || 'cash').replace(/_/g, ' '),
@@ -205,8 +278,7 @@ exports.getReceipt = async (req, res, next) => {
         reference: payment.reference || null,
       })),
       amountPaidRwf: formatRwf(data.amountPaid),
-      changeGivenRwf: formatRwf((data.payments || []).reduce((sum, payment) => sum + (Number(payment.changeGiven) || 0), 0)
-        || Math.max(0, Number(data.amountPaid || 0) - Number(data.grandTotal || data.totalAmount || 0))),
+      changeGivenRwf: recordedChange == null ? null : formatRwf(recordedChange),
     };
     data.ebm.rcptNoDisplay = data.ebm.rcptNo == null ? null : String(data.ebm.rcptNo);
     data.ebm.rcptDtDisplay = data.ebm.rcptDt ? formatReceiptDate(data.ebm.rcptDt) : null;
@@ -215,9 +287,44 @@ exports.getReceipt = async (req, res, next) => {
     data.ebm.qrCodeDataUrl = qrPng ? `data:image/png;base64,${qrPng.toString('base64')}` : null;
     data.ebm.qrPlaceholder = qrPng || ebmStatus === 'submitted' ? null : 'No RRA QR response';
     data.customerTinDisplay = data.customerTin || data.client?.taxId || null;
+    data.registerName = register?.name || data.registerName || null;
+    data.receiptDocument = buildPosReceiptDocument(data, {
+      registerName: data.registerName || null,
+      tillType: data.tillType || 'retail',
+    });
 
     res.json({ success: true, data });
   } catch (error) {
     next(error);
+  }
+};
+
+exports.reprintReceipt = async (req, res, next) => {
+  try {
+    const companyId = req.user?.company?._id || req.user?.companyId;
+    const actorUserId = req.posAuthContext?.user?.id || req.user?._id || req.user?.id;
+    const invoiceId = req.params.invoiceId;
+    const sessionCompanyId = req.posAuthContext?.company?.id;
+    const sessionRegisterId = req.posAuthContext?.session?.registerId;
+    if (sessionCompanyId && String(sessionCompanyId) !== String(companyId)) {
+      return res.status(403).json({ success: false, code: 'POS_RECEIPT_COMPANY_MISMATCH', message: 'This POS session cannot reprint receipts for another company.' });
+    }
+    if (req.body?.registerId && sessionRegisterId && String(req.body.registerId) !== String(sessionRegisterId)) {
+      return res.status(403).json({ success: false, code: 'POS_RECEIPT_REGISTER_MISMATCH', message: 'This POS session cannot reprint receipts for another register.' });
+    }
+    const idempotencyKey = req.get?.('Idempotency-Key') || req.headers?.['idempotency-key'];
+    const result = await createReceiptCopy({
+      companyId, invoiceId, actorUserId, idempotencyKey,
+      reason: req.body?.reason,
+      registerId: sessionRegisterId || req.body?.registerId || null,
+      reqIp: requestIp(req),
+    });
+    req.receiptSubmission = result.submission;
+    req.receiptCopy = result.reprint;
+    req.receiptCopyReplay = result.replayed;
+    return exports.getReceipt(req, res, next);
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ success: false, code: error.code, message: error.message });
+    return next(error);
   }
 };

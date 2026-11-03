@@ -19,6 +19,9 @@ const DEFAULT_PRODUCT_SELECT = { id: true, name: true, sku: true, barcode: true,
 const CLIENT_SELECT_FIELDS = new Set([
   'name', 'code', 'type', 'contact', 'taxId', 'paymentTerms', 'isActive',
   'outstandingBalance', 'creditLimit', 'notes', 'region', 'industry',
+  // Receipt delivery UI and public receipt authorization read this persisted
+  // customer preference from the populated invoice client.
+  'digitalReceiptConsent',
 ]);
 const SUPPLIER_SELECT_FIELDS = new Set([
   'name', 'code', 'contact', 'taxId', 'paymentTerms', 'isActive', 'region',

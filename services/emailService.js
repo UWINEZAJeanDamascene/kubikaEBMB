@@ -59,7 +59,7 @@ const sendEmail = async (to, subject, html, { text, attachments, retries } = {})
   const validRecipients = recipients.filter(isValidEmail);
 
   if (validRecipients.length === 0) {
-    console.warn('❌ sendEmail: no valid recipients —', to);
+    console.warn('Email not sent: no valid recipients.');
     return false;
   }
 
@@ -79,10 +79,10 @@ const sendEmail = async (to, subject, html, { text, attachments, retries } = {})
       const transporter = getTransporter();
       const delivery = await transporter.sendMail(mailOptions);
       if (delivery?.messageId === 'skipped' || (Array.isArray(delivery?.accepted) && delivery.accepted.length === 0)) {
-        console.warn(`[Mailer] Provider did not accept the message for ${validRecipients.join(', ')}`);
+        console.warn('[Mailer] Provider did not accept the message.');
         return false;
       }
-      console.log(`📧 Email sent to: ${validRecipients.join(', ')}`);
+      console.log('Email accepted by provider.');
       return true;
     } catch (error) {
       const isLast = attempt === maxAttempts;
@@ -91,15 +91,12 @@ const sendEmail = async (to, subject, html, { text, attachments, retries } = {})
         ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'ESOCKET'].includes(error.code);
 
       if (isLast || !isTransient) {
-        console.error(
-          `❌ Email failed [attempt ${attempt}/${maxAttempts}] to=${validRecipients.join(',')} subject="${subject}":`,
-          error.message
-        );
+        console.error(`Email failed [attempt ${attempt}/${maxAttempts}].`);
         return false;
       }
 
       const delay = RETRY_BASE_MS * Math.pow(2, attempt - 1);
-      console.warn(`⚠️  Email retry ${attempt}/${maxAttempts} in ${delay}ms — ${error.message}`);
+      console.warn(`Email retry ${attempt}/${maxAttempts} in ${delay}ms.`);
       await sleep(delay);
     }
   }

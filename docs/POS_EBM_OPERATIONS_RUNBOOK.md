@@ -24,6 +24,54 @@ Default thresholds are:
 
 Operators can tune these server environment variables: `POS_TILL_LARGE_VARIANCE_THRESHOLD_RWF`, `POS_CHECKOUT_ALERT_MIN_SAMPLES`, `POS_CHECKOUT_5XX_ALERT_PCT`, `POS_EBM_SLO_TARGET_PCT`, `POS_EBM_SLO_TARGET_SECONDS`, `POS_EBM_LAG_WARNING_SECONDS`, and `POS_EBM_LAG_CRITICAL_SECONDS`. Restart the API after changing them. Dashboard alerts are visible to platform administrators while viewing System Health; route these signals to an external paging system if unattended notification is required.
 
+## Manual mobile-money operations
+
+MTN MoMo and Airtel Money are manual-only. No provider credentials, sandbox provisioning, outbound payment request, status polling, webhook, or callback is used. The former automatic request/status endpoints return `Automatic confirmation is not set up yet.` The provider interface remains available for a future implementation, but API mode is not available.
+
+A POS payment settings manager configures the company’s receiving number or merchant code, enables each provider for the company and register, and chooses **VERIFY** (manager confirmation required before sale completion or shift close) or **INSTANT** (counts as received immediately). Cashiers see the shop receiving details and exact balance due, check the SMS or MoMo app, record the transaction ID, optionally enter the payer phone, and confirm receipt. Amounts must be whole RWF and exactly equal the amount due. Transaction IDs are normalized and unique per company and provider.
+
+Managers use the reconciliation panel to filter payments by day, provider, cashier, and status; review provider totals and cashier/status reports; and mark payments MATCHED, MISSING, or DISPUTED. Reconciliation does not create accounting entries. CSV statement import is not available yet. Successful manual payments post to the provider-specific mobile-money clearing account in the single POS V2 completion journal. Mobile-money refunds are sent from the shop wallet, then recorded on the manager refund task with the refund transaction ID; cash refunds are not created.
+
+## Gift card operations (POS API)
+
+- Check a card with `GET /api/pos/payments/gift-cards/:code/balance`. This requires an authenticated POS session with gift-card redemption permission and returns the balance, currency, expiry, and last four code characters.
+- Issue or load a card with `POST /api/pos/payments/gift-cards` and an `Idempotency-Key`. Use `operation: "ISSUE"` with an amount and reason to create a card, or `operation: "LOAD"` with the existing card code, amount, and reason. Issue may include an expiry date; load may not. Both operations accept whole-RWF amounts, require an open shift and enabled cash tender, record cash-in and gift-card liability, and require gift-card management permission.
+- An issue response includes the new card code once. An idempotent retry returns the prior result without exposing the code again; securely give the original code to the customer and do not rely on retrying to retrieve it.
+- Redeem through `POST /api/pos/payments-v2/sales/:saleId/payments` using a `GIFT_CARD` allocation and the card code. The POS checks expiry, currency, customer assignment, and available balance; the balance change, payment, and ledger record are committed together.
+- If an issue response is lost, do not issue a replacement with a new key until the original result is reconciled. Use the same key to check for a replay, then escalate if the code is no longer available.
+
+## Running the PostgreSQL gift-card concurrency test
+
+By default, the integration test only accepts `POS_TEST_DATABASE_URL` pointed at a local PostgreSQL database whose name ends in `_test`. For a normal local database, opt in explicitly with `POS_TEST_ALLOW_LOCAL_DATABASE=true`; it still refuses non-local hosts. The test creates temporary rows in the selected database and deletes them afterward. Do not use a production or shared database.
+
+In PowerShell, for the normal local database configured in `.env`, use:
+
+```powershell
+$env:POS_TEST_ALLOW_LOCAL_DATABASE = 'true'
+npm run test:pos-gift-card-concurrency
+$testExitCode = $LASTEXITCODE
+Remove-Item Env:POS_TEST_ALLOW_LOCAL_DATABASE
+if ($testExitCode -ne 0) { exit $testExitCode }
+```
+
+With that opt-in, the test loads `DATABASE_URL` from the process environment or `.env`, verifies the host is loopback, and does not apply migrations. If required POS tables are missing, stop and review the local migration status rather than running migrations against a shared database. The suite calls the real POS controllers to cover competing redemptions, ten simultaneous small redemptions, same-key retry, a redemption racing a refund, transactional rollback after a forced ledger failure, company isolation, concurrent/replayed sale cancellation, missing/reversed/mismatched completion redemptions, and shift-close blocking. It checks ledger totals against account balances after each scenario. Every scenario uses tagged fixture rows and removes them in `finally`; the rollback scenario also removes its temporary PostgreSQL trigger and function.
+
+The rollback check targets the transaction boundary that exists in Payments V2: gift cards are debited when payment is recorded. A later sale-completion failure therefore must leave the already-recorded payment intact; it cannot roll back a payment committed earlier. The `posE2eCheckout.test.js` suite exercises the completion controller/service with mocked persistence boundaries. The PostgreSQL-backed downstream posting test is separate: it uses the real completion controller, sale controller, journal service, inventory models, and database transaction; it forces a journal insert failure, then retries twice concurrently with the same key and verifies the rollback and single committed journal, stock deduction, and EBM dispatch. The test only mocks EBM/notification boundaries and cleans up tagged rows and its temporary trigger in `finally`. Run it against a local test database with:
+
+```powershell
+$env:POS_TEST_ALLOW_LOCAL_DATABASE = 'true'
+npm run test:pos-sale-completion-integration
+$testExitCode = $LASTEXITCODE
+Remove-Item Env:POS_TEST_ALLOW_LOCAL_DATABASE
+if ($testExitCode -ne 0) { exit $testExitCode }
+```
+
+For the focused mocked controller/service test, run:
+
+```powershell
+npm test -- --runInBand --runTestsByPath .\test\posE2eCheckout.test.js
+```
+
 ## 1. EBM queue item failed
 
 ### Triage
@@ -66,7 +114,9 @@ If no separate manager with close permission is available, the shift is already 
 
 ### End-of-shift Z-report
 
-After closing a shift, open **Recent shift reconciliations** and select **Z-report** for that closed shift. The report is linked to the till session and includes sales, discounts, tenders by method, POS refunds, voided invoices, tax buckets, opening float, cash retained from sales, cash refunds, expected drawer cash, physical count, and variance. A cash ledger difference is a review signal: compare the report with the recorded cash activity and linked invoice/refund records before signing off. POS credit-note refunds must be recorded while the cashier has an open till so the refund is attributed to that shift; cash refunds reduce expected drawer cash.
+Use **View X-report** during an open shift for a live preview; it does not show close time, counted cash, variance, a Z number, or a FINAL label. After closing, open **Recent shift reconciliations** and select **Reprint Z**. The immutable Z snapshot is labeled **FINAL** and includes business name/TIN, branch and register, shift number, cashiers, timestamps, opening float, gross sales, discounts, tax and net sales, refunds, EBM tax-code/rate buckets, payment totals (cash, MoMo, Airtel, card, credit, gift card, and explicitly unspecified mobile money), cash in/out/safe drops, expected and counted cash, difference, void count/amount, no-sale drawer openings, and per-cashier sales/refund subtotals. Select **Screen layout**, **Thermal · 58 mm**, or **Thermal · 80 mm** before printing.
+
+Mobile-money provider is captured when selected in the POS payment form. Older payments without provider metadata remain listed as **Mobile money (unspecified)** rather than being guessed as MoMo or Airtel. No-sale drawer openings require one-time manager approval and are counted after recording. A cash ledger difference is a review signal: compare the report with recorded cash activity and linked invoice/refund records before signing off. POS cash movements are attributed only through invoice-linked POS shifts (never by guessing from register/time overlap). POS credit-note refunds must be recorded while the cashier has an open till so the refund is attributed to that shift; cash refunds reduce expected drawer cash.
 
 ## 3. POS idempotency conflict or checkout pending
 

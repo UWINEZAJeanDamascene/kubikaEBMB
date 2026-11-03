@@ -476,6 +476,88 @@ exports.getCompanyUsers = async (req, res) => {
   }
 };
 
+/** PATCH /api/companies/:id/users/:userId/role — platform_admin recovery control */
+exports.changeCompanyUserRole = async (req, res) => {
+  try {
+    const companyId = toIdString(req.params.id);
+    const userId = toIdString(req.params.userId);
+    const roleName = String(req.body?.role || '').trim();
+    const reason = String(req.body?.reason || '').trim();
+    if (!roleName || roleName.length > 80 || reason.length < 5 || reason.length > 500) {
+      return res.status(400).json({
+        success: false,
+        code: 'PLATFORM_ROLE_CHANGE_INVALID',
+        message: 'Choose a role and enter a reason of at least 5 characters.',
+      });
+    }
+    if (['platform_admin', 'super_admin'].includes(roleName.toLowerCase())) {
+      return res.status(400).json({
+        success: false,
+        code: 'PLATFORM_ROLE_ASSIGNMENT_FORBIDDEN',
+        message: 'Company users cannot be assigned a platform-owner role from this control.',
+      });
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const company = await tx.company.findUnique({ where: { id: companyId }, select: { id: true } });
+      if (!company) return { error: [404, 'COMPANY_NOT_FOUND', 'Company was not found.'] };
+      const user = await tx.user.findFirst({
+        where: { id: userId, companyId },
+        select: { id: true, name: true, email: true, role: true, isActive: true },
+      });
+      if (!user) return { error: [404, 'COMPANY_USER_NOT_FOUND', 'This user does not belong to the selected company.'] };
+      const role = await tx.role.findFirst({
+        where: {
+          name: { equals: roleName, mode: 'insensitive' },
+          OR: [{ isSystemRole: true }, { companyId }],
+        },
+        select: { id: true, name: true },
+      });
+      if (!role) return { error: [400, 'COMPANY_ROLE_NOT_FOUND', 'Choose a role that exists for this company.'] };
+      if (user.role === role.name) return { user: { ...user, role: role.name }, previousRole: user.role, unchanged: true };
+
+      const updated = await tx.user.update({
+        where: { id: user.id },
+        data: {
+          role: role.name,
+          roles: { deleteMany: {}, create: [{ roleId: role.id }] },
+        },
+        select: { id: true, name: true, email: true, role: true, isActive: true },
+      });
+      return { user: updated, previousRole: user.role, unchanged: false };
+    });
+    if (result.error) {
+      const [status, code, message] = result.error;
+      return res.status(status).json({ success: false, code, message });
+    }
+
+    if (!result.unchanged) {
+      await AuditLogService.log({
+        companyId,
+        userId: req.user._id,
+        action: 'company_user.role_changed_by_platform_owner',
+        entityType: 'user',
+        entityId: result.user.id,
+        changes: {
+          targetName: result.user.name,
+          targetEmail: result.user.email,
+          previousRole: result.previousRole,
+          newRole: result.user.role,
+          reason,
+        },
+      });
+    }
+    return res.json({
+      success: true,
+      message: result.unchanged ? 'This user already has that role.' : 'Company role updated.',
+      data: { ...result.user, _id: result.user.id },
+    });
+  } catch (error) {
+    console.error('changeCompanyUserRole error:', error);
+    return res.status(500).json({ success: false, message: 'Could not update this company user role.' });
+  }
+};
+
 /** PUT /api/companies/:id/approve — platform_admin */
 exports.approveCompany = async (req, res) => {
   try {

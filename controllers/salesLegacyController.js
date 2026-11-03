@@ -9,7 +9,6 @@ const { findClaimedRegister, registerClaimRequiredError } = require('../services
 const StockLevel = require('../models/StockLevel');
 const StockSerialNumber = require('../models/StockSerialNumber');
 const StockBatch = require('../models/StockBatch');
-const InventoryBatch = require('../models/InventoryBatch');
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -17,17 +16,6 @@ function escapeRegex(value) {
 
 function isObjectIdString(value) {
   return /^[0-9a-fA-F]{24}$/.test(String(value || '').trim());
-}
-
-function resolveProductTaxRate(product) {
-  const configuredRate = Number(product?.taxRate);
-  if (Number.isFinite(configuredRate) && configuredRate > 0) return configuredRate;
-  const taxCode = String(product?.taxCode || product?.ebm?.taxTyCd || product?.ebm?.taxTypeCode || '').trim().toUpperCase();
-  return taxCode === 'B' ? 18 : 0;
-}
-
-function roundMoney(value) {
-  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
 const { runInTransaction } = require('../services/transactionService');
@@ -39,151 +27,37 @@ const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { createHash, randomBytes } = require('crypto');
 const { dbClient } = require('../lib/prisma');
 const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
+const { writePosAuditLog, requestIp } = require('../services/posAuditService');
 const ebmService = require('../services/ebmService');
 const EBMSalesService = require('../services/ebmSalesService');
 const { verifyCapability: verifyPosOfflineCapability } = require('../services/posOfflineCapabilityService');
 const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
 const { getWarehouseTransferVisibility } = require('../services/posTransferVisibilityService');
 const notificationDeliveryService = require('../services/notificationDeliveryService');
+const posPaymentService = require('../services/posPaymentService');
+const {
+  calculatePosLineAmounts,
+  hashPosSalePayload,
+  lineValuesMatch,
+  pendingCheckoutPayload,
+  resolveProductTaxRate,
+  roundMoney,
+} = require('../services/posCheckoutCoreService');
 
-function hashPosSalePayload(payload) {
-  const canonical = { ...(payload || {}) };
-  // Device claim is an authorization context, not part of the sale itself.
-  // Excluding it keeps already-saved offline/idempotent checkout keys replayable.
-  delete canonical.deviceId;
-  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
-}
+const { consumeTrackedBatches, findAvailableSerialsOutsideQuarantine } = require('../services/posTrackedStockService');
 
-async function consumeTrackedBatches(companyId, productId, warehouseId, quantity, session) {
-  const batches = await StockBatch.find({
-    company: companyId,
-    product: productId,
-    warehouse: warehouseId,
-    qtyOnHand: { $gt: 0 },
-    isQuarantined: false,
-  }).sort({ expiryDate: 1, createdAt: 1 }).session(session);
-  const eligible = batches.filter((batch) => !batch.expiryDate || new Date(batch.expiryDate) >= new Date());
-  const available = eligible.reduce((sum, batch) => sum + Number(batch.qtyOnHand || 0), 0);
-  if (available < quantity) {
-    const error = new Error(`Insufficient non-quarantined, non-expired batch stock. Available: ${available}, required: ${quantity}`);
-    error.code = 'INSUFFICIENT_STOCK';
-    throw error;
-  }
-
-  let remaining = quantity;
-  const allocations = [];
-  let totalCost = 0;
-  for (const batch of eligible) {
-    if (remaining <= 0) break;
-    const taken = Math.min(remaining, Number(batch.qtyOnHand || 0));
-    if (taken <= 0) continue;
-    batch.qtyOnHand = Number(batch.qtyOnHand) - taken;
-    await batch.save({ session });
-    const unitCost = Number(batch.unitCost || 0);
-    allocations.push({ batchNo: batch.batchNo, quantity: taken, unitCost });
-    totalCost += taken * unitCost;
-
-    let batchRemaining = taken;
-    const legacyBatches = await InventoryBatch.find({
-      company: companyId, product: productId, warehouse: warehouseId,
-      batchNumber: batch.batchNo, availableQuantity: { $gt: 0 },
-    }).sort({ receivedDate: 1 }).session(session);
-    for (const legacy of legacyBatches) {
-      if (batchRemaining <= 0) break;
-      const legacyTake = Math.min(batchRemaining, Number(legacy.availableQuantity || 0));
-      legacy.availableQuantity = Number(legacy.availableQuantity) - legacyTake;
-      legacy.quantity = Math.max(0, Number(legacy.quantity || 0) - legacyTake);
-      legacy.totalCost = Number(legacy.quantity) * Number(legacy.unitCost || 0);
-      legacy.updateStatus?.();
-      await legacy.save({ session });
-      batchRemaining -= legacyTake;
-    }
-    remaining -= taken;
-  }
-  return { allocations, totalCost, quantity };
-}
-
-async function findAvailableSerialsOutsideQuarantine({ companyId, productId, warehouseId, serialNumbers }) {
-  const pageSize = 500;
-  const candidates = [];
-  for (let offset = 0; offset < serialNumbers.length; offset += pageSize) {
-    const serialChunk = serialNumbers.slice(offset, offset + pageSize);
-    const rows = await StockSerialNumber.find({
-      company: companyId,
-      product: productId,
-      warehouse: warehouseId,
-      serialNo: { $in: serialChunk },
-      status: { $in: ['in_stock', 'returned'] },
-    }).select('_id serialNo batch').limit(serialChunk.length).lean();
-    candidates.push(...rows);
-  }
-
-  const batchIds = [...new Set(candidates
-    .map((serial) => String(serial.batch?._id || serial.batch?.id || serial.batch || ''))
-    .filter(Boolean))];
-  const quarantinedBatchIds = new Set();
-  for (let offset = 0; offset < batchIds.length; offset += pageSize) {
-    const batchChunk = batchIds.slice(offset, offset + pageSize);
-    const rows = await StockBatch.find({
-      company: companyId,
-      _id: { $in: batchChunk },
-      isQuarantined: true,
-      qtyOnHand: { $gt: 0 },
-    }).select('_id').limit(batchChunk.length).lean();
-    for (const batch of rows) quarantinedBatchIds.add(String(batch._id));
-  }
-
-  return candidates.filter((serial) => {
-    const batchId = String(serial.batch?._id || serial.batch?.id || serial.batch || '');
-    return !batchId || !quarantinedBatchIds.has(batchId);
-  });
-}
+const { replayPosSale } = require('../services/posSaleReplayService');
 
 async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash }) {
-  if (!requestKey) return false;
-  const rows = await dbClient().$queryRawUnsafe(
-    'SELECT request_key AS "requestKey", created_by_id AS "createdById", payload_hash AS "payloadHash", invoice_id AS "invoiceId", status FROM pos_sale_requests WHERE company_id = $1 AND request_key = $2 LIMIT 1',
-    String(companyId), requestKey,
-  );
-  const record = rows[0];
-  if (!record) return false;
-
-  if (String(record.createdById) !== String(req.user.id) || record.payloadHash !== payloadHash) {
-    res.status(409).json({
-      success: false,
-      code: 'POS_IDEMPOTENCY_KEY_CONFLICT',
-      message: 'This checkout key was already used for a different sale. Resolve the previous attempt before starting another.',
-    });
-    return true;
-  }
-  if (record.status !== 'completed' || !record.invoiceId) {
-    res.status(409).json({
-      success: false,
-      code: 'POS_SALE_STILL_PROCESSING',
-      message: 'This sale is still being resolved. Retry the same checkout shortly; do not start a new sale yet.',
-    });
-    return true;
-  }
-
-  const invoice = await Invoice.findOne({ _id: record.invoiceId, company: companyId })
-    .populate('client lines.product createdBy');
-  if (!invoice) {
-    res.status(409).json({
-      success: false,
-      code: 'POS_IDEMPOTENT_SALE_UNAVAILABLE',
-      message: 'The previous checkout was recorded, but its invoice is unavailable. Contact an administrator before retrying.',
-    });
-    return true;
-  }
-  const tendered = Array.isArray(req.body?.payments) && req.body.payments.length
-    ? req.body.payments.reduce((sum, payment) => sum + (Number(payment?.amount) || 0), 0)
-    : Number(req.body?.paymentAmount) || 0;
-  const total = Number(invoice.grandTotal ?? invoice.totalAmount) || 0;
-  const cashTendered = Array.isArray(req.body?.payments) && req.body.payments.length
-    ? req.body.payments.filter((payment) => payment?.paymentMethod === 'cash').reduce((sum, payment) => sum + (Number(payment?.amount) || 0), 0)
-    : req.body?.paymentMethod === 'cash' ? tendered : 0;
-  const changeDue = cashTendered >= Math.max(0, tendered - total) ? Math.max(0, tendered - total) : 0;
-  res.status(200).json({ success: true, message: 'This checkout was already completed.', data: invoice, changeDue, replayed: true });
+  const replay = await replayPosSale({
+    companyId,
+    requestKey,
+    payloadHash,
+    cashierId: String(req.posAuthContext?.session?.userId || req.user.id),
+    body: req.body,
+  });
+  if (!replay.handled) return false;
+  res.status(replay.status).json(replay.body);
   return true;
 }
 
@@ -194,7 +68,10 @@ const sendDirectSaleEmail = async (invoice, companyId, { explicit = false } = {}
       return;
     }
     const invoiceWithProducts = await Invoice.findById(invoice._id).populate('items.product', 'name');
-    await notificationDeliveryService.sendInvoiceDelivery(invoiceWithProducts || invoice, companyId, { explicit });
+    await notificationDeliveryService.sendInvoiceDelivery(invoiceWithProducts || invoice, companyId, {
+      explicit,
+      requireDigitalReceiptConsent: true,
+    });
   } catch (err) {
     console.error('[Direct Sale Email] Failed:', err.message);
   }
@@ -207,7 +84,7 @@ const sendDirectSaleEmail = async (invoice, companyId, { explicit = false } = {}
  *
  * This is the only supported POS sale write path. POST /api/pos/sale is retired.
  *
- * Workflow: Invoice (Direct) → Payment
+ * Workflow: Invoice (Direct) Ã¢â€ â€™ Payment
  * No quotation, no sales order, no delivery note
  * Stock decrement happens immediately via WAC/FIFO
  * Journals posted: Dr Receivable / Cr Revenue + Dr COGS / Cr Inventory
@@ -217,6 +94,9 @@ exports.createDirectSale = async (req, res, next) => {
   let requestKey = '';
   let payloadHash = '';
   let offlineContext = null;
+  let createdPending = false;
+  let completionReplayed = false;
+  let proformaDocument = null;
   try {
     companyId = req.user.company._id;
     // Mock mode is intentionally manual so development/test checkouts never
@@ -224,14 +104,92 @@ exports.createDirectSale = async (req, res, next) => {
     // are submitted after the sale transaction commits.
     const fiscalMode = String(ebmService.getConfig().mode || 'mock').toLowerCase();
     const autoFiscalSubmission = fiscalMode !== 'mock';
-    requestKey = String(req.get('Idempotency-Key') || '').trim();
+    const proformaDocumentId = String(req.body?.proformaDocumentId || '').trim();
+    if (proformaDocumentId) {
+      proformaDocument = await dbClient().posNonPostingDocument.findFirst({ where: { id: proformaDocumentId, companyId: String(companyId) } });
+      if (!proformaDocument || proformaDocument.documentType !== 'PROFORMA') {
+        return res.status(404).json({ success: false, code: 'POS_PROFORMA_NOT_FOUND', message: 'Proforma was not found for this company.' });
+      }
+      if (!['open', 'converted'].includes(proformaDocument.status)) {
+        return res.status(409).json({ success: false, code: 'POS_PROFORMA_NOT_OPEN', message: 'This proforma cannot be converted.' });
+      }
+      const savedDocument = proformaDocument.documentData || {};
+      const requestedLines = Array.isArray(req.body?.items) ? req.body.items : [];
+      const savedLines = Array.isArray(savedDocument.items) ? savedDocument.items : [];
+      const sameLines = requestedLines.length === savedLines.length && savedLines.every((savedLine, index) => {
+        const requestedLine = requestedLines[index] || {};
+        const sameNumber = (left, right) => Math.abs(Number(left || 0) - Number(right || 0)) <= 0.005;
+        const requestedSerials = Array.isArray(requestedLine.serialNumbers) ? requestedLine.serialNumbers.map(String) : [];
+        const savedSerials = Array.isArray(savedLine.serialNumbers) ? savedLine.serialNumbers.map(String) : [];
+        return String(requestedLine.productId || requestedLine._id || '') === String(savedLine.productId)
+          && sameNumber(requestedLine.quantity ?? requestedLine.cartQuantity, savedLine.quantity)
+          && sameNumber(requestedLine.unitPrice ?? requestedLine.cartUnitPrice, savedLine.unitPrice)
+          && sameNumber(requestedLine.discountPct ?? requestedLine.cartDiscountPct, savedLine.discountPct)
+          && JSON.stringify(requestedSerials) === JSON.stringify(savedSerials);
+      });
+      if (!sameLines || String(req.body?.warehouseId || '') !== String(savedDocument.warehouseId || '')) {
+        return res.status(409).json({ success: false, code: 'POS_PROFORMA_CART_CHANGED', message: 'The cart or warehouse changed after this proforma was saved. Clear the proforma selection and review the sale.' });
+      }
+      req.body = {
+        ...req.body,
+        items: (savedDocument.items || []).map((item) => ({
+          productId: item.productId, quantity: item.quantity, unitPrice: item.unitPrice,
+          discountPct: item.discountPct, serialNumbers: item.serialNumbers || [],
+        })),
+        warehouseId: savedDocument.warehouseId,
+        clientId: savedDocument.clientId || undefined,
+        clientInfo: savedDocument.clientInfo || undefined,
+      };
+    }
+    requestKey = req.posV2Completion ? '' : String(proformaDocument?.conversionKey || req.get('Idempotency-Key') || '').trim();
     if (requestKey && !/^[a-zA-Z0-9_-]{16,100}$/.test(requestKey)) {
       return res.status(400).json({ success: false, code: 'POS_INVALID_IDEMPOTENCY_KEY', message: 'Checkout idempotency key is invalid.' });
     }
     const requestedRegisterId = String(req.body.registerId || '');
     const claimedRegister = await findClaimedRegister(companyId, requestedRegisterId, req.body.deviceId);
     if (!claimedRegister) throw registerClaimRequiredError();
-    payloadHash = hashPosSalePayload(req.body);
+    if (claimedRegister.trainingMode) {
+      return res.status(409).json({ success: false, code: 'POS_REGISTER_TRAINING_MODE', message: 'This register is in training mode. No real sale can be recorded until a manager turns training mode off.' });
+    }
+    if (proformaDocument && String(proformaDocument.registerId) !== String(claimedRegister.id)) {
+      return res.status(403).json({ success: false, code: 'POS_PROFORMA_REGISTER_MISMATCH', message: 'Convert this proforma on the register where it was created.' });
+    }
+    const posCashierId = String(req.posAuthContext?.session?.userId || req.user.id);
+    if (req.posAuthContext && (
+      String(req.posAuthContext.session.companyId) !== String(companyId)
+      || String(req.posAuthContext.session.registerId) !== String(claimedRegister.id)
+    )) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_SESSION_REGISTER_MISMATCH',
+        message: 'The active cashier session does not match this register.',
+      });
+    }
+    const paymentSettings = await posPaymentService.getPaymentSettings(String(companyId));
+    const configuredPaymentFlow = posPaymentService.resolvePaymentFlow(paymentSettings, String(claimedRegister.id));
+    if (req.posPaymentFlow === 'PAYMENTS_V2' && configuredPaymentFlow !== 'PAYMENTS_V2') {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_PAYMENT_FLOW_DISABLED',
+        message: 'V2 payments are not enabled for this register. Ask a manager to review POS payment settings.',
+      });
+    }
+    if (!req.posPaymentFlow && configuredPaymentFlow === 'PAYMENTS_V2') {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_PAYMENT_V2_REQUIRED',
+        message: 'This till uses the new payment flow. Please use the payment screen.',
+      });
+    }
+    const isV2Pending = req.posPaymentFlow === 'PAYMENTS_V2' && !req.posV2Completion;
+    payloadHash = req.posV2Completion ? '' : hashPosSalePayload(req.body);
+    if (isV2Pending && !requestKey) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_IDEMPOTENCY_KEY_REQUIRED',
+        message: 'Provide an Idempotency-Key before creating a pending POS sale.',
+      });
+    }
     if (requestKey && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
     if (req.body.offlineSnapshotCapability || req.body.offlineSaleId || req.body.offlineCreatedAt) {
       const claims = verifyPosOfflineCapability(req.body.offlineSnapshotCapability);
@@ -264,6 +222,13 @@ exports.createDirectSale = async (req, res, next) => {
         saleCreatedAt,
       };
     }
+    if (isV2Pending && offlineContext) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_PAYMENT_V2_ONLINE_REQUIRED',
+        message: 'V2 payments require an online POS session. Use the legacy checkout while offline.',
+      });
+    }
 
     const invoiceCurrency = await CurrencyService.getCompanyBase(companyId);
     const {
@@ -272,6 +237,7 @@ exports.createDirectSale = async (req, res, next) => {
       items,
       warehouseId,
       paymentMethod,
+      paymentProvider,
       paymentAmount,
       paymentReference,
       payments: requestedPayments,
@@ -282,6 +248,14 @@ exports.createDirectSale = async (req, res, next) => {
       tillSession,
       promotionId,
     } = req.body;
+    if (isV2Pending && (Array.isArray(requestedPayments) && requestedPayments.length
+      || Number(paymentAmount) > 0)) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_PAYMENT_V2_SEPARATE_PAYMENT_REQUIRED',
+        message: 'Create the pending sale first, then record cash through the POS Payments V2 payment screen.',
+      });
+    }
     if (offlineContext && (paymentMethod !== 'cash' || Array.isArray(req.body.payments) && req.body.payments.length
       || req.body.splitTender === true)) {
       return res.status(400).json({ success: false, code: 'POS_OFFLINE_CASH_ONLY', message: 'Offline POS accepts only a single cash payment.' });
@@ -304,14 +278,14 @@ exports.createDirectSale = async (req, res, next) => {
 
     const activeTill = await TillSession.findOne({
       company: companyId,
-      openedBy: req.user.id,
       registerId: claimedRegister.code,
       status: 'open',
     });
     if (!activeTill) {
       return res.status(400).json({
         success: false,
-        message: 'Till session is required and must be open to record a POS sale'
+        code: 'POS_SHIFT_REQUIRED',
+        message: 'Open this register shift before recording a POS sale.',
       });
     }
     if (tillSession?.id && String(tillSession.id) !== String(activeTill._id)) {
@@ -570,9 +544,6 @@ exports.createDirectSale = async (req, res, next) => {
         }
       }
 
-      const subtotal = roundMoney(quantity * unitPrice);
-      const discountAmount = roundMoney(subtotal * (discountPct / 100));
-      const netAmount = roundMoney(subtotal - discountAmount);
       const taxRate = offlineContext ? Number(snapshotProduct.taxRate) : resolveProductTaxRate(product);
       if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
         return res.status(422).json({
@@ -585,8 +556,9 @@ exports.createDirectSale = async (req, res, next) => {
       if (offlineContext && (Number(item.taxRate) !== taxRate || String(item.taxCode || '') !== String(taxCode))) {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_TAX_SNAPSHOT_MISMATCH', message: `${product.name} tax settings do not match the signed offline catalog.` });
       }
-      const taxAmount = roundMoney(netAmount * (taxRate / 100));
-      const lineTotal = roundMoney(netAmount + taxAmount);
+      const { subtotal, discountAmount, netAmount, taxAmount, lineTotal } = calculatePosLineAmounts({
+        quantity, unitPrice, discountPct, taxRate,
+      });
       if (![subtotal, discountAmount, netAmount, taxAmount, lineTotal].every(Number.isFinite)
         || lineTotal > Number.MAX_SAFE_INTEGER) {
         return res.status(400).json({
@@ -611,6 +583,7 @@ exports.createDirectSale = async (req, res, next) => {
         lineSubtotal: subtotal,
         lineTotal: lineTotal,
         warehouse: warehouseId,
+        serialNumbers,
       });
 
       if (isStockable) {
@@ -636,7 +609,7 @@ exports.createDirectSale = async (req, res, next) => {
       });
     }
 
-    if (requiresManagerApproval && !req.body.managerApprovalId) {
+    if (requiresManagerApproval && !req.body.managerApprovalId && !req.posV2Completion) {
       return res.status(403).json({
         success: false,
         code: 'POS_MANAGER_APPROVAL_REQUIRED',
@@ -654,18 +627,30 @@ exports.createDirectSale = async (req, res, next) => {
     // Determine payment status
     const normalizedPaymentReference = String(paymentReference || '').trim();
     const storedValueMethods = ['gift_card', 'store_credit', 'loyalty'];
-    const supportedPaymentMethods = ['cash', 'card', 'bank_transfer', 'mobile_money', 'cheque', ...storedValueMethods];
-    const rawPayments = Array.isArray(requestedPayments) && requestedPayments.length
+    const supportedPaymentMethods = ['cash', 'card', 'bank_transfer', 'mobile_money', 'cheque', 'loyalty_points', ...storedValueMethods];
+    const rawPayments = isV2Pending
+      ? []
+      : req.posV2Completion
+      ? (Array.isArray(requestedPayments) ? requestedPayments : [])
+      : Array.isArray(requestedPayments) && requestedPayments.length
       ? requestedPayments
-      : [{ paymentMethod, amount: paymentAmount, reference: normalizedPaymentReference, bankAccountId }];
+      : [{
+        paymentMethod,
+        provider: paymentProvider,
+        amount: paymentAmount,
+        reference: normalizedPaymentReference,
+        bankAccountId,
+      }];
     if (rawPayments.length > 5) {
       return res.status(400).json({ success: false, code: 'POS_TOO_MANY_TENDERS', message: 'A sale can contain at most five payment methods.' });
     }
     const normalizedPayments = [];
     const transactionReferences = new Set();
+    const v2StoredValuePaymentIds = new Set(req.posV2Completion?.storedValuePaymentIds || []);
     const placeholderReferences = new Set(['na', 'n/a', 'none', 'null', 'unknown', 'test', 'paid', 'cash', '-', '0', '000']);
     for (const [index, entry] of rawPayments.entries()) {
       const method = String(entry?.paymentMethod || (rawPayments.length === 1 ? paymentMethod : '')).toLowerCase();
+      const provider = String(entry?.provider || '').trim().toLowerCase();
       const amount = entry?.amount == null || entry.amount === '' ? 0 : Number(entry.amount);
       const reference = String(entry?.reference || '').trim();
       if (!Number.isFinite(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
@@ -676,6 +661,9 @@ exports.createDirectSale = async (req, res, next) => {
       }
       if (amount > 0 && !supportedPaymentMethods.includes(method)) {
         return res.status(400).json({ success: false, code: 'ERR_INVALID_PAYMENT_METHOD', message: `Select a supported method for payment ${index + 1}.` });
+      }
+      if (provider && (method !== 'mobile_money' || !['momo', 'airtel'].includes(provider))) {
+        return res.status(400).json({ success: false, code: 'POS_MOBILE_MONEY_PROVIDER_INVALID', message: `Select MoMo or Airtel as the provider for payment ${index + 1}.` });
       }
       if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method) && !reference) {
         return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_REQUIRED', message: `Enter a verified transaction or cheque reference for payment ${index + 1}.` });
@@ -694,16 +682,37 @@ exports.createDirectSale = async (req, res, next) => {
         }
         transactionReferences.add(referenceKey);
       }
-      if (amount > 0 && ['gift_card', 'store_credit'].includes(method) && reference.length < 8) {
+      const savedV2GiftCardPayment = req.posV2Completion
+        && method === 'gift_card'
+        && v2StoredValuePaymentIds.has(String(entry?.posPaymentId || ''))
+        && Boolean(entry?.storedValueAccountId);
+      if (amount > 0 && ['gift_card', 'store_credit'].includes(method)
+        && reference.length < 8 && !savedV2GiftCardPayment) {
         return res.status(400).json({ success: false, code: 'POS_STORED_VALUE_CODE_REQUIRED', message: `Enter the ${method.replace('_', ' ')} code for payment ${index + 1}.` });
       }
       if (amount > 0 && method === 'loyalty' && (!clientId || clientId === 'walk-in')) {
         return res.status(400).json({ success: false, code: 'POS_LOYALTY_CUSTOMER_REQUIRED', message: 'Select a registered customer to redeem loyalty credit.' });
       }
-      if (amount > 0 && storedValueMethods.includes(method) && offlineContext) {
+      if (amount > 0 && method === 'loyalty_points' && (!clientId || clientId === 'walk-in')) {
+        return res.status(400).json({ success: false, code: 'POS_LOYALTY_POINTS_CUSTOMER_REQUIRED', message: 'Select a registered customer to redeem loyalty points.' });
+      }
+      if (amount > 0 && method === 'loyalty_points' && req.posV2Completion) {
+        return res.status(409).json({ success: false, code: 'POS_LOYALTY_POINTS_V2_UNAVAILABLE', message: 'Loyalty points are not available in this checkout until their fiscal payment treatment is confirmed.' });
+      }
+      if (amount > 0 && (storedValueMethods.includes(method) || method === 'loyalty_points') && offlineContext) {
         return res.status(400).json({ success: false, code: 'POS_STORED_VALUE_OFFLINE_UNAVAILABLE', message: 'Gift card, store credit, and loyalty payments require an online balance check.' });
       }
-      normalizedPayments.push({ paymentMethod: method, amount, reference, bankAccountId: entry?.bankAccountId || (rawPayments.length === 1 ? bankAccountId : null) || null });
+      normalizedPayments.push({
+        paymentMethod: method,
+        ...(method === 'mobile_money' ? { provider } : {}),
+        amount,
+        reference,
+        bankAccountId: entry?.bankAccountId || (rawPayments.length === 1 ? bankAccountId : null) || null,
+        ...(req.posV2Completion && entry?.storedValueAccountId
+          ? { storedValueAccountId: String(entry.storedValueAccountId) } : {}),
+        ...(req.posV2Completion && entry?.posPaymentId
+          ? { posPaymentId: String(entry.posPaymentId) } : {}),
+      });
     }
     for (const tender of normalizedPayments) tender.amount = roundMoney(tender.amount);
     const amountTendered = roundMoney(normalizedPayments.reduce((sum, tender) => sum + tender.amount, 0));
@@ -757,22 +766,41 @@ exports.createDirectSale = async (req, res, next) => {
       amountPaid = roundMoney(paidAmount);
       amountOutstanding = roundMoney(grandTotal - amountPaid);
     }
+    if (isV2Pending) {
+      paymentStatus = 'PENDING_PAYMENT';
+      amountPaid = 0;
+      amountOutstanding = grandTotal;
+    }
 
     // Execute in transaction
     let invoice;
     let totalCOGS = 0;
+    let v2CreditLedgerData = null;
+    let customerCreditLedgerData = null;
+    let customerCreditTermsDays = 30;
+    let fiscalOutboxId = null;
     const financialAccountCodes = new Set();
 
     await runInTransaction(async (session) => {
       if (requestKey) {
         const reservation = await dbClient().$queryRawUnsafe(
           'INSERT INTO pos_sale_requests (company_id, request_key, created_by_id, payload_hash, status, created_at, updated_at) VALUES ($1, $2, $3, $4, \'processing\', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, request_key) DO NOTHING RETURNING request_key AS "requestKey"',
-          String(companyId), requestKey, String(req.user.id), payloadHash,
+          String(companyId), requestKey, posCashierId, payloadHash,
         );
         if (!reservation.length) {
           const error = new Error('This POS checkout request is already being processed.');
           error.code = 'POS_IDEMPOTENCY_DUPLICATE';
           throw error;
+        }
+      }
+      if (proformaDocument) {
+        const lockedProforma = await dbClient().$queryRawUnsafe(
+          'SELECT status, conversion_key AS "conversionKey" FROM pos_non_posting_documents WHERE id = $1 AND company_id = $2 AND document_type = \'PROFORMA\' FOR UPDATE',
+          String(proformaDocument.id), String(companyId),
+        );
+        if (lockedProforma.length !== 1 || lockedProforma[0].status !== 'open'
+          || String(lockedProforma[0].conversionKey) !== String(proformaDocument.conversionKey)) {
+          throw Object.assign(new Error('This proforma has already been converted or changed.'), { code: 'POS_PROFORMA_NOT_OPEN' });
         }
       }
       if (offlineContext) {
@@ -793,13 +821,13 @@ exports.createDirectSale = async (req, res, next) => {
         );
       }
 
-      if (requiresManagerApproval) {
+      if (requiresManagerApproval && !req.posV2Completion) {
         const approvalPayload = { ...req.body };
         delete approvalPayload.managerApprovalId;
         await consumePosManagerApproval({
           approvalId: req.body.managerApprovalId,
           companyId,
-          cashierId: req.user.id,
+          cashierId: posCashierId,
           action: 'discount',
           subjectId: null,
           payload: approvalPayload,
@@ -809,7 +837,7 @@ exports.createDirectSale = async (req, res, next) => {
       // Reserve receivables against the customer's configured credit limit
       // while holding their row lock. This serializes concurrent POS checkouts
       // for the same account so two tills cannot spend the same credit twice.
-      if (amountOutstanding > 0) {
+      if (amountOutstanding > 0 && !isV2Pending) {
         if (!clientId) {
           const error = new Error('Walk-in sales must be paid in full. Select a customer with an approved credit limit to record an unpaid balance.');
           error.code = 'POS_WALKIN_CREDIT_NOT_ALLOWED';
@@ -821,7 +849,7 @@ exports.createDirectSale = async (req, res, next) => {
           throw error;
         }
         const lockedClients = await dbClient().$queryRawUnsafe(
-          'SELECT credit_limit, outstanding_balance FROM clients WHERE id = $1 AND company_id = $2 FOR UPDATE',
+          'SELECT credit_limit, outstanding_balance, credit_account_status, credit_terms_days, code FROM clients WHERE id = $1 AND company_id = $2 AND is_active = TRUE FOR UPDATE',
           String(client._id), String(companyId),
         );
         if (!lockedClients.length) {
@@ -829,10 +857,113 @@ exports.createDirectSale = async (req, res, next) => {
           error.code = 'POS_CLIENT_NOT_FOUND';
           throw error;
         }
+        if (String(lockedClients[0].credit_account_status || 'ACTIVE') !== 'ACTIVE') {
+          throw Object.assign(new Error('This customer credit account is on hold or closed. Ask a manager to review it before charging the account.'), {
+            code: 'POS_CREDIT_ACCOUNT_NOT_ACTIVE',
+          });
+        }
+        customerCreditTermsDays = Number(lockedClients[0].credit_terms_days ?? 30);
+        if (req.posV2Completion && /^WALKIN-/i.test(String(lockedClients[0].code || ''))) {
+          throw Object.assign(new Error('Choose a named customer before adding credit. Walk-in sales must be paid in full.'), {
+            code: 'POS_CREDIT_CUSTOMER_REQUIRED',
+          });
+        }
         const creditLimit = Number(lockedClients[0].credit_limit || 0);
         const outstandingBalance = Number(lockedClients[0].outstanding_balance || 0);
         const nextOutstandingBalance = outstandingBalance + amountOutstanding;
-        if (creditLimit <= 0 || nextOutstandingBalance > creditLimit + 0.00005) {
+        const exceedsCreditLimit = creditLimit <= 0 || nextOutstandingBalance > creditLimit + 0.00005;
+        if (req.posV2Completion
+          && Math.abs(amountOutstanding - Number(req.posV2Completion.creditAmount || 0)) > 0.00005) {
+          throw Object.assign(new Error('The saved credit allocation does not match the invoice balance. Review the sale before completing it.'), {
+            code: 'POS_CREDIT_ALLOCATION_MISMATCH',
+          });
+        }
+        if (req.posV2Completion) {
+          const overdueRows = await dbClient().$queryRawUnsafe(
+            'SELECT COALESCE(SUM(amount_outstanding), 0)::text AS "overdueAmount" FROM invoices WHERE company_id = $1 AND client_id = $2 AND id <> $3 AND due_date < CURRENT_TIMESTAMP AND amount_outstanding > 0 AND status NOT IN (\'cancelled\', \'draft\', \'PENDING_PAYMENT\', \'fully_paid\')',
+            String(companyId),
+            String(client._id),
+            String(req.posV2Completion.invoiceId),
+          );
+          if (Number(overdueRows[0]?.overdueAmount || 0) > 0) {
+            throw Object.assign(new Error('This customer has an overdue balance. Choose another payment method or ask a manager to review the account.'), {
+              code: 'POS_CUSTOMER_OVERDUE',
+            });
+          }
+          const paymentSettings = await posPaymentService.getPaymentSettings(String(companyId));
+          if (exceedsCreditLimit && !paymentSettings.allowOverCreditLimit) {
+            const availableCredit = Math.max(0, creditLimit - outstandingBalance);
+            throw Object.assign(
+              new Error(`This credit sale exceeds the customer's available credit of ${Math.floor(availableCredit)} RWF.`),
+              { code: 'POS_CREDIT_LIMIT_EXCEEDED' },
+            );
+          }
+          if (exceedsCreditLimit) {
+            const overrideReason = String(req.posV2Completion.creditOverrideReason || '').trim();
+            if (overrideReason.length < 10) {
+              throw Object.assign(new Error('Enter a reason of at least 10 characters before requesting a manager credit-limit override.'), {
+                code: 'POS_CREDIT_OVERRIDE_REASON_REQUIRED',
+              });
+            }
+            const approvalContext = {
+              saleId: String(req.posV2Completion.invoiceId),
+              clientId: String(client._id),
+              creditAmount: Math.round(amountOutstanding),
+              creditLimit: Math.round(creditLimit),
+              outstandingBalance: Math.round(outstandingBalance),
+              reason: overrideReason,
+            };
+            const approvalToken = String(req.posV2Completion.creditApprovalToken || '').trim();
+            if (!approvalToken) {
+              throw Object.assign(new Error('A manager must approve this credit amount before the sale can be completed.'), {
+                code: 'POS_CREDIT_APPROVAL_REQUIRED',
+                approvalContext,
+              });
+            }
+            const approval = await dbClient().posApproval.findFirst({
+              where: {
+                companyId: String(companyId),
+                registerId: String(claimedRegister.id),
+                requestedBy: posCashierId,
+                action: 'CREDIT_OVER_LIMIT',
+                tokenHash: createHash('sha256').update(approvalToken, 'utf8').digest('hex'),
+                usedAt: null,
+                expiresAt: { gt: new Date() },
+                context: { equals: approvalContext },
+              },
+            });
+            if (!approval) {
+              throw Object.assign(new Error('The manager approval is invalid, expired, already used, or no longer matches this customer balance.'), {
+                code: 'POS_CREDIT_APPROVAL_INVALID',
+              });
+            }
+            const consumed = await dbClient().posApproval.updateMany({
+              where: {
+                id: approval.id,
+                companyId: String(companyId),
+                registerId: String(claimedRegister.id),
+                requestedBy: posCashierId,
+                action: 'CREDIT_OVER_LIMIT',
+                usedAt: null,
+                expiresAt: { gt: new Date() },
+              },
+              data: { usedAt: new Date() },
+            });
+            if (consumed.count !== 1) {
+              throw Object.assign(new Error('The manager approval was already used or expired. Request a new approval.'), {
+                code: 'POS_CREDIT_APPROVAL_INVALID',
+              });
+            }
+            await writePosAuditLog({
+              companyId: String(companyId),
+              registerId: String(claimedRegister.id),
+              userId: posCashierId,
+              event: 'APPROVAL_USED',
+              metadata: { approvalId: approval.id, action: 'CREDIT_OVER_LIMIT', approvedBy: approval.approvedBy, reason: overrideReason },
+              ip: requestIp(req),
+            }, dbClient());
+          }
+        } else if (exceedsCreditLimit) {
           const availableCredit = Math.max(0, creditLimit - outstandingBalance);
           const error = new Error(`Customer credit limit exceeded. Available credit: ${availableCredit.toFixed(2)}; this sale needs ${amountOutstanding.toFixed(2)}.`);
           error.code = 'POS_CREDIT_LIMIT_EXCEEDED';
@@ -841,6 +972,12 @@ exports.createDirectSale = async (req, res, next) => {
         // Client.save below persists customer totals in this same transaction.
         // Use the freshly locked balance instead of the stale pre-transaction read.
         client.outstandingBalance = nextOutstandingBalance;
+        customerCreditLedgerData = {
+          clientId: String(client._id),
+          amount: Math.round(amountOutstanding),
+          clientBalanceAfter: nextOutstandingBalance,
+        };
+        if (req.posV2Completion) v2CreditLedgerData = customerCreditLedgerData;
       }
 
       if (!client) {
@@ -851,50 +988,164 @@ exports.createDirectSale = async (req, res, next) => {
         });
       }
 
+      const activePosShifts = await dbClient().$queryRawUnsafe(
+        'SELECT "id", "opened_by" AS "openedById" FROM "pos_shifts" WHERE "company_id" = $1 AND "register_id" = $2 AND "status" IN (\'open\', \'reopened\') FOR UPDATE',
+        String(companyId),
+        String(claimedRegister.id),
+      );
+      const activePosShift = activePosShifts[0];
+      if (!activePosShift) {
+        throw Object.assign(new Error('An open POS shift is required before recording a POS sale.'), {
+          code: 'POS_SHIFT_REQUIRED',
+        });
+      }
+      if (String(activePosShift.openedById) !== String(activeTill.openedById || activeTill.openedBy)) {
+        throw Object.assign(new Error('The open till session is not linked to this register shift. Refresh the till before recording a sale.'), {
+          code: 'POS_TILL_SHIFT_LINK_MISSING',
+        });
+      }
+
       // 1. Create the invoice
       const saleConfirmedAt = new Date();
-      invoice = await Invoice.create([{
-        company: companyId,
-        client: client._id,
-        customerName: client.name,
-        customerTin: client.taxId,
-        customerAddress: client.contact?.address || client.address,
-        lines: invoiceLines,
-        status: paymentStatus, // Already confirmed/paid status
-        posOrigin: true,
-        ebm: {
+      if (req.posV2Completion) {
+        const lockedInvoice = await dbClient().$queryRawUnsafe(
+          'SELECT status, pos_completion_key AS "completionKey" FROM invoices WHERE id = $1 AND company_id = $2 FOR UPDATE',
+          String(req.posV2Completion.invoiceId), String(companyId),
+        );
+        if (!lockedInvoice.length) {
+          throw Object.assign(new Error('The pending POS sale was not found.'), { code: 'POS_PENDING_SALE_NOT_FOUND' });
+        }
+        if (lockedInvoice[0].status !== 'PENDING_PAYMENT') {
+          if (lockedInvoice[0].completionKey === req.posV2Completion.completionKey) {
+            completionReplayed = true;
+            return;
+          }
+          throw Object.assign(new Error('The pending POS sale was already completed or changed.'), {
+            code: 'POS_SALE_NOT_PENDING',
+          });
+        }
+        invoice = await Invoice.findOne({
+          _id: req.posV2Completion.invoiceId,
+          company: companyId,
+        }).session(session);
+        if (!invoice || Math.abs(Number(invoice.totalAmount) - grandTotal) > 0.009) {
+          throw Object.assign(new Error('The pending sale totals changed. Review or cancel the pending sale before retrying.'), {
+            code: 'POS_PENDING_SALE_TOTAL_CHANGED',
+          });
+        }
+        const savedLines = await dbClient().invoiceLine.findMany({
+          where: { companyId: String(companyId), invoiceId: String(invoice._id) },
+          orderBy: { lineOrder: 'asc' },
+        });
+        if (savedLines.length !== invoiceLines.length
+          || savedLines.some((line, index) => !lineValuesMatch(line, invoiceLines[index]))) {
+          throw Object.assign(new Error('The pending sale lines changed. Review or cancel the pending sale before retrying.'), {
+            code: 'POS_PENDING_SALE_LINES_CHANGED',
+          });
+        }
+        invoice.status = paymentStatus;
+        invoice.amountPaid = amountPaid;
+        invoice.amountOutstanding = amountOutstanding;
+        invoice.confirmedAt = saleConfirmedAt;
+        invoice.confirmedBy = posCashierId;
+        invoice.stockDeducted = true;
+        invoice.autoConfirm = true;
+        invoice.ebm = {
+          ...(invoice.ebm || {}),
           fiscalEnvironment: fiscalMode,
           environment: fiscalMode,
           ebmStatus: autoFiscalSubmission ? 'pending' : 'not_submitted',
-          retryCount: 0,
-        },
-        currencyCode: invoiceCurrency,
-        subtotal: subtotal,
-        totalDiscount: totalDiscount,
-        taxAmount: totalTax,
-        totalAmount: grandTotal,
-        grandTotal: grandTotal,
-        ...(offlineContext ? { invoiceDate: offlineContext.saleCreatedAt } : {}),
-        amountPaid: amountPaid,
-        amountOutstanding: amountOutstanding,
-        notes: notes || '',
-        terms: terms || '',
-        dueDate: dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-        createdBy: req.user.id,
-        confirmedAt: saleConfirmedAt,
-        confirmedBy: req.user.id,
-        confirmedDate: saleConfirmedAt,
-        stockDeducted: true,
-        autoConfirm: true
-      }], { session });
+          retryCount: Number(invoice.ebm?.retryCount) || 0,
+          paymentFlow: 'PAYMENTS_V2',
+        };
+        await invoice.save({ session });
+      } else {
+        invoice = await Invoice.create([{
+          company: companyId,
+          client: client._id,
+          customerName: client.name,
+          customerTin: client.taxId,
+          customerAddress: client.contact?.address || client.address,
+          lines: invoiceLines,
+          status: paymentStatus,
+          posOrigin: true,
+          ...(isV2Pending ? {
+            tillSessionId: String(activeTill._id),
+            shiftId: String(activePosShift.id),
+            cashierId: posCashierId,
+            registerId: String(claimedRegister.id),
+            posCheckoutPayload: pendingCheckoutPayload(req.body),
+          } : {}),
+          ebm: {
+            fiscalEnvironment: fiscalMode,
+            environment: fiscalMode,
+            ebmStatus: isV2Pending ? 'not_submitted' : autoFiscalSubmission ? 'pending' : 'not_submitted',
+            retryCount: 0,
+            ...(isV2Pending ? { paymentFlow: 'PAYMENTS_V2' } : {}),
+          },
+          currencyCode: invoiceCurrency,
+          subtotal: subtotal,
+          totalDiscount: totalDiscount,
+          taxAmount: totalTax,
+          totalAmount: grandTotal,
+          grandTotal: grandTotal,
+          ...(offlineContext ? { invoiceDate: offlineContext.saleCreatedAt } : {}),
+          amountPaid: amountPaid,
+          amountOutstanding: amountOutstanding,
+          notes: notes || '',
+          terms: terms || '',
+          dueDate: dueDate || new Date(Date.now() + Math.max(0, customerCreditTermsDays) * 24 * 60 * 60 * 1000),
+          createdBy: posCashierId,
+          ...(isV2Pending ? {} : {
+            confirmedAt: saleConfirmedAt,
+            confirmedBy: posCashierId,
+            confirmedDate: saleConfirmedAt,
+          }),
+          stockDeducted: !isV2Pending,
+          autoConfirm: !isV2Pending,
+        }], { session });
 
-      invoice = invoice[0];
+        invoice = invoice[0];
+      }
+      // V2 checkout first creates a pending invoice. Keep its proforma open
+      // until payment completion commits the real sale and its postings.
+      if (proformaDocument && !isV2Pending) {
+        const converted = await dbClient().$executeRawUnsafe(
+          'UPDATE pos_non_posting_documents SET status = \'converted\', converted_invoice_id = $3, converted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND company_id = $2 AND document_type = \'PROFORMA\' AND status = \'open\' AND conversion_key = $4',
+          String(proformaDocument.id), String(companyId), String(invoice._id), String(proformaDocument.conversionKey),
+        );
+        if (converted !== 1) throw Object.assign(new Error('The proforma could not be linked to the completed sale.'), { code: 'POS_PROFORMA_CONVERSION_FAILED' });
+      }
 
       // Stored-value balances are locked and debited inside the sale transaction.
       // This prevents concurrent tills from spending the same balance twice.
       let storedValuePaid = 0;
       for (const tender of appliedPayments.filter((payment) => storedValueMethods.includes(payment.paymentMethod))) {
         const kind = tender.paymentMethod;
+        if (req.posV2Completion
+          && kind === 'gift_card'
+          && v2StoredValuePaymentIds.has(String(tender.posPaymentId || ''))
+          && tender.storedValueAccountId) {
+          const redemptionRows = await dbClient().$queryRawUnsafe(
+            'SELECT l.id, l.amount::text AS amount, l.reference, l.account_id AS "accountId" FROM pos_stored_value_ledger l JOIN pos_stored_value_accounts a ON a.id = l.account_id AND a.company_id = l.company_id AND a.kind = \'gift_card\' JOIN pos_payments p ON p.id = l.pos_payment_id AND p.company_id = l.company_id AND p.sale_id = l.invoice_id AND p.method = \'GIFT_CARD\' AND p.status = \'SUCCESS\' AND p.reference = a.code_suffix WHERE l.company_id = $1 AND l.account_id = $2 AND l.pos_payment_id = $3 AND l.invoice_id = $4 AND l.operation_type = \'REDEEM\'::"PosStoredValueOperation" AND l.kind = \'gift_card\' AND NOT EXISTS (SELECT 1 FROM pos_stored_value_ledger r WHERE r.company_id = l.company_id AND r.account_id = l.account_id AND r.pos_payment_id = l.pos_payment_id AND r.invoice_id = l.invoice_id AND r.operation_type = \'REFUND\'::"PosStoredValueOperation" AND r.kind = \'gift_card\') ORDER BY l.created_at ASC LIMIT 2',
+            String(companyId),
+            String(tender.storedValueAccountId),
+            String(tender.posPaymentId),
+            String(invoice._id),
+          );
+          const redemption = redemptionRows[0];
+          if (redemptionRows.length !== 1
+            || !redemption
+            || !Number.isSafeInteger(Number(redemption.amount))
+            || Number(redemption.amount) !== Number(tender.amount)) {
+            throw Object.assign(new Error('The saved gift card balance record does not match this payment. Ask a manager to review the sale.'), {
+              code: 'POS_GIFT_CARD_REDEMPTION_MISMATCH',
+            });
+          }
+          storedValuePaid += tender.amount;
+          tender.reference = String(redemption.reference || tender.reference || '');
+          continue;
+        }
         let accountRows;
         if (kind === 'loyalty') {
           accountRows = await dbClient().$queryRawUnsafe(
@@ -942,31 +1193,99 @@ exports.createDirectSale = async (req, res, next) => {
         await dbClient().$executeRawUnsafe(
           'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, invoice_id, kind, entry_type, amount, balance_after, reference, created_by_id, created_at) VALUES ($1, $2, $3, $4, $5, \'redeem\', $6, $7, $8, $9, CURRENT_TIMESTAMP)',
           randomBytes(12).toString('hex'), String(companyId), String(storedAccount.id), String(invoice._id), kind,
-          tender.amount, Number(updatedRows[0].balance), kind === 'loyalty' ? null : String(storedAccount.codeSuffix || tender.reference.slice(-4)), String(req.user.id),
+          tender.amount, Number(updatedRows[0].balance), kind === 'loyalty' ? null : String(storedAccount.codeSuffix || tender.reference.slice(-4)), posCashierId,
         );
         storedValuePaid += tender.amount;
         tender.storedValueAccountId = String(storedAccount.id);
         tender.reference = kind === 'loyalty' ? '' : String(storedAccount.codeSuffix || tender.reference.slice(-4));
       }
 
-      // Loyalty is issued as monetary reward credit: 1% of the discounted,
-      // pre-tax amount funded by non-credit tenders. The same sale journal
-      // records the reward expense and matching customer-credit liability.
+      const pointTenders = appliedPayments.filter((payment) => payment.paymentMethod === 'loyalty_points');
+      if (pointTenders.length) {
+        if (String(invoiceCurrency).toUpperCase() !== 'RWF') {
+          throw Object.assign(new Error('Loyalty points can only be redeemed on RWF sales.'), { code: 'POS_LOYALTY_POINTS_CURRENCY_UNSUPPORTED' });
+        }
+        await dbClient().$queryRawUnsafe(
+          'SELECT pg_advisory_xact_lock(hashtext($1))::text AS locked',
+          `${String(companyId)}:loyalty-customer:${String(client._id)}`,
+        );
+        const settingsRow = await dbClient().systemSettings.findUnique({
+          where: { companyId: String(companyId) }, select: { posLoyaltySettings: true },
+        });
+        const pointValueRwf = Number(settingsRow?.posLoyaltySettings?.pointValueRwf ?? 1);
+        if (!Number.isFinite(pointValueRwf) || pointValueRwf < 0.01) {
+          throw Object.assign(new Error('The company loyalty point value is not configured correctly.'), { code: 'POS_LOYALTY_POINT_VALUE_INVALID' });
+        }
+        const totalRows = await dbClient().$queryRawUnsafe(
+          `SELECT COALESCE(SUM(l.points), 0)::int AS balance
+             FROM pos_customer_loyalty_ledger l
+             JOIN clients c ON c.id = l.client_id AND c.company_id = l.company_id
+            WHERE l.company_id = $1 AND (c.id = $2 OR c.merged_into_client_id = $2)`,
+          String(companyId), String(client._id),
+        );
+        let pointsBalance = Number(totalRows[0]?.balance || 0);
+        for (const [pointIndex, tender] of pointTenders.entries()) {
+          const points = Math.round(Number(tender.amount) / pointValueRwf);
+          if (!Number.isSafeInteger(points) || points <= 0 || Math.abs(points * pointValueRwf - Number(tender.amount)) > 0.005) {
+            throw Object.assign(new Error(`The tender amount must be an exact multiple of RWF ${pointValueRwf.toFixed(2)} per point.`), { code: 'POS_LOYALTY_POINTS_AMOUNT_INVALID' });
+          }
+          if (points > pointsBalance) {
+            throw Object.assign(new Error(`The customer has ${pointsBalance} loyalty points available.`), { code: 'POS_LOYALTY_POINTS_INSUFFICIENT' });
+          }
+          pointsBalance -= points;
+          const idempotencyKey = `pos-sale:${String(invoice._id)}:loyalty-points:${pointIndex}`;
+          const reason = `POS checkout redemption at RWF ${pointValueRwf.toFixed(2)} per point`;
+          const requestHash = createHash('sha256').update(JSON.stringify({
+            companyId: String(companyId), customerId: String(client._id), invoiceId: String(invoice._id),
+            points: -points, pointValueRwf,
+          })).digest('hex');
+          await dbClient().$executeRawUnsafe(
+            'INSERT INTO pos_customer_loyalty_ledger (id, company_id, client_id, entry_type, points, balance_after, invoice_id, reason, created_by_id, idempotency_key, request_hash, created_at) VALUES ($1, $2, $3, \'REDEEM\', $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)',
+            randomBytes(12).toString('hex'), String(companyId), String(client._id), -points, pointsBalance,
+            String(invoice._id), reason, String(posCashierId), idempotencyKey, requestHash,
+          );
+          await writePosAuditLog({
+            companyId: String(companyId), registerId: String(registerId || ''), userId: String(posCashierId),
+            event: 'CUSTOMER_LOYALTY_REDEEMED',
+            metadata: {
+              customerId: String(client._id), invoiceId: String(invoice._id), points,
+              pointValueRwf, tenderAmountRwf: Number(tender.amount), balanceAfter: pointsBalance,
+            },
+            ip: requestIp(req),
+          }, dbClient());
+          tender.loyaltyPointsRedeemed = points;
+          tender.loyaltyPointValueRwf = pointValueRwf;
+          storedValuePaid += Number(tender.amount);
+        }
+      }
+
+      // Loyalty wallet credit is a company-configured monetary reward, separate
+      // from points. Existing companies default to the historical 1% rate.
       let loyaltyEarned = 0;
       let loyaltyAccountId = null;
+      let loyaltyEarnRatePercent = 1;
       const qualifyingPaidSales = Math.max(0, paidAmount - storedValuePaid);
       if (clientId && clientId !== 'walk-in' && grandTotal > 0 && qualifyingPaidSales > 0) {
-        loyaltyEarned = roundMoney(netSales * Math.min(1, qualifyingPaidSales / grandTotal) * 0.01);
+        const loyaltySettingsRow = await dbClient().systemSettings.findUnique({
+          where: { companyId: String(companyId) },
+          select: { posLoyaltySettings: true },
+        });
+        const loyaltySettings = loyaltySettingsRow?.posLoyaltySettings || {};
+        const walletCreditEnabled = loyaltySettings.walletCreditEnabled !== false;
+        loyaltyEarnRatePercent = Number(loyaltySettings.walletCreditEarnRatePercent ?? 1);
+        if (walletCreditEnabled && Number.isFinite(loyaltyEarnRatePercent) && loyaltyEarnRatePercent > 0) {
+          loyaltyEarned = roundMoney(netSales * Math.min(1, qualifyingPaidSales / grandTotal) * (loyaltyEarnRatePercent / 100));
+        }
         if (loyaltyEarned > 0) {
           const walletRows = await dbClient().$queryRawUnsafe(
             'INSERT INTO pos_stored_value_accounts (id, company_id, client_id, kind, currency_code, balance, is_active, created_by_id, created_at, updated_at) VALUES ($1, $2, $3, \'loyalty\', $4, $5, TRUE, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, client_id, kind, currency_code) DO UPDATE SET balance = pos_stored_value_accounts.balance + EXCLUDED.balance, updated_at = CURRENT_TIMESTAMP RETURNING id, balance',
-            randomBytes(12).toString('hex'), String(companyId), String(client._id), String(invoiceCurrency).toUpperCase(), loyaltyEarned, String(req.user.id),
+            randomBytes(12).toString('hex'), String(companyId), String(client._id), String(invoiceCurrency).toUpperCase(), loyaltyEarned, posCashierId,
           );
           const wallet = walletRows[0];
           loyaltyAccountId = String(wallet.id);
           await dbClient().$executeRawUnsafe(
-            'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, invoice_id, kind, entry_type, amount, balance_after, reference, notes, created_by_id, created_at) VALUES ($1, $2, $3, $4, \'loyalty\', \'earn\', $5, $6, $7, \'1% of paid discounted pre-tax POS sales\', $8, CURRENT_TIMESTAMP)',
-            randomBytes(12).toString('hex'), String(companyId), loyaltyAccountId, String(invoice._id), loyaltyEarned, Number(wallet.balance), String(invoice.referenceNo), String(req.user.id),
+            'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, invoice_id, kind, entry_type, amount, balance_after, reference, notes, created_by_id, created_at) VALUES ($1, $2, $3, $4, \'loyalty\', \'earn\', $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)',
+            randomBytes(12).toString('hex'), String(companyId), loyaltyAccountId, String(invoice._id), loyaltyEarned, Number(wallet.balance), String(invoice.referenceNo), `${loyaltyEarnRatePercent}% of paid discounted pre-tax POS sales`, posCashierId,
           );
         }
       }
@@ -986,13 +1305,32 @@ exports.createDirectSale = async (req, res, next) => {
         );
       }
       const linkedInvoice = await dbClient().$executeRawUnsafe(
-        'UPDATE invoices SET till_session_id = $1, register_id = $2 WHERE id = $3 AND company_id = $4',
-        String(activeTill._id), String(activeTill.registerId || ''), String(invoice._id), String(companyId),
+        'UPDATE invoices SET till_session_id = $1, register_id = $2, shift_id = $5, cashier_id = $6 WHERE id = $3 AND company_id = $4',
+        String(activeTill._id),
+        String(isV2Pending || req.posV2Completion ? claimedRegister.id : activeTill.registerId || ''),
+        String(invoice._id),
+        String(companyId),
+        String(activePosShift.id),
+        posCashierId,
       );
       if (linkedInvoice !== 1) {
         const error = new Error('Could not link the POS sale to its cashier shift. The sale was not completed.');
         error.code = 'POS_TILL_LINK_FAILED';
         throw error;
+      }
+
+      if (isV2Pending) {
+        const finalized = await dbClient().$executeRawUnsafe(
+          'UPDATE pos_sale_requests SET invoice_id = $3, status = \'completed\', updated_at = CURRENT_TIMESTAMP WHERE company_id = $1 AND request_key = $2 AND payload_hash = $4',
+          String(companyId), requestKey, String(invoice._id), payloadHash,
+        );
+        if (finalized !== 1) {
+          throw Object.assign(new Error('The pending POS sale could not be finalized.'), {
+            code: 'POS_IDEMPOTENCY_FINALIZE_FAILED',
+          });
+        }
+        createdPending = true;
+        return;
       }
 
       // 2. Deduct stock using proper inventory service (WAC/FIFO)
@@ -1173,7 +1511,7 @@ exports.createDirectSale = async (req, res, next) => {
             && conflict.productId === String(product._id)) ? [] : (lineData.serialNumbers || []),
           notes: `Direct sale - Invoice ${invoice.referenceNo}${offlineConflicts.some((conflict) => conflict.conflictType === 'serial'
             && conflict.productId === String(product._id)) ? ' (serial assignment pending manager resolution)' : ''}`,
-          performedBy: req.user.id,
+          performedBy: posCashierId,
           movementDate: new Date(),
         });
       }
@@ -1229,6 +1567,10 @@ exports.createDirectSale = async (req, res, next) => {
       const paymentAccounts = new Map();
       for (const tender of appliedPayments) {
         if (!bankPaymentMethods.includes(tender.paymentMethod)) continue;
+        const manualPosMobileMoney = tender.paymentMethod === 'mobile_money'
+          && req.posV2Completion
+          && ['momo', 'airtel'].includes(String(tender.provider || '').toLowerCase());
+        if (manualPosMobileMoney) continue;
         if (!tender.bankAccountId) {
           const error = new Error(`Select the bank or mobile money account used for ${tender.paymentMethod}`);
           error.code = 'POS_PAYMENT_ACCOUNT_REQUIRED';
@@ -1255,9 +1597,19 @@ exports.createDirectSale = async (req, res, next) => {
           settlementAccount = await JournalService.getMappedAccountCode(
             companyId, 'sales', 'giftCardLiability', DEFAULT_ACCOUNTS.deferredRevenue || '2850',
           );
-        } else if (tender.paymentMethod === 'store_credit' || tender.paymentMethod === 'loyalty') {
+        } else if (tender.paymentMethod === 'store_credit' || tender.paymentMethod === 'loyalty' || tender.paymentMethod === 'loyalty_points') {
           settlementAccount = await JournalService.getMappedAccountCode(
             companyId, 'sales', 'customerAdvances', DEFAULT_ACCOUNTS.customerAdvances || '2860',
+          );
+        } else if (tender.paymentMethod === 'mobile_money'
+          && req.posV2Completion
+          && ['momo', 'airtel'].includes(String(tender.provider || '').toLowerCase())) {
+          const accountKey = String(tender.provider).toLowerCase() === 'airtel' ? 'airtelMoney' : 'mtnMoMo';
+          settlementAccount = await JournalService.getMappedAccountCode(
+            companyId,
+            'cash',
+            accountKey,
+            DEFAULT_ACCOUNTS[accountKey],
           );
         } else if (paymentBankAccount) {
           settlementAccount = paymentBankAccount.ledgerAccountId;
@@ -1324,6 +1676,7 @@ exports.createDirectSale = async (req, res, next) => {
         ));
       }
 
+      if (req.posV2Completion) revenueLines.push(...cogsLines);
       const journalEntries = [{
         date: invoice.invoiceDate,
         description: `Direct sale - Invoice ${invoice.referenceNo}`,
@@ -1339,11 +1692,14 @@ exports.createDirectSale = async (req, res, next) => {
             reference: tender.reference || null,
             bankAccountId: tender.bankAccountId || null,
             storedValueAccountId: tender.storedValueAccountId || null,
+            loyaltyPointsRedeemed: tender.loyaltyPointsRedeemed || null,
+            loyaltyPointValueRwf: tender.loyaltyPointValueRwf || null,
           })),
           loyaltyCreditEarned: loyaltyEarned,
+          ...(req.posV2Completion ? { paymentFlow: 'PAYMENTS_V2' } : {}),
         },
       }];
-      if (cogsLines.length > 0) {
+      if (cogsLines.length > 0 && !req.posV2Completion) {
         journalEntries.push({
           date: invoice.invoiceDate,
           description: `COGS for Invoice ${invoice.referenceNo}`,
@@ -1376,7 +1732,7 @@ exports.createDirectSale = async (req, res, next) => {
       }
 
       invoice.revenueJournalEntry = createdEntries[0]._id;
-      if (createdEntries[1]) invoice.cogsJournalEntry = createdEntries[1]._id;
+      invoice.cogsJournalEntry = req.posV2Completion ? null : createdEntries[1]?._id || null;
       await invoice.save({ session });
 
       // 4. Add payment record if provided
@@ -1386,13 +1742,15 @@ exports.createDirectSale = async (req, res, next) => {
           amount: tender.amount,
           paymentMethod: tender.paymentMethod,
           reference: tender.reference || '',
+          ...(tender.provider ? { provider: tender.provider } : {}),
           bankAccountId: tender.bankAccountId || null,
           ...(tender.storedValueAccountId ? { storedValueAccountId: tender.storedValueAccountId } : {}),
+          ...(tender.loyaltyPointsRedeemed ? { loyaltyPointsRedeemed: tender.loyaltyPointsRedeemed, loyaltyPointValueRwf: tender.loyaltyPointValueRwf } : {}),
           ...(changeDue > 0 && tender.paymentMethod === 'cash' && index === firstCashPayment
             ? { receivedAmount: cashTendered, changeGiven: changeDue }
             : {}),
           paidDate: new Date(),
-          recordedBy: req.user.id,
+          recordedBy: posCashierId,
         }));
         // Preserve change details even when non-cash tenders cover the invoice
         // and the cash portion is returned completely as change.
@@ -1406,7 +1764,7 @@ exports.createDirectSale = async (req, res, next) => {
             receivedAmount: cashTendered,
             changeGiven: changeDue,
             paidDate: new Date(),
-            recordedBy: req.user.id,
+            recordedBy: posCashierId,
           });
         }
         invoice.payments.push(...savedPayments);
@@ -1424,12 +1782,12 @@ exports.createDirectSale = async (req, res, next) => {
           amount: cashPaidAmount,
           invoiceId: String(invoice._id),
           reference: invoice.referenceNo,
-          recordedBy: String(req.user.id),
+          recordedBy: posCashierId,
           recordedAt: new Date().toISOString(),
         };
         const updatedTill = await dbClient().$executeRawUnsafe(
           'UPDATE till_sessions SET expected_cash = expected_cash + $1::numeric, cash_activity = cash_activity || $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE company_id = $3 AND id = $4 AND opened_by = $5 AND status = \'open\'',
-          cashPaidAmount, JSON.stringify([activity]), String(companyId), String(activeTill._id), String(req.user.id),
+          cashPaidAmount, JSON.stringify([activity]), String(companyId), String(activeTill._id), String(activeTill.openedById || activeTill.openedBy),
         );
         if (updatedTill !== 1) {
           const error = new Error('The till closed while this cash sale was being recorded. No sale was completed.');
@@ -1443,6 +1801,72 @@ exports.createDirectSale = async (req, res, next) => {
       client.totalPurchases = (client.totalPurchases || 0) + grandTotal;
       client.lastPurchaseDate = new Date();
       await client.save({ session });
+      if (customerCreditLedgerData) {
+        const creditEntryKey = `POSSALE:${String(invoice._id)}`;
+        const creditRequestHash = createHash('sha256').update(JSON.stringify({ invoiceId: String(invoice._id), clientId: customerCreditLedgerData.clientId, amount: customerCreditLedgerData.amount })).digest('hex');
+        await dbClient().posCustomerCreditLedger.create({
+          data: {
+            id: randomBytes(12).toString('hex'),
+            companyId: String(companyId),
+            clientId: customerCreditLedgerData.clientId,
+            entryType: 'CHARGE',
+            direction: 'increase',
+            amount: customerCreditLedgerData.amount,
+            balanceAfter: customerCreditLedgerData.clientBalanceAfter,
+            invoiceId: String(invoice._id),
+            dueDate: invoice.dueDate || null,
+            reason: 'POS credit sale',
+            createdById: String(req.user.id),
+            idempotencyKey: creditEntryKey,
+            requestHash: creditRequestHash,
+          },
+        });
+      }
+      if (v2CreditLedgerData) {
+        await dbClient().arTransactionLedger.create({
+          data: {
+            id: randomBytes(12).toString('hex'),
+            companyId: String(companyId),
+            clientId: v2CreditLedgerData.clientId,
+            invoiceId: String(invoice._id),
+            transactionType: 'invoice_created',
+            transactionDate: invoice.invoiceDate || saleConfirmedAt,
+            referenceNo: invoice.referenceNo,
+            description: `POS credit sale - Invoice ${invoice.referenceNo}`,
+            amount: v2CreditLedgerData.amount,
+            direction: 'increase',
+            invoiceBalanceAfter: v2CreditLedgerData.amount,
+            clientBalanceAfter: v2CreditLedgerData.clientBalanceAfter,
+            sourceType: 'invoice',
+            sourceId: String(invoice._id),
+            sourceReference: invoice.referenceNo,
+            journalEntryId: String(createdEntries[0]._id),
+            metadata: {
+              paymentFlow: 'PAYMENTS_V2',
+              paymentIds: req.posV2Completion.creditPaymentIds || [],
+            },
+            createdById: String(req.user.id),
+            fiscalYear: new Date(invoice.invoiceDate || saleConfirmedAt).getFullYear(),
+            accountingPeriod: (() => {
+              const date = new Date(invoice.invoiceDate || saleConfirmedAt);
+              return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+            })(),
+          },
+        });
+      }
+      if (req.posV2Completion) {
+        const finalizedInvoice = await dbClient().$executeRawUnsafe(
+          'UPDATE invoices SET pos_completion_key = $1, pos_checkout_payload = NULL WHERE id = $2 AND company_id = $3 AND status IN (\'fully_paid\', \'partially_paid\')',
+          req.posV2Completion.completionKey,
+          String(invoice._id),
+          String(companyId),
+        );
+        if (finalizedInvoice !== 1) {
+          throw Object.assign(new Error('The POS sale completion receipt could not be finalized.'), {
+            code: 'POS_IDEMPOTENCY_FINALIZE_FAILED',
+          });
+        }
+      }
       if (requestKey) {
         const finalized = await dbClient().$executeRawUnsafe(
           'UPDATE pos_sale_requests SET invoice_id = $3, status = \'completed\', updated_at = CURRENT_TIMESTAMP WHERE company_id = $1 AND request_key = $2 AND payload_hash = $4',
@@ -1454,7 +1878,109 @@ exports.createDirectSale = async (req, res, next) => {
           throw error;
         }
       }
+      if (req.posV2Completion && autoFiscalSubmission) {
+        const txDb = dbClient();
+        const registerId = String(claimedRegister.id);
+        const shiftId = String(activePosShift.id);
+        await require('../services/posEbmTenantGuard').assertPosEbmTenantContext(txDb, {
+          companyId,
+          invoiceId: invoice._id,
+          registerId,
+          shiftId,
+        });
+        const receiptKey = {
+          companyId: String(companyId),
+          documentType: 'pos',
+          documentId: String(invoice._id),
+          salesTyCd: 'N',
+          rcptTyCd: 'S',
+        };
+        const existingOutbox = await txDb.ebmSubmissionQueue.findFirst({ where: receiptKey });
+        if (existingOutbox) {
+          fiscalOutboxId = existingOutbox.id;
+          if (existingOutbox.signedAt || existingOutbox.ebmStatus === 'submitted') return;
+        } else {
+          const outboxId = randomBytes(12).toString('hex');
+          let fiscalPayload = null;
+          let preparationError = null;
+          try {
+            const prepared = await EBMSalesService.prepareV2SaleSubmission(invoice._id, {
+              companyId,
+              modifierUserId: posCashierId || req.user._id,
+              journalLines: createdEntries[0].lines || journalEntries[0].lines,
+              salesAccountCode: salesAccount,
+              taxAccountCode: vatAccount,
+            });
+            fiscalPayload = prepared.payload;
+          } catch (error) {
+            preparationError = error;
+          }
+          const pending = !!fiscalPayload;
+          const payload = fiscalPayload || {};
+          const payloadHash = pending
+            ? createHash('sha256').update(JSON.stringify(payload)).digest('hex')
+            : null;
+          const environment = String(fiscalMode || 'sandbox');
+          const endpoint = require('../services/ebmService').VSDC_ENDPOINTS.SAVE_SALES;
+          const createdOutbox = await txDb.ebmSubmissionQueue.create({
+            data: {
+              id: outboxId,
+              ...receiptKey,
+              endpoint,
+              operationKey: 'default',
+              correlationId: `sales:${invoice._id}`,
+              environment,
+              payload,
+              ebmStatus: pending ? 'pending' : 'failed',
+              retryCount: 0,
+              maxRetries: 5,
+              nextRetryAt: pending ? new Date() : null,
+              lastAttemptAt: null,
+              lastError: preparationError
+                ? { code: String(preparationError.code || 'EBM_V2_PAYLOAD_PREPARATION_FAILED'), message: String(preparationError.message || 'Fiscal payload preparation failed.').slice(0, 500) }
+                : {},
+              attempts: [],
+              isRetryable: pending,
+              registerId,
+              shiftId,
+              cashierId: String(posCashierId),
+              requestPayloadHash: payloadHash,
+            },
+          });
+          if (!pending) {
+            await txDb.ebmAlert.create({ data: {
+              id: randomBytes(12).toString('hex'), companyId: String(companyId), queueId: createdOutbox.id,
+              documentType: 'pos', documentId: String(invoice._id), endpoint,
+              operationKey: 'default', attemptsMade: 0,
+              lastErrorMessage: String(preparationError?.message || 'Fiscal payload preparation failed.').slice(0, 1000),
+              lastErrorCode: String(preparationError?.code || 'EBM_V2_PAYLOAD_PREPARATION_FAILED'),
+              payload: {}, status: 'open',
+            } });
+            await writePosAuditLog({
+              companyId, registerId, userId: posCashierId, event: 'EBM_V2_NEEDS_REVIEW',
+              metadata: { submissionId: createdOutbox.id, before: { ebmStatus: null }, after: { ebmStatus: 'failed', code: preparationError?.code || 'EBM_V2_PAYLOAD_PREPARATION_FAILED' } },
+            }, txDb);
+          }
+          fiscalOutboxId = createdOutbox.id;
+        }
+      }
     }, { maxWait: 10000, timeout: 90000 });
+
+    if (completionReplayed) {
+      const completedInvoice = await Invoice.findOne({ _id: req.posV2Completion.invoiceId, company: companyId })
+        .populate('client lines.product createdBy');
+      return res.json({ success: true, replayed: true, data: completedInvoice });
+    }
+
+    if (createdPending) {
+      await invoice.populate('client lines.product createdBy');
+      return res.status(201).json({
+        success: true,
+        message: 'Sale saved. Record cash payment to complete the invoice.',
+        data: invoice,
+        paymentRequired: true,
+      });
+    }
 
     // Journal posting used the outer sale transaction, so refresh reporting
     // and bank balance caches only after all records have committed.
@@ -1470,10 +1996,18 @@ exports.createDirectSale = async (req, res, next) => {
     // Populate response
     await invoice.populate('client lines.product createdBy');
 
-    if (autoFiscalSubmission) {
+    if (autoFiscalSubmission && req.posV2Completion && fiscalOutboxId) {
+      // The queue row committed with the sale. Dispatch is only a fast path;
+      // database recovery can find the same durable pending row after a crash.
+      EBMSalesService.submitInvoiceAsync(invoice._id, {
+        companyId,
+        modifierUserId: posCashierId || req.user._id,
+        outboxId: fiscalOutboxId,
+      });
+    } else if (autoFiscalSubmission && !req.posV2Completion) {
       // Fiscal communication must not roll back a completed sale. The service
       // records failures and retryable payloads in the durable EBM queue.
-      EBMSalesService.submitInvoiceAsync(invoice._id, { companyId, modifierUserId: req.user.id || req.user._id });
+      EBMSalesService.submitInvoiceAsync(invoice._id, { companyId, modifierUserId: posCashierId || req.user._id });
     }
 
     // Delivery/alert failures are isolated from the already committed sale.
@@ -1517,6 +2051,24 @@ exports.createDirectSale = async (req, res, next) => {
     if (error?.code === 'POS_PAYMENT_ACCOUNT_REQUIRED' || error?.code === 'POS_PAYMENT_ACCOUNT_INVALID') {
       return res.status(400).json({ success: false, code: error.code, message: error.message });
     }
+    if (['POS_CREDIT_APPROVAL_REQUIRED', 'POS_CREDIT_APPROVAL_INVALID'].includes(error?.code)) {
+      try {
+        await writePosAuditLog({
+          companyId: String(companyId),
+          registerId: String(req.posAuthContext?.register?.id || req.body?.registerId || ''),
+          userId: String(req.user?.id || ''),
+          event: 'APPROVAL_DENIED',
+          metadata: {
+            action: 'CREDIT_OVER_LIMIT',
+            saleId: String(req.posV2Completion?.invoiceId || ''),
+            reason: error.code,
+          },
+          ip: requestIp(req),
+        }, dbClient());
+      } catch (auditError) {
+        return next(auditError);
+      }
+    }
     if (['POS_WALKIN_CREDIT_NOT_ALLOWED', 'POS_CREDIT_LIMIT_EXCEEDED', 'POS_CLIENT_NOT_FOUND'].includes(error?.code)) {
       return res.status(error.code === 'POS_CLIENT_NOT_FOUND' ? 404 : 409).json({
         success: false,
@@ -1524,8 +2076,40 @@ exports.createDirectSale = async (req, res, next) => {
         message: error.message,
       });
     }
+    if ([
+      'POS_CREDIT_CUSTOMER_REQUIRED',
+      'POS_CUSTOMER_OVERDUE',
+      'POS_CREDIT_ALLOCATION_MISMATCH',
+      'POS_CREDIT_APPROVAL_INVALID',
+      'POS_GIFT_CARD_REDEMPTION_MISMATCH',
+    ].includes(error?.code)) {
+      return res.status(409).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+      });
+    }
+    if (error?.code === 'POS_CREDIT_APPROVAL_REQUIRED') {
+      return res.status(403).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+        approvalContext: error.approvalContext,
+      });
+    }
     if (error?.code === 'POS_ZERO_VALUE_SALE') {
       return res.status(400).json({ success: false, code: error.code, message: error.message });
+    }
+    if ([
+      'POS_SHIFT_REQUIRED',
+      'POS_TILL_SHIFT_LINK_MISSING',
+      'POS_PENDING_SALE_NOT_FOUND',
+      'POS_PENDING_SALE_TOTAL_CHANGED',
+      'POS_PENDING_SALE_LINES_CHANGED',
+      'POS_SALE_NOT_PENDING',
+      'POS_IDEMPOTENCY_FINALIZE_FAILED',
+    ].includes(error?.code)) {
+      return res.status(409).json({ success: false, code: error.code, message: error.message });
     }
     if (error?.code === 'PERIOD_CLOSED') {
       return res.status(409).json({ success: false, code: error.code, message: error.message });
@@ -1551,6 +2135,32 @@ exports.createDirectSale = async (req, res, next) => {
       });
     }
     next(error);
+  }
+};
+
+exports.getCheckoutPaymentFlow = async (req, res, next) => {
+  try {
+    const companyId = String(req.user?.company?._id || '');
+    const registerId = String(req.query.registerId || '').trim();
+    const deviceId = String(req.query.deviceId || '').trim();
+    if (!companyId || !registerId || !deviceId) throw registerClaimRequiredError();
+
+    const register = await findClaimedRegister(companyId, registerId, deviceId);
+    if (!register) throw registerClaimRequiredError();
+
+    const settings = await posPaymentService.getPaymentSettings(companyId);
+    return res.json({
+      success: true,
+      data: {
+        registerId: String(register.id),
+        paymentFlow: posPaymentService.resolvePaymentFlow(settings, String(register.id)),
+        methods: posPaymentService.resolveEnabledMethods(settings, String(register.id)),
+        manualMobileMoneyMode: settings.manualMobileMoneyMode,
+        manualMobileMoneyReceivers: settings.manualMobileMoneyReceivers,
+      },
+    });
+  } catch (error) {
+    return next(error);
   }
 };
 
@@ -1621,6 +2231,7 @@ exports.getPosProducts = async (req, res, next) => {
     // It avoids a full matching-row count and work proportional to page depth.
     const fetchedProducts = await Product.find(query)
       .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode imageUrl imageUrls category isStockable trackingType trackSerialNumbers trackBatch')
+      .populate('category')
       .sort({ name: 1, _id: 1 })
       .limit(resultLimit + 1);
     const hasMore = fetchedProducts.length > resultLimit;
@@ -1629,6 +2240,22 @@ exports.getPosProducts = async (req, res, next) => {
     const nextCursor = hasMore && lastProduct
       ? Buffer.from(JSON.stringify({ name: lastProduct.name, id: String(lastProduct._id) })).toString('base64url')
       : null;
+
+    // Resolve category IDs explicitly as well as using populate below. The
+    // till must never render an opaque foreign key as a category chip label.
+    const productCategoryIds = [...new Set(products.map((product) => {
+      const category = product.category;
+      return String(category && typeof category === 'object'
+        ? (category.id || category._id || category.categoryId || '')
+        : (category || ''));
+    }).filter(isObjectIdString))];
+    const categoryRows = productCategoryIds.length
+      ? await dbClient().category.findMany({
+        where: { companyId: String(companyId), id: { in: productCategoryIds } },
+        select: { id: true, name: true },
+      })
+      : [];
+    const categoryNameById = new Map(categoryRows.map((category) => [String(category.id).trim(), category.name]));
 
     const [warehouseStockLevels, priceListPricing, transferVisibility, quarantinedRows] = await Promise.all([
       warehouseId && products.length
@@ -1683,7 +2310,11 @@ exports.getPosProducts = async (req, res, next) => {
         reservedStock,
         quarantinedStock,
         averageCost: toNumber(p.averageCost),
-        category: p.category,
+        // Till filters need a human-readable category. Product.find() selects
+        // only the category foreign key unless the relation is populated.
+        category: p.category && typeof p.category === 'object'
+          ? (p.category.name || categoryNameById.get(String(p.category.id || p.category._id || p.category.categoryId || '').trim()) || null)
+          : (categoryNameById.get(String(p.category || '').trim()) || (isObjectIdString(p.category) ? null : p.category)),
         isAvailable: currentStock > 0 || p.isStockable === false,
         incomingTransfers: transferVisibility[String(p._id)]?.incoming || [],
         outgoingTransfers: transferVisibility[String(p._id)]?.outgoing || [],

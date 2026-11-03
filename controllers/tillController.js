@@ -4,7 +4,9 @@ const { PermissionService, resolveUserRoles } = require('../middleware/authorize
 const { tillSessionToApi } = require('../utils/tillMappers');
 const { runInTransaction } = require('../services/transactionService');
 const { findClaimedRegister, registerClaimRequiredError } = require('../services/posRegisterService');
+const { findOpenPosShiftForRegisterCode } = require('../services/posShiftLinkService');
 const { consumeApproval } = require('./posManagerApprovalController');
+const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 
 function largeVarianceManagerThreshold() {
   const configured = Number(process.env.POS_TILL_LARGE_VARIANCE_THRESHOLD_RWF);
@@ -135,6 +137,13 @@ exports.closeTill = async (req, res, next) => {
     const { closingCount, closeNotes, handoverToEmail } = req.body;
     const register = await requireClaimedRegister(req);
     const { registerId } = parseRegister(req);
+    if (await findOpenPosShiftForRegisterCode(prisma, companyId, register.code)) {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_SHIFT_CLOSE_REQUIRED',
+        message: 'Close this shift from the POS shift screen so the final report and cash reconciliation are recorded.',
+      });
+    }
     if (closingCount == null) {
       return res.status(400).json({ success: false, message: 'Enter the counted cash before closing this shift' });
     }
@@ -258,6 +267,82 @@ exports.closeTill = async (req, res, next) => {
   }
 };
 
+exports.recordNoSale = async (req, res, next) => {
+  const companyId = String(req.user.company?._id || req.user.companyId || '');
+  const cashierId = String(req.user.id || req.user._id || '');
+  const tillSessionId = String(req.body?.tillSessionId || '');
+  if (!/^[a-f\d]{24}$/i.test(tillSessionId)) {
+    return res.status(400).json({
+      success: false,
+      code: 'POS_TILL_ID_INVALID',
+      message: 'Select a valid open till before recording a no-sale drawer opening.',
+    });
+  }
+
+  try {
+    const result = await runInTransaction(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(
+        `SELECT id, opened_by, register_id, cash_activity
+           FROM till_sessions
+          WHERE id = $1 AND company_id = $2 AND status = 'open'
+            AND ($3::text IS NULL OR register_id = $3)
+          FOR UPDATE`,
+        tillSessionId, companyId, req.posAuthContext ? String(req.posAuthContext.register.code) : null,
+      );
+      const till = rows[0];
+      if (!till || String(till.opened_by).trim() !== cashierId) {
+        return { code: 'POS_TILL_SESSION_CHANGED' };
+      }
+
+      await consumeApproval({
+        approvalId: req.body?.approvalId,
+        companyId,
+        cashierId,
+        action: 'no_sale',
+        subjectId: tillSessionId,
+        payload: { tillSessionId },
+      });
+      const approvalRows = await tx.$queryRawUnsafe(
+        'SELECT manager_id FROM pos_manager_approvals WHERE id = $1 AND company_id = $2',
+        String(req.body.approvalId), companyId,
+      );
+
+      const now = new Date();
+      const activity = Array.isArray(till.cash_activity) ? till.cash_activity : [];
+      const updated = await tx.tillSession.update({
+        where: { id: tillSessionId },
+        data: {
+          cashActivity: [...activity, {
+            type: 'no_sale',
+            recordedBy: cashierId,
+            approvedById: approvalRows[0]?.manager_id ? String(approvalRows[0].manager_id).trim() : null,
+            approvedAt: now.toISOString(),
+            recordedAt: now.toISOString(),
+          }],
+        },
+      });
+      return { till: tillSessionToApi(updated) };
+    });
+    if (result.code === 'POS_TILL_SESSION_CHANGED') {
+      return res.status(409).json({
+        success: false,
+        code: result.code,
+        message: 'This till is no longer open for the signed-in cashier. Refresh the POS shift.',
+      });
+    }
+    return res.json({ success: true, data: result.till });
+  } catch (error) {
+    if (['POS_MANAGER_APPROVAL_REQUIRED', 'POS_MANAGER_APPROVAL_INVALID'].includes(error?.code)) {
+      return res.status(error.statusCode || 409).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+      });
+    }
+    return next(error);
+  }
+};
+
 /** Manager-authorized reconciliation when the cashier who owns an open shift is unavailable. */
 exports.managerCloseTill = async (req, res, next) => {
   try {
@@ -290,6 +375,12 @@ exports.managerCloseTill = async (req, res, next) => {
         const error = new Error('This shift is already closed or is not in this workspace. Refresh the shift list.');
         error.statusCode = 409;
         error.code = 'POS_TILL_SESSION_CHANGED';
+        throw error;
+      }
+      if (await findOpenPosShiftForRegisterCode(tx, companyId, active.register_id)) {
+        const error = new Error('Close this shift from the POS shift screen so the final report and cash reconciliation are recorded.');
+        error.statusCode = 409;
+        error.code = 'POS_SHIFT_CLOSE_REQUIRED';
         throw error;
       }
       if (String(active.opened_by) === requestedById) {
@@ -381,7 +472,10 @@ exports.getTillShifts = async (req, res, next) => {
     const companyId = String(req.user.company?._id || req.user.companyId || '');
     const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
     const rows = await prisma.tillSession.findMany({
-      where: { companyId },
+      where: {
+        companyId,
+        ...(req.posAuthContext ? { registerId: String(req.posAuthContext.register.code) } : {}),
+      },
       include: { openedBy: { select: { id: true, name: true, email: true } } },
       orderBy: { openedAt: 'desc' },
       take: limit,
@@ -395,5 +489,121 @@ exports.getTillShifts = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  }
+};
+
+/** Delete an accidentally opened till only when it has no financial activity. */
+exports.deleteEmptyTillShift = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company?._id || req.user.companyId || '');
+    const userId = String(req.user.id || req.user._id || '');
+    const tillSessionId = String(req.params.tillSessionId || '').trim();
+    if (!/^[a-f\d]{24}$/i.test(tillSessionId)) {
+      return res.status(400).json({ success: false, code: 'POS_TILL_ID_INVALID', message: 'Select a valid shift.' });
+    }
+
+    const result = await runInTransaction(async (tx) => {
+      const lockedRows = await tx.$queryRawUnsafe(
+        'SELECT id, company_id, opened_by, register_id, register_name, status, opening_float, expected_cash, closing_count, cash_variance, cash_activity, handover_from_id, handover_to_id, close_notes, z_report, z_report_generated_at, opened_at FROM till_sessions WHERE id = $1 AND company_id = $2 FOR UPDATE',
+        tillSessionId, companyId,
+      );
+      const till = lockedRows[0];
+      if (!till) return { code: 'POS_TILL_NOT_FOUND' };
+      if (till.status !== 'open') return { code: 'POS_TILL_DELETE_CLOSED' };
+
+      const activity = Array.isArray(till.cash_activity) ? till.cash_activity : [];
+      const onlyZeroOpeningFloat = activity.length === 1
+        && activity[0]?.type === 'opening_float'
+        && Number(activity[0]?.amount || 0) === 0;
+      const tillHasFinancialActivity = Number(till.opening_float) !== 0
+        || Number(till.expected_cash) !== 0
+        || till.closing_count != null
+        || till.cash_variance != null
+        || !onlyZeroOpeningFloat
+        || till.handover_from_id != null
+        || till.handover_to_id != null
+        || Boolean(String(till.close_notes || '').trim())
+        || till.z_report != null
+        || till.z_report_generated_at != null;
+      if (tillHasFinancialActivity) return { code: 'POS_TILL_DELETE_NOT_EMPTY' };
+
+      const register = await tx.posRegister.findFirst({
+        where: { companyId, code: String(till.register_id) },
+        select: { id: true, name: true },
+      });
+      let shift = null;
+      if (register) {
+        shift = await tx.posShift.findFirst({
+          where: {
+            companyId,
+            registerId: register.id,
+            openedById: String(till.opened_by),
+            openedAt: new Date(till.opened_at),
+            status: { in: ['open', 'reopened'] },
+          },
+          select: {
+            id: true,
+            shiftNumber: true,
+            status: true,
+            openingFloat: true,
+            closedAt: true,
+            countedCash: true,
+            journalEntryId: true,
+            cashMovements: { select: { id: true }, take: 1 },
+            zReport: { select: { id: true } },
+            correctionReports: { select: { id: true }, take: 1 },
+            invoices: { select: { id: true }, take: 1 },
+            payments: { select: { id: true }, take: 1 },
+          },
+        });
+      }
+      if (shift && (
+        !['open', 'reopened'].includes(shift.status)
+        || Number(shift.openingFloat) !== 0
+        || shift.closedAt != null
+        || shift.countedCash != null
+        || shift.journalEntryId != null
+        || shift.cashMovements.length || shift.zReport || shift.correctionReports.length
+        || shift.invoices.length || shift.payments.length
+      )) return { code: 'POS_TILL_DELETE_NOT_EMPTY' };
+
+      if (shift) await tx.posShift.delete({ where: { id: shift.id } });
+      await tx.tillSession.delete({ where: { id: tillSessionId } });
+      return {
+        code: null,
+        registerId: register?.id || null,
+        registerName: register?.name || String(till.register_name || 'Register'),
+        posShiftId: shift?.id || null,
+        shiftNumber: shift?.shiftNumber || null,
+      };
+    });
+
+    if (result.code) {
+      const errors = {
+        POS_TILL_NOT_FOUND: [404, 'POS_TILL_NOT_FOUND', 'Shift not found in this workspace.'],
+        POS_TILL_DELETE_CLOSED: [409, 'POS_TILL_DELETE_CLOSED', 'Closed shifts are financial records and cannot be deleted.'],
+        POS_TILL_DELETE_NOT_EMPTY: [409, 'POS_TILL_DELETE_NOT_EMPTY', 'Only an empty shift with no cash activity, sales, payments, or reports can be deleted.'],
+      };
+      const [status, code, message] = errors[result.code];
+      return res.status(status).json({ success: false, code, message });
+    }
+
+    await writePosAuditLog({
+      companyId,
+      registerId: result.registerId,
+      userId,
+      event: 'SHIFT_DELETED',
+      metadata: {
+        tillSessionId,
+        posShiftId: result.posShiftId,
+        shiftNumber: result.shiftNumber,
+        registerName: result.registerName,
+        reason: 'Empty shift removed by an authorized manager.',
+      },
+      ip: requestIp(req),
+    });
+    return res.json({ success: true, data: { deletedTillSessionId: tillSessionId, deletedPosShiftId: result.posShiftId } });
+  } catch (error) {
+    return next(error);
   }
 };
