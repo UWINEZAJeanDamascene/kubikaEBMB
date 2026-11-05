@@ -30,6 +30,7 @@ module.exports = {
       "petty_cash_opening", // opening petty cash fund — internal
       "petty_cash", // legacy petty cash float opening — internal
       "opening_balance", // balance-sheet opening entries (not period flows)
+      "pos_bank_deposit", // cash transfer from till to cash in transit
     ],
 
     // ── OPERATING ────────────────────────────────────────────────────────

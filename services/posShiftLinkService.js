@@ -203,6 +203,8 @@ async function recordTillCashMovement(client, {
         type: movement.type,
         amount: movement.amount,
         reasonCode: movement.reasonCode,
+        reference: movement.reference || null,
+        bankSlipReference: movement.bankSlipReference || null,
         note: movement.note,
         recordedBy: movement.performedById,
         recordedAt: new Date().toISOString(),

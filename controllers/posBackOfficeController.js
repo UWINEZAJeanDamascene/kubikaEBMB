@@ -4,6 +4,7 @@ const { prisma } = require('../lib/prisma');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const { lockRegisterForZNumber } = require('../services/posShiftLinkService');
 const { getPosZReportHighWaterMark } = require('../services/posZReportSequence');
+const { getBankDepositClearingBalances } = require('../services/posBankDepositClearingService');
 
 function companyIdFrom(req) {
   const company = req.user?.company;
@@ -224,6 +225,7 @@ exports.shifts = async (req, res, next) => {
         closedBy: { select: { id: true, name: true } },
       },
     });
+    const depositClearingBalances = await getBankDepositClearingBalances(companyId);
     const deletable = new Map(await Promise.all(data.filter((shift) => shift.status === 'closed').map(async (shift) => [
       shift.id,
       await isDeletableEmptyClosedShift(prisma, companyId, shift),
@@ -231,7 +233,20 @@ exports.shifts = async (req, res, next) => {
     return res.json({ success: true, data: data.map((shift) => {
       const { journalEntryId, note, cashMovements, correctionReports, invoices, payments, ebmSubmissionQueues, zReport, ...publicShift } = shift;
       const publicZReport = zReport ? { zNumber: zReport.zNumber, generatedAt: zReport.generatedAt } : null;
-      return { ...publicShift, zReport: publicZReport, canDelete: deletable.get(shift.id) === true };
+      const cashPostingStatus = shift.status !== 'closed'
+        ? 'not_closed'
+        : Number(shift.difference || 0) === 0
+          ? 'not_required'
+          : journalEntryId
+            ? 'posted'
+            : 'pending';
+      return {
+        ...publicShift,
+        zReport: publicZReport,
+        canDelete: deletable.get(shift.id) === true,
+        cashPostingStatus,
+        bankDepositClearingBalance: depositClearingBalances.get(String(shift.registerId)) || 0,
+      };
     }) });
   } catch (error) {
     return next(error);

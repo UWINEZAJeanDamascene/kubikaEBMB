@@ -283,7 +283,7 @@ exports.getProducts = async (req, res, next) => {
       '_id', 'company', 'name', 'sku', 'barcode', 'imageUrl', 'imageUrls', 'category', 'unit', 'supplier',
       'currentStock', 'reservedQuantity', 'isActive', 'lowStockThreshold',
       'averageCost', 'sellingPrice', 'costPrice', 'costingMethod', 'isArchived',
-      'trackingType', 'trackBatch', 'trackSerialNumbers', 'defaultWarehouse', 'ebm', 'createdAt', 'updatedAt'
+      'trackingType', 'trackBatch', 'trackSerialNumbers', 'defaultWarehouse', 'ebm', 'isNoDiscount', 'createdAt', 'updatedAt'
     ]).join(' ');
 
     const hasComplexFilter = !!(query.$or || query.$expr || query.$text);
@@ -298,7 +298,7 @@ exports.getProducts = async (req, res, next) => {
       productQuery.populate('category', 'name');
     } else if (!isPicker) {
       productQuery
-        .populate('category', 'name')
+        .populate('category', 'name isNoDiscount')
         .populate('supplier', 'name code');
     }
 

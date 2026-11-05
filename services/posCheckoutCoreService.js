@@ -36,7 +36,9 @@ function pendingCheckoutPayload(body) {
       productId: String(item.productId),
       quantity: item.quantity,
       ...(item.unitPrice != null ? { unitPrice: item.unitPrice } : {}),
+      ...(item.catalogUnitPrice != null ? { catalogUnitPrice: item.catalogUnitPrice } : {}),
       ...(item.discountPct != null ? { discountPct: item.discountPct } : {}),
+      ...(item.discountReason != null ? { discountReason: String(item.discountReason) } : {}),
       ...(item.unit != null ? { unit: item.unit } : {}),
       ...(item.description != null ? { description: item.description } : {}),
       ...(Array.isArray(item.serialNumbers) ? { serialNumbers: item.serialNumbers } : {}),
@@ -46,6 +48,9 @@ function pendingCheckoutPayload(body) {
     ...(body.terms != null ? { terms: String(body.terms) } : {}),
     ...(body.dueDate != null ? { dueDate: body.dueDate } : {}),
     ...(body.promotionId ? { promotionId: String(body.promotionId) } : {}),
+    ...(body.clientId ? { clientId: String(body.clientId) } : {}),
+    ...(body.cartDiscountPct != null ? { cartDiscountPct: Number(body.cartDiscountPct) } : {}),
+    ...(body.cartDiscountReason != null ? { cartDiscountReason: String(body.cartDiscountReason) } : {}),
     ...(body.proformaDocumentId ? { proformaDocumentId: String(body.proformaDocumentId) } : {}),
   };
 }

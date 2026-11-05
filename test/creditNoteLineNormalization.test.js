@@ -1,4 +1,7 @@
-const { normalizeCreditNoteLines } = require('../utils/creditNoteLineNormalization');
+const {
+  normalizeCreditNoteLines,
+  requiresReturnedBatch,
+} = require('../utils/creditNoteLineNormalization');
 
 const invoice = {
   lines: [
@@ -50,5 +53,35 @@ describe('credit note line normalization', () => {
     expect(() => normalizeCreditNoteLines(invoice, [
       { invoiceLineId: 'line-1', quantity: 6 },
     ], 'price_adjustment')).toThrow('no more than the 5 remaining');
+  });
+
+  test('defaults lines to restock and calculates the original tax amount to cents', () => {
+    const lines = normalizeCreditNoteLines(invoice, [
+      { invoiceLineId: 'line-1', quantity: 1.5, returnToWarehouse: 'warehouse-1' },
+    ], 'goods_return');
+
+    expect(lines[0]).toMatchObject({
+      returnDisposition: 'restock',
+      unitCost: 50,
+      lineTax: 27,
+    });
+  });
+
+  test('requires a reason and a stockable goods return for write-offs', () => {
+    expect(() => normalizeCreditNoteLines(invoice, [
+      { invoiceLineId: 'line-1', quantity: 1, returnDisposition: 'write_off' },
+    ], 'goods_return')).toThrow('write-off reason');
+
+    expect(() => normalizeCreditNoteLines(invoice, [
+      { invoiceLineId: 'line-1', quantity: 1, returnDisposition: 'write_off', writeOffReason: 'Damaged' },
+    ], 'price_adjustment')).toThrow('only available for stockable goods-return lines');
+  });
+
+  test('requires the returned batch only when stock is being restocked', () => {
+    const batchProduct = { trackingType: 'batch' };
+
+    expect(requiresReturnedBatch(batchProduct, 'restock')).toBe(true);
+    expect(requiresReturnedBatch(batchProduct, 'write_off')).toBe(false);
+    expect(requiresReturnedBatch({ trackingType: 'none' }, 'restock')).toBe(false);
   });
 });

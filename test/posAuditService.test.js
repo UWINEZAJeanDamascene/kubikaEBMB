@@ -47,6 +47,9 @@ describe('POS audit logging', () => {
     expect(POS_AUDIT_EVENTS.has('PIN_RESET')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('SHIFT_HISTORY_VIEWED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('PAYMENT_SETTINGS_UPDATED')).toBe(true);
+    expect(POS_AUDIT_EVENTS.has('DISCOUNT_SETTINGS_UPDATED')).toBe(true);
+    expect(POS_AUDIT_EVENTS.has('REGISTER_DISCOUNT_SETTINGS_UPDATED')).toBe(true);
+    expect(POS_AUDIT_EVENTS.has('APPROVAL_POLICY_UPDATED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('PAYMENT_REMOVED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('PAYMENT_PROVIDER_REQUESTED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('PAYMENT_PROVIDER_REQUEST_UNCERTAIN')).toBe(true);

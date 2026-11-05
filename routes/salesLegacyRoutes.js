@@ -19,6 +19,8 @@ const priceListController = require('../controllers/priceListController');
 const posStoredValueController = require('../controllers/posStoredValueController');
 const posNonPostingDocumentController = require('../controllers/posNonPostingDocumentController');
 const posPublicReceiptController = require('../controllers/posPublicReceiptController');
+const posDiscountApplicationController = require('../controllers/posDiscountApplicationController');
+const posVoucherController = require('../controllers/posVoucherController');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 
 // All routes require authentication
@@ -45,6 +47,17 @@ const canReadSale = requireAnyPosPermission(
 );
 const canManageHeldSales = canCreateSale;
 const canManagePromotions = requirePermissionOrRoles('sales_invoices', 'approve', ['admin', 'manager']);
+const canIssueBackOfficeGiftCards = requirePermissionOrRoles('pos_gift_cards', 'issue_backoffice', ['admin', 'owner', 'accountant']);
+const canReadVouchers = requirePermissionOrRoles('pos_vouchers', 'read', ['admin', 'manager']);
+const canCreateVouchers = requirePermissionOrRoles('pos_vouchers', 'create', ['admin', 'manager']);
+const canEditVouchers = requirePermissionOrRoles('pos_vouchers', 'edit', ['admin', 'manager']);
+const canGenerateVouchers = requirePermissionOrRoles('pos_vouchers', 'generate', ['admin', 'manager']);
+const canPauseVouchers = requirePermissionOrRoles('pos_vouchers', 'pause', ['admin', 'manager']);
+const canCancelVouchers = requirePermissionOrRoles('pos_vouchers', 'cancel', ['admin', 'manager']);
+const canRestoreVouchers = requirePermissionOrRoles('pos_vouchers', 'restore', ['admin', 'manager']);
+const canApproveVoucherRestore = requirePermissionOrRoles('pos_vouchers', 'approve_restore', ['admin', 'manager']);
+const canReadVoucherHistory = requirePermissionOrRoles('pos_vouchers', 'history', ['admin', 'manager']);
+const canManageVoucherSettings = requirePermissionOrRoles('pos_vouchers', 'settings', ['admin', 'manager']);
 const canManagePriceLists = requirePermissionOrRoles('warehouses', 'update', ['admin', 'manager', 'warehouse_manager']);
 const requirePosSessionAuth = requirePosSession();
 const requirePosPaymentPermission = requirePosSessionPermission('pos.payment.take');
@@ -65,16 +78,44 @@ router.get('/promotions', canReadPosCatalog, posPromotionController.list);
 router.get('/promotions/manage', canManagePromotions, posPromotionController.list);
 router.post('/promotions', canManagePromotions, posPromotionController.create);
 router.patch('/promotions/:promotionId/active', canManagePromotions, posPromotionController.setActive);
+router.get('/vouchers', canReadVouchers, posVoucherController.list);
+router.get('/vouchers/settings', canReadVouchers, posVoucherController.getSettings);
+router.put('/vouchers/settings', canManageVoucherSettings, posVoucherController.updateSettings);
+router.post('/vouchers', canCreateVouchers, posVoucherController.create);
+router.post('/vouchers/bulk-generate', canGenerateVouchers, posVoucherController.bulkGenerate);
+router.put('/vouchers/:voucherId', canEditVouchers, posVoucherController.update);
+router.patch('/vouchers/:voucherId/pause', canPauseVouchers, (req, res, next) => {
+  req.body.status = 'PAUSED';
+  return posVoucherController.setStatus(req, res, next);
+});
+router.patch('/vouchers/:voucherId/activate', canEditVouchers, (req, res, next) => {
+  req.body.status = 'ACTIVE';
+  return posVoucherController.setStatus(req, res, next);
+});
+router.patch('/vouchers/:voucherId/cancel', canCancelVouchers, (req, res, next) => {
+  req.body.status = 'CANCELLED';
+  return posVoucherController.setStatus(req, res, next);
+});
+router.get('/vouchers/:voucherId/redemptions', canReadVoucherHistory, posVoucherController.history);
+router.post('/vouchers/redemptions/:redemptionId/restore', canRestoreVouchers, canApproveVoucherRestore, posVoucherController.restore);
+router.post('/vouchers/reserve', canCreateSale, requirePosSessionAuth, requirePosSessionPermission('pos.voucher.redeem'), posVoucherController.reserve);
+router.post('/vouchers/release', canCreateSale, requirePosSessionAuth, requirePosSessionPermission('pos.voucher.redeem'), posVoucherController.release);
 router.get('/price-lists/manage', canManagePriceLists, priceListController.listManage);
 router.post('/price-lists', canManagePriceLists, priceListController.create);
 router.patch('/price-lists/:priceListId', canManagePriceLists, priceListController.update);
 router.put('/price-lists/:priceListId/prices', canManagePriceLists, priceListController.replacePrices);
 router.put('/warehouses/:warehouseId/price-list', canManagePriceLists, priceListController.assignWarehouse);
 router.get('/stored-value/balance', canReadStoredValue, posStoredValueController.lookup);
-router.post('/stored-value/issue', canManagePromotions, posStoredValueController.issue);
+router.post('/stored-value/issue', (req, res, next) => {
+  const requiredPermission = String(req.body?.kind || '').toLowerCase() === 'gift_card'
+    ? canIssueBackOfficeGiftCards
+    : canManagePromotions;
+  return requiredPermission(req, res, next);
+}, posStoredValueController.issue);
 
 // Canonical POS checkout (the only supported sale write path)
 router.get('/payment-flow', canCreateSale, getCheckoutPaymentFlow);
+router.post('/discounts/apply', canCreateSale, requirePosSessionAuth, requirePosSessionPermission('pos.till.discount'), posDiscountApplicationController.apply);
 router.post('/direct-sale', canCreateSale, requireOnlinePosSession, requireOnlinePosPaymentPermission, logAction('sales_legacy_direct_sale'), createDirectSale);
 router.post('/offline-snapshot', canCreateSale, posOfflineController.issueSnapshot);
 router.get('/offline-conflicts', canManagePromotions, posOfflineController.listConflicts);

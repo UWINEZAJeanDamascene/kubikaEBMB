@@ -3,6 +3,7 @@
 const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const { normalizePosShiftSettings } = require('../services/posShiftService');
+const { normalizePosGiftCardSettings } = require('../services/posGiftCardSettingsService');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const {
   DEFAULT_RECEIPT_SETTINGS, normalizeReceiptSettings, resolveReceiptSettings,
@@ -12,11 +13,11 @@ const {
 const SETTING_FIELDS = [
   'cashAccountability', 'denominations', 'defaultFloat', 'varianceTolerance',
   'varianceApprovalLimit', 'cashOutApprovalLimit', 'drawerWarnAmount',
-  'heldSalesOnClose', 'idleLockMinutes', 'receipt', 'loyalty',
+  'heldSalesOnClose', 'idleLockMinutes', 'receipt', 'loyalty', 'giftCardLimits',
 ];
 // These fields describe the GET response and are not writable settings. Ignore
 // them for clients that submit the response object they received from GET.
-const READ_ONLY_RESPONSE_FIELDS = new Set(['receiptScope', 'receiptBranchId', 'hasReceiptOverride']);
+const READ_ONLY_RESPONSE_FIELDS = new Set(['receiptScope', 'receiptBranchId', 'hasReceiptOverride', 'giftCardTillTypes']);
 // Keep the existing wallet behavior for companies that have not saved this
 // setting yet. The reward percentage is separate from loyalty point value.
 const DEFAULT_LOYALTY_SETTINGS = Object.freeze({
@@ -57,6 +58,10 @@ function normalizedSettings(row, branchId = null) {
   const storedReceiptSettings = row?.posReceiptSettings;
   return {
     ...shift,
+    giftCardLimits: normalizePosGiftCardSettings(row?.posGiftCardSettings),
+    giftCardTillTypes: Array.isArray(row?.posDiscountSettings?.systemTillTypes)
+      ? row.posDiscountSettings.systemTillTypes.map((type) => String(type).toLowerCase())
+      : ['retail'],
     idleLockMinutes: row?.posIdleLockMinutes ?? 5,
     receipt: resolveReceiptSettings(storedReceiptSettings, branchId),
     loyalty: normalizeLoyaltySettings(row?.posLoyaltySettings),
@@ -99,6 +104,8 @@ exports.getSettings = async (req, res, next) => {
         posHeldSalesOnClose: true,
         posReceiptSettings: true,
         posLoyaltySettings: true,
+        posGiftCardSettings: true,
+        posDiscountSettings: true,
       },
     });
     return res.json({
@@ -136,6 +143,7 @@ exports.updateSettings = async (req, res, next) => {
 
     let shift;
     let receipt;
+    let giftCardLimits;
     try {
       shift = normalizePosShiftSettings({
         cashAccountability: body.cashAccountability,
@@ -149,6 +157,7 @@ exports.updateSettings = async (req, res, next) => {
       });
       receipt = normalizeReceiptSettings(body.receipt);
       body.loyalty = normalizeLoyaltySettings(body.loyalty);
+      giftCardLimits = normalizePosGiftCardSettings(body.giftCardLimits);
     } catch (error) {
       if (error instanceof TypeError || error instanceof RangeError) return sendInvalid(res, error.message);
       throw error;
@@ -161,7 +170,10 @@ exports.updateSettings = async (req, res, next) => {
         create: { id: generateObjectId(), companyId },
         update: {},
       });
-      const current = await tx.systemSettings.findUnique({ where: { companyId }, select: { posReceiptSettings: true, posLoyaltySettings: true } });
+      const current = await tx.systemSettings.findUnique({
+        where: { companyId },
+        select: { posReceiptSettings: true, posLoyaltySettings: true, posGiftCardSettings: true },
+      });
       const storedReceiptSettings = saveReceiptSettings(current?.posReceiptSettings, receipt, branchId);
       const saved = await tx.systemSettings.update({
         where: { companyId },
@@ -177,6 +189,7 @@ exports.updateSettings = async (req, res, next) => {
           posHeldSalesOnClose: shift.heldSalesOnClose,
           posReceiptSettings: storedReceiptSettings,
           posLoyaltySettings: body.loyalty,
+          posGiftCardSettings: giftCardLimits,
           lastUpdatedBy: userId || null,
         },
         select: {
@@ -191,6 +204,8 @@ exports.updateSettings = async (req, res, next) => {
           posHeldSalesOnClose: true,
           posReceiptSettings: true,
           posLoyaltySettings: true,
+          posGiftCardSettings: true,
+          posDiscountSettings: true,
         },
       });
       await writePosAuditLog({
@@ -203,6 +218,7 @@ exports.updateSettings = async (req, res, next) => {
           receiptBranchId: branchId,
           cashAccountability: shift.cashAccountability,
           denominationCount: shift.denominations.length,
+          giftCardLimits,
         },
         ip: requestIp(req),
       }, tx);

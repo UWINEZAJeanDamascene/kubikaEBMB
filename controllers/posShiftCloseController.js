@@ -7,6 +7,7 @@ const { runInTransaction } = require('../services/transactionService');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const { getPosEbmSettings } = require('../services/posEbmSettingsService');
 const { getPosZReportHighWaterMark } = require('../services/posZReportSequence');
+const { releaseInvoiceReservations } = require('../services/posVoucherService');
 const { buildReport } = require('./tillZReportController');
 const {
   findRegisterForShift,
@@ -423,6 +424,7 @@ exports.close = async (req, res, next) => {
             cancellationReason: 'AUTO_CANCELLED_SHIFT_CLOSE',
           },
         });
+        await releaseInvoiceReservations(tx, companyId, invoice.id, userId);
         await writePosAuditLog({
           companyId,
           registerId,

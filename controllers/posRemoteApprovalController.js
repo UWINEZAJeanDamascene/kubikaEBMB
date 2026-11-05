@@ -6,10 +6,57 @@ const { generateObjectId } = require('../utils/objectId');
 const { writePosAuditLog, requestIp } = require('../services/posAuditService');
 const { ACTIONS: APPROVAL_PERMISSION_RULES } = require('./posManagerApprovalController');
 const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
+const {
+  POLICY_ACTIONS,
+  defaultApprovalPolicy,
+  getApprovalPolicy,
+  validatePolicyDuration,
+} = require('../services/posApprovalPolicyService');
 
 const ACTIONS = new Set(Object.keys(APPROVAL_PERMISSION_RULES).map((action) => action.toUpperCase()));
-const REQUEST_TTL_MS = 10 * 60 * 1000;
 const hashPayload = (payload) => createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
+
+function approvalQueueFilters(query = {}) {
+  const rawStatus = String(query.status || 'PENDING').toUpperCase();
+  if (!['ALL', 'PENDING', 'APPROVED', 'REJECTED', 'EXPIRED'].includes(rawStatus)) {
+    return { error: 'Choose a valid approval status.' };
+  }
+  const where = {};
+  if (rawStatus !== 'ALL') where.status = rawStatus;
+  const action = String(query.action || '').trim();
+  if (action) {
+    if (!ACTIONS.has(action.toUpperCase())) return { error: 'Choose a supported approval action.' };
+    where.action = { equals: action, mode: 'insensitive' };
+  }
+  const dateRange = {};
+  for (const [parameter, operator] of [['from', 'gte'], ['to', 'lt']]) {
+    const value = String(query[parameter] || '').trim();
+    if (!value) continue;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return { error: 'Use YYYY-MM-DD for approval date filters.' };
+    const date = new Date(`${value}T00:00:00.000Z`);
+    if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) {
+      return { error: 'Provide a valid approval date.' };
+    }
+    if (operator === 'lt') date.setUTCDate(date.getUTCDate() + 1);
+    dateRange[operator] = date;
+  }
+  if (dateRange.gte && dateRange.lt && dateRange.gte >= dateRange.lt) {
+    return { error: 'The approval end date must be on or after the start date.' };
+  }
+  if (Object.keys(dateRange).length) where.createdAt = dateRange;
+  const search = String(query.search || '').trim().slice(0, 100);
+  if (search) {
+    where.OR = [
+      { action: { contains: search, mode: 'insensitive' } },
+      { cashier: { is: { name: { contains: search, mode: 'insensitive' } } } },
+      { register: { is: { name: { contains: search, mode: 'insensitive' } } } },
+      { register: { is: { code: { contains: search, mode: 'insensitive' } } } },
+    ];
+  }
+  const limitValue = Number(query.limit);
+  const limit = Number.isInteger(limitValue) && limitValue > 0 ? Math.min(limitValue, 200) : 100;
+  return { status: rawStatus, where, limit };
+}
 
 function companyId(req) {
   return String(req.user?.company?._id || req.user?.company?.id || req.user?.companyId || '');
@@ -40,6 +87,8 @@ exports.eligibleManagers = async (req, res, next) => {
     if (!context || !company || !ACTIONS.has(action.toUpperCase())) {
       return res.status(400).json({ success: false, code: 'POS_APPROVAL_ACTION_INVALID', message: 'Choose a supported approval action.' });
     }
+    const policy = await getApprovalPolicy(prisma, company, action);
+    if (!policy.enabled) return res.json({ success: true, data: [] });
     const candidates = await prisma.user.findMany({
       where: { companyId: company, isActive: true, id: { not: cashierId } },
       orderBy: { name: 'asc' },
@@ -71,13 +120,17 @@ exports.create = async (req, res, next) => {
     if (!context || !ACTIONS.has(action.toUpperCase()) || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
       return res.status(400).json({ success: false, code: 'POS_APPROVAL_REQUEST_INVALID', message: 'Provide a supported action and its details.' });
     }
+    const policy = await getApprovalPolicy(prisma, context.session.companyId, action);
+    if (!policy.enabled) {
+      return res.status(403).json({ success: false, code: 'POS_APPROVAL_POLICY_DISABLED', message: 'This action is not currently enabled for manager approval.' });
+    }
     if (!assignedManagerId || assignedManagerId === String(context.session.userId)) {
       return res.status(400).json({ success: false, code: 'POS_APPROVAL_MANAGER_REQUIRED', message: 'Choose a different authorized manager for this request.' });
     }
     const assignedManager = await loadActionApprover(context.session.companyId, assignedManagerId, action);
     if (!assignedManager) return res.status(403).json({ success: false, code: 'POS_APPROVAL_MANAGER_UNAVAILABLE', message: 'That manager is not available to approve this action.' });
     const requestId = generateObjectId();
-    const expiresAt = new Date(Date.now() + REQUEST_TTL_MS);
+    const expiresAt = new Date(Date.now() + policy.requestTtlSeconds * 1000);
     const created = await prisma.$transaction(async (tx) => {
       const request = await tx.posApprovalRequest.create({
         data: {
@@ -135,15 +188,16 @@ exports.status = async (req, res, next) => {
 exports.list = async (req, res, next) => {
   try {
     const tenantId = companyId(req);
-    const managerId = String(req.user?.id || req.user?._id || '');
     if (!tenantId) return res.status(400).json({ success: false, code: 'COMPANY_REQUIRED', message: 'Select a company first.' });
-    const status = ['PENDING', 'APPROVED', 'REJECTED', 'EXPIRED'].includes(String(req.query.status || '').toUpperCase())
-      ? String(req.query.status).toUpperCase() : 'PENDING';
-    if (status === 'PENDING') {
+    const filters = approvalQueueFilters(req.query);
+    if (filters.error) {
+      return res.status(400).json({ success: false, code: 'POS_APPROVAL_FILTER_INVALID', message: filters.error });
+    }
+    if (filters.status === 'PENDING' || filters.status === 'ALL') {
       await prisma.posApprovalRequest.updateMany({ where: { companyId: tenantId, status: 'PENDING', expiresAt: { lte: new Date() } }, data: { status: 'EXPIRED' } });
     }
     const rows = await prisma.posApprovalRequest.findMany({
-      where: { companyId: tenantId, status, OR: [{ assignedManagerId: managerId }, { assignedManagerId: null }] }, orderBy: { createdAt: 'desc' }, take: 100,
+      where: { companyId: tenantId, ...filters.where }, orderBy: { createdAt: 'desc' }, take: filters.limit,
       select: { id: true, registerId: true, cashierId: true, assignedManagerId: true, action: true, subjectId: true, payload: true, status: true, decisionReason: true, decisionAt: true, expiresAt: true, createdAt: true, decisionById: true },
     });
     const ids = [...new Set(rows.flatMap((row) => [row.cashierId, row.decisionById, row.assignedManagerId].filter(Boolean)))];
@@ -161,11 +215,15 @@ exports.list = async (req, res, next) => {
         const rule = APPROVAL_PERMISSION_RULES[row.action] || APPROVAL_PERMISSION_RULES[String(row.action).toUpperCase()];
         const roles = Array.isArray(req.userRoles) ? req.userRoles : [];
         const managerId = String(req.user?.id || req.user?._id || '');
-        return Boolean((!row.assignedManagerId || row.assignedManagerId === managerId) && rule && roles.some((role) => PermissionService.check(role, rule.resource, rule.permission)));
+        return Boolean(row.status === 'PENDING' && row.expiresAt > new Date()
+          && (!row.assignedManagerId || row.assignedManagerId === managerId)
+          && rule && roles.some((role) => PermissionService.check(role, rule.resource, rule.permission)));
       })(),
     })) });
   } catch (error) { return next(error); }
 };
+
+exports.approvalQueueFilters = approvalQueueFilters;
 
 exports.decide = async (req, res, next) => {
   try {
@@ -195,15 +253,30 @@ exports.decide = async (req, res, next) => {
       if (!rule || !roles.some((role) => PermissionService.check(role, rule.resource, rule.permission))) {
         return { error: [403, 'POS_MANAGER_PERMISSION_REQUIRED', 'Your role cannot decide this type of POS request.'] };
       }
+      const policy = await getApprovalPolicy(tx, tenantId, request.action);
+      if (!policy.enabled) {
+        await tx.posApprovalRequest.updateMany({
+          where: { id: request.id, companyId: tenantId, status: 'PENDING' },
+          data: { status: 'EXPIRED' },
+        });
+        await writePosAuditLog({
+          companyId: tenantId,
+          registerId: request.registerId,
+          userId: managerId,
+          event: 'APPROVAL_DENIED',
+          metadata: { approvalRequestId: request.id, action: request.action, reason: 'POS_APPROVAL_POLICY_DISABLED' },
+          ip: requestIp(req),
+        }, tx);
+        return { error: [409, 'POS_APPROVAL_POLICY_DISABLED', 'This approval policy was disabled before a manager decided the request.'] };
+      }
       const managerApprovalId = decision === 'APPROVE' ? generateObjectId() : null;
       if (managerApprovalId) {
-        const ttlMs = request.action === 'DISCOUNT_OVER_LIMIT' ? 10 * 60 * 1000 : 5 * 60 * 1000;
         // The approval request has an immediate FK to this row, so create the
         // one-use approval first, within this transaction, before linking it.
         await tx.posManagerApproval.create({ data: {
           id: managerApprovalId, companyId: tenantId, cashierId: request.cashierId, managerId,
           tillSessionId: request.tillSessionId, action: request.action, subjectId: request.subjectId,
-          payloadHash: request.payloadHash, expiresAt: new Date(Date.now() + ttlMs),
+          payloadHash: request.payloadHash, expiresAt: new Date(Date.now() + policy.managerApprovalTtlSeconds * 1000),
         } });
       }
       const update = await tx.posApprovalRequest.updateMany({
@@ -226,5 +299,76 @@ exports.decide = async (req, res, next) => {
     });
     if (result.error) return res.status(result.error[0]).json({ success: false, code: result.error[1], message: result.error[2] });
     return res.json({ success: true, data: result });
+  } catch (error) { return next(error); }
+};
+
+exports.listPolicies = async (req, res, next) => {
+  try {
+    const tenantId = companyId(req);
+    if (!tenantId) return res.status(400).json({ success: false, code: 'COMPANY_REQUIRED', message: 'Select a company first.' });
+    const saved = await prisma.posApprovalPolicy.findMany({ where: { companyId: tenantId } });
+    const byAction = new Map(saved.map((policy) => [policy.action, policy]));
+    return res.json({
+      success: true,
+      data: POLICY_ACTIONS.map((action) => ({ ...defaultApprovalPolicy(action), ...byAction.get(action) })),
+    });
+  } catch (error) { return next(error); }
+};
+
+exports.updatePolicy = async (req, res, next) => {
+  try {
+    const tenantId = companyId(req);
+    const managerId = String(req.user?.id || req.user?._id || '');
+    const action = String(req.params.action || '');
+    const body = req.body || {};
+    if (!tenantId || !managerId) return res.status(400).json({ success: false, code: 'COMPANY_REQUIRED', message: 'Select a company first.' });
+    if (!POLICY_ACTIONS.includes(action)) {
+      return res.status(400).json({ success: false, code: 'POS_APPROVAL_ACTION_INVALID', message: 'Choose a supported approval action.' });
+    }
+    if (typeof body.enabled !== 'boolean'
+      || !validatePolicyDuration(body.requestTtlSeconds, 60, 3600)
+      || !validatePolicyDuration(body.pinApprovalTtlSeconds, 30, 300)
+      || !validatePolicyDuration(body.managerApprovalTtlSeconds, 30, 600)) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_APPROVAL_POLICY_INVALID',
+        message: 'Set enabled and valid request, PIN approval, and manager approval expirations.',
+      });
+    }
+    const policy = await prisma.$transaction(async (tx) => {
+      const saved = await tx.posApprovalPolicy.upsert({
+        where: { companyId_action: { companyId: tenantId, action } },
+        create: {
+          id: generateObjectId(),
+          companyId: tenantId,
+          action,
+          enabled: body.enabled,
+          requestTtlSeconds: body.requestTtlSeconds,
+          pinApprovalTtlSeconds: body.pinApprovalTtlSeconds,
+          managerApprovalTtlSeconds: body.managerApprovalTtlSeconds,
+        },
+        update: {
+          enabled: body.enabled,
+          requestTtlSeconds: body.requestTtlSeconds,
+          pinApprovalTtlSeconds: body.pinApprovalTtlSeconds,
+          managerApprovalTtlSeconds: body.managerApprovalTtlSeconds,
+        },
+      });
+      await writePosAuditLog({
+        companyId: tenantId,
+        userId: managerId,
+        event: 'APPROVAL_POLICY_UPDATED',
+        metadata: {
+          action,
+          enabled: saved.enabled,
+          requestTtlSeconds: saved.requestTtlSeconds,
+          pinApprovalTtlSeconds: saved.pinApprovalTtlSeconds,
+          managerApprovalTtlSeconds: saved.managerApprovalTtlSeconds,
+        },
+        ip: requestIp(req),
+      }, tx);
+      return saved;
+    });
+    return res.json({ success: true, data: policy });
   } catch (error) { return next(error); }
 };

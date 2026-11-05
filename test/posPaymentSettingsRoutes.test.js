@@ -42,6 +42,7 @@ jest.mock('../services/posPaymentService', () => ({
 }));
 
 const posPaymentService = require('../services/posPaymentService');
+const paymentSettingsController = require('../controllers/posPaymentSettingsController');
 const paymentSettingsRoutes = require('../routes/posPaymentSettingsRoutes');
 
 const app = express();
@@ -64,6 +65,21 @@ function safeSettings(overrides = {}) {
       AIRTEL_MONEY: { configured: false },
     },
     ...overrides,
+  };
+}
+
+function response() {
+  return {
+    statusCode: 200,
+    body: null,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    },
   };
 }
 
@@ -169,6 +185,7 @@ describe('POS payment settings routes', () => {
       code: 'REGISTER-1',
       name: 'Main',
       isActive: true,
+      systemTillType: 'retail',
     }]);
   });
 
@@ -238,5 +255,72 @@ describe('POS payment settings routes', () => {
       userId: '507f1f77bcf86cd799439013',
       registerId: '507f1f77bcf86cd799439012',
     }));
+  });
+
+  test('admin payment settings read is scoped to the signed-in company', async () => {
+    const settings = safeSettings({ enabledMethods: ['CARD'] });
+    posPaymentService.getPaymentSettings.mockResolvedValue(settings);
+    posPaymentService.listPaymentRegisters.mockResolvedValue([{
+      id: '507f1f77bcf86cd799439012',
+      code: 'REGISTER-1',
+      name: 'Main',
+      isActive: true,
+      systemTillType: 'retail',
+    }]);
+    const res = response();
+
+    await paymentSettingsController.getAdminSettings({
+      user: { company: { _id: 'company-admin' } },
+    }, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.settings.enabledMethods).toEqual(['CARD']);
+    expect(res.body.data.registers).toEqual([expect.objectContaining({
+      id: '507f1f77bcf86cd799439012',
+      systemTillType: 'retail',
+    })]);
+    expect(posPaymentService.getPaymentSettings).toHaveBeenCalledWith('company-admin');
+  });
+
+  test('admin payment settings save is tied to a company register and authenticated manager audit identity', async () => {
+    const registerId = '507f1f77bcf86cd799439012';
+    const settings = safeSettings({ enabledMethods: ['CARD', 'CASH'] });
+    posPaymentService.listPaymentRegisters.mockResolvedValue([{ id: registerId, isActive: true }]);
+    posPaymentService.savePaymentSettings.mockResolvedValue(settings);
+    const res = response();
+
+    await paymentSettingsController.updateAdminSettings({
+      user: { id: 'manager-user', companyId: 'company-admin' },
+      body: { registerId, settings },
+      ip: '127.0.0.2',
+      headers: {},
+    }, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(200);
+    expect(posPaymentService.savePaymentSettings).toHaveBeenCalledWith({
+      companyId: 'company-admin',
+      settings,
+      userId: 'manager-user',
+      registerId,
+      ip: '127.0.0.2',
+    });
+  });
+
+  test('admin payment settings save rejects registers outside the authenticated company', async () => {
+    posPaymentService.listPaymentRegisters.mockResolvedValue([]);
+    const res = response();
+
+    await paymentSettingsController.updateAdminSettings({
+      user: { id: 'manager-user', companyId: 'company-admin' },
+      body: {
+        registerId: '507f1f77bcf86cd799439099',
+        settings: safeSettings(),
+      },
+      headers: {},
+    }, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body.code).toBe('POS_PAYMENT_REGISTER_NOT_FOUND');
+    expect(posPaymentService.savePaymentSettings).not.toHaveBeenCalled();
   });
 });

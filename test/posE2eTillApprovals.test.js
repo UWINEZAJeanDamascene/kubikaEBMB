@@ -15,6 +15,7 @@ jest.mock('../lib/prisma', () => ({
     tillSession: { findFirst: jest.fn(), findMany: jest.fn() },
     posRegister: { findFirst: jest.fn() },
     posManagerApproval: { create: jest.fn(), findMany: jest.fn() },
+    posApprovalPolicy: { findUnique: jest.fn().mockResolvedValue(null) },
     product: { findMany: jest.fn() },
   },
   dbClient: jest.fn(),
@@ -70,6 +71,7 @@ const {
 describe('POS E2E — till open / close / variance', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.posApprovalPolicy.findUnique.mockResolvedValue(null);
     resolveUserRoles.mockResolvedValue([{ name: 'sales', is_system_role: true }]);
     PermissionService.check.mockReturnValue(false);
     prisma.posRegister.findFirst.mockResolvedValue({ name: 'Front counter' });

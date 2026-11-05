@@ -117,6 +117,9 @@ function buildPosReceiptDocument(sale, context = {}) {
     })) : [];
   const ebm = sale.ebm && typeof sale.ebm === 'object' ? sale.ebm : {};
   const currency = sale.currencyCode || sale.currency || 'RWF';
+  const voucherRedemptions = Array.isArray(sale.posPricingSnapshot?.voucherRedemptions)
+    ? sale.posPricingSnapshot.voucherRedemptions
+    : [];
   const fiscal = {};
   const fiscalFields = {
     receiptNumber: ebm.rcptNoDisplay ?? ebm.rcptNo,
@@ -170,6 +173,8 @@ function buildPosReceiptDocument(sale, context = {}) {
       unit: line.unit || null,
       unitPriceRwf: savedMoney(line.unitPriceRwf ?? line.unitPrice, currency),
       discountRwf: savedMoney(line.discountAmountRwf ?? line.discountAmount ?? line.discountRwf, currency),
+      discountPercent: line.discountPercent == null ? null : Number(line.discountPercent),
+      discountReason: line.discountReason || null,
       totalRwf: savedMoney(line.lineTotalRwf ?? line.lineTotal ?? line.totalRwf, currency),
       sku: settings.showSku === true ? (line.itemCode || line.sku || null) : null,
       barcode: settings.showBarcode === true ? (line.barcode || null) : null,
@@ -179,6 +184,16 @@ function buildPosReceiptDocument(sale, context = {}) {
       currency,
       subtotalRwf: savedMoney(sale.subtotal, currency),
       discountRwf: savedMoney(sale.discountAmountRwf ?? sale.discountAmount ?? sale.totalDiscount, currency),
+      totalSavedRwf: savedMoney(sale.discountAmountRwf ?? sale.discountAmount ?? sale.totalDiscount, currency),
+      voucherDiscountRwf: savedMoney(
+        voucherRedemptions.reduce((sum, voucher) => sum + (Number(voucher.amountRwf) || 0), 0),
+        currency,
+      ),
+      vouchers: voucherRedemptions.map((voucher) => ({
+        name: String(voucher.name || 'Voucher'),
+        code: String(voucher.maskedCode || 'Voucher'),
+        discountRwf: savedMoney(voucher.amountRwf, currency),
+      })),
       taxes: savedTaxes.map((tax) => ({
         code: tax.code || tax.taxClass || null,
         label: tax.label || tax.taxTypeLabel || null,

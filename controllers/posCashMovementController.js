@@ -41,6 +41,7 @@ function approvalTokenFrom(req) {
 }
 
 function sameMovementRequest(existing, expected) {
+  const isBankDeposit = expected.type === 'cash_out' && expected.reasonCode === 'BANK_DEPOSIT';
   return existing.companyId === expected.companyId
     && existing.registerId === expected.registerId
     && existing.shiftId === expected.shiftId
@@ -48,14 +49,20 @@ function sameMovementRequest(existing, expected) {
     && existing.type === expected.type
     && existing.amount === expected.amount
     && existing.reasonCode === expected.reasonCode
+    && (isBankDeposit || (existing.reference || null) === expected.reference)
+    && (existing.bankSlipReference || null) === expected.bankSlipReference
     && (existing.note || null) === expected.note;
 }
 
 function movementResponse(movement, replayed) {
+  const movementWithStatus = {
+    ...movement,
+    postingStatus: movement.journalEntryId ? 'posted' : 'pending',
+  };
   return {
     success: true,
     replayed,
-    data: { movement },
+    data: { movement: movementWithStatus },
   };
 }
 
@@ -81,7 +88,15 @@ exports.list = async (req, res, next) => {
       where: { companyId, registerId, shiftId },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
-    return res.json({ success: true, data: { movements } });
+    return res.json({
+      success: true,
+      data: {
+        movements: movements.map((movement) => ({
+          ...movement,
+          postingStatus: movement.journalEntryId ? 'posted' : 'pending',
+        })),
+      },
+    });
   } catch (error) {
     return next(error);
   }
@@ -103,6 +118,12 @@ exports.create = async (req, res, next) => {
   const type = String(req.body?.type || '').trim().toLowerCase();
   const amount = req.body?.amount;
   const reasonCode = String(req.body?.reasonCode || '').trim().toUpperCase();
+  const rawReference = req.body?.reference;
+  const reference = rawReference == null ? null : String(rawReference).trim() || null;
+  const rawBankSlipReference = req.body?.bankSlipReference;
+  const requestedBankSlipReference = rawBankSlipReference == null
+    ? null
+    : String(rawBankSlipReference).trim() || null;
   const note = req.body?.note == null ? null : req.body.note;
 
   if (!MOVEMENT_TYPES.has(type)) {
@@ -119,9 +140,26 @@ exports.create = async (req, res, next) => {
   if (!/^[A-Z0-9_]{2,40}$/.test(reasonCode)) {
     return invalidRequest(res, 400, 'POS_CASH_MOVEMENT_REASON_INVALID', 'Provide a reason code between 2 and 40 letters, numbers, or underscores.');
   }
+  if (rawReference != null && (typeof rawReference !== 'string' || (reference || '').length > 100)) {
+    return invalidRequest(res, 400, 'POS_CASH_MOVEMENT_REFERENCE_INVALID', 'Movement reference must be text no longer than 100 characters.');
+  }
+  if (rawBankSlipReference != null
+    && (typeof rawBankSlipReference !== 'string' || (requestedBankSlipReference || '').length > 100)) {
+    return invalidRequest(res, 400, 'POS_BANK_SLIP_REFERENCE_INVALID', 'Bank receipt reference must be text no longer than 100 characters.');
+  }
   if (note !== null && (typeof note !== 'string' || note.trim().length > 500)) {
     return invalidRequest(res, 400, 'POS_CASH_MOVEMENT_NOTE_INVALID', 'Movement note must be text no longer than 500 characters.');
   }
+  if (type === 'cash_out' && reasonCode === 'BANK_DEPOSIT' && !note?.trim()) {
+    return invalidRequest(
+      res,
+      400,
+      'POS_BANK_DEPOSIT_EVIDENCE_REQUIRED',
+      'Provide a deposit note before recording a bank deposit.',
+    );
+  }
+  const isBankDeposit = type === 'cash_out' && reasonCode === 'BANK_DEPOSIT';
+  const bankSlipReference = isBankDeposit ? (requestedBankSlipReference || reference) : null;
   const normalizedNote = note?.trim() || null;
   const expected = {
     companyId,
@@ -131,6 +169,8 @@ exports.create = async (req, res, next) => {
     type,
     amount,
     reasonCode,
+    reference: isBankDeposit ? null : reference,
+    bankSlipReference,
     note: normalizedNote,
   };
 
@@ -248,6 +288,9 @@ exports.create = async (req, res, next) => {
         data: {
           id: generateObjectId(),
           ...expected,
+          reference: isBankDeposit
+            ? `POSDEP-${createHash('sha256').update(`${companyId}:${key}`).digest('hex').slice(0, 20).toUpperCase()}`
+            : reference,
           idempotencyKey: key,
           approvedById,
         },
@@ -271,7 +314,12 @@ exports.create = async (req, res, next) => {
         companyId,
         registerCode: register.code,
         shift,
-        movement: { ...expected, id: recordedMovement.id },
+        movement: {
+          ...expected,
+          id: recordedMovement.id,
+          reference: recordedMovement.reference,
+          bankSlipReference: recordedMovement.bankSlipReference,
+        },
       });
       await writePosAuditLog({
         companyId,
@@ -284,6 +332,8 @@ exports.create = async (req, res, next) => {
           type,
           amount,
           reasonCode,
+          reference: movement.reference,
+          bankSlipReference,
           approvedById,
           journalEntryId,
         },
@@ -322,6 +372,10 @@ exports.create = async (req, res, next) => {
     if (error?.code === 'POS_TILL_SHIFT_LINK_MISSING') {
       return invalidRequest(res, 409, error.code, error.message);
     }
+    if (error?.code === 'POS_BANK_DEPOSIT_CLEARING_ACCOUNT_REQUIRED'
+      || error?.code === 'POS_BANK_DEPOSIT_CLEARING_ACCOUNT_INVALID') {
+      return invalidRequest(res, 409, error.code, error.message);
+    }
     if (error?.code === 'P2002') {
       try {
         const prior = await prisma.posCashMovement.findFirst({
@@ -337,6 +391,73 @@ exports.create = async (req, res, next) => {
         return next(recoveryError);
       }
     }
+    return next(error);
+  }
+};
+
+exports.recordBankSlipReference = async (req, res, next) => {
+  try {
+    const { companyId, registerId, userId } = contextFor(req);
+    const shiftId = String(req.params.shiftId || '');
+    const movementId = String(req.params.movementId || '');
+    const rawReference = req.body?.bankSlipReference;
+    const bankSlipReference = typeof rawReference === 'string' ? rawReference.trim() : '';
+    if (!bankSlipReference || bankSlipReference.length > 100) {
+      return invalidRequest(
+        res,
+        400,
+        'POS_BANK_SLIP_REFERENCE_INVALID',
+        'Enter a bank receipt reference no longer than 100 characters.',
+      );
+    }
+
+    const result = await runInTransaction(async (tx) => {
+      const locked = await tx.$queryRawUnsafe(
+        'SELECT "id" FROM "pos_cash_movements" WHERE "id" = $1 AND "company_id" = $2 AND "register_id" = $3 AND "shift_id" = $4 AND "type" = \'cash_out\' AND "reason_code" = \'BANK_DEPOSIT\' FOR UPDATE',
+        movementId,
+        companyId,
+        registerId,
+        shiftId,
+      );
+      if (!locked.length) return { code: 'POS_BANK_DEPOSIT_NOT_FOUND' };
+      const existing = await tx.posCashMovement.findFirst({
+        where: {
+          id: movementId,
+          companyId,
+          registerId,
+          shiftId,
+          type: 'cash_out',
+          reasonCode: 'BANK_DEPOSIT',
+        },
+      });
+      if (!existing) return { code: 'POS_BANK_DEPOSIT_NOT_FOUND' };
+      if (existing.bankSlipReference === bankSlipReference) return { movement: existing };
+
+      const updated = await tx.posCashMovement.update({
+        where: { id: existing.id },
+        data: { bankSlipReference },
+      });
+      await writePosAuditLog({
+        companyId,
+        registerId,
+        userId,
+        event: 'BANK_SLIP_REFERENCE_RECORDED',
+        metadata: {
+          movementId,
+          shiftId,
+          previousReference: existing.bankSlipReference || null,
+          reference: bankSlipReference,
+        },
+        ip: requestIp(req),
+      }, tx);
+      return { movement: updated };
+    });
+
+    if (result.code === 'POS_BANK_DEPOSIT_NOT_FOUND') {
+        return invalidRequest(res, 404, result.code, 'Bank deposit not found for this register and shift.');
+    }
+    return res.json({ success: true, data: { movement: result.movement } });
+  } catch (error) {
     return next(error);
   }
 };

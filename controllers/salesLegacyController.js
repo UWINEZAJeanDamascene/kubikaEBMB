@@ -24,6 +24,8 @@ const JournalService = require('../services/journalService');
 const CurrencyService = require('../services/CurrencyService');
 const cacheService = require('../services/cacheService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+const posAccountingProfileService = require('../services/posAccountingProfileService');
+const { buildSaleJournalEntries } = require('../services/posAccountingBuilders');
 const { createHash, randomBytes } = require('crypto');
 const { dbClient } = require('../lib/prisma');
 const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
@@ -36,6 +38,10 @@ const { getWarehouseTransferVisibility } = require('../services/posTransferVisib
 const notificationDeliveryService = require('../services/notificationDeliveryService');
 const posPaymentService = require('../services/posPaymentService');
 const {
+  quoteReservation: quotePosVouchers,
+  redeemReservation: redeemPosVouchers,
+} = require('../services/posVoucherService');
+const {
   calculatePosLineAmounts,
   hashPosSalePayload,
   lineValuesMatch,
@@ -47,6 +53,14 @@ const {
 const { consumeTrackedBatches, findAvailableSerialsOutsideQuarantine } = require('../services/posTrackedStockService');
 
 const { replayPosSale } = require('../services/posSaleReplayService');
+const {
+  DEFAULT_DISCOUNT_SETTINGS,
+  evaluateDiscountCaps,
+  getApplicableDiscountLimits,
+  getTillTypeFeatures,
+  normalizeStoredDiscountSettings,
+} = require('../services/posDiscountSettingsService');
+const { buildDiscountApprovalContext } = require('../services/posDiscountApplicationService');
 
 async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash }) {
   const replay = await replayPosSale({
@@ -134,8 +148,10 @@ exports.createDirectSale = async (req, res, next) => {
         ...req.body,
         items: (savedDocument.items || []).map((item) => ({
           productId: item.productId, quantity: item.quantity, unitPrice: item.unitPrice,
-          discountPct: item.discountPct, serialNumbers: item.serialNumbers || [],
+          discountPct: item.discountPct, discountReason: item.discountReason, serialNumbers: item.serialNumbers || [],
         })),
+        cartDiscountPct: Number(savedDocument.cartDiscountPct) || 0,
+        cartDiscountReason: savedDocument.cartDiscountReason || '',
         warehouseId: savedDocument.warehouseId,
         clientId: savedDocument.clientId || undefined,
         clientInfo: savedDocument.clientInfo || undefined,
@@ -247,6 +263,10 @@ exports.createDirectSale = async (req, res, next) => {
       bankAccountId,
       tillSession,
       promotionId,
+      cartDiscountPct: rawCartDiscountPct,
+      cartDiscountReason,
+      discountApprovalScope,
+      voucherReservationTokens,
     } = req.body;
     if (isV2Pending && (Array.isArray(requestedPayments) && requestedPayments.length
       || Number(paymentAmount) > 0)) {
@@ -331,12 +351,69 @@ exports.createDirectSale = async (req, res, next) => {
         _id: { $in: productIds },
         company: companyId,
       })
-        .select('name sku sellingPrice unit taxRate taxCode currentStock isStockable averageCost trackingType trackSerialNumbers trackBatch')
+        .select('name sku sellingPrice unit taxRate taxCode currentStock isStockable isNoDiscount category averageCost trackingType trackSerialNumbers trackBatch')
         .lean();
       productsBatch.forEach((p) => productsMap.set(p._id.toString(), p));
     } catch (batchErr) {
       console.warn('[createDirectSale] Batch product load failed:', batchErr.message);
     }
+    const categoryIds = [...new Set([...productsMap.values()]
+      .map((product) => String(product.category?._id || product.category || ''))
+      .filter(isObjectIdString))];
+    const categoryRestrictions = categoryIds.length
+      ? await dbClient().category.findMany({
+        where: { companyId: String(companyId), id: { in: categoryIds } },
+        select: { id: true, isNoDiscount: true },
+      })
+      : [];
+    const noDiscountCategoryIds = new Set(
+      categoryRestrictions.filter((category) => category.isNoDiscount).map((category) => String(category.id)),
+    );
+    const isDiscountRestricted = (product) => Boolean(product.isNoDiscount)
+      || noDiscountCategoryIds.has(String(product.category?._id || product.category || ''));
+    const [discountSettingsRow, roleAssignments] = await Promise.all([
+      dbClient().systemSettings.findUnique({
+        where: { companyId: String(companyId) },
+        select: { posDiscountSettings: true },
+      }),
+      posCashierId
+        ? dbClient().userRole.findMany({
+          where: { userId: posCashierId, role: { is: { OR: [{ companyId: String(companyId) }, { companyId: null }] } } },
+          select: { roleId: true },
+        })
+        : [],
+    ]);
+    const discountSettings = normalizeStoredDiscountSettings(
+      discountSettingsRow?.posDiscountSettings || DEFAULT_DISCOUNT_SETTINGS,
+    );
+    const tillFeatures = getTillTypeFeatures(discountSettings, claimedRegister.systemTillType);
+    if (!tillFeatures.manualDiscounts && Number(rawCartDiscountPct) > 0) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_TILL_FEATURE_DISABLED',
+        message: 'Manual discounts are disabled for this till type.',
+      });
+    }
+    if (!tillFeatures.promotions && promotionId) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_TILL_FEATURE_DISABLED',
+        message: 'Promotions are disabled for this till type.',
+      });
+    }
+    if (!tillFeatures.vouchers && (Array.isArray(voucherReservationTokens) && voucherReservationTokens.length
+      || req.posV2Completion?.voucherReservations)) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_TILL_FEATURE_DISABLED',
+        message: 'Promotional vouchers are disabled for this till type.',
+      });
+    }
+    const applicableDiscountLimits = getApplicableDiscountLimits(
+      discountSettings,
+      roleAssignments.map((assignment) => assignment.roleId),
+      claimedRegister.discountLabel || null,
+    );
     const priceListPricing = offlineContext
       ? { priceListId: null, priceByProduct: new Map() }
       : await getWarehousePriceListPrices(companyId, warehouseId, productIds);
@@ -352,6 +429,7 @@ exports.createDirectSale = async (req, res, next) => {
     let promotion = null;
     const promotionDiscountPctByIndex = new Map();
     let promotionDiscountAmount = 0;
+    let promotionDiscountPercent = 0;
     if (promotionId) {
       if (offlineContext) {
         promotion = (offlineContext.snapshotData.promotions || []).find((entry) => String(entry.id) === String(promotionId)) || null;
@@ -367,11 +445,10 @@ exports.createDirectSale = async (req, res, next) => {
       }
       if (!promotion) return res.status(409).json({ success: false, code: 'POS_PROMOTION_UNAVAILABLE', message: 'This promotion is no longer active. Refresh the POS promotions and retry.' });
       const promotionValue = Number(promotion.value);
-      const maxPercent = Math.min(100, Math.max(1, Number(process.env.POS_PROMOTION_MAX_PERCENT) || 50));
-      const maxFixed = Math.max(1, Number(process.env.POS_PROMOTION_MAX_FIXED_RWF) || 1000000);
-      if ((promotion.discountType === 'percent' && (!Number.isFinite(promotionValue) || promotionValue > maxPercent))
-        || (promotion.discountType === 'fixed' && (!Number.isFinite(promotionValue) || promotionValue > maxFixed))) {
-        return res.status(409).json({ success: false, code: 'POS_PROMOTION_ABOVE_CAP', message: 'This promotion exceeds the configured POS manager discount cap.' });
+      if (!Number.isFinite(promotionValue) || promotionValue <= 0 || promotionValue > Number.MAX_SAFE_INTEGER
+        || !['percent', 'fixed'].includes(promotion.discountType)
+        || (promotion.discountType === 'percent' && promotionValue > 100)) {
+        return res.status(409).json({ success: false, code: 'POS_PROMOTION_INVALID', message: 'This promotion has an invalid discount value.' });
       }
       const bases = items.map((item) => {
         const product = productsMap.get(String(item.productId));
@@ -383,6 +460,7 @@ exports.createDirectSale = async (req, res, next) => {
         const requestedPrice = item.unitPrice == null ? price : Number(item.unitPrice);
         if (!product || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price)
           || Math.abs(requestedPrice - price) > 0.000001 || Number(item.discountPct || 0) !== 0) return null;
+        if (isDiscountRestricted(product)) return 0;
         return quantity * price;
       });
       if (bases.some((amount) => amount == null)) {
@@ -393,14 +471,58 @@ exports.createDirectSale = async (req, res, next) => {
       promotionDiscountAmount = promotion.discountType === 'percent'
         ? Math.round((baseTotal * promotionValue / 100 + Number.EPSILON) * 100) / 100
         : Math.min(baseTotal, Math.round((promotionValue + Number.EPSILON) * 100) / 100);
+      promotionDiscountPercent = promotionDiscountAmount / baseTotal * 100;
       let allocated = 0;
-      bases.forEach((base, index) => {
-        const lineDiscount = index === bases.length - 1
+      const eligibleIndexes = bases.map((base, index) => base > 0 ? index : -1).filter((index) => index >= 0);
+      eligibleIndexes.forEach((index, eligibleIndex) => {
+        const base = bases[index];
+        const lineDiscount = eligibleIndex === eligibleIndexes.length - 1
           ? Math.max(0, promotionDiscountAmount - allocated)
           : Math.round((promotionDiscountAmount * base / baseTotal + Number.EPSILON) * 100) / 100;
         allocated += lineDiscount;
         promotionDiscountPctByIndex.set(index, base > 0 ? lineDiscount / base * 100 : 0);
       });
+    }
+    const cartDiscountPct = rawCartDiscountPct == null || rawCartDiscountPct === ''
+      ? 0
+      : Number(rawCartDiscountPct);
+    if (!Number.isFinite(cartDiscountPct) || cartDiscountPct < 0 || cartDiscountPct > 100) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_DISCOUNT_VALUE_INVALID',
+        message: 'Cart discount must be between 0 and 100 percent.',
+      });
+    }
+    if (offlineContext && cartDiscountPct > 0) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_OFFLINE_DISCOUNT_UNSUPPORTED',
+        message: 'Cart discounts require online server validation and cannot be applied to an offline sale.',
+      });
+    }
+    if (cartDiscountPct > 0) {
+      if (promotion) {
+        return res.status(400).json({
+          success: false,
+          code: 'POS_DISCOUNT_SCOPES_CANNOT_COMBINE',
+          message: 'Apply either a promotion or a cart discount, not both.',
+        });
+      }
+      if (items.some((item) => Number(item.discountPct || 0) > 0)) {
+        return res.status(400).json({
+          success: false,
+          code: 'POS_DISCOUNT_SCOPES_CANNOT_COMBINE',
+          message: 'Apply either line discounts or a cart discount, not both.',
+        });
+      }
+      const reason = typeof cartDiscountReason === 'string' ? cartDiscountReason.trim() : '';
+      if (!discountSettings.discountReasons.some((value) => value.toLocaleLowerCase() === reason.toLocaleLowerCase())) {
+        return res.status(400).json({
+          success: false,
+          code: 'POS_DISCOUNT_REASON_REQUIRED',
+          message: 'Select a valid configured reason for the cart discount.',
+        });
+      }
     }
 
     // Validate all items and build invoice lines
@@ -450,9 +572,14 @@ exports.createDirectSale = async (req, res, next) => {
         : effectivePrice(String(product._id), product.sellingPrice, priceListPricing.priceByProduct);
       const requestedUnitPrice = item.unitPrice == null ? productPrice : Number(item.unitPrice);
       const requestedDiscountPct = item.discountPct == null ? 0 : Number(item.discountPct);
+      const isRestrictedProduct = isDiscountRestricted(product);
+      const appliedCartDiscountPct = isRestrictedProduct ? 0 : cartDiscountPct;
       const discountPct = promotion
         ? Number(promotionDiscountPctByIndex.get(itemIndex) || 0)
-        : requestedDiscountPct;
+        : appliedCartDiscountPct > 0 ? appliedCartDiscountPct : requestedDiscountPct;
+      const discountReason = appliedCartDiscountPct > 0
+        ? String(cartDiscountReason || '').trim()
+        : typeof item.discountReason === 'string' ? item.discountReason.trim() : '';
       if (offlineContext && (
         item.catalogUnitPrice == null
         || Math.abs(Number(item.catalogUnitPrice) - productPrice) > 0.000001
@@ -483,12 +610,34 @@ exports.createDirectSale = async (req, res, next) => {
           message: `Price or discount is invalid for ${product.name}`,
         });
       }
+      if (isRestrictedProduct
+        && (requestedDiscountPct > 0 || requestedUnitPrice < productPrice - 0.000001 || discountPct > 0)) {
+        return res.status(403).json({
+          success: false,
+          code: 'POS_ITEM_DISCOUNT_NOT_ALLOWED',
+          message: `${product.name} or its category is marked as no-discount.`,
+        });
+      }
+      if (!appliedCartDiscountPct && requestedDiscountPct > 0 && !discountSettings.discountReasons.some(
+        (reason) => reason.toLocaleLowerCase() === discountReason.toLocaleLowerCase(),
+      )) {
+        return res.status(400).json({
+          success: false,
+          code: 'POS_DISCOUNT_REASON_REQUIRED',
+          message: 'Select a valid configured reason for every manual discount.',
+        });
+      }
 
       const unitPrice = requestedUnitPrice;
       const hasPriceOverride = Math.abs(unitPrice - productPrice) > 0.000001;
-      if (hasPriceOverride || discountPct > 0) {
-        if (!promotion) requiresManagerApproval = true;
+      if (!tillFeatures.manualDiscounts && (requestedDiscountPct > 0 || hasPriceOverride)) {
+        return res.status(403).json({
+          success: false,
+          code: 'POS_TILL_FEATURE_DISABLED',
+          message: 'Manual discounts and price overrides are disabled for this till type.',
+        });
       }
+      if (hasPriceOverride) requiresManagerApproval = true;
       
       const isStockable = offlineContext ? snapshotProduct.isStockable !== false : product.isStockable !== false;
       const serialNumbers = Array.isArray(item.serialNumbers)
@@ -577,6 +726,10 @@ exports.createDirectSale = async (req, res, next) => {
         unit: offlineContext ? snapshotProduct.unit : (item.unit || product.unit || 'pcs'),
         unitPrice: unitPrice,
         discountPct: discountPct,
+        discountReason,
+        discountCapPercent: promotion
+          ? Number(promotionDiscountPctByIndex.get(itemIndex) || 0)
+          : appliedCartDiscountPct > 0 ? 0 : requestedDiscountPct,
         taxCode: taxCode,
         taxRate: taxRate,
         taxAmount: taxAmount,
@@ -594,6 +747,7 @@ exports.createDirectSale = async (req, res, next) => {
           warehouseId,
           lineData: {
             productName: product.name,
+            lineOrder: invoiceLines.length - 1,
             unitCost: offlineContext ? Number(snapshotProduct.averageCost) || 0 : Number(product.averageCost) || 0,
             serialNumbers,
           },
@@ -609,20 +763,101 @@ exports.createDirectSale = async (req, res, next) => {
       });
     }
 
-    if (requiresManagerApproval && !req.body.managerApprovalId && !req.posV2Completion) {
-      return res.status(403).json({
+    const voucherTokens = Array.isArray(voucherReservationTokens)
+      ? [...new Set(voucherReservationTokens.map((token) => String(token || '').trim()).filter(Boolean))]
+      : [];
+    if (voucherTokens.length > 10 || (voucherReservationTokens != null && !Array.isArray(voucherReservationTokens))) {
+      return res.status(400).json({
         success: false,
-        code: 'POS_MANAGER_APPROVAL_REQUIRED',
-        message: 'A second manager must approve discounts or price overrides before this sale can be recorded.',
+        code: 'POS_VOUCHER_RESERVATION_INVALID',
+        message: 'Voucher reservations are invalid. Reapply the voucher before checkout.',
       });
+    }
+    const voucherCartInput = {
+      items: items.map((item, index) => ({
+        productId: String(item.productId),
+        quantity: Number(item.quantity),
+        unitPrice: Number(invoiceLines[index].unitPrice),
+        catalogUnitPrice: Number(item.catalogUnitPrice ?? invoiceLines[index].unitPrice),
+        discountPct: Number(item.discountPct || 0),
+        discountReason: String(item.discountReason || ''),
+      })),
+      cartDiscountPct,
+      cartDiscountReason,
+      promotionId: String(promotionId || ''),
+      clientId: client?.isWalkIn ? 'walk-in' : String(clientId || 'walk-in'),
+      warehouseId: String(warehouseId || ''),
+      promotion,
+    };
+    const voucherProductsById = new Map(items.map((item, index) => {
+      const product = productsMap.get(String(item.productId));
+      const restricted = isDiscountRestricted(product);
+      const categoryId = String(product.category?._id || product.category || '');
+      return [String(item.productId), {
+        price: Number(invoiceLines[index].unitPrice),
+        isActive: true,
+        isNoDiscount: restricted,
+        category: { _id: categoryId, isNoDiscount: Boolean(product.categoryNoDiscount) },
+        taxCode: invoiceLines[index].taxCode,
+      }];
+    }));
+    const voucherQuote = await quotePosVouchers(String(companyId), posCashierId, {
+      tokens: voucherTokens,
+      ...(req.posV2Completion?.voucherReservations ? { invoiceId: req.posV2Completion.invoiceId } : {}),
+      cartInput: voucherCartInput,
+      productsById: voucherProductsById,
+    });
+
+    const discountBeforeVouchers = roundMoney(
+      invoiceLines.reduce((sum, line) => sum + (line.lineSubtotal * (line.discountPct || 0) / 100), 0),
+    );
+    if (voucherQuote) {
+      const voucherCodeLabels = [...new Set(voucherQuote.vouchers.map((voucher) => `****${voucher.codeSuffix}`))];
+      for (const [index, line] of invoiceLines.entries()) {
+        const voucherDiscount = Number(voucherQuote.pricing.lines[index]?.voucherDiscountRwf || 0);
+        if (!voucherDiscount) continue;
+        const existingDiscount = roundMoney(line.lineSubtotal * Number(line.discountPct || 0) / 100);
+        const totalLineDiscount = roundMoney(existingDiscount + voucherDiscount);
+        if (totalLineDiscount > line.lineSubtotal + 0.005) {
+          return res.status(409).json({
+            success: false,
+            code: 'POS_VOUCHER_CART_CHANGED',
+            message: 'Voucher allocation no longer matches the sale. Reapply the voucher.',
+          });
+        }
+        const netAmount = roundMoney(line.lineSubtotal - totalLineDiscount);
+        line.discountPct = line.lineSubtotal > 0 ? totalLineDiscount / line.lineSubtotal * 100 : 0;
+        line.discountReason = [line.discountReason, ...voucherCodeLabels.map((label) => `Voucher ${label}`)]
+          .filter(Boolean)
+          .join('; ');
+        line.taxAmount = roundMoney(netAmount * (line.taxRate / 100));
+        line.lineTotal = roundMoney(netAmount + line.taxAmount);
+      }
     }
 
     // Calculate totals
     const subtotal = roundMoney(invoiceLines.reduce((sum, line) => sum + line.lineSubtotal, 0));
-    const totalDiscount = roundMoney(invoiceLines.reduce((sum, line) => sum + (line.lineSubtotal * (line.discountPct || 0) / 100), 0));
+    const voucherDiscountRwf = Number(voucherQuote?.pricing.totals.voucherDiscountRwf || 0);
+    const totalDiscount = roundMoney(discountBeforeVouchers + voucherDiscountRwf);
     const netSales = roundMoney(subtotal - totalDiscount);
     const totalTax = roundMoney(invoiceLines.reduce((sum, line) => sum + line.taxAmount, 0));
     const grandTotal = roundMoney(invoiceLines.reduce((sum, line) => sum + line.lineTotal, 0));
+    const breachedDiscountCaps = evaluateDiscountCaps({
+      limits: applicableDiscountLimits,
+      lineDiscounts: invoiceLines.map((line) => ({ percent: Number(line.discountCapPercent) || 0 })),
+      cartDiscountPercent: promotion ? promotionDiscountPercent : cartDiscountPct,
+      totalDiscountRwf: discountBeforeVouchers,
+    });
+    requiresManagerApproval = requiresManagerApproval || breachedDiscountCaps.length > 0;
+    if (requiresManagerApproval && !req.body.managerApprovalId && !req.posV2Completion) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_MANAGER_APPROVAL_REQUIRED',
+        message: breachedDiscountCaps.length
+          ? 'The configured discount limit was exceeded. A second manager must approve this sale.'
+          : 'A second manager must approve price overrides before this sale can be recorded.',
+      });
+    }
 
     // Determine payment status
     const normalizedPaymentReference = String(paymentReference || '').trim();
@@ -647,6 +882,7 @@ exports.createDirectSale = async (req, res, next) => {
     const normalizedPayments = [];
     const transactionReferences = new Set();
     const v2StoredValuePaymentIds = new Set(req.posV2Completion?.storedValuePaymentIds || []);
+    const v2ManualMobileMoneyPaymentIds = new Set(req.posV2Completion?.manualMobileMoneyPaymentIds || []);
     const placeholderReferences = new Set(['na', 'n/a', 'none', 'null', 'unknown', 'test', 'paid', 'cash', '-', '0', '000']);
     for (const [index, entry] of rawPayments.entries()) {
       const method = String(entry?.paymentMethod || (rawPayments.length === 1 ? paymentMethod : '')).toLowerCase();
@@ -665,7 +901,11 @@ exports.createDirectSale = async (req, res, next) => {
       if (provider && (method !== 'mobile_money' || !['momo', 'airtel'].includes(provider))) {
         return res.status(400).json({ success: false, code: 'POS_MOBILE_MONEY_PROVIDER_INVALID', message: `Select MoMo or Airtel as the provider for payment ${index + 1}.` });
       }
-      if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method) && !reference) {
+      const savedV2ManualMobileMoneyPayment = req.posV2Completion
+        && method === 'mobile_money'
+        && v2ManualMobileMoneyPaymentIds.has(String(entry?.manualMobileMoneyPaymentId || ''));
+      if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method)
+        && !reference && !savedV2ManualMobileMoneyPayment) {
         return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_REQUIRED', message: `Enter a verified transaction or cheque reference for payment ${index + 1}.` });
       }
       if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method)
@@ -675,7 +915,7 @@ exports.createDirectSale = async (req, res, next) => {
       if (reference.length > 120) {
         return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_TOO_LONG', message: 'Payment references must be 120 characters or fewer.' });
       }
-      if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method)) {
+      if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method) && reference) {
         const referenceKey = reference.toLowerCase();
         if (transactionReferences.has(referenceKey)) {
           return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_DUPLICATE', message: 'Each non-cash payment must use its own transaction reference.' });
@@ -771,10 +1011,22 @@ exports.createDirectSale = async (req, res, next) => {
       amountPaid = 0;
       amountOutstanding = grandTotal;
     }
+    const hasCreditTender = String(paymentMethod || '').toLocaleLowerCase() === 'credit'
+      || (Array.isArray(requestedPayments) && requestedPayments.some((payment) => (
+        String(payment?.paymentMethod || '').toLocaleLowerCase() === 'credit'
+      )));
+    if (!tillFeatures.customerCredit && (hasCreditTender || !isV2Pending && amountOutstanding > 0)) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_TILL_FEATURE_DISABLED',
+        message: 'Customer credit is disabled for this till type. Complete payment before finishing the sale.',
+      });
+    }
 
     // Execute in transaction
     let invoice;
     let totalCOGS = 0;
+    let storedLinesForPosting = invoiceLines;
     let v2CreditLedgerData = null;
     let customerCreditLedgerData = null;
     let customerCreditTermsDays = 30;
@@ -822,8 +1074,11 @@ exports.createDirectSale = async (req, res, next) => {
       }
 
       if (requiresManagerApproval && !req.posV2Completion) {
-        const approvalPayload = { ...req.body };
-        delete approvalPayload.managerApprovalId;
+        const discountApplicationApproval = discountApprovalScope === 'DISCOUNT_APPLICATION';
+        const approvalPayload = discountApplicationApproval
+          ? buildDiscountApprovalContext(req.body)
+          : { ...req.body };
+        if (!discountApplicationApproval) delete approvalPayload.managerApprovalId;
         await consumePosManagerApproval({
           approvalId: req.body.managerApprovalId,
           companyId,
@@ -1043,7 +1298,9 @@ exports.createDirectSale = async (req, res, next) => {
             code: 'POS_PENDING_SALE_LINES_CHANGED',
           });
         }
+        storedLinesForPosting = savedLines;
         invoice.status = paymentStatus;
+        invoice.posPostingStatus = 'pending';
         invoice.amountPaid = amountPaid;
         invoice.amountOutstanding = amountOutstanding;
         invoice.confirmedAt = saleConfirmedAt;
@@ -1058,6 +1315,7 @@ exports.createDirectSale = async (req, res, next) => {
           retryCount: Number(invoice.ebm?.retryCount) || 0,
           paymentFlow: 'PAYMENTS_V2',
         };
+        if (voucherQuote) invoice.posPricingSnapshot = voucherQuote.pricing;
         await invoice.save({ session });
       } else {
         invoice = await Invoice.create([{
@@ -1069,12 +1327,20 @@ exports.createDirectSale = async (req, res, next) => {
           lines: invoiceLines,
           status: paymentStatus,
           posOrigin: true,
+          posPostingStatus: 'pending',
+          posCheckoutPayload: isV2Pending
+            ? pendingCheckoutPayload(req.body)
+            : {
+              items: (Array.isArray(req.body.items) ? req.body.items : []).map((item) => ({
+                ...(item.unitPrice != null ? { unitPrice: Number(item.unitPrice) } : {}),
+                ...(item.catalogUnitPrice != null ? { catalogUnitPrice: Number(item.catalogUnitPrice) } : {}),
+              })),
+            },
           ...(isV2Pending ? {
             tillSessionId: String(activeTill._id),
             shiftId: String(activePosShift.id),
             cashierId: posCashierId,
             registerId: String(claimedRegister.id),
-            posCheckoutPayload: pendingCheckoutPayload(req.body),
           } : {}),
           ebm: {
             fiscalEnvironment: fiscalMode,
@@ -1084,6 +1350,7 @@ exports.createDirectSale = async (req, res, next) => {
             ...(isV2Pending ? { paymentFlow: 'PAYMENTS_V2' } : {}),
           },
           currencyCode: invoiceCurrency,
+          ...(voucherQuote ? { posPricingSnapshot: voucherQuote.pricing } : {}),
           subtotal: subtotal,
           totalDiscount: totalDiscount,
           taxAmount: totalTax,
@@ -1106,6 +1373,21 @@ exports.createDirectSale = async (req, res, next) => {
         }], { session });
 
         invoice = invoice[0];
+      }
+      const voucherResult = voucherQuote || voucherTokens.length || req.posV2Completion?.voucherReservations
+        ? await redeemPosVouchers(session, String(companyId), posCashierId, {
+          tokens: voucherTokens,
+          invoiceId: req.posV2Completion?.voucherReservations ? req.posV2Completion.invoiceId : String(invoice._id),
+          cartInput: voucherCartInput,
+          productsById: voucherProductsById,
+          holdForPending: isV2Pending,
+        })
+        : null;
+      if (Boolean(voucherQuote) !== Boolean(voucherResult)
+        || voucherQuote && JSON.stringify(voucherQuote.pricing) !== JSON.stringify(voucherResult.pricing)) {
+        throw Object.assign(new Error('Voucher pricing changed during checkout. Reapply the voucher and retry.'), {
+          code: 'POS_VOUCHER_CART_CHANGED',
+        });
       }
       // V2 checkout first creates a pending invoice. Keep its proforma open
       // until payment completion commits the real sale and its postings.
@@ -1265,7 +1547,7 @@ exports.createDirectSale = async (req, res, next) => {
       let loyaltyAccountId = null;
       let loyaltyEarnRatePercent = 1;
       const qualifyingPaidSales = Math.max(0, paidAmount - storedValuePaid);
-      if (clientId && clientId !== 'walk-in' && grandTotal > 0 && qualifyingPaidSales > 0) {
+      if (clientId && clientId !== 'walk-in' && !client.isWalkIn && grandTotal > 0 && qualifyingPaidSales > 0) {
         const loyaltySettingsRow = await dbClient().systemSettings.findUnique({
           where: { companyId: String(companyId) },
           select: { posLoyaltySettings: true },
@@ -1475,6 +1757,25 @@ exports.createDirectSale = async (req, res, next) => {
           }
         }
 
+        const invoiceLine = storedLinesForPosting[stockUpdate.lineData.lineOrder];
+        if (!invoiceLine || String(invoiceLine.productId || invoiceLine.product || '') !== String(product._id)) {
+          throw new Error(`Could not match the saved invoice line for ${product.name} while recording its cost.`);
+        }
+        invoiceLine.unitCost = unitCost;
+        invoiceLine.cogsAmount = cogsAmount;
+        const invoiceLineCostUpdate = await dbClient().invoiceLine.updateMany({
+          where: {
+            invoiceId: String(invoice._id),
+            companyId: String(companyId),
+            lineOrder: stockUpdate.lineData.lineOrder,
+            productId: String(product._id),
+          },
+          data: { unitCost, cogsAmount },
+        });
+        if (invoiceLineCostUpdate.count !== 1) {
+          throw new Error(`Could not save the inventory cost for ${product.name} on invoice ${invoice.referenceNo}.`);
+        }
+
         totalCOGS += cogsAmount;
         if (offlineContext || (allowNegativeStock && trackingType === 'none')) {
           await dbClient().$executeRawUnsafe(
@@ -1547,22 +1848,6 @@ exports.createDirectSale = async (req, res, next) => {
 
       // 3. Post balanced revenue and COGS entries in the same transaction as
       // the invoice and inventory changes. Any posting error must roll back it all.
-      const arAccount = await JournalService.getMappedAccountCode(
-        companyId, 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable,
-      );
-      const salesAccount = await JournalService.getMappedAccountCode(
-        companyId, 'sales', 'salesRevenue', DEFAULT_ACCOUNTS.salesRevenue,
-      );
-      const vatAccount = await JournalService.getMappedAccountCode(
-        companyId, 'tax', 'vatOutput', DEFAULT_ACCOUNTS.vatOutput,
-      );
-      const cogsAccount = await JournalService.getMappedAccountCode(
-        companyId, 'inventory', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold,
-      );
-      const inventoryAccount = await JournalService.getMappedAccountCode(
-        companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory,
-      );
-
       const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
       const paymentAccounts = new Map();
       for (const tender of appliedPayments) {
@@ -1589,75 +1874,86 @@ exports.createDirectSale = async (req, res, next) => {
         }
       }
 
-      const revenueLines = [];
-      for (const tender of appliedPayments) {
-        const paymentBankAccount = tender.bankAccountId ? paymentAccounts.get(String(tender.bankAccountId)) : null;
-        let settlementAccount;
-        if (tender.paymentMethod === 'gift_card') {
-          settlementAccount = await JournalService.getMappedAccountCode(
-            companyId, 'sales', 'giftCardLiability', DEFAULT_ACCOUNTS.deferredRevenue || '2850',
-          );
-        } else if (tender.paymentMethod === 'store_credit' || tender.paymentMethod === 'loyalty' || tender.paymentMethod === 'loyalty_points') {
-          settlementAccount = await JournalService.getMappedAccountCode(
-            companyId, 'sales', 'customerAdvances', DEFAULT_ACCOUNTS.customerAdvances || '2860',
-          );
-        } else if (tender.paymentMethod === 'mobile_money'
-          && req.posV2Completion
-          && ['momo', 'airtel'].includes(String(tender.provider || '').toLowerCase())) {
-          const accountKey = String(tender.provider).toLowerCase() === 'airtel' ? 'airtelMoney' : 'mtnMoMo';
-          settlementAccount = await JournalService.getMappedAccountCode(
-            companyId,
-            'cash',
-            accountKey,
-            DEFAULT_ACCOUNTS[accountKey],
-          );
-        } else if (paymentBankAccount) {
-          settlementAccount = paymentBankAccount.ledgerAccountId;
-        } else if (tender.paymentMethod === 'mobile_money') {
-          settlementAccount = await JournalService.getMappedAccountCode(
-            companyId, 'cash', 'mtnMoMo', DEFAULT_ACCOUNTS.mtnMoMo || '1200',
-          );
-        } else if (tender.paymentMethod === 'cash' || tender.paymentMethod === 'card') {
-          settlementAccount = await JournalService.getMappedAccountCode(
-            companyId, 'cash', 'cashOnHand', DEFAULT_ACCOUNTS.cashOnHand || '1000',
-          );
-        } else {
-          settlementAccount = await JournalService.getMappedAccountCode(
-            companyId, 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank || '1100',
-          );
+      let accountingProfile;
+      try {
+        accountingProfile = await posAccountingProfileService.getProfile(String(companyId));
+      } catch (error) {
+        error.accountingPostingFailure = true;
+        throw error;
+      }
+      const scope = {
+        tillType: String(claimedRegister.systemTillType || 'retail').toLowerCase(),
+        registerId: String(claimedRegister.id),
+      };
+      const mappedAccount = async (profileKey, moduleName, mappingKey, fallback) => {
+        try {
+          return posAccountingProfileService.resolveAccount(accountingProfile, profileKey, scope)
+            || await JournalService.getMappedAccountCode(companyId, moduleName, mappingKey, fallback);
+        } catch (error) {
+          error.accountingPostingFailure = true;
+          throw error;
         }
-        if (!settlementAccount) throw new Error(`No ledger account is configured for ${tender.paymentMethod}`);
-        revenueLines.push(JournalService.createDebitLine(
-          settlementAccount, tender.amount, `POS ${tender.paymentMethod} payment - Invoice ${invoice.referenceNo}`,
-        ));
+      };
+      const postingAccounts = {
+        posRegisterCash: await mappedAccount('posRegisterCash', 'cash', 'cashOnHand', DEFAULT_ACCOUNTS.posRegisterCash),
+        cardClearing: await mappedAccount('cardClearing', 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank),
+        mtnMoMo: await mappedAccount('mtnMoMo', 'cash', 'mtnMoMo', DEFAULT_ACCOUNTS.mtnMoMo),
+        airtelMoney: await mappedAccount('airtelMoney', 'cash', 'airtelMoney', DEFAULT_ACCOUNTS.airtelMoney),
+        cashAtBank: await mappedAccount('cashAtBank', 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank),
+        accountsReceivable: await mappedAccount('accountsReceivable', 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable),
+        customerAdvances: await mappedAccount('customerAdvances', 'sales', 'customerAdvances', DEFAULT_ACCOUNTS.customerAdvances),
+        giftCardLiability: await mappedAccount('giftCardLiability', 'sales', 'giftCardLiability', DEFAULT_ACCOUNTS.deferredRevenue),
+        loyaltyRewardsExpense: await mappedAccount('loyaltyRewardsExpense', 'expenses', 'marketing', DEFAULT_ACCOUNTS.marketing),
+        inventory: await mappedAccount('inventory', 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory),
+        salesRevenue: await mappedAccount('salesRevenue', 'sales', 'salesRevenue', DEFAULT_ACCOUNTS.salesRevenue),
+        vatOutput: await mappedAccount('vatOutput', 'tax', 'vatOutput', DEFAULT_ACCOUNTS.vatOutput),
+        costOfGoodsSold: await mappedAccount('costOfGoodsSold', 'inventory', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold),
+      };
+      const salesAccount = postingAccounts.salesRevenue;
+      const vatAccount = postingAccounts.vatOutput;
+      const postingInvoice = {
+        id: String(invoice._id),
+        referenceNo: invoice.referenceNo,
+        ebm: invoice.ebm,
+        totalAmount: grandTotal,
+        subtotal,
+        totalDiscount,
+        taxAmount: totalTax,
+        amountPaid,
+        amountOutstanding,
+        lines: storedLinesForPosting,
+        cogsAmount: totalCOGS,
+      };
+      const postingTenders = appliedPayments.map((tender) => ({
+        ...tender,
+        amountRwf: tender.amount,
+        accountCode: tender.bankAccountId
+          ? paymentAccounts.get(String(tender.bankAccountId))?.ledgerAccountId
+          : undefined,
+      }));
+      let builtEntries;
+      try {
+        builtEntries = buildSaleJournalEntries({
+          invoice: postingInvoice,
+          tenders: postingTenders,
+          accounts: postingAccounts,
+        });
+      } catch (error) {
+        error.accountingPostingFailure = true;
+        throw error;
       }
-      if (amountOutstanding > 0) {
-        revenueLines.push(JournalService.createDebitLine(
-          arAccount, amountOutstanding, `Receivable from ${client.name} - Invoice ${invoice.referenceNo}`,
-        ));
-      }
-      if (netSales > 0) {
-        revenueLines.push(JournalService.createCreditLine(
-          salesAccount, netSales, `Sales revenue - Invoice ${invoice.referenceNo}`,
-        ));
-      }
+      const revenueLines = builtEntries[0].lines.map((line) => (
+        line.debit > 0
+          ? JournalService.createDebitLine(line.accountCode, line.debit, line.description)
+          : JournalService.createCreditLine(line.accountCode, line.credit, line.description)
+      ));
       if (loyaltyEarned > 0) {
-        const loyaltyExpense = await JournalService.getMappedAccountCode(
-          companyId, 'sales', 'salesReturns', DEFAULT_ACCOUNTS.salesReturns || '4100',
-        );
-        const loyaltyLiability = await JournalService.getMappedAccountCode(
-          companyId, 'sales', 'customerAdvances', DEFAULT_ACCOUNTS.customerAdvances || '2860',
-        );
+        const loyaltyLiability = postingAccounts.customerAdvances;
         revenueLines.push(JournalService.createDebitLine(
-          loyaltyExpense, loyaltyEarned, `Loyalty credit earned - Invoice ${invoice.referenceNo}`,
+          postingAccounts.loyaltyRewardsExpense, loyaltyEarned, `Loyalty credit earned - Invoice ${invoice.referenceNo}`,
         ));
         revenueLines.push(JournalService.createCreditLine(
           loyaltyLiability, loyaltyEarned, `Loyalty credit liability - Invoice ${invoice.referenceNo}`,
-        ));
-      }
-      if (totalTax > 0) {
-        revenueLines.push(JournalService.createCreditLine(
-          vatAccount, totalTax, `VAT on sales - Invoice ${invoice.referenceNo}`,
         ));
       }
       if (revenueLines.length < 2) {
@@ -1666,26 +1962,23 @@ exports.createDirectSale = async (req, res, next) => {
         throw error;
       }
 
-      const cogsLines = [];
-      if (totalCOGS > 0) {
-        cogsLines.push(JournalService.createDebitLine(
-          cogsAccount, totalCOGS, `COGS for Invoice ${invoice.referenceNo}`,
-        ));
-        cogsLines.push(JournalService.createCreditLine(
-          inventoryAccount, totalCOGS, `Inventory reduction for Invoice ${invoice.referenceNo}`,
-        ));
-      }
-
-      if (req.posV2Completion) revenueLines.push(...cogsLines);
-      const journalEntries = [{
+      const journalEntries = builtEntries.map((entry, index) => ({
         date: invoice.invoiceDate,
-        description: `Direct sale - Invoice ${invoice.referenceNo}`,
-        sourceType: 'invoice',
+        description: index === 0
+          ? `Direct sale - Invoice ${invoice.referenceNo}`
+          : `COGS for Invoice ${invoice.referenceNo}`,
+        sourceType: entry.sourceType,
         sourceId: invoice._id,
         sourceReference: invoice.referenceNo,
-        lines: revenueLines,
+        lines: index === 0
+          ? revenueLines
+          : entry.lines.map((line) => (
+            line.debit > 0
+              ? JournalService.createDebitLine(line.accountCode, line.debit, line.description)
+              : JournalService.createCreditLine(line.accountCode, line.credit, line.description)
+          )),
         isAutoGenerated: true,
-        sourceData: {
+        ...(index === 0 ? { sourceData: {
           payments: appliedPayments.map((tender) => ({
             amount: tender.amount,
             paymentMethod: tender.paymentMethod,
@@ -1697,19 +1990,8 @@ exports.createDirectSale = async (req, res, next) => {
           })),
           loyaltyCreditEarned: loyaltyEarned,
           ...(req.posV2Completion ? { paymentFlow: 'PAYMENTS_V2' } : {}),
-        },
-      }];
-      if (cogsLines.length > 0 && !req.posV2Completion) {
-        journalEntries.push({
-          date: invoice.invoiceDate,
-          description: `COGS for Invoice ${invoice.referenceNo}`,
-          sourceType: 'invoice_cogs',
-          sourceId: invoice._id,
-          sourceReference: invoice.referenceNo,
-          lines: cogsLines,
-          isAutoGenerated: true,
-        });
-      }
+        } } : {}),
+      }));
       for (const line of journalEntries.flatMap((entry) => entry.lines)) {
         financialAccountCodes.add(line.accountCode);
       }
@@ -1717,7 +1999,7 @@ exports.createDirectSale = async (req, res, next) => {
       let createdEntries;
       try {
         createdEntries = await JournalService.createEntriesAtomic(
-          companyId, req.user.id, journalEntries, { session },
+          companyId, req.user.id, journalEntries, { session, allowDuplicate: false },
         );
       } catch (error) {
         error.accountingPostingFailure = true;
@@ -1733,6 +2015,7 @@ exports.createDirectSale = async (req, res, next) => {
 
       invoice.revenueJournalEntry = createdEntries[0]._id;
       invoice.cogsJournalEntry = req.posV2Completion ? null : createdEntries[1]?._id || null;
+      invoice.posPostingStatus = 'posted';
       await invoice.save({ session });
 
       // 4. Add payment record if provided
@@ -1796,11 +2079,13 @@ exports.createDirectSale = async (req, res, next) => {
         }
       }
 
-      // Keep customer sales totals aligned with invoice revenue, including
-      // credit sales and partially paid invoices.
-      client.totalPurchases = (client.totalPurchases || 0) + grandTotal;
-      client.lastPurchaseDate = new Date();
-      await client.save({ session });
+      // The company walk-in customer is protected from all updates by the
+      // database. Keep purchase aggregates only for mutable named customers.
+      if (!client.isWalkIn) {
+        client.totalPurchases = (client.totalPurchases || 0) + grandTotal;
+        client.lastPurchaseDate = new Date();
+        await client.save({ session });
+      }
       if (customerCreditLedgerData) {
         const creditEntryKey = `POSSALE:${String(invoice._id)}`;
         const creditRequestHash = createHash('sha256').update(JSON.stringify({ invoiceId: String(invoice._id), clientId: customerCreditLedgerData.clientId, amount: customerCreditLedgerData.amount })).digest('hex');
@@ -2041,6 +2326,20 @@ exports.createDirectSale = async (req, res, next) => {
       }
     }
     if (error?.accountingPostingFailure || error?.code === 'POS_ACCOUNTING_POST_FAILED') {
+      if (req.posV2Completion) {
+        try {
+          const updated = await dbClient().$executeRawUnsafe(
+            'UPDATE invoices SET pos_posting_status = $1 WHERE id = $2 AND company_id = $3 AND pos_origin = TRUE AND revenue_journal_entry_id IS NULL',
+            'failed', String(req.posV2Completion.invoiceId), String(companyId),
+          );
+          if (updated !== 1) {
+            throw new Error('The failed POS posting status could not be saved for the pending sale.');
+          }
+        } catch (statusError) {
+          console.error('[createDirectSale] Could not persist failed POS posting status:', statusError);
+          return next(statusError);
+        }
+      }
       console.error('[createDirectSale] Accounting posting failed; sale rolled back:', error);
       return res.status(503).json({
         success: false,
@@ -2100,6 +2399,16 @@ exports.createDirectSale = async (req, res, next) => {
     if (error?.code === 'POS_ZERO_VALUE_SALE') {
       return res.status(400).json({ success: false, code: error.code, message: error.message });
     }
+    if (String(error?.code || '').startsWith('POS_VOUCHER_')) {
+      const status = error.code === 'POS_VOUCHER_LOOKUP_LOCKED'
+        ? 429
+        : ['POS_VOUCHER_INVALID', 'POS_VOUCHER_SETTINGS_INVALID', 'POS_VOUCHER_RESERVATION_INVALID'].includes(error.code)
+          ? 400
+          : error.code.endsWith('_NOT_FOUND')
+            ? 404
+            : 409;
+      return res.status(status).json({ success: false, code: error.code, message: error.message });
+    }
     if ([
       'POS_SHIFT_REQUIRED',
       'POS_TILL_SHIFT_LINK_MISSING',
@@ -2149,14 +2458,40 @@ exports.getCheckoutPaymentFlow = async (req, res, next) => {
     if (!register) throw registerClaimRequiredError();
 
     const settings = await posPaymentService.getPaymentSettings(companyId);
+    const cashierId = String(req.user?.id || req.user?._id || '');
+    const [discountSettingsRow, roleAssignments] = await Promise.all([
+      dbClient().systemSettings.findUnique({
+        where: { companyId },
+        select: { posDiscountSettings: true },
+      }),
+      cashierId
+        ? dbClient().userRole.findMany({
+          where: { userId: cashierId, role: { is: { OR: [{ companyId }, { companyId: null }] } } },
+          select: { roleId: true },
+        })
+        : [],
+    ]);
+    const discountSettings = normalizeStoredDiscountSettings(
+      discountSettingsRow?.posDiscountSettings || DEFAULT_DISCOUNT_SETTINGS,
+    );
+    const tillFeatures = getTillTypeFeatures(discountSettings, register.systemTillType);
     return res.json({
       success: true,
       data: {
         registerId: String(register.id),
         paymentFlow: posPaymentService.resolvePaymentFlow(settings, String(register.id)),
-        methods: posPaymentService.resolveEnabledMethods(settings, String(register.id)),
+        methods: posPaymentService.resolveEnabledMethods(settings, String(register.id))
+          .filter((method) => method !== 'CREDIT' || tillFeatures.customerCredit),
         manualMobileMoneyMode: settings.manualMobileMoneyMode,
         manualMobileMoneyReceivers: settings.manualMobileMoneyReceivers,
+        discountLimits: getApplicableDiscountLimits(
+          discountSettings,
+          roleAssignments.map((assignment) => assignment.roleId),
+          register.discountLabel || null,
+        ),
+        discountReasons: discountSettings.discountReasons,
+        features: tillFeatures,
+        registerDiscountLabel: register.discountLabel || null,
       },
     });
   } catch (error) {
@@ -2230,7 +2565,7 @@ exports.getPosProducts = async (req, res, next) => {
     // Keyset pagination uses the indexed sort key and a single look-ahead row.
     // It avoids a full matching-row count and work proportional to page depth.
     const fetchedProducts = await Product.find(query)
-      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode imageUrl imageUrls category isStockable trackingType trackSerialNumbers trackBatch')
+      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode imageUrl imageUrls category isNoDiscount isStockable trackingType trackSerialNumbers trackBatch')
       .populate('category')
       .sort({ name: 1, _id: 1 })
       .limit(resultLimit + 1);
@@ -2252,10 +2587,10 @@ exports.getPosProducts = async (req, res, next) => {
     const categoryRows = productCategoryIds.length
       ? await dbClient().category.findMany({
         where: { companyId: String(companyId), id: { in: productCategoryIds } },
-        select: { id: true, name: true },
+        select: { id: true, name: true, isNoDiscount: true },
       })
       : [];
-    const categoryNameById = new Map(categoryRows.map((category) => [String(category.id).trim(), category.name]));
+    const categoryById = new Map(categoryRows.map((category) => [String(category.id).trim(), category]));
 
     const [warehouseStockLevels, priceListPricing, transferVisibility, quarantinedRows] = await Promise.all([
       warehouseId && products.length
@@ -2313,8 +2648,11 @@ exports.getPosProducts = async (req, res, next) => {
         // Till filters need a human-readable category. Product.find() selects
         // only the category foreign key unless the relation is populated.
         category: p.category && typeof p.category === 'object'
-          ? (p.category.name || categoryNameById.get(String(p.category.id || p.category._id || p.category.categoryId || '').trim()) || null)
-          : (categoryNameById.get(String(p.category || '').trim()) || (isObjectIdString(p.category) ? null : p.category)),
+          ? (p.category.name || categoryById.get(String(p.category.id || p.category._id || p.category.categoryId || '').trim())?.name || null)
+          : (categoryById.get(String(p.category || '').trim())?.name || (isObjectIdString(p.category) ? null : p.category)),
+        isNoDiscount: Boolean(p.isNoDiscount),
+        categoryNoDiscount: Boolean(p.category && typeof p.category === 'object' && p.category.isNoDiscount)
+          || Boolean(categoryById.get(String(p.category?.id || p.category?._id || p.category || '').trim())?.isNoDiscount),
         isAvailable: currentStock > 0 || p.isStockable === false,
         incomingTransfers: transferVisibility[String(p._id)]?.incoming || [],
         outgoingTransfers: transferVisibility[String(p._id)]?.outgoing || [],

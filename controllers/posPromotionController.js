@@ -2,10 +2,6 @@ const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 
 const companyIdFor = (req) => String(req.user.company?._id || req.user.companyId || '');
-const caps = () => ({
-  maxPercent: Math.min(100, Math.max(1, Number(process.env.POS_PROMOTION_MAX_PERCENT) || 50)),
-  maxFixed: Math.max(1, Number(process.env.POS_PROMOTION_MAX_FIXED_RWF) || 1000000),
-});
 const present = (row) => ({
   _id: row.id,
   name: row.name,
@@ -29,7 +25,7 @@ exports.list = async (req, res, next) => {
         ORDER BY is_active DESC, starts_at DESC, name ASC`,
       ...(managerView ? [companyId] : [companyId, now]),
     );
-    return res.json({ success: true, data: rows.map(present), caps: caps() });
+    return res.json({ success: true, data: rows.map(present) });
   } catch (error) { return next(error); }
 };
 
@@ -42,16 +38,15 @@ exports.create = async (req, res, next) => {
     const value = Number(req.body.value);
     const startsAt = new Date(req.body.startsAt);
     const endsAt = new Date(req.body.endsAt);
-    const limit = caps();
     if (name.length < 2 || name.length > 120 || !/^[A-Z0-9][A-Z0-9_-]{1,39}$/.test(code)
       || !['percent', 'fixed'].includes(discountType) || !Number.isFinite(value) || value <= 0
-      || (discountType === 'percent' && value > limit.maxPercent)
-      || (discountType === 'fixed' && value > limit.maxFixed)
+      || (discountType === 'percent' && value > 100)
+      || value > Number.MAX_SAFE_INTEGER
       || Number.isNaN(startsAt.getTime()) || Number.isNaN(endsAt.getTime()) || endsAt <= startsAt) {
       return res.status(400).json({
         success: false,
         code: 'POS_PROMOTION_INVALID',
-        message: `Enter a unique code, valid date window, and discount within the configured caps (up to ${limit.maxPercent}% or RWF ${limit.maxFixed.toLocaleString()}).`,
+        message: 'Enter a valid name, code, discount value, and date window.',
       });
     }
     const now = new Date();

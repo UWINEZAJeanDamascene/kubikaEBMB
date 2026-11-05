@@ -11,9 +11,12 @@ const CASHIER_POS_PERMISSIONS = [
   'pos.till.close_shift',
   'pos.till.discount',
   'pos.till.receive_account_payment',
+  'pos.voucher.redeem',
   // A cashier must be able to start the shift before the till can sell.
   'pos.till.open_shift',
   'pos.receipt.share',
+  'pos.giftcard.issue',
+  'pos.giftcard.redeem',
 ];
 const SUPERVISOR_POS_PERMISSIONS = [
   ...CASHIER_POS_PERMISSIONS,
@@ -46,6 +49,7 @@ const STORE_MANAGER_POS_PERMISSIONS = [
   'pos.admin.audit',
   'pos.shift.settings',
   'pos.payment.settings',
+  'pos.payment.reconcile',
   'pos.payment.manual_confirm',
   'pos.giftcard.manage',
   // Managers may administer private customer receipt links.
@@ -133,7 +137,7 @@ function configuredPermissions(matrix, roles) {
     if (Array.isArray(permissions)) {
       const configured = permissions.filter((permission) => typeof permission === 'string');
       return roleName === 'cashier' || roleName === 'sales'
-        ? [...new Set([...configured, 'pos.receipt.share'])]
+      ? [...new Set([...configured, 'pos.receipt.share', 'pos.giftcard.redeem'])]
         : configured;
     }
     if (roleName === 'cashier' || roleName === 'sales') return CASHIER_POS_PERMISSIONS;

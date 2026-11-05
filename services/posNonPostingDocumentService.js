@@ -1,9 +1,13 @@
 'use strict';
 
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const Product = require('../models/Product');
 const Client = require('../models/Client');
 const { generateObjectId } = require('../utils/objectId');
+const {
+  DEFAULT_DISCOUNT_SETTINGS,
+  normalizeStoredDiscountSettings,
+} = require('./posDiscountSettingsService');
 
 function fail(statusCode, code, message) {
   return Object.assign(new Error(message), { statusCode, code });
@@ -22,18 +26,45 @@ async function createDocument({ companyId, registerId, userId, kind, input }) {
     quantity: Number(row.quantity ?? row.cartQuantity),
     unitPrice: Number(row.unitPrice ?? row.cartUnitPrice),
     discountPct: Number(row.discountPct ?? row.cartDiscountPct ?? 0),
+    discountReason: typeof row.discountReason === 'string' ? row.discountReason.trim() : '',
     serialNumbers: Array.isArray(row.serialNumbers) ? row.serialNumbers.map(String) : [],
   }));
+  const cartDiscountPct = Number(input.cartDiscountPct || 0);
+  const cartDiscountReason = typeof input.cartDiscountReason === 'string' ? input.cartDiscountReason.trim() : '';
+  if (!Number.isFinite(cartDiscountPct) || cartDiscountPct < 0 || cartDiscountPct > 100) {
+    throw fail(400, 'POS_DISCOUNT_VALUE_INVALID', 'Cart discount must be between 0 and 100 percent.');
+  }
+  if (cartDiscountPct > 0 && normalized.some((row) => row.discountPct > 0)) {
+    throw fail(400, 'POS_DISCOUNT_SCOPES_CANNOT_COMBINE', 'Apply either line discounts or a cart discount, not both.');
+  }
+  if (cartDiscountPct > 0) {
+    const settingsRow = await dbClient().systemSettings.findUnique({
+      where: { companyId: String(companyId) },
+      select: { posDiscountSettings: true },
+    });
+    const settings = normalizeStoredDiscountSettings(
+      settingsRow?.posDiscountSettings || DEFAULT_DISCOUNT_SETTINGS,
+    );
+    if (!settings.discountReasons.some((reason) => reason.toLocaleLowerCase() === cartDiscountReason.toLocaleLowerCase())) {
+      throw fail(400, 'POS_DISCOUNT_REASON_REQUIRED', 'Select a configured discount reason for the cart discount.');
+    }
+  }
   if (normalized.some((row) => !/^[a-f\d]{24}$/i.test(row.productId) || !Number.isFinite(row.quantity) || row.quantity <= 0
     || !Number.isFinite(row.unitPrice) || row.unitPrice < 0 || !Number.isFinite(row.discountPct) || row.discountPct < 0 || row.discountPct > 100)) {
     throw fail(400, 'POS_DOCUMENT_ITEMS_INVALID', 'Each item needs a valid product, positive quantity, and valid price or discount.');
   }
   const productIds = [...new Set(normalized.map((row) => row.productId))];
   const products = await Product.find({ _id: { $in: productIds }, company: String(companyId) })
-    .select('name sku unit sellingPrice taxRate taxCode ebm')
+    .select('name sku unit sellingPrice taxRate taxCode ebm isNoDiscount category')
     .lean();
   const productById = new Map(products.map((product) => [String(product._id), product]));
   if (products.length !== productIds.length) throw fail(404, 'POS_DOCUMENT_PRODUCT_NOT_FOUND', 'One or more items are no longer available in this company.');
+  const restrictedCategories = cartDiscountPct > 0
+    ? new Set((await dbClient().category.findMany({
+      where: { companyId: String(companyId), isNoDiscount: true },
+      select: { id: true },
+    })).map((category) => String(category.id)))
+    : new Set();
 
   let clientInfo = input.clientInfo || null;
   if (input.clientId) {
@@ -46,7 +77,12 @@ async function createDocument({ companyId, registerId, userId, kind, input }) {
     const product = productById.get(row.productId);
     const unitPrice = Math.round(row.unitPrice * 100) / 100;
     const gross = row.quantity * unitPrice;
-    const discount = Math.round(gross * row.discountPct) / 100;
+    const categoryId = String(product.category?._id || product.category || '');
+    const restricted = Boolean(product.isNoDiscount) || restrictedCategories.has(categoryId);
+    const discountPct = cartDiscountPct > 0
+      ? restricted ? 0 : cartDiscountPct
+      : row.discountPct;
+    const discount = Math.round(gross * discountPct) / 100;
     const net = Math.max(0, gross - discount);
     const configuredTaxRate = Number(product.taxRate);
     const taxRate = Number.isFinite(configuredTaxRate) && configuredTaxRate > 0
@@ -55,7 +91,8 @@ async function createDocument({ companyId, registerId, userId, kind, input }) {
     const tax = Math.round(net * taxRate) / 100;
     return {
       productId: row.productId, name: product.name, sku: product.sku || null, unit: product.unit || null,
-      quantity: row.quantity, unitPrice, discountPct: row.discountPct, discountAmount: discount,
+      quantity: row.quantity, unitPrice, discountPct, discountAmount: discount,
+      discountReason: cartDiscountPct > 0 && !restricted ? cartDiscountReason : row.discountReason,
       taxRate, taxAmount: tax, lineTotal: Math.round((net + tax) * 100) / 100,
       serialNumbers: row.serialNumbers,
     };
@@ -73,6 +110,7 @@ async function createDocument({ companyId, registerId, userId, kind, input }) {
     documentNumber, documentType: type, status: 'open', totalAmount, conversionKey,
     documentData: {
       items, clientId: input.clientId || null, clientInfo, warehouseId: input.warehouseId || null,
+      cartDiscountPct, cartDiscountReason,
       subtotal, discountAmount, taxAmount, totalAmount, createdAt: now.toISOString(),
       informationalOnly: type === 'PROFORMA', trainingOnly: type === 'TRAINING',
     },

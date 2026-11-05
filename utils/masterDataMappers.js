@@ -55,6 +55,7 @@ function categoryToApi(row) {
     defaultCogsAccount: row.defaultCogsAccount ?? null,
     defaultRevenueAccount: row.defaultRevenueAccount ?? null,
     isActive: Boolean(row.isActive),
+    isNoDiscount: Boolean(row.isNoDiscount),
     createdBy: row.createdById ?? null,
     customFields: row.customFields ?? {},
     ...mapTimestamps(row),
@@ -69,6 +70,7 @@ const CATEGORY_INPUT_MAP = {
   defaultCogsAccount: 'defaultCogsAccount',
   defaultRevenueAccount: 'defaultRevenueAccount',
   isActive: 'isActive',
+  isNoDiscount: 'isNoDiscount',
   customFields: 'customFields',
 };
 
@@ -449,6 +451,7 @@ function productToApi(row) {
     cogsAccount: row.cogsAccount ?? null,
     revenueAccount: row.revenueAccount ?? null,
     isArchived: Boolean(row.isArchived),
+    isNoDiscount: Boolean(row.isNoDiscount),
     weight: row.weight ?? 0,
     brand: row.brand ?? null,
     location: row.location ?? null,
@@ -497,6 +500,7 @@ const PRODUCT_INPUT_MAP = {
   cogsAccount: 'cogsAccount',
   revenueAccount: 'revenueAccount',
   isArchived: 'isArchived',
+  isNoDiscount: 'isNoDiscount',
   weight: 'weight',
   brand: 'brand',
   location: 'location',

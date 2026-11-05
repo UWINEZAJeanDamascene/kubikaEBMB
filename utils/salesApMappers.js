@@ -60,6 +60,7 @@ function quotationLineToApi(row) {
       unit: row.unit ?? null,
       unitPrice: qtyNum(row.unitPrice),
       discountPct: qtyNum(row.discountPct),
+      discountReason: row.discountReason ?? null,
       taxRate: qtyNum(row.taxRate),
       lineSubtotal: qtyNum(row.lineSubtotal),
       lineDiscount: qtyNum(row.lineDiscount),
@@ -131,6 +132,7 @@ function invoiceLineToApi(row) {
       unit: row.unit ?? null,
       unitPrice: qtyNum(row.unitPrice),
       discountPct: qtyNum(row.discountPct),
+      discountReason: row.discountReason ?? null,
       taxRate: qtyNum(row.taxRate),
       taxCode: row.taxCode,
       lineSubtotal: qtyNum(row.lineSubtotal),
@@ -213,6 +215,10 @@ function invoiceToApi(row) {
     deliveryNote: row.deliveryNoteId ?? null,
     status,
     posOrigin: Boolean(row.posOrigin),
+    posPostingStatus: row.posOrigin
+      ? (row.posPostingStatus
+        || (row.revenueJournalEntryId ? 'posted' : ['draft', 'PENDING_PAYMENT'].includes(row.status) ? 'pending' : 'failed'))
+      : null,
     tillSessionId: row.tillSessionId ?? null,
     registerId: row.registerId ?? null,
     shiftId: row.shiftId ?? null,
@@ -236,6 +242,7 @@ function invoiceToApi(row) {
     totalB18: qtyNum(row.totalB18),
     totalDiscount: moneyStr(totalDiscount),
     posPromotion,
+    posPricingSnapshot: row.posPricingSnapshot ?? null,
     invoiceDate: row.invoiceDate,
     date: row.invoiceDate,
     dueDate: row.dueDate,
@@ -290,6 +297,7 @@ async function invoiceTranslateCreate(data) {
       unit: line.unit ?? null,
       unitPrice,
       discountPct,
+      discountReason: line.discountReason ?? null,
       taxRate,
       taxCode: line.taxCode ?? 'A',
       lineSubtotal,
@@ -338,11 +346,13 @@ async function invoiceTranslateCreate(data) {
     deliveryNoteId: data.deliveryNote ? toIdString(data.deliveryNote) : null,
     status: data.status || 'draft',
     posOrigin: data.posOrigin === true,
+    posPostingStatus: data.posPostingStatus ?? null,
     tillSessionId: data.tillSessionId ? toIdString(data.tillSessionId) : null,
     shiftId: data.shiftId ? toIdString(data.shiftId) : null,
     cashierId: data.cashierId ? toIdString(data.cashierId) : null,
     registerId: data.registerId ? String(data.registerId) : null,
     posCheckoutPayload: data.posCheckoutPayload ?? undefined,
+    posPricingSnapshot: data.posPricingSnapshot ?? undefined,
     currencyCode: data.currencyCode || data.currency || 'RWF',
     exchangeRate: data.exchangeRate ?? 1,
     subtotal: moneyStr(subtotal),
@@ -379,7 +389,9 @@ function invoiceTranslateUpdate(update = {}) {
     badDebtWrittenOff: 'badDebtWrittenOff', writtenOffAt: 'writtenOffAt',
     writtenOffBy: 'writtenOffById', badDebtReason: 'badDebtReason',
     invoiceDate: 'invoiceDate', dueDate: 'dueDate', paidDate: 'paidDate',
-    payments: 'payments', ebm: 'ebm', terms: 'terms', notes: 'notes',
+    payments: 'payments', posPricingSnapshot: 'posPricingSnapshot',
+    posPostingStatus: 'posPostingStatus',
+    ebm: 'ebm', terms: 'terms', notes: 'notes',
     revenueJournalEntry: 'revenueJournalEntryId', cogsJournalEntry: 'cogsJournalEntryId',
     stockDeducted: 'stockDeducted', autoConfirm: 'autoConfirm',
     balance: 'amountOutstanding',
@@ -728,9 +740,31 @@ function creditNoteToApi(row) {
       lineTotal,
       returnToWarehouse: l.returnToWarehouseId ?? null,
       batchId: l.batchId ?? null,
+      returnDisposition: l.returnDisposition || 'restock',
+      writeOffReason: l.writeOffReason ?? null,
+      nonStockWriteOff: Boolean(l.nonStockWriteOff),
       serialNumbers: l.serialNumbers ?? [],
     };
   });
+  const hasRestockCost = lines.some((line) => (
+    line.returnDisposition === 'restock'
+    && line.product?.isStockable !== false
+    && Number(line.quantity) * Number(line.unitCost) > 0
+  ));
+  const hasWriteOffCost = lines.some((line) => (
+    line.returnDisposition === 'write_off'
+    && line.product?.isStockable !== false
+    && Number(line.quantity) * Number(line.unitCost) > 0
+  ));
+  const postingStatus = row.status === 'confirmed'
+    ? (row.revenueReversalEntryId
+      && (!hasRestockCost || row.cogsReversalEntryId)
+      && (!hasWriteOffCost || row.writeOffReversalEntryId)
+      ? 'posted'
+      : 'failed')
+    : ['draft', 'processing'].includes(String(row.status || '').toLowerCase())
+      ? 'pending'
+      : null;
   return {
     _id: row.id,
     company: row.companyId,
@@ -749,6 +783,16 @@ function creditNoteToApi(row) {
     totalAmount: qtyNum(row.totalAmount),
     grandTotal: qtyNum(row.totalAmount),
     stockReversed: row.stockReversed,
+    postingStatus,
+    revenueReversalEntry: row.revenueReversalEntry
+      ? relationRef(row.revenueReversalEntry, row.revenueReversalEntryId)
+      : row.revenueReversalEntryId ?? null,
+    cogsReversalEntry: row.cogsReversalEntry
+      ? relationRef(row.cogsReversalEntry, row.cogsReversalEntryId)
+      : row.cogsReversalEntryId ?? null,
+    writeOffReversalEntry: row.writeOffReversalEntry
+      ? relationRef(row.writeOffReversalEntry, row.writeOffReversalEntryId)
+      : row.writeOffReversalEntryId ?? null,
     confirmedBy: row.confirmedById ?? null,
     confirmedAt: row.confirmedAt ?? null,
     amountRefunded: qtyNum(row.amountRefunded),
@@ -1317,6 +1361,9 @@ const CREDIT_NOTE_HEADER = {
   status: 'status',
   posOrigin: 'posOrigin',
   stockReversed: 'stockReversed',
+  revenueReversalEntry: 'revenueReversalEntryId',
+  cogsReversalEntry: 'cogsReversalEntryId',
+  writeOffReversalEntry: 'writeOffReversalEntryId',
   creditDate: 'creditDate',
   reason: 'reason',
   type: 'type',
@@ -1354,11 +1401,16 @@ function creditNoteTranslateCreate(data) {
       lineTotal: line.lineTotal ?? 0,
       returnToWarehouseId: line.returnToWarehouse ? toIdString(line.returnToWarehouse) : null,
       batchId: line.batchId ? toIdString(line.batchId) : null,
+      returnDisposition: line.returnDisposition || 'restock',
+      writeOffReason: line.writeOffReason ?? null,
+      nonStockWriteOff: line.nonStockWriteOff ?? false,
       serialNumbers: line.serialNumbers ?? [],
     }));
 }
 
-const creditNoteTranslateUpdate = genericTranslateUpdate(CREDIT_NOTE_HEADER, ['invoiceId', 'clientId']);
+const creditNoteTranslateUpdate = genericTranslateUpdate(CREDIT_NOTE_HEADER, [
+  'invoiceId', 'clientId', 'revenueReversalEntryId', 'cogsReversalEntryId', 'writeOffReversalEntryId',
+]);
 
 // ── Translate: DeliveryNote ──────────────────────────────────────────────────
 

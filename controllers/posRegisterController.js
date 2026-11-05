@@ -21,6 +21,8 @@ const publicRegister = (register) => ({
   rraBranchId: register.rraBranchId || null,
   isActive: register.isActive,
   trainingMode: Boolean(register.trainingMode),
+  systemTillType: register.systemTillType || 'retail',
+  discountLabel: register.discountLabel || null,
   claimed: Boolean(register.claimedDeviceId),
   claimedAt: register.claimedAt,
   claimExpiresAt: register.claimExpiresAt,

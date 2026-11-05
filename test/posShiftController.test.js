@@ -6,6 +6,7 @@ jest.mock('../lib/prisma', () => ({
     tillSession: { findFirst: jest.fn() },
     invoice: { findMany: jest.fn() },
     posCashMovement: { findMany: jest.fn() },
+    posEbmSettings: { findUnique: jest.fn().mockResolvedValue(null) },
     $transaction: jest.fn(),
   },
 }));
@@ -244,7 +245,16 @@ describe('POS current shift endpoint', () => {
       register: { code: 'POS-1', name: 'Front Register' },
       invoices: [{ totalAmount: 12500 }],
       cashMovements: [
-        { type: 'cash_in', amount: 1000 },
+        {
+          id: 'movement-1',
+          type: 'cash_in',
+          amount: 1000,
+          reasonCode: 'GIFT_CARD_SALE',
+          reference: null,
+          note: 'Gift card issue',
+          journalEntryId: 'journal-id',
+          createdAt: new Date('2026-10-29T08:30:00.000Z'),
+        },
         { type: 'cash_out', amount: 250 },
         { type: 'safe_drop', amount: 500 },
       ],
@@ -252,7 +262,7 @@ describe('POS current shift endpoint', () => {
     });
     const res = createResponse();
 
-    await current(createRequest(), res, jest.fn());
+    await current(createRequest(), res, (error) => { throw error; });
 
     expect(res.body.data.totals).toEqual({
       salesCount: 1,
@@ -262,6 +272,12 @@ describe('POS current shift endpoint', () => {
       safeDrops: 500,
     });
     expect(res.body.data.shift).not.toHaveProperty('expectedCash');
+    expect(res.body.data.cashMovements[0]).toEqual(expect.objectContaining({
+      id: 'movement-1',
+      journalEntryId: 'journal-id',
+      postingStatus: 'posted',
+    }));
+    expect(res.body.data.bankDepositClearingBalance).toBe(0);
     expect(res.body.data).not.toHaveProperty('expectedCash');
     expect(res.body.data.report.cash).not.toHaveProperty('expectedCash');
     expect(res.body.data.report.cash).not.toHaveProperty('computedExpectedCash');
@@ -283,7 +299,7 @@ describe('POS current shift endpoint', () => {
     });
     const res = createResponse();
 
-    await xReport(createRequest(), res, jest.fn());
+    await xReport(createRequest(), res, (error) => { throw error; });
 
     expect(res.statusCode).toBe(200);
     expect(res.body.data.shift.status).toBe('reopened');

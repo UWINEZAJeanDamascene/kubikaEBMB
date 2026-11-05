@@ -59,11 +59,13 @@ exports.convertProforma = async (req, res, next) => {
       proformaDocumentId: document.id,
       items: Array.isArray(saved.items) ? saved.items.map((item) => ({
         productId: item.productId, quantity: item.quantity, unitPrice: item.unitPrice,
-        discountPct: item.discountPct, serialNumbers: item.serialNumbers || [],
+        discountPct: item.discountPct, discountReason: item.discountReason, serialNumbers: item.serialNumbers || [],
       })) : [],
       warehouseId: req.body?.warehouseId || saved.warehouseId,
       clientId: req.body?.clientId || saved.clientId || undefined,
       clientInfo: req.body?.clientInfo || saved.clientInfo || undefined,
+      cartDiscountPct: Number(saved.cartDiscountPct) || 0,
+      cartDiscountReason: saved.cartDiscountReason || '',
       registerId: req.posRegister?.code || req.body?.registerId,
     };
     req.body = saleBody;

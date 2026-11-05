@@ -20,6 +20,7 @@ const { runInTransaction } = require('../services/transactionService');
 const {
   create,
   list,
+  recordBankSlipReference,
 } = require('../controllers/posCashMovementController');
 const { APPROVABLE_ACTIONS } = require('../controllers/posApprovalController');
 
@@ -49,6 +50,8 @@ function createRequest({
   type = 'cash_in',
   amount = 10000,
   reasonCode = 'BANK_FLOAT',
+  reference,
+  note,
   key = IDEMPOTENCY_KEY,
   approvalToken,
 } = {}) {
@@ -57,6 +60,8 @@ function createRequest({
       type,
       amount,
       reasonCode,
+      ...(reference !== undefined ? { reference } : {}),
+      ...(note !== undefined ? { note } : {}),
       ...(approvalToken ? { approvalToken } : {}),
     },
     headers: { 'idempotency-key': key },
@@ -113,6 +118,7 @@ describe('POS cash movement endpoint', () => {
       [createRequest({ amount: 10.5 }), 'POS_CASH_MOVEMENT_AMOUNT_INVALID'],
       [createRequest({ amount: 2147483648 }), 'POS_CASH_MOVEMENT_AMOUNT_INVALID'],
       [createRequest({ reasonCode: 'bad reason' }), 'POS_CASH_MOVEMENT_REASON_INVALID'],
+      [createRequest({ type: 'cash_out', reasonCode: 'BANK_DEPOSIT' }), 'POS_BANK_DEPOSIT_EVIDENCE_REQUIRED'],
     ];
 
     for (const [req, code] of invalidCases) {
@@ -136,7 +142,11 @@ describe('POS cash movement endpoint', () => {
     await create(createRequest(), res, jest.fn());
 
     expect(res.statusCode).toBe(201);
-    expect(res.body.data.movement).toEqual({ ...movement, journalEntryId: 'journal-entry-id' });
+    expect(res.body.data.movement).toEqual({
+      ...movement,
+      journalEntryId: 'journal-entry-id',
+      postingStatus: 'posted',
+    });
     expect(tx.$queryRawUnsafe).toHaveBeenCalledWith(
       expect.stringContaining('FOR UPDATE'),
       SHIFT_ID,
@@ -184,6 +194,7 @@ describe('POS cash movement endpoint', () => {
       type: 'cash_in',
       amount: 10000,
       reasonCode: 'BANK_FLOAT',
+      reference: null,
       note: null,
     };
     const tx = createTransaction();
@@ -279,6 +290,230 @@ describe('POS cash movement endpoint', () => {
     expect(tx.posApproval.findFirst).not.toHaveBeenCalled();
   });
 
+  test('records bank-deposit evidence, reduces expected till cash once, and replays idempotently', async () => {
+    const tx = createTransaction();
+    const movement = {
+      id: 'movement-id',
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      shiftId: SHIFT_ID,
+      performedById: USER_ID,
+      type: 'cash_out',
+      amount: 400,
+      reasonCode: 'BANK_DEPOSIT',
+      reference: 'POSDEP-0123456789ABCDEF0123',
+      bankSlipReference: 'SLIP-2026-001',
+      note: 'Cash sealed in deposit bag.',
+    };
+    tx.posCashMovement.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+    tx.posCashMovement.create.mockResolvedValue(movement);
+    tx.posCashMovement.update.mockResolvedValue({ ...movement, journalEntryId: 'journal-entry-id' });
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const response = createResponse();
+
+    await create(createRequest({
+      type: 'cash_out',
+      amount: 400,
+      reasonCode: 'BANK_DEPOSIT',
+      reference: 'SLIP-2026-001',
+      note: 'Cash sealed in deposit bag.',
+    }), response, jest.fn());
+
+    expect(response.statusCode).toBe(201);
+    expect(tx.posCashMovement.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        type: 'cash_out',
+        amount: 400,
+        reasonCode: 'BANK_DEPOSIT',
+        reference: expect.stringMatching(/^POSDEP-[A-F0-9]{20}$/),
+        bankSlipReference: 'SLIP-2026-001',
+        note: 'Cash sealed in deposit bag.',
+      }),
+    });
+    expect(tx.tillSession.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        expectedCash: 600,
+        cashActivity: [expect.objectContaining({
+          type: 'cash_out',
+          amount: 400,
+          reference: 'POSDEP-0123456789ABCDEF0123',
+        })],
+      }),
+    }));
+
+    tx.posCashMovement.findFirst.mockResolvedValue(movement);
+    const replay = createResponse();
+    await create(createRequest({
+      type: 'cash_out',
+      amount: 400,
+      reasonCode: 'BANK_DEPOSIT',
+      reference: 'SLIP-2026-001',
+      note: 'Cash sealed in deposit bag.',
+    }), replay, jest.fn());
+    expect(replay.statusCode).toBe(200);
+    expect(replay.body.replayed).toBe(true);
+    expect(tx.posCashMovement.create).toHaveBeenCalledTimes(1);
+  });
+
+  test('generates a stable internal reference when the bank receipt is not available yet', async () => {
+    const tx = createTransaction();
+    tx.posCashMovement.findFirst.mockResolvedValue(null);
+    let createdMovement;
+    tx.posCashMovement.create.mockImplementation(async ({ data }) => {
+      createdMovement = { id: 'movement-id', ...data };
+      return createdMovement;
+    });
+    tx.posCashMovement.update.mockImplementation(async ({ data }) => ({ ...createdMovement, ...data }));
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const response = createResponse();
+    const request = createRequest({
+      type: 'cash_out',
+      amount: 400,
+      reasonCode: 'BANK_DEPOSIT',
+      note: 'Cash sealed in deposit bag.',
+    });
+
+    await create(request, response, jest.fn());
+
+    expect(response.statusCode).toBe(201);
+    expect(response.body.data.movement.reference).toMatch(/^POSDEP-[A-F0-9]{20}$/);
+    expect(response.body.data.movement.bankSlipReference).toBeNull();
+    expect(tx.posCashMovement.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        reference: response.body.data.movement.reference,
+        bankSlipReference: null,
+      }),
+    });
+
+    tx.posCashMovement.findFirst.mockResolvedValue(response.body.data.movement);
+    const replay = createResponse();
+    await create(request, replay, jest.fn());
+    expect(replay.statusCode).toBe(200);
+    expect(replay.body.data.movement.reference).toBe(response.body.data.movement.reference);
+  });
+
+  test('records an official bank slip reference later on a tenant and register scoped deposit', async () => {
+    const tx = createTransaction();
+    const existing = {
+      id: 'movement-id',
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      shiftId: SHIFT_ID,
+      type: 'cash_out',
+      reasonCode: 'BANK_DEPOSIT',
+      bankSlipReference: null,
+    };
+    tx.posCashMovement.findFirst.mockResolvedValue(existing);
+    tx.posCashMovement.update.mockResolvedValue({ ...existing, bankSlipReference: 'BANK-RECEIPT-91' });
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const response = createResponse();
+
+    await recordBankSlipReference({
+      ...createRequest(),
+      params: { shiftId: SHIFT_ID, movementId: 'movement-id' },
+      body: { bankSlipReference: 'BANK-RECEIPT-91' },
+    }, response, jest.fn());
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body.data.movement.bankSlipReference).toBe('BANK-RECEIPT-91');
+    expect(tx.posCashMovement.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: 'movement-id',
+        companyId: COMPANY_ID,
+        registerId: REGISTER_ID,
+        shiftId: SHIFT_ID,
+        type: 'cash_out',
+        reasonCode: 'BANK_DEPOSIT',
+      },
+    });
+    expect(tx.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('FOR UPDATE'),
+      'movement-id',
+      COMPANY_ID,
+      REGISTER_ID,
+      SHIFT_ID,
+    );
+    expect(tx.posCashMovement.update).toHaveBeenCalledWith({
+      where: { id: 'movement-id' },
+      data: { bankSlipReference: 'BANK-RECEIPT-91' },
+    });
+  });
+
+  test('allows correcting a bank receipt reference and records the correction in the audit log', async () => {
+    const tx = createTransaction();
+    tx.posCashMovement.findFirst.mockResolvedValue({
+      id: 'movement-id',
+      bankSlipReference: 'BANK-RECEIPT-91',
+    });
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const response = createResponse();
+
+    await recordBankSlipReference({
+      ...createRequest(),
+      params: { shiftId: SHIFT_ID, movementId: 'movement-id' },
+      body: { bankSlipReference: 'BANK-RECEIPT-92' },
+    }, response, jest.fn());
+
+    expect(response.statusCode).toBe(200);
+    expect(tx.posCashMovement.update).toHaveBeenCalledWith({
+      where: { id: 'movement-id' },
+      data: { bankSlipReference: 'BANK-RECEIPT-92' },
+    });
+    expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        event: 'BANK_SLIP_REFERENCE_RECORDED',
+        metadata: expect.objectContaining({
+          previousReference: 'BANK-RECEIPT-91',
+          reference: 'BANK-RECEIPT-92',
+        }),
+      }),
+    }));
+  });
+
+  test('applies the existing approval threshold to bank deposits', async () => {
+    prisma.systemSettings.findUnique.mockResolvedValue({ posCashOutApprovalLimit: 5000 });
+    const tx = createTransaction();
+    tx.posCashMovement.findFirst.mockResolvedValue(null);
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const response = createResponse();
+
+    await create(createRequest({
+      type: 'cash_out',
+      amount: 7000,
+      reasonCode: 'BANK_DEPOSIT',
+      reference: 'SLIP-2026-002',
+      note: 'Deposit envelope.',
+    }), response, jest.fn());
+
+    expect(response.statusCode).toBe(403);
+    expect(response.body.code).toBe('POS_APPROVAL_REQUIRED');
+    expect(tx.posCashMovement.create).not.toHaveBeenCalled();
+  });
+
+  test('returns a clear configuration error when the deposit clearing account is unmapped', async () => {
+    postCashMovement.mockRejectedValue(Object.assign(
+      new Error('Map a bank deposit clearing asset account in the POS accounting profile before posting deposits.'),
+      { code: 'POS_BANK_DEPOSIT_CLEARING_ACCOUNT_REQUIRED' },
+    ));
+    const tx = createTransaction();
+    tx.posCashMovement.findFirst.mockResolvedValue(null);
+    tx.posCashMovement.create.mockResolvedValue({ id: 'movement-id' });
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const response = createResponse();
+
+    await create(createRequest({
+      type: 'cash_out',
+      amount: 400,
+      reasonCode: 'BANK_DEPOSIT',
+      reference: 'SLIP-2026-003',
+      note: 'Deposit envelope.',
+    }), response, jest.fn());
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body.code).toBe('POS_BANK_DEPOSIT_CLEARING_ACCOUNT_REQUIRED');
+    expect(tx.tillSession.update).not.toHaveBeenCalled();
+  });
+
   test('returns a clear conflict when accounting is locked', async () => {
     postCashMovement.mockRejectedValue(Object.assign(new Error('Closed accounting period'), {
       code: 'PERIOD_CLOSED',
@@ -309,6 +544,9 @@ describe('POS cash movement endpoint', () => {
     expect(prisma.posCashMovement.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { companyId: COMPANY_ID, registerId: REGISTER_ID, shiftId: SHIFT_ID },
     }));
-    expect(res.body.data.movements).toEqual([{ id: 'movement-id' }]);
+    expect(res.body.data.movements).toEqual([{
+      id: 'movement-id',
+      postingStatus: 'pending',
+    }]);
   });
 });

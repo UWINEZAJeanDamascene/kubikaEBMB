@@ -4,6 +4,8 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const {
   invoiceToApi,
   invoiceLineToApi,
+  invoiceTranslateCreate,
+  invoiceTranslateUpdate,
   quotationToApi,
   salesOrderToApi,
   purchaseOrderToApi,
@@ -113,6 +115,11 @@ describe('Phase 5+6 sales/AP mappers', () => {
   });
 
   test('invoiceToApi embeds lines and items alias', () => {
+    const pricingSnapshot = {
+      version: 1,
+      currencyCode: 'RWF',
+      totals: { totalDiscountRwf: 25 },
+    };
     const api = invoiceToApi({
       id: 'inv1',
       companyId: 'c1',
@@ -134,6 +141,7 @@ describe('Phase 5+6 sales/AP mappers', () => {
       stockDeducted: false,
       autoConfirm: false,
       payments: [],
+      posPricingSnapshot: pricingSnapshot,
       ebm: {},
       lines: [{
         id: 'l1',
@@ -159,6 +167,47 @@ describe('Phase 5+6 sales/AP mappers', () => {
     expect(api.items).toHaveLength(1);
     expect(api.lines[0].quantity).toBe(2);
     expect(api.totalAmount).toBe('1180.00');
+    expect(api.posPricingSnapshot).toEqual(pricingSnapshot);
+  });
+
+  test('persists pricing snapshots on invoice creation and update', async () => {
+    const pricingSnapshot = {
+      version: 1,
+      currencyCode: 'RWF',
+      lines: [{ lineId: 'line-1', totalDiscountRwf: 25 }],
+    };
+
+    const created = await invoiceTranslateCreate({
+      referenceNo: 'INV-PRICING-1',
+      company: 'company-1',
+      client: 'client-1',
+      posPricingSnapshot: pricingSnapshot,
+    });
+    const updated = invoiceTranslateUpdate({ posPricingSnapshot: pricingSnapshot });
+
+    expect(created.posPricingSnapshot).toEqual(pricingSnapshot);
+    expect(updated.posPricingSnapshot).toEqual(pricingSnapshot);
+  });
+
+  test('maps invoice line discount reasons to the persisted line field', async () => {
+    const created = await invoiceTranslateCreate({
+      referenceNo: 'INV-DISCOUNT-REASON-1',
+      company: 'company-1',
+      client: 'client-1',
+      lines: [{
+        product: 'product-1',
+        qty: 1,
+        unitPrice: 55_000,
+        discountPct: 9.09,
+        discountReason: 'Voucher ****JWLQ',
+      }],
+    });
+
+    expect(created.lines.create[0]).toMatchObject({
+      productId: 'product-1',
+      discountPct: 9.09,
+      discountReason: 'Voucher ****JWLQ',
+    });
   });
 
   test('invoiceLineToApi preserves product populate shape', () => {

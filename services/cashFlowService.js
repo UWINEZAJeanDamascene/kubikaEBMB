@@ -133,17 +133,17 @@ class CashFlowService {
   }
 
   /**
-   * Build one period's cash flow data.
+   * Resolve configured cash accounts and always include register cash.
    * @private
    */
-  static async _buildPeriodData(companyId, dateFrom, dateTo) {
-    // ── Step 1: Resolve cash account codes ──────────────────────────
+  static async _getCashAccountCodes(companyId) {
     let cashAccountCodes = [];
     try {
       const BankAccount = require("../models/BankAccount");
       const { PettyCashFloat } = require("../models/PettyCash");
+      const ChartOfAccount = require("../models/ChartOfAccount");
 
-      const [bankAccts, pettyCash] = await Promise.all([
+      const [bankAccts, pettyCash, cashEquivalents] = await Promise.all([
         BankAccount.find({
           company: String(companyId),
           isActive: true,
@@ -152,15 +152,19 @@ class CashFlowService {
           company: String(companyId),
           isActive: true,
         }).lean(),
+        ChartOfAccount.find({
+          company: String(companyId),
+          subtype: "cash_equivalent",
+          isActive: true,
+          allow_direct_posting: true,
+        }).lean(),
       ]);
 
       cashAccountCodes = [
-        ...bankAccts.map((b) => b.ledgerAccountId?.toString()).filter(Boolean),
-        ...pettyCash.map((f) => f.ledgerAccountId?.toString()).filter(Boolean),
+        ...bankAccts.map((account) => account.ledgerAccountId?.toString()).filter(Boolean),
+        ...pettyCash.map((account) => account.ledgerAccountId?.toString()).filter(Boolean),
+        ...cashEquivalents.map((account) => String(account.code)),
       ];
-
-      // Deduplicate
-      cashAccountCodes = [...new Set(cashAccountCodes)];
     } catch {
       // Models unavailable — fall through to defaults
     }
@@ -168,6 +172,16 @@ class CashFlowService {
     if (cashAccountCodes.length === 0) {
       cashAccountCodes = CashFlowService.CASH_ACCOUNT_CODES;
     }
+    return [...new Set([...cashAccountCodes, "1000"])];
+  }
+
+  /**
+   * Build one period's cash flow data.
+   * @private
+   */
+  static async _buildPeriodData(companyId, dateFrom, dateTo) {
+    // ── Step 1: Resolve cash account codes ──────────────────────────
+    const cashAccountCodes = await CashFlowService._getCashAccountCodes(companyId);
 
     // ── Step 2: Aggregate cash movements grouped by sourceType ───────
     // Exclude internal transfers at database level for efficiency.

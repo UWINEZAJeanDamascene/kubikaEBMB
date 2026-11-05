@@ -147,11 +147,13 @@ describe('POS session authorization middleware', () => {
     const cashier = await permissionsForUser({ role: 'cashier' }, COMPANY_ID, {});
     expect(cashier).toEqual(expect.arrayContaining([
       'pos.till.sell', 'pos.till.cash_move', 'pos.till.close_shift', 'pos.till.discount',
-      'pos.till.receive_account_payment', 'pos.till.open_shift', 'pos.receipt.share',
+      'pos.till.receive_account_payment', 'pos.voucher.redeem', 'pos.till.open_shift',
+      'pos.receipt.share', 'pos.giftcard.issue', 'pos.giftcard.redeem',
     ]));
     expect(cashier).not.toEqual(expect.arrayContaining([
       'pos.till.refund', 'pos.till.void', 'pos.till.no_sale', 'pos.till.reprint',
       'pos.till.credit_sell', 'pos.admin.view', 'pos.admin.registers', 'pos.admin.settings',
+      'pos.payment.reconcile',
     ]));
     const configuredCashier = await permissionsForUser(
       { role: 'cashier' },
@@ -159,6 +161,7 @@ describe('POS session authorization middleware', () => {
       { cashier: { permissions: ['pos.till.sell'] } },
     );
     expect(configuredCashier).toContain('pos.receipt.share');
+    expect(configuredCashier).toContain('pos.giftcard.redeem');
 
     resolveUserRoles.mockResolvedValue([{ name: 'supervisor' }]);
     const supervisor = await permissionsForUser({ role: 'supervisor' }, COMPANY_ID, {});
@@ -172,6 +175,7 @@ describe('POS session authorization middleware', () => {
     const storeManager = await permissionsForUser({ role: 'store_manager' }, COMPANY_ID, {});
     expect(storeManager).toEqual(expect.arrayContaining([
       'pos.admin.view', 'pos.admin.reports', 'pos.admin.cashiers', 'pos.admin.registers', 'pos.admin.audit',
+      'pos.payment.reconcile',
     ]));
     expect(storeManager).not.toContain('pos.admin.roles');
   });
@@ -244,7 +248,7 @@ describe('POS session authorization middleware', () => {
     await requirePermission('pos.sell')(req, res, next);
 
     expect(next).toHaveBeenCalledWith();
-    expect(req.posPermissions).toEqual(['pos.sell', 'pos.receipt.share']);
+    expect(req.posPermissions).toEqual(['pos.sell', 'pos.receipt.share', 'pos.giftcard.redeem']);
 
     const denied = response();
     await requirePermission('pos.refund')(req, denied, jest.fn());
@@ -280,7 +284,9 @@ describe('POS session authorization middleware', () => {
       'pos.till.close_shift',
       'pos.till.discount',
       'pos.till.receive_account_payment',
+      'pos.voucher.redeem',
       'pos.till.open_shift',
+      'pos.giftcard.redeem',
     ]));
     expect(cashierPermissions).not.toEqual(expect.arrayContaining([
       'pos.till.refund', 'pos.till.void', 'pos.till.no_sale', 'pos.till.reprint',

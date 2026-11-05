@@ -186,7 +186,12 @@ exports.getInvoices = async (req, res, next) => {
 
     const total = await Invoice.countDocuments(query);
     const invoices = await Invoice.find(query)
-      .select({ client: 1, createdBy: 1, quotation: 1, referenceNo: 1, status: 1, invoiceDate: 1, dueDate: 1, totalAmount: 1, amountPaid: 1, amountOutstanding: 1, company: 1, createdAt: 1 })
+      .select({
+        client: 1, createdBy: 1, quotation: 1, referenceNo: 1, status: 1,
+        invoiceDate: 1, dueDate: 1, totalAmount: 1, amountPaid: 1,
+        amountOutstanding: 1, company: 1, createdAt: 1, posOrigin: 1,
+        posPostingStatus: 1, revenueJournalEntryId: 1,
+      })
       .populate('-lines')
       .sort({ createdAt: -1, _id: -1 })
       .limit(limit)

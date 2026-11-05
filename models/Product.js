@@ -55,6 +55,7 @@ const FIELD_MAP = {
   cogsAccount: { target: 'cogsAccount' },
   revenueAccount: { target: 'revenueAccount' },
   isArchived: { target: 'isArchived' },
+  isNoDiscount: { target: 'isNoDiscount' },
   weight: { target: 'weight' },
   brand: { target: 'brand' },
   location: { target: 'location' },
@@ -94,7 +95,7 @@ function buildProductInclude(populate = []) {
   const inc = {};
   for (const p of populate) {
     const path = typeof p === 'object' ? p.path : p;
-    if (path === 'category') inc.category = { select: { id: true, name: true } };
+    if (path === 'category') inc.category = { select: { id: true, name: true, isNoDiscount: true } };
     if (path === 'supplier') inc.supplier = { select: { id: true, name: true, code: true } };
     if (path === 'preferredSupplier') inc.preferredSupplier = { select: { id: true, name: true, code: true } };
     if (path === 'defaultWarehouse') inc.defaultWarehouse = { select: { id: true, name: true, code: true } };
@@ -107,7 +108,7 @@ const PRODUCT_SCALAR_FIELDS = [
   'id', 'companyId', 'name', 'sku', 'barcode', 'barcodeType', 'imageUrl', 'imageUrls', 'description',
   'categoryId', 'unit', 'supplierId', 'currentStock', 'reservedQuantity',
   'isActive', 'isStockable', 'lowStockThreshold', 'averageCost', 'sellingPrice',
-  'costPrice', 'lastSupplyDate', 'lastSaleDate', 'costingMethod',
+  'costPrice', 'isNoDiscount', 'lastSupplyDate', 'lastSaleDate', 'costingMethod',
   'inventoryAccount', 'cogsAccount', 'revenueAccount', 'isArchived', 'weight',
   'brand', 'location', 'trackingType', 'trackBatch', 'trackSerialNumbers',
   'reorderPoint', 'reorderQuantity', 'defaultWarehouseId', 'preferredSupplierId',

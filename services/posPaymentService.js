@@ -3,6 +3,7 @@
 const { dbClient } = require('../lib/prisma');
 const { runInTransaction } = require('./transactionService');
 const { writePosAuditLog } = require('./posAuditService');
+const { DEFAULT_SYSTEM_TILL_TYPES } = require('./posDiscountSettingsService');
 const {
   API_UNAVAILABLE_MESSAGE,
   MOBILE_MONEY_PROVIDERS,
@@ -37,6 +38,8 @@ const PAYMENT_SETTINGS_SELECT = Object.freeze({
   paidSaleRefundApprovalAmount: true,
   paidSaleRefundApprovalCount: true,
   posReturnWindowDays: true,
+  writeOffApprovalThresholdRwf: true,
+  writeOffApprovalThresholdByTillType: true,
   momoTimeoutSec: true,
   cashRounding: true,
   allowOverCreditLimit: true,
@@ -55,6 +58,8 @@ const PAYMENT_SETTINGS_FIELDS = new Set([
   'paidSaleRefundApprovalAmount',
   'paidSaleRefundApprovalCount',
   'posReturnWindowDays',
+  'writeOffApprovalThresholdRwf',
+  'writeOffApprovalThresholdByTillType',
   'momoTimeoutSec',
   'cashRounding',
   'allowOverCreditLimit',
@@ -82,7 +87,33 @@ function validateMethod(method) {
   }
 }
 
-function providerStatuses(receivers = {}, mode = 'VERIFY') {
+function normalizeWriteOffApprovalThresholds(value) {
+  if (value == null) value = {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'writeOffApprovalThresholdByTillType must be an object.');
+  }
+  const allowedTypes = new Set(DEFAULT_SYSTEM_TILL_TYPES);
+  const entries = Object.entries(value);
+  const unknownType = entries.find(([type]) => !allowedTypes.has(String(type).trim().toLowerCase()));
+  if (unknownType) {
+    throw paymentError('POS_PAYMENT_SETTINGS_INVALID', `Unsupported system till type for write-off approval: ${unknownType[0]}.`);
+  }
+  return Object.fromEntries(entries.map(([type, threshold]) => {
+    if (!Number.isSafeInteger(threshold) || threshold < 0) {
+      throw paymentError('POS_PAYMENT_SETTINGS_INVALID', `Write-off approval threshold for ${type} must be a non-negative whole RWF amount.`);
+    }
+    return [String(type).trim().toLowerCase(), threshold];
+  }));
+}
+
+function resolveWriteOffApprovalThreshold(settings, tillType = 'retail') {
+  const companyThreshold = settings?.writeOffApprovalThresholdRwf ?? 10000;
+  const overrides = normalizeWriteOffApprovalThresholds(settings?.writeOffApprovalThresholdByTillType);
+  const type = String(tillType || 'retail').trim().toLowerCase();
+  return Object.hasOwn(overrides, type) ? overrides[type] : companyThreshold;
+}
+
+function providerStatuses(receivers = {}, mode = 'INSTANT') {
   return Object.fromEntries(MOBILE_PAYMENT_METHODS.map((method) => [
     method,
     {
@@ -180,14 +211,16 @@ function normalizeSettings(settings) {
       paidSaleRefundApprovalAmount: 20000,
       paidSaleRefundApprovalCount: 3,
       posReturnWindowDays: 30,
+      writeOffApprovalThresholdRwf: 10000,
+      writeOffApprovalThresholdByTillType: {},
       momoTimeoutSec: 120,
       cashRounding: null,
       allowOverCreditLimit: false,
       bankTransferNeedsConfirm: true,
       providerEnvironment: 'sandbox',
-      manualMobileMoneyMode: 'VERIFY',
+      manualMobileMoneyMode: 'INSTANT',
       manualMobileMoneyReceivers: {},
-      providers: providerStatuses({}, 'VERIFY'),
+      providers: providerStatuses({}, 'INSTANT'),
     };
   }
 
@@ -219,6 +252,13 @@ function normalizeSettings(settings) {
   if (!Number.isSafeInteger(posReturnWindowDays) || posReturnWindowDays < 0 || posReturnWindowDays > 3650) {
     throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'posReturnWindowDays must be a whole number between 0 and 3650.');
   }
+  const writeOffApprovalThresholdRwf = settings.writeOffApprovalThresholdRwf ?? 10000;
+  if (!Number.isSafeInteger(writeOffApprovalThresholdRwf) || writeOffApprovalThresholdRwf < 0) {
+    throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'writeOffApprovalThresholdRwf must be a non-negative whole RWF amount.');
+  }
+  const writeOffApprovalThresholdByTillType = normalizeWriteOffApprovalThresholds(
+    settings.writeOffApprovalThresholdByTillType,
+  );
   if (!Number.isInteger(settings.momoTimeoutSec) || settings.momoTimeoutSec < 1) {
     throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'momoTimeoutSec must be a positive whole number of seconds.');
   }
@@ -236,10 +276,11 @@ function normalizeSettings(settings) {
   if (!PAYMENT_ENVIRONMENTS.includes(settings.providerEnvironment)) {
     throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'providerEnvironment must be sandbox or production.');
   }
-  const manualMobileMoneyMode = settings.manualMobileMoneyMode ?? 'VERIFY';
-  if (!['INSTANT', 'VERIFY'].includes(manualMobileMoneyMode)) {
+  const configuredManualMobileMoneyMode = settings.manualMobileMoneyMode ?? 'INSTANT';
+  if (!['INSTANT', 'VERIFY'].includes(configuredManualMobileMoneyMode)) {
     throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'manualMobileMoneyMode must be INSTANT or VERIFY.');
   }
+  const manualMobileMoneyMode = 'INSTANT';
   const manualMobileMoneyReceivers = normalizeReceivers(settings.manualMobileMoneyReceivers ?? {});
 
   return {
@@ -252,6 +293,8 @@ function normalizeSettings(settings) {
     paidSaleRefundApprovalAmount,
     paidSaleRefundApprovalCount,
     posReturnWindowDays,
+    writeOffApprovalThresholdRwf,
+    writeOffApprovalThresholdByTillType,
     momoTimeoutSec: settings.momoTimeoutSec,
     cashRounding: settings.cashRounding ?? null,
     allowOverCreditLimit: settings.allowOverCreditLimit,
@@ -293,15 +336,17 @@ async function getPaymentSettings(companyId) {
 
 async function listPaymentRegisters(companyId) {
   const scopedCompanyId = requireCompanyId(companyId);
-  const registers = await dbClient().posRegister.findMany({
-    where: { companyId: scopedCompanyId },
-    select: { id: true, code: true, name: true, isActive: true },
-    orderBy: [{ name: 'asc' }, { code: 'asc' }],
-    take: 501,
-  });
-  if (registers.length > 500) {
+  const where = { companyId: scopedCompanyId };
+  const registerCount = await dbClient().posRegister.count({ where });
+  if (registerCount > 500) {
     throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'Payment settings cannot be loaded for more than 500 POS registers.');
   }
+  const registers = await dbClient().posRegister.findMany({
+    where,
+    select: { id: true, code: true, name: true, isActive: true, systemTillType: true },
+    orderBy: [{ name: 'asc' }, { code: 'asc' }],
+    take: 500,
+  });
   return registers;
 }
 
@@ -354,6 +399,8 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
     paidSaleRefundApprovalAmount: normalized.paidSaleRefundApprovalAmount,
     paidSaleRefundApprovalCount: normalized.paidSaleRefundApprovalCount,
     posReturnWindowDays: normalized.posReturnWindowDays,
+    writeOffApprovalThresholdRwf: normalized.writeOffApprovalThresholdRwf,
+    writeOffApprovalThresholdByTillType: normalized.writeOffApprovalThresholdByTillType,
     momoTimeoutSec: normalized.momoTimeoutSec,
     cashRounding: normalized.cashRounding,
     allowOverCreditLimit: normalized.allowOverCreditLimit,
@@ -364,14 +411,17 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
   };
 
   return runInTransaction(async (tx) => {
+    const registerCount = await tx.posRegister.count({
+      where: { companyId: scopedCompanyId },
+    });
+    if (registerCount > 500) {
+      throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'Payment settings cannot be saved for more than 500 POS registers.');
+    }
     const registers = await tx.posRegister.findMany({
       where: { companyId: scopedCompanyId },
       select: { id: true, isActive: true },
-      take: 501,
+      take: 500,
     });
-    if (registers.length > 500) {
-      throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'Payment settings cannot be saved for more than 500 POS registers.');
-    }
     const registerById = new Map(registers.map((register) => [register.id, register]));
     const unknownRegister = [...registerIds, ...flowRegisterIds].find((id) => !registerById.has(id));
     if (unknownRegister) {
@@ -381,11 +431,13 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
       );
     }
     for (const [id, methods] of Object.entries(normalized.registerOverrides)) {
-      const disabledMethod = methods.find((method) => !normalized.enabledMethods.includes(method));
+      const disabledMethod = methods.find((method) => (
+        method !== 'CASH' && !normalized.enabledMethods.includes(method)
+      ));
       if (disabledMethod) {
         throw paymentError(
           'POS_PAYMENT_REGISTER_METHOD_DISABLED',
-          `Register overrides cannot enable ${disabledMethod} when the company has disabled it.`,
+          `Register overrides cannot enable ${disabledMethod} when the company has disabled it. Only cash can be controlled independently per register.`,
         );
       }
       if (registerById.get(id)?.isActive && methods.length === 0) {
@@ -581,4 +633,6 @@ module.exports = {
   assertPaymentMethodEnabled,
   requestProviderPayment,
   calculatePaymentTotals,
+  normalizeWriteOffApprovalThresholds,
+  resolveWriteOffApprovalThreshold,
 };

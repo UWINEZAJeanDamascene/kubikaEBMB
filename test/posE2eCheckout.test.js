@@ -35,6 +35,14 @@ jest.mock('../services/journalService', () => ({
   createCreditLine: jest.fn((account, amount, desc) => ({ accountCode: account, debit: 0, credit: amount, description: desc })),
   createEntriesAtomic: jest.fn(),
 }));
+jest.mock('../services/posAccountingProfileService', () => ({
+  getProfile: jest.fn().mockResolvedValue({
+    companyDefaults: {},
+    tillTypeOverrides: {},
+    registerOverrides: {},
+  }),
+  resolveAccount: jest.fn(() => null),
+}));
 jest.mock('../services/CurrencyService', () => ({ getCompanyBase: jest.fn() }));
 jest.mock('../services/cacheService', () => ({ bumpCompanyFinancialCaches: jest.fn() }));
 jest.mock('../services/emailService', () => ({ sendInvoiceEmail: jest.fn() }));
@@ -76,6 +84,7 @@ const StockLevel = require('../models/StockLevel');
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
+const posAccountingProfileService = require('../services/posAccountingProfileService');
 const CurrencyService = require('../services/CurrencyService');
 const cacheService = require('../services/cacheService');
 const { consumeApproval } = require('../controllers/posManagerApprovalController');
@@ -112,9 +121,19 @@ function stockLevelRows(qtyOnHand = 50, qtyReserved = 0) {
 function emptyCheckoutDb() {
   return {
     stockBatch: { groupBy: jest.fn().mockResolvedValue([]) },
+    systemSettings: { findUnique: jest.fn().mockResolvedValue(null) },
+    userRole: { findMany: jest.fn().mockResolvedValue([]) },
     $queryRawUnsafe: checkoutQueryMock(),
   };
 }
+
+const discountTestSettings = {
+  defaultLimits: { maxLineDiscountPercent: 0, maxCartDiscountPercent: null, maxSaleDiscountRwf: null },
+  rules: [],
+  discountReasons: ['Test discount'],
+  systemTillTypes: ['retail'],
+  registerLabels: [],
+};
 
 function checkoutQueryMock(initialImplementation = async () => []) {
   const query = jest.fn();
@@ -181,8 +200,14 @@ function stubHappyPathDeps({ stockMatchedCount = 1, momoBank = null } = {}) {
 
   const db = {
     stockBatch: { groupBy: jest.fn().mockResolvedValue([]) },
-    invoiceLine: { findMany: jest.fn().mockResolvedValue([]) },
+    category: { findMany: jest.fn().mockResolvedValue([]) },
+    userRole: { findMany: jest.fn().mockResolvedValue([]) },
+    invoiceLine: {
+      findMany: jest.fn().mockResolvedValue([]),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
     posCustomerCreditLedger: { create: jest.fn().mockResolvedValue({ id: 'credit-ledger-1' }) },
+    systemSettings: { findUnique: jest.fn().mockResolvedValue({ posDiscountSettings: discountTestSettings }) },
     // SELECT replay → empty; INSERT reservation → claimed row.
     $queryRawUnsafe: checkoutQueryMock(async (sql) => {
       if (String(sql).includes('INSERT INTO pos_sale_requests')) {
@@ -203,6 +228,16 @@ function stubHappyPathDeps({ stockMatchedCount = 1, momoBank = null } = {}) {
 describe('POS E2E — checkout (sales-legacy)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    dbClient.mockReturnValue({
+      systemSettings: { findUnique: jest.fn().mockResolvedValue(null) },
+      userRole: { findMany: jest.fn().mockResolvedValue([]) },
+    });
+    posAccountingProfileService.getProfile.mockResolvedValue({
+      companyDefaults: {},
+      tillTypeOverrides: {},
+      registerOverrides: {},
+    });
+    posAccountingProfileService.resolveAccount.mockImplementation(() => null);
     const paymentService = require('../services/posPaymentService');
     paymentService.getPaymentSettings.mockResolvedValue({
       paymentFlow: 'LEGACY',
@@ -258,10 +293,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     Warehouse.findOne.mockResolvedValue({ _id: IDS.warehouse });
     Product.find.mockReturnValue(leanFind([catalogProduct()]));
     StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows()) });
-    dbClient.mockReturnValue({
-      stockBatch: { groupBy: jest.fn().mockResolvedValue([]) },
-      $queryRawUnsafe: jest.fn().mockResolvedValue([]),
-    });
+    const { db } = stubHappyPathDeps();
+    db.systemSettings.findUnique.mockResolvedValue({ posDiscountSettings: discountTestSettings });
 
     const res = mockRes();
     await createDirectSale(makeReq({
@@ -277,6 +310,18 @@ describe('POS E2E — checkout (sales-legacy)', () => {
 
   test('cash checkout posts stock, journals, and till cash activity', async () => {
     const { invoice, db } = stubHappyPathDeps();
+    const scopedProfile = {
+      companyDefaults: { salesRevenue: '4000' },
+      tillTypeOverrides: { retail: { salesRevenue: '4010' } },
+      registerOverrides: { '888888888888888888888888': { posRegisterCash: '1005' } },
+    };
+    posAccountingProfileService.getProfile.mockResolvedValueOnce(scopedProfile);
+    posAccountingProfileService.resolveAccount.mockImplementation((profile, key, scope) => (
+      profile.registerOverrides[scope.registerId]?.[key]
+      || profile.tillTypeOverrides[scope.tillType]?.[key]
+      || profile.companyDefaults[key]
+      || null
+    ));
     const shiftId = '777777777777777777777778';
     db.$queryRawUnsafe.mockImplementation(async (sql) => {
       if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
@@ -295,6 +340,9 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.data).toBe(invoice);
     expect(res.body.changeDue).toBe(0);
+    expect(Invoice.create.mock.calls[0][0][0].posCheckoutPayload).toEqual({
+      items: [{ unitPrice: 1000, catalogUnitPrice: 1000 }],
+    });
     expect(db.$queryRawUnsafe).toHaveBeenCalledWith(
       expect.stringContaining('"opened_by" AS "openedById"'),
       IDS.company,
@@ -302,7 +350,32 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     );
     expect(StockLevel.updateMany).toHaveBeenCalled();
     expect(inventoryService.consume).toHaveBeenCalled();
+    expect(db.invoiceLine.updateMany).toHaveBeenCalledWith({
+      where: {
+        invoiceId: IDS.invoice,
+        companyId: IDS.company,
+        lineOrder: 0,
+        productId: IDS.product,
+      },
+      data: { unitCost: 400, cogsAmount: 400 },
+    });
     expect(JournalService.createEntriesAtomic).toHaveBeenCalled();
+    const [, , journalEntries, journalOptions] = JournalService.createEntriesAtomic.mock.calls[0];
+    expect(journalOptions).toEqual(expect.objectContaining({ session: null, allowDuplicate: false }));
+    expect(journalEntries[0].lines).toEqual(expect.arrayContaining([
+      expect.objectContaining({ accountCode: '1005', debit: 1180 }),
+      expect.objectContaining({ accountCode: '4010', credit: 1000 }),
+    ]));
+    expect(posAccountingProfileService.resolveAccount).toHaveBeenCalledWith(
+      scopedProfile,
+      'posRegisterCash',
+      { tillType: 'retail', registerId: '888888888888888888888888' },
+    );
+    expect(posAccountingProfileService.resolveAccount).toHaveBeenCalledWith(
+      scopedProfile,
+      'loyaltyRewardsExpense',
+      { tillType: 'retail', registerId: '888888888888888888888888' },
+    );
     expect(findClaimedRegister).toHaveBeenCalledWith(IDS.company, IDS.registerId, IDS.deviceId);
     expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
       expect.stringContaining('shift_id = $5, cashier_id = $6'),
@@ -321,6 +394,41 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       IDS.till,
       IDS.cashier,
     );
+  });
+
+  test('completes an approved discounted sale without updating the protected walk-in customer', async () => {
+    const { db } = stubHappyPathDeps();
+    const walkInCustomer = {
+      _id: IDS.client,
+      isWalkIn: true,
+      totalPurchases: 0,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    Client.findOne.mockResolvedValue(walkInCustomer);
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('FROM "pos_shifts"')) {
+        return [{ id: '777777777777777777777778', openedById: IDS.cashier }];
+      }
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      return [];
+    });
+
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        clientId: IDS.client,
+        items: [saleLine({ discountPct: 10 })],
+        paymentAmount: 1062,
+        managerApprovalId: IDS.approval,
+      }),
+      headers: { 'Idempotency-Key': 'approved-walkin-sale-1' },
+    }), res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.body.success).toBe(true);
+    expect(consumeApproval).toHaveBeenCalled();
+    expect(walkInCustomer.save).not.toHaveBeenCalled();
+    expect(JournalService.createEntriesAtomic).toHaveBeenCalled();
   });
 
   test('V2 checkout stores a pending invoice without stock, journal, or till-cash side effects', async () => {
@@ -415,12 +523,22 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     const req = makeReq({
       body: checkoutBody({
         clientId: IDS.client,
-        payments: [{ paymentMethod: 'cash', amount: 1180 }],
+        payments: [{
+          paymentMethod: 'mobile_money',
+          provider: 'airtel',
+          amount: 1180,
+          reference: '',
+          manualMobileMoneyPaymentId: 'manual-mobile-money-payment',
+        }],
         paymentAmount: 0,
       }),
     });
     req.posPaymentFlow = 'PAYMENTS_V2';
-    req.posV2Completion = { invoiceId: IDS.invoice, completionKey: 'complete-key-0001' };
+    req.posV2Completion = {
+      invoiceId: IDS.invoice,
+      completionKey: 'complete-key-0001',
+      manualMobileMoneyPaymentIds: ['manual-mobile-money-payment'],
+    };
     const res = mockRes();
 
     await createDirectSale(req, res, (err) => { throw err; });
@@ -913,6 +1031,12 @@ describe('POS E2E — checkout (sales-legacy)', () => {
 
     expect(failed.statusCode).toBe(503);
     expect(failed.body.code).toBe('POS_ACCOUNTING_POST_FAILED');
+    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('SET pos_posting_status = $1'),
+      'failed',
+      IDS.invoice,
+      IDS.company,
+    );
     expect(retried.map((res) => res.statusCode).sort()).toEqual([200, 201]);
     expect(retried.every((res) => res.body.success)).toBe(true);
     expect(retried.filter((res) => res.body.replayed === true)).toHaveLength(1);
@@ -1153,6 +1277,70 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     });
   });
 
+  test('checkout payment flow applies the configured feature policy for the assigned till type', async () => {
+    const db = dbClient();
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        systemTillTypes: ['retail', 'restaurant'],
+        tillTypeFeatures: {
+          retail: { manualDiscounts: true, promotions: true, vouchers: true, customerCredit: true },
+          restaurant: { manualDiscounts: false, promotions: true, vouchers: false, customerCredit: false },
+        },
+      },
+    });
+    findClaimedRegister.mockResolvedValueOnce({
+      id: '888888888888888888888888',
+      systemTillType: 'restaurant',
+    });
+    const paymentService = require('../services/posPaymentService');
+    paymentService.resolveEnabledMethods.mockReturnValue(['CASH', 'CREDIT']);
+    const res = mockRes();
+
+    await getCheckoutPaymentFlow(makeReq({
+      query: { registerId: 'REG-1', deviceId: 'device-1' },
+    }), res, (error) => { throw error; });
+
+    expect(res.body.data.methods).toEqual(['CASH']);
+    expect(res.body.data.features).toEqual({
+      manualDiscounts: false,
+      promotions: true,
+      vouchers: false,
+      customerCredit: false,
+    });
+  });
+
+  test('checkout rejects a manual discount disabled for the assigned till type', async () => {
+    const { db } = stubHappyPathDeps();
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        ...discountTestSettings,
+        systemTillTypes: ['retail', 'restaurant'],
+        tillTypeFeatures: {
+          retail: { manualDiscounts: true, promotions: true, vouchers: true, customerCredit: true },
+          restaurant: { manualDiscounts: false, promotions: true, vouchers: true, customerCredit: true },
+        },
+      },
+    });
+    findClaimedRegister.mockResolvedValueOnce({
+      id: '888888888888888888888888',
+      _id: IDS.registerId,
+      code: IDS.registerId,
+      systemTillType: 'restaurant',
+    });
+    const res = mockRes();
+
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        items: [saleLine({ discountPct: 5, discountReason: 'Test discount' })],
+        paymentAmount: 1121,
+      }),
+    }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body.code).toBe('POS_TILL_FEATURE_DISABLED');
+    expect(Invoice.create).not.toHaveBeenCalled();
+  });
+
   test('discounted checkout consumes the one-use manager approval', async () => {
     stubHappyPathDeps();
     const res = mockRes();
@@ -1172,6 +1360,165 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       cashierId: IDS.cashier,
       action: 'discount',
     }));
+  });
+
+  test('allows discounts within configured caps without manager approval', async () => {
+    const { db } = stubHappyPathDeps();
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        ...discountTestSettings,
+        defaultLimits: { maxLineDiscountPercent: 10, maxCartDiscountPercent: null, maxSaleDiscountRwf: null },
+      },
+    });
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        items: [saleLine({ discountPct: 5 })],
+        paymentAmount: 1121,
+      }),
+      headers: { 'Idempotency-Key': 'within-cap-key-12345' },
+    }), res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
+  test('applies cart discounts within configured caps without manager approval', async () => {
+    const { db } = stubHappyPathDeps();
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        ...discountTestSettings,
+        defaultLimits: { maxLineDiscountPercent: null, maxCartDiscountPercent: 5, maxSaleDiscountRwf: null },
+      },
+    });
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        items: [saleLine({ discountPct: 0, discountReason: '' })],
+        cartDiscountPct: 5,
+        cartDiscountReason: 'Test discount',
+        paymentAmount: 1121,
+      }),
+      headers: { 'Idempotency-Key': 'cart-within-cap-12345' },
+    }), res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
+  test('consumes approval against the exact reasoned cart discount context', async () => {
+    const { db } = stubHappyPathDeps();
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        ...discountTestSettings,
+        defaultLimits: { maxLineDiscountPercent: null, maxCartDiscountPercent: 5, maxSaleDiscountRwf: null },
+      },
+    });
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        items: [saleLine({ discountPct: 0, discountReason: '' })],
+        cartDiscountPct: 10,
+        cartDiscountReason: 'Test discount',
+        paymentAmount: 1062,
+        managerApprovalId: IDS.approval,
+        discountApprovalScope: 'DISCOUNT_APPLICATION',
+      }),
+      headers: { 'Idempotency-Key': 'approved-cart-discount-123' },
+    }), res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(consumeApproval).toHaveBeenCalledWith(expect.objectContaining({
+      approvalId: IDS.approval,
+      action: 'discount',
+      payload: expect.objectContaining({
+        cartDiscountPct: 10,
+        cartDiscountReason: 'Test discount',
+        items: [expect.objectContaining({ productId: IDS.product, discountPct: 0 })],
+      }),
+    }));
+  });
+
+  test.each([
+    ['percent', 10],
+    ['fixed', 100],
+  ])('requires manager approval when a %s promotion exceeds the whole-cart cap', async (discountType, value) => {
+    const { db } = stubHappyPathDeps();
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        ...discountTestSettings,
+        defaultLimits: { maxLineDiscountPercent: null, maxCartDiscountPercent: 5, maxSaleDiscountRwf: null },
+      },
+    });
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('FROM pos_promotions')) {
+        return [{ id: 'promotion-1', name: 'Promotion', discountType, value }];
+      }
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      return [];
+    });
+
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        items: [saleLine()],
+        promotionId: 'promotion-1',
+        paymentAmount: 1062,
+      }),
+      headers: { 'Idempotency-Key': `${discountType}-promotion-cap-key` },
+    }), res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body.code).toBe('POS_MANAGER_APPROVAL_REQUIRED');
+    expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
+  test('blocks no-discount products even when a manager approval is supplied', async () => {
+    const { db } = stubHappyPathDeps();
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        ...discountTestSettings,
+        defaultLimits: { maxLineDiscountPercent: 10, maxCartDiscountPercent: 10, maxSaleDiscountRwf: 10000 },
+      },
+    });
+    Product.find.mockReturnValue(leanFind([catalogProduct({ isNoDiscount: true })]));
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        items: [saleLine({ discountPct: 2 })],
+        paymentAmount: 1121,
+        managerApprovalId: IDS.approval,
+      }),
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body.code).toBe('POS_ITEM_DISCOUNT_NOT_ALLOWED');
+    expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
+  test('blocks category-restricted products even when a manager approval is supplied', async () => {
+    const categoryId = '555555555555555555555555';
+    const { db } = stubHappyPathDeps();
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        ...discountTestSettings,
+        defaultLimits: { maxLineDiscountPercent: 10, maxCartDiscountPercent: 10, maxSaleDiscountRwf: 10000 },
+      },
+    });
+    Product.find.mockReturnValue(leanFind([catalogProduct({ category: categoryId })]));
+    db.category.findMany.mockResolvedValue([{ id: categoryId, isNoDiscount: true }]);
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        items: [saleLine({ discountPct: 2 })],
+        paymentAmount: 1121,
+        managerApprovalId: IDS.approval,
+      }),
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body.code).toBe('POS_ITEM_DISCOUNT_NOT_ALLOWED');
+    expect(consumeApproval).not.toHaveBeenCalled();
   });
 
   test('stock race returns conflict when warehouse qty changes mid-checkout', async () => {

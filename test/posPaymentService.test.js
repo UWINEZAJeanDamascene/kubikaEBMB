@@ -18,6 +18,7 @@ const {
   assertPaymentMethodEnabled,
   calculatePaymentTotals,
   resolvePaymentFlow,
+  resolveWriteOffApprovalThreshold,
 } = require('../services/posPaymentService');
 
 const COMPANY_ID = '507f1f77bcf86cd799439011';
@@ -36,6 +37,8 @@ function validSettings(overrides = {}) {
     providerEnvironment: 'sandbox',
     manualMobileMoneyMode: 'VERIFY',
     manualMobileMoneyReceivers: {},
+    writeOffApprovalThresholdRwf: 10000,
+    writeOffApprovalThresholdByTillType: {},
     ...overrides,
   };
 }
@@ -72,12 +75,29 @@ describe('POS payment settings and totals', () => {
       momoTimeoutSec: 120,
       cashRounding: null,
       providerEnvironment: 'sandbox',
+      manualMobileMoneyMode: 'INSTANT',
       providers: {
         MTN_MOMO: { configured: false },
         AIRTEL_MONEY: { configured: false },
       },
     });
     await expect(isPaymentMethodEnabled({ companyId: COMPANY_ID, method: 'CASH' })).resolves.toBe(false);
+  });
+
+  test('normalizes legacy VERIFY settings to instant manual mobile-money confirmation', async () => {
+    dbClient.mockReturnValue({
+      posPaymentSettings: {
+        findUnique: jest.fn().mockResolvedValue(validSettings({ manualMobileMoneyMode: 'VERIFY' })),
+      },
+    });
+
+    await expect(getPaymentSettings(COMPANY_ID)).resolves.toMatchObject({
+      manualMobileMoneyMode: 'INSTANT',
+      providers: {
+        MTN_MOMO: { configured: false },
+        AIRTEL_MONEY: { configured: false },
+      },
+    });
   });
 
   test('lists only registers belonging to the requested company', async () => {
@@ -87,21 +107,26 @@ describe('POS payment settings and totals', () => {
       name: 'Main',
       isActive: true,
     }];
-    const posRegister = { findMany: jest.fn().mockResolvedValue(registers) };
+    const posRegister = {
+      count: jest.fn().mockResolvedValue(registers.length),
+      findMany: jest.fn().mockResolvedValue(registers),
+    };
     dbClient.mockReturnValue({ posRegister });
 
     await expect(listPaymentRegisters(COMPANY_ID)).resolves.toEqual(registers);
     expect(posRegister.findMany).toHaveBeenCalledWith({
       where: { companyId: COMPANY_ID },
-      select: { id: true, code: true, name: true, isActive: true },
+      select: { id: true, code: true, name: true, isActive: true, systemTillType: true },
       orderBy: [{ name: 'asc' }, { code: 'asc' }],
-      take: 501,
+      take: 500,
     });
+    expect(posRegister.count).toHaveBeenCalledWith({ where: { companyId: COMPANY_ID } });
   });
 
   test('rejects register lists larger than the settings API limit', async () => {
     const posRegister = {
-      findMany: jest.fn().mockResolvedValue(Array.from({ length: 501 }, (_, index) => ({ id: String(index) }))),
+      count: jest.fn().mockResolvedValue(501),
+      findMany: jest.fn(),
     };
     dbClient.mockReturnValue({ posRegister });
 
@@ -128,6 +153,16 @@ describe('POS payment settings and totals', () => {
     ]);
   });
 
+  test('lets a register CASH override take precedence when company CASH is disabled', () => {
+    const settings = validSettings({
+      enabledMethods: ['CARD'],
+      registerOverrides: { [REGISTER_ID]: ['CASH'] },
+    });
+
+    expect(resolveEnabledMethods(settings, REGISTER_ID)).toEqual(['CASH']);
+    expect(resolveEnabledMethods(settings, 'other-register')).toEqual(['CARD']);
+  });
+
   test('defaults every register to legacy flow and supports register-specific V2 opt-in', () => {
     const settings = validSettings({
       paymentFlow: 'LEGACY',
@@ -139,11 +174,46 @@ describe('POS payment settings and totals', () => {
     expect(resolvePaymentFlow(validSettings(), REGISTER_ID)).toBe('LEGACY');
   });
 
+  test('saves a register-specific V2 flow with its configured Airtel receiving method', async () => {
+    const settings = validSettings({
+      enabledMethods: ['CASH', 'AIRTEL_MONEY'],
+      manualMobileMoneyReceivers: { AIRTEL_MONEY: '+250788123456' },
+      registerPaymentFlowOverrides: { [REGISTER_ID]: 'PAYMENTS_V2' },
+    });
+    const posPaymentSettings = {
+      findUnique: jest.fn().mockResolvedValue(null),
+      upsert: jest.fn().mockResolvedValue(settings),
+    };
+    dbClient.mockReturnValue({
+      posPaymentSettings,
+      posRegister: {
+        count: jest.fn().mockResolvedValue(1),
+        findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]),
+      },
+    });
+
+    await savePaymentSettings({
+      companyId: COMPANY_ID,
+      settings,
+      userId: '507f1f77bcf86cd799439013',
+      registerId: REGISTER_ID,
+    });
+
+    expect(posPaymentSettings.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      update: expect.objectContaining({
+        enabledMethods: ['CASH', 'AIRTEL_MONEY'],
+        manualMobileMoneyReceivers: { AIRTEL_MONEY: '+250788123456' },
+        registerPaymentFlowOverrides: { [REGISTER_ID]: 'PAYMENTS_V2' },
+      }),
+    }));
+  });
+
   test('requires cash to be enabled on active registers using V2 payments', async () => {
     const posPaymentSettings = { upsert: jest.fn() };
     dbClient.mockReturnValue({
       posPaymentSettings,
       posRegister: {
+        count: jest.fn().mockResolvedValue(1),
         findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]),
       },
     });
@@ -183,6 +253,25 @@ describe('POS payment settings and totals', () => {
     });
   });
 
+  test('keeps an enabled non-cash method available when CASH is disabled', async () => {
+    dbClient.mockReturnValue({
+      posPaymentSettings: {
+        findUnique: jest.fn().mockResolvedValue(validSettings({ enabledMethods: ['CARD'] })),
+      },
+    });
+
+    await expect(isPaymentMethodEnabled({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      method: 'CARD',
+    })).resolves.toBe(true);
+    await expect(assertPaymentMethodEnabled({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      method: 'CARD',
+    })).resolves.toBeUndefined();
+  });
+
   test('saves validated settings with a company scope and tenant-owned register overrides', async () => {
     const settings = validSettings({
       enabledMethods: ['CASH', 'CARD', 'BANK_TRANSFER', 'CREDIT', 'GIFT_CARD', 'STORE_CREDIT', 'LOYALTY_POINTS'],
@@ -190,6 +279,8 @@ describe('POS payment settings and totals', () => {
       providerEnvironment: 'production',
       paymentFlow: 'LEGACY',
       registerPaymentFlowOverrides: {},
+      writeOffApprovalThresholdRwf: 12000,
+      writeOffApprovalThresholdByTillType: { restaurant: 25000 },
       providers: {
         MTN_MOMO: { configured: true },
         AIRTEL_MONEY: { configured: false },
@@ -203,6 +294,7 @@ describe('POS payment settings and totals', () => {
       upsert: jest.fn().mockResolvedValue({ ...settings, companyId: COMPANY_ID }),
     };
     const posRegister = {
+      count: jest.fn().mockResolvedValue(1),
       findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]),
     };
     dbClient.mockReturnValue({ posPaymentSettings, posRegister });
@@ -219,12 +311,14 @@ describe('POS payment settings and totals', () => {
       registerOverrides: { [REGISTER_ID]: ['CASH'] },
       paymentFlow: 'LEGACY',
       registerPaymentFlowOverrides: {},
+      writeOffApprovalThresholdRwf: 12000,
+      writeOffApprovalThresholdByTillType: { restaurant: 25000 },
       providerEnvironment: 'production',
     });
     expect(posRegister.findMany).toHaveBeenCalledWith({
       where: { companyId: COMPANY_ID },
       select: { id: true, isActive: true },
-      take: 501,
+      take: 500,
     });
     expect(posPaymentSettings.upsert).toHaveBeenCalledWith({
       where: { companyId: COMPANY_ID },
@@ -238,12 +332,15 @@ describe('POS payment settings and totals', () => {
         pendingSaleMaxAgeHours: null,
         paidSaleRefundApprovalAmount: 20000,
         paidSaleRefundApprovalCount: 3,
+        posReturnWindowDays: 30,
+        writeOffApprovalThresholdRwf: 12000,
+        writeOffApprovalThresholdByTillType: { restaurant: 25000 },
         momoTimeoutSec: 120,
         cashRounding: null,
         allowOverCreditLimit: false,
         bankTransferNeedsConfirm: true,
         providerEnvironment: 'production',
-        manualMobileMoneyMode: 'VERIFY',
+        manualMobileMoneyMode: 'INSTANT',
         manualMobileMoneyReceivers: {},
       },
       update: {
@@ -255,12 +352,15 @@ describe('POS payment settings and totals', () => {
         pendingSaleMaxAgeHours: null,
         paidSaleRefundApprovalAmount: 20000,
         paidSaleRefundApprovalCount: 3,
+        posReturnWindowDays: 30,
+        writeOffApprovalThresholdRwf: 12000,
+        writeOffApprovalThresholdByTillType: { restaurant: 25000 },
         momoTimeoutSec: 120,
         cashRounding: null,
         allowOverCreditLimit: false,
         bankTransferNeedsConfirm: true,
         providerEnvironment: 'production',
-        manualMobileMoneyMode: 'VERIFY',
+        manualMobileMoneyMode: 'INSTANT',
         manualMobileMoneyReceivers: {},
       },
       select: expect.any(Object),
@@ -280,7 +380,7 @@ describe('POS payment settings and totals', () => {
     const posPaymentSettings = { upsert: jest.fn() };
     dbClient.mockReturnValue({
       posPaymentSettings,
-      posRegister: { findMany: jest.fn().mockResolvedValue([]) },
+      posRegister: { count: jest.fn().mockResolvedValue(0), findMany: jest.fn().mockResolvedValue([]) },
     });
 
     await expect(savePaymentSettings({
@@ -290,6 +390,21 @@ describe('POS payment settings and totals', () => {
       registerId: REGISTER_ID,
     })).rejects.toMatchObject({ code: 'POS_PAYMENT_REGISTER_OVERRIDE_INVALID' });
     expect(posPaymentSettings.upsert).not.toHaveBeenCalled();
+  });
+
+  test('uses the till-type write-off threshold override when configured', () => {
+    expect(resolveWriteOffApprovalThreshold({
+      writeOffApprovalThresholdRwf: 10000,
+      writeOffApprovalThresholdByTillType: { restaurant: 25000 },
+    }, 'restaurant')).toBe(25000);
+    expect(resolveWriteOffApprovalThreshold({
+      writeOffApprovalThresholdRwf: 10000,
+      writeOffApprovalThresholdByTillType: { restaurant: 25000 },
+    }, 'retail')).toBe(10000);
+    expect(resolveWriteOffApprovalThreshold({
+      writeOffApprovalThresholdRwf: 0,
+      writeOffApprovalThresholdByTillType: {},
+    }, 'retail')).toBe(0);
   });
 
   test.each(['MTN_MOMO', 'AIRTEL_MONEY'])('keeps %s disabled when its adapter is unconfigured', async (method) => {
@@ -340,7 +455,7 @@ describe('POS payment settings and totals', () => {
         findUnique: jest.fn().mockResolvedValue(null),
         upsert: jest.fn().mockImplementation(({ create }) => Promise.resolve(create)),
       },
-      posRegister: { findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]) },
+      posRegister: { count: jest.fn().mockResolvedValue(1), findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]) },
     };
     dbClient.mockReturnValue(tx);
     runInTransaction.mockImplementation((operation) => operation(tx));
@@ -363,7 +478,7 @@ describe('POS payment settings and totals', () => {
   test('rejects register overrides that enable company-disabled methods', async () => {
     dbClient.mockReturnValue({
       posPaymentSettings: { findUnique: jest.fn(), upsert: jest.fn() },
-      posRegister: { findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]) },
+      posRegister: { count: jest.fn().mockResolvedValue(1), findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]) },
     });
     await expect(savePaymentSettings({
       companyId: COMPANY_ID,
@@ -376,11 +491,41 @@ describe('POS payment settings and totals', () => {
     })).rejects.toMatchObject({ code: 'POS_PAYMENT_REGISTER_METHOD_DISABLED' });
   });
 
+  test('saves an independent per-register CASH override when company CASH is disabled', async () => {
+    const posPaymentSettings = {
+      findUnique: jest.fn().mockResolvedValue(null),
+      upsert: jest.fn().mockImplementation(({ create }) => create),
+    };
+    const posRegister = {
+      count: jest.fn().mockResolvedValue(1),
+      findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]),
+    };
+    dbClient.mockReturnValue({ posPaymentSettings, posRegister });
+
+    await expect(savePaymentSettings({
+      companyId: COMPANY_ID,
+      settings: validSettings({
+        enabledMethods: ['CARD'],
+        registerOverrides: { [REGISTER_ID]: ['CASH'] },
+      }),
+      userId: '507f1f77bcf86cd799439013',
+      registerId: REGISTER_ID,
+    })).resolves.toMatchObject({
+      enabledMethods: ['CARD'],
+      registerOverrides: { [REGISTER_ID]: ['CASH'] },
+    });
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      event: 'PAYMENT_SETTINGS_UPDATED',
+    }), expect.any(Object));
+  });
+
   test('rejects a configuration that leaves an active register without any method', async () => {
     const posPaymentSettings = { findUnique: jest.fn(), upsert: jest.fn() };
     dbClient.mockReturnValue({
       posPaymentSettings,
-      posRegister: { findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]) },
+      posRegister: { count: jest.fn().mockResolvedValue(1), findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]) },
     });
     await expect(savePaymentSettings({
       companyId: COMPANY_ID,
@@ -418,6 +563,7 @@ describe('POS payment settings and totals', () => {
       upsert: jest.fn().mockImplementation(({ create }) => Promise.resolve(create)),
     };
     const posRegister = {
+      count: jest.fn().mockResolvedValue(1),
       findMany: jest.fn().mockResolvedValue([{ id: REGISTER_ID, isActive: true }]),
     };
     const tx = { posPaymentSettings, posRegister };

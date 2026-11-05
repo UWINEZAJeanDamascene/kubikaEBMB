@@ -4,6 +4,7 @@ const { normalizePosShiftSettings } = require('../services/posShiftService');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const { findTillSessionForShift } = require('../services/posShiftLinkService');
 const { buildReport } = require('./tillZReportController');
+const { getBankDepositClearingBalances } = require('../services/posBankDepositClearingService');
 const {
   openTillSessionForShift,
 } = require('../services/posShiftLinkService');
@@ -135,7 +136,17 @@ exports.current = async (req, res, next) => {
         note: true,
         register: { select: { code: true, name: true } },
         cashMovements: {
-          select: { type: true, amount: true },
+          select: {
+            id: true,
+            type: true,
+            amount: true,
+            reasonCode: true,
+            reference: true,
+            bankSlipReference: true,
+            note: true,
+            journalEntryId: true,
+            createdAt: true,
+          },
         },
         invoices: {
           where: { status: { notIn: ['cancelled', 'PENDING_PAYMENT'] } },
@@ -144,7 +155,19 @@ exports.current = async (req, res, next) => {
       },
     });
 
-    if (!shift) return res.json({ success: true, data: { shift: null, totals: null, settings: publicSettings } });
+    if (!shift) {
+      const depositClearingBalances = await getBankDepositClearingBalances(companyId);
+      return res.json({
+        success: true,
+        data: {
+          shift: null,
+          cashMovements: [],
+          bankDepositClearingBalance: depositClearingBalances.get(registerId) || 0,
+          totals: null,
+          settings: publicSettings,
+        },
+      });
+    }
 
     const totals = {
       salesCount: shift.invoices.length,
@@ -170,6 +193,7 @@ exports.current = async (req, res, next) => {
       throw error;
     }
     const report = await buildReport(companyId, till);
+    const depositClearingBalances = await getBankDepositClearingBalances(companyId);
     report.cash.drawerWarning = settings.drawerWarnAmount !== null
       && Number(report.cash.expectedCash || 0) >= settings.drawerWarnAmount;
     report.cash.drawerWarningAmount = settings.drawerWarnAmount;
@@ -194,6 +218,11 @@ exports.current = async (req, res, next) => {
           openingCount: shift.openingCount,
           note: shift.note,
         },
+        cashMovements: shift.cashMovements.map((movement) => ({
+          ...movement,
+          postingStatus: movement.journalEntryId ? 'posted' : 'pending',
+        })),
+        bankDepositClearingBalance: depositClearingBalances.get(registerId) || 0,
         totals,
         report,
         settings: publicSettings,

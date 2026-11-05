@@ -82,7 +82,7 @@ exports.issue = async (req, res) => {
     const client = clientId ? await Client.findOne({ _id: clientId, company: companyId, isActive: true }) : null;
     if (clientId && !client) return res.status(404).json({ success: false, message: 'Customer was not found.' });
 
-    const code = generateStoredValueCode();
+    let code = '';
     const accountId = generateObjectId();
     const entryId = generateObjectId();
     const actorId = String(req.user.id);
@@ -116,10 +116,16 @@ exports.issue = async (req, res) => {
     }
 
     await runInTransaction(async (session) => {
-      await dbClient().$executeRawUnsafe(
-        'INSERT INTO pos_stored_value_accounts (id, company_id, client_id, kind, code_hash, code_suffix, currency_code, balance, is_active, created_by_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)',
-        accountId, companyId, clientId, kind, hashStoredValueCode(code), code.slice(-4), currencyCode, amount, actorId,
-      );
+      let accountCreated = false;
+      for (let attempt = 0; attempt < 8 && !accountCreated; attempt += 1) {
+        code = generateStoredValueCode();
+        const inserted = await dbClient().$executeRawUnsafe(
+          'INSERT INTO pos_stored_value_accounts (id, company_id, client_id, kind, code_hash, code_suffix, currency_code, balance, is_active, created_by_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, code_hash) DO NOTHING',
+          accountId, companyId, clientId, kind, hashStoredValueCode(code), code.slice(-4), currencyCode, amount, actorId,
+        );
+        accountCreated = Number(inserted) === 1;
+      }
+      if (!accountCreated) throw new Error('Could not generate a unique stored-value code.');
       await dbClient().$executeRawUnsafe(
         'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, kind, entry_type, amount, balance_after, reference, notes, created_by_id, created_at) VALUES ($1, $2, $3, $4, \'issue\', $5, $5, $6, $7, $8, CURRENT_TIMESTAMP)',
         entryId, companyId, accountId, kind, amount, String(req.body.reference || '').trim() || null, notes, actorId,

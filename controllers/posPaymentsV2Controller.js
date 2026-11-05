@@ -13,6 +13,11 @@ const { generateObjectId } = require('../utils/objectId');
 const { createDirectSale } = require('./salesLegacyController');
 const { normalizeMobileMoneyReference, MOBILE_MONEY_PROVIDERS } = require('../services/posPaymentProviders/manualMobileMoney');
 const { hasPosPermission } = require('../middleware/posAuthMiddleware');
+const {
+  DEFAULT_DISCOUNT_SETTINGS,
+  getTillTypeFeatures,
+  normalizeStoredDiscountSettings,
+} = require('../services/posDiscountSettingsService');
 
 const IDEMPOTENCY_KEY_PATTERN = /^[a-zA-Z0-9_-]{8,100}$/;
 const MAX_SPLIT_PAYMENT_LINES = 10;
@@ -60,6 +65,32 @@ async function assertPaymentsV2(companyId, registerId) {
     });
   }
   return settings;
+}
+
+async function assertTillFeature(companyId, registerId, feature) {
+  const [register, settingsRow] = await Promise.all([
+    dbClient().posRegister.findFirst({
+      where: { id: String(registerId), companyId: String(companyId), isActive: true },
+      select: { systemTillType: true },
+    }),
+    dbClient().systemSettings.findUnique({
+      where: { companyId: String(companyId) },
+      select: { posDiscountSettings: true },
+    }),
+  ]);
+  if (!register) {
+    throw Object.assign(new Error('The active POS register could not be verified.'), {
+      code: 'POS_REGISTER_UNAVAILABLE',
+    });
+  }
+  const settings = normalizeStoredDiscountSettings(
+    settingsRow?.posDiscountSettings || DEFAULT_DISCOUNT_SETTINGS,
+  );
+  if (!getTillTypeFeatures(settings, register.systemTillType)[feature]) {
+    throw Object.assign(new Error(`${feature} is disabled for this till type.`), {
+      code: 'POS_TILL_FEATURE_DISABLED',
+    });
+  }
 }
 
 function completionKey(req) {
@@ -225,6 +256,16 @@ exports.recordCashPayment = async (req, res, next) => {
     const allocationMethods = [...new Set(allocations.map((payment) => payment.method))];
     if (allocationMethods.includes('CREDIT') && !req.posPermissions?.includes('pos.credit.sell')) {
       return invalid(res, 403, 'POS_PERMISSION_DENIED', 'Your POS role does not allow customer credit sales.');
+    }
+    if (allocationMethods.includes('CREDIT')) {
+      try {
+        await assertTillFeature(companyId, String(register.id), 'customerCredit');
+      } catch (error) {
+        if (error?.code === 'POS_TILL_FEATURE_DISABLED') {
+          return invalid(res, 403, error.code, 'Customer credit is disabled for this till type.');
+        }
+        throw error;
+      }
     }
     if (allocationMethods.includes('GIFT_CARD') && !req.posPermissions?.includes('pos.giftcard.redeem')) {
       return invalid(res, 403, 'POS_PERMISSION_DENIED', 'Your POS role does not allow gift card redemption.');
@@ -1017,23 +1058,42 @@ exports.reportPaymentsByMethod = async (req, res, next) => {
         ...(dateTo ? { lte: dateTo } : {}),
       } } : {})),
     };
-    const payments = await dbClient().posPayment.findMany({
-      where,
-      select: { method: true, status: true, amount: true, reconciliationStatus: true, cashierId: true },
-      take: 10000,
-    });
+    const [paymentGroups, totalPayments, payments] = await Promise.all([
+      dbClient().posPayment.groupBy({
+        by: ['method', 'status'],
+        where,
+        _count: { _all: true },
+        _sum: { amount: true },
+      }),
+      dbClient().posPayment.count({ where }),
+      dbClient().posPayment.findMany({
+        where,
+        select: { method: true, status: true, amount: true, reconciliationStatus: true, cashierId: true },
+        take: 500,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      }),
+    ]);
     const byMethod = {};
-    for (const payment of payments) {
-      const method = String(payment.method);
+    for (const group of paymentGroups) {
+      const method = String(group.method);
       if (!byMethod[method]) byMethod[method] = { count: 0, amount: 0, cashierCount: 0, statuses: {} };
-      byMethod[method].count += 1;
-      byMethod[method].amount += Number(payment.amount || 0);
-      const status = String(payment.status);
+      const count = Number(group._count?._all || 0);
+      const amount = Number(group._sum?.amount || 0);
+      byMethod[method].count += count;
+      byMethod[method].amount += amount;
+      const status = String(group.status);
       if (!byMethod[method].statuses[status]) byMethod[method].statuses[status] = { count: 0, amount: 0 };
-      byMethod[method].statuses[status].count += 1;
-      byMethod[method].statuses[status].amount += Number(payment.amount || 0);
+      byMethod[method].statuses[status].count += count;
+      byMethod[method].statuses[status].amount += amount;
     }
-    return res.json({ success: true, data: { byMethod, filters: { dateFrom: dateFrom?.toISOString() || null, dateTo: dateTo?.toISOString() || null, shiftId: req.query?.shiftId || null, cashierId: req.query?.cashierId || null } } });
+    return res.json({
+      success: true,
+      data: {
+        byMethod,
+        details: { returned: payments.length, total: totalPayments, limit: 500, hasMore: totalPayments > payments.length },
+        filters: { dateFrom: dateFrom?.toISOString() || null, dateTo: dateTo?.toISOString() || null, shiftId: req.query?.shiftId || null, cashierId: req.query?.cashierId || null },
+      },
+    });
   } catch (error) {
     return next(error);
   }
@@ -1042,41 +1102,61 @@ exports.reportPaymentsByMethod = async (req, res, next) => {
 exports.reportPaymentReconciliation = async (req, res, next) => {
   const { companyId } = context(req);
   try {
-    const [payments, events] = await Promise.all([
+    const paymentWhere = {
+      companyId,
+      method: { in: ['MTN_MOMO', 'AIRTEL_MONEY'] },
+      normalizedReference: { not: null },
+    };
+    const [payments, events, paymentGroups, eventGroups, paymentCount, eventCount] = await Promise.all([
       dbClient().posPayment.findMany({
-        where: {
-          companyId,
-          method: { in: ['MTN_MOMO', 'AIRTEL_MONEY'] },
-          normalizedReference: { not: null },
-        },
+        where: paymentWhere,
         select: {
           id: true, method: true, amount: true, providerTxId: true, normalizedReference: true,
           reconciliationStatus: true, status: true, createdAt: true,
         },
-        take: 10000,
+        take: 500,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       }),
       dbClient().posProviderEvent.findMany({
-        where: { companyId },
+        where: { companyId, matchedPaymentId: null },
         select: {
           id: true, provider: true, eventKey: true, payload: true, signatureOk: true,
           matchedPaymentId: true, createdAt: true,
         },
-        take: 10000,
+        take: 500,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       }),
+      dbClient().posPayment.groupBy({
+        by: ['method', 'reconciliationStatus'],
+        where: paymentWhere,
+        _count: { _all: true },
+        _sum: { amount: true },
+      }),
+      dbClient().posProviderEvent.groupBy({
+        by: ['provider'],
+        where: { companyId },
+        _count: { _all: true },
+      }),
+      dbClient().posPayment.count({ where: paymentWhere }),
+      dbClient().posProviderEvent.count({ where: { companyId, matchedPaymentId: null } }),
     ]);
     const providerTotals = {
-      MTN_MOMO: { paymentsCount: 0, paymentAmount: 0, matchedCount: 0, unmatchedCount: 0, eventsCount: events.filter((event) => event.provider === 'MTN_MOMO').length },
-      AIRTEL_MONEY: { paymentsCount: 0, paymentAmount: 0, matchedCount: 0, unmatchedCount: 0, eventsCount: events.filter((event) => event.provider === 'AIRTEL_MONEY').length },
+      MTN_MOMO: { paymentsCount: 0, paymentAmount: 0, matchedCount: 0, unmatchedCount: 0, eventsCount: 0 },
+      AIRTEL_MONEY: { paymentsCount: 0, paymentAmount: 0, matchedCount: 0, unmatchedCount: 0, eventsCount: 0 },
     };
-    for (const payment of payments) {
-      const totals = providerTotals[payment.method];
+    for (const group of paymentGroups) {
+      const totals = providerTotals[group.method];
       if (!totals) continue;
-      totals.paymentsCount += 1;
-      totals.paymentAmount += Number(payment.amount || 0);
-      if (payment.reconciliationStatus === 'MATCHED') totals.matchedCount += 1;
-      else totals.unmatchedCount += 1;
+      const count = Number(group._count?._all || 0);
+      totals.paymentsCount += count;
+      totals.paymentAmount += Number(group._sum?.amount || 0);
+      if (group.reconciliationStatus === 'MATCHED') totals.matchedCount += count;
+      else totals.unmatchedCount += count;
+    }
+    for (const group of eventGroups) {
+      if (providerTotals[group.provider]) {
+        providerTotals[group.provider].eventsCount = Number(group._count?._all || 0);
+      }
     }
     return res.json({
       success: true,
@@ -1086,7 +1166,14 @@ exports.reportPaymentReconciliation = async (req, res, next) => {
           ...payment,
           createdAt: payment.createdAt?.toISOString(),
         })),
-        unmatchedEvents: events.filter((event) => !event.matchedPaymentId),
+        unmatchedEvents: events.map((event) => ({
+          ...event,
+          createdAt: event.createdAt?.toISOString(),
+        })),
+        details: {
+          payments: { returned: payments.length, total: paymentCount, limit: 500, hasMore: paymentCount > payments.length },
+          unmatchedEvents: { returned: events.length, total: eventCount, limit: 500, hasMore: eventCount > events.length },
+        },
       },
     });
   } catch (error) {
@@ -1119,6 +1206,7 @@ exports.completeSale = async (req, res, next) => {
         tillSessionId: true,
         clientId: true,
         posCheckoutPayload: true,
+        posPricingSnapshot: true,
         posCompletionKey: true,
       },
     });
@@ -1248,6 +1336,11 @@ exports.completeSale = async (req, res, next) => {
     req.posV2Completion = {
       invoiceId: saleId,
       completionKey: key,
+      manualMobileMoneyPaymentIds: payments
+        .filter((payment) => ['MTN_MOMO', 'AIRTEL_MONEY'].includes(payment.method))
+        .map((payment) => String(payment.id)),
+      voucherReservations: Array.isArray(invoice.posPricingSnapshot?.voucherRedemptions)
+        && invoice.posPricingSnapshot.voucherRedemptions.length > 0,
       ...(creditAmount > 0 ? {
         creditAmount,
         creditPaymentIds: creditPayments.map((payment) => String(payment.id)),

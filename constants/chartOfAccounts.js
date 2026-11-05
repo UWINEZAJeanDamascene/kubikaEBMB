@@ -35,6 +35,13 @@ const CHART_OF_ACCOUNTS = {
     normalBalance: "debit",
     allowDirectPosting: true,
   },
+  1120: {
+    name: "Cash in Transit (Bank Deposit Clearing)",
+    type: "asset",
+    subtype: "cash_equivalent",
+    normalBalance: "debit",
+    allowDirectPosting: true,
+  },
   1200: {
     name: "MTN MoMo Clearing",
     type: "asset",
@@ -749,6 +756,7 @@ const DEFAULT_ACCOUNTS = {
   posCashOverShortExpense: "6100",
   posCashOverShortIncome: "4200",
   cashAtBank: "1100",
+  bankDepositClearing: "1120",
   mtnMoMo: "1200",
   airtelMoney: "1210",
   employeeAdvances: "1250",

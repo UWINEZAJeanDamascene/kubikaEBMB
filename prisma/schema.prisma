@@ -324,6 +324,9 @@ model SystemSettings {
   posDrawerWarnAmount                Int?     @map("pos_drawer_warn_amount")
   posReceiptSettings                 Json     @default("{\"paperWidth\":80,\"columns\":42,\"showCashier\":true,\"showCustomer\":true,\"showSku\":false,\"showBarcode\":false,\"headerNote\":\"\",\"footerNote\":\"Thank you for shopping with us.\",\"returnPolicy\":\"\",\"logoUrl\":\"\",\"autoPrintOnSale\":false,\"digitalReceiptsEnabled\":true,\"digitalReceiptExpiryDays\":30}") @map("pos_receipt_settings")
   posLoyaltySettings                 Json     @default("{\"pointValueRwf\":1}") @map("pos_loyalty_settings")
+  posGiftCardSettings                Json     @default("{\"maxPerCard\":100000,\"dailyLimitPerCashier\":300000,\"tillTypeOverrides\":{}}") @map("pos_gift_card_settings")
+  posDiscountSettings                Json     @default("{\"defaultLimits\":{\"maxLineDiscountPercent\":null,\"maxCartDiscountPercent\":null,\"maxSaleDiscountRwf\":null},\"rules\":[],\"discountReasons\":[],\"systemTillTypes\":[\"retail\"],\"registerLabels\":[]}") @map("pos_discount_settings")
+  posVoucherSettings                 Json     @default("{\"maxVouchersPerSale\":1,\"reservationTtlMinutes\":15,\"invalidAttemptsBeforeLockout\":5,\"lockoutMinutes\":15}") @map("pos_voucher_settings")
   posHeldSalesOnClose                String   @default("WARN") @map("pos_held_sales_on_close") @db.VarChar(16)
   lastUpdatedBy                      String?  @map("last_updated_by") @db.Char(24)
   createdAt                          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -877,8 +880,12 @@ model Company {
   posRegisterAccess           PosRegisterAccess[]
   posSessions                 PosSession[]
   posApprovals                PosApproval[]
+  posApprovalPolicies         PosApprovalPolicy[]
   posAuditLogs                PosAuditLog[]
   posPromotions               PosPromotion[]
+  posVouchers                 PosVoucher[]
+  posVoucherRedemptions       PosVoucherRedemption[]
+  posVoucherCodeAttempts      PosVoucherCodeAttempt[]
   posStoredValueAccounts      PosStoredValueAccount[]
   posStoredValueLedger        PosStoredValueLedger[]
   posPayments                 PosPayment[]
@@ -1214,6 +1221,8 @@ model PosRegister {
   claimExpiresAt         DateTime?                  @map("claim_expires_at") @db.Timestamptz(3)
   claimCodeUsedAt        DateTime?                  @map("claim_code_used_at") @db.Timestamptz(3)
   trainingMode           Boolean                    @default(false) @map("training_mode")
+  systemTillType         String                     @default("retail") @map("system_till_type") @db.VarChar(40)
+  discountLabel          String?                    @map("discount_label") @db.VarChar(80)
   deviceTokenHash        String?                    @unique @map("device_token_hash") @db.VarChar(64)
   lastSeenAt             DateTime?                  @map("last_seen_at") @db.Timestamptz(3)
   createdById            String?                    @map("created_by_id") @db.Char(24)
@@ -1410,6 +1419,8 @@ model PosCashMovement {
   type           PosCashMovementType
   amount         Int
   reasonCode     String              @map("reason_code") @db.VarChar(40)
+  reference      String?             @db.VarChar(100)
+  bankSlipReference String?          @map("bank_slip_reference") @db.VarChar(100)
   note           String?
   performedById  String              @map("performed_by") @db.Char(24)
   approvedById   String?             @map("approved_by") @db.Char(24)
@@ -1573,6 +1584,23 @@ model PosAuditLog {
   @@map("pos_audit_logs")
 }
 
+model PosApprovalPolicy {
+  id                       String   @id @db.Char(24)
+  companyId                String   @map("company_id") @db.Char(24)
+  action                   String   @db.VarChar(40)
+  enabled                  Boolean  @default(true)
+  requestTtlSeconds        Int      @default(600) @map("request_ttl_seconds")
+  pinApprovalTtlSeconds    Int      @default(60) @map("pin_approval_ttl_seconds")
+  managerApprovalTtlSeconds Int     @default(300) @map("manager_approval_ttl_seconds")
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company                  Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, action])
+  @@index([companyId, enabled])
+  @@map("pos_approval_policies")
+}
+
 /// Short-lived, one-use, second-person approval for sensitive POS operations.
 model PosManagerApproval {
   id                    String               @id @db.Char(24)
@@ -1649,6 +1677,92 @@ model PosPromotion {
   @@map("pos_promotions")
 }
 
+/// Promotional discounts. Voucher secrets are stored only as a SHA-256 hash;
+/// the plaintext code is returned once when the voucher is generated.
+model PosVoucher {
+  id                       String   @id @db.Char(24)
+  companyId                String   @map("company_id") @db.Char(24)
+  batchId                  String?  @map("batch_id") @db.Char(24)
+  codeHash                 String   @map("code_hash") @db.Char(64)
+  codeSuffix               String   @map("code_suffix") @db.VarChar(8)
+  name                     String   @db.VarChar(120)
+  discountType             String   @map("discount_type") @db.VarChar(16)
+  value                    Decimal  @db.Decimal(19, 4)
+  maxDiscountRwf           Int?     @map("max_discount_rwf")
+  minSpendRwf              Int      @default(0) @map("min_spend_rwf")
+  totalUsageLimit           Int?     @map("total_usage_limit")
+  perCustomerUsageLimit     Int?     @map("per_customer_usage_limit")
+  singleUse                 Boolean  @default(false) @map("single_use")
+  canCombineWithDiscounts   Boolean  @default(false) @map("can_combine_with_discounts")
+  startsAt                  DateTime @map("starts_at") @db.Timestamptz(3)
+  endsAt                    DateTime @map("ends_at") @db.Timestamptz(3)
+  customerIds               Json     @default("[]") @map("customer_ids")
+  customerGroupTags         Json     @default("[]") @map("customer_group_tags")
+  excludedProductIds        Json     @default("[]") @map("excluded_product_ids")
+  excludedCategoryIds       Json     @default("[]") @map("excluded_category_ids")
+  status                    String   @default("ACTIVE") @db.VarChar(16)
+  createdById               String   @map("created_by_id") @db.Char(24)
+  updatedById               String?  @map("updated_by_id") @db.Char(24)
+  createdAt                 DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                 DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company                   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  redemptions               PosVoucherRedemption[]
+
+  @@unique([companyId, codeHash])
+  @@index([companyId, status, startsAt, endsAt])
+  @@index([companyId, batchId])
+  @@map("pos_vouchers")
+}
+
+/// Reservations become redemptions only in the same transaction that completes
+/// the POS sale. Released and expired reservations remain for audit/history.
+model PosVoucherRedemption {
+  id                    String    @id @db.Char(24)
+  companyId             String    @map("company_id") @db.Char(24)
+  voucherId             String    @map("voucher_id") @db.Char(24)
+  clientId              String?   @map("client_id") @db.Char(24)
+  cashierId             String    @map("cashier_id") @db.Char(24)
+  tillSessionId         String?   @map("till_session_id") @db.Char(24)
+  cartKeyHash           String    @map("cart_key_hash") @db.Char(64)
+  reservationTokenHash  String    @unique @map("reservation_token_hash") @db.Char(64)
+  invoiceId             String?   @map("invoice_id") @db.Char(24)
+  codeSuffix            String    @map("code_suffix") @db.VarChar(8)
+  status                String    @default("RESERVED") @db.VarChar(16)
+  discountRwf           Int       @default(0) @map("discount_rwf")
+  pricingSnapshot       Json      @map("pricing_snapshot")
+  expiresAt             DateTime  @map("expires_at") @db.Timestamptz(3)
+  redeemedAt            DateTime? @map("redeemed_at") @db.Timestamptz(3)
+  restoredAt            DateTime? @map("restored_at") @db.Timestamptz(3)
+  restoredById          String?   @map("restored_by_id") @db.Char(24)
+  restoreReason         String?   @map("restore_reason") @db.VarChar(500)
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company               Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  voucher               PosVoucher @relation(fields: [voucherId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, voucherId, status, expiresAt])
+  @@index([companyId, clientId, voucherId, status])
+  @@index([companyId, invoiceId])
+  @@map("pos_voucher_redemptions")
+}
+
+/// Durable cashier lockout state for repeated invalid voucher-code attempts.
+/// Only the hash of an attempted code is stored; plaintext codes are never logged.
+model PosVoucherCodeAttempt {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  cashierId      String   @map("cashier_id") @db.Char(24)
+  attemptCount   Int      @default(0) @map("attempt_count")
+  windowStartedAt DateTime @map("window_started_at") @db.Timestamptz(3)
+  lockedUntil    DateTime? @map("locked_until") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, cashierId])
+  @@index([companyId, lockedUntil])
+  @@map("pos_voucher_code_attempts")
+}
+
 /// Monetary stored value accepted as POS tender. Codes are stored as hashes;
 /// all balance movements are kept in PosStoredValueLedger for auditability.
 model PosStoredValueAccount {
@@ -1663,12 +1777,17 @@ model PosStoredValueAccount {
   isActive     Boolean                @default(true) @map("is_active")
   expiresAt    DateTime?              @map("expires_at") @db.Timestamptz(3)
   createdById  String?                @map("created_by_id") @db.Char(24)
+  replacementKey String?              @map("replacement_key") @db.VarChar(100)
+  replacesAccountId String?            @map("replaces_account_id") @db.Char(24)
+  replacedByAccountId String?           @map("replaced_by_account_id") @db.Char(24)
+  replacedAt   DateTime?              @map("replaced_at") @db.Timestamptz(3)
   createdAt    DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
   company      Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
   ledger       PosStoredValueLedger[]
 
   @@unique([companyId, codeHash])
+  @@unique([companyId, replacementKey])
   @@unique([companyId, clientId, kind, currencyCode])
   @@index([companyId, kind, isActive])
   @@index([companyId, clientId, kind])
@@ -1827,12 +1946,14 @@ model PosPaymentSettings {
   paidSaleRefundApprovalAmount Int                        @default(20000) @map("paid_sale_refund_approval_amount")
   paidSaleRefundApprovalCount  Int                        @default(3) @map("paid_sale_refund_approval_count")
   posReturnWindowDays          Int                        @default(30) @map("pos_return_window_days")
+  writeOffApprovalThresholdRwf Int                        @default(10000) @map("write_off_approval_threshold_rwf")
+  writeOffApprovalThresholdByTillType Json                 @default("{}") @map("write_off_approval_threshold_by_till_type")
   momoTimeoutSec               Int                        @default(120) @map("momo_timeout_sec")
   cashRounding                 Int?                       @map("cash_rounding")
   allowOverCreditLimit         Boolean                    @default(false) @map("allow_over_credit_limit")
   bankTransferNeedsConfirm     Boolean                    @default(true) @map("bank_transfer_needs_confirm")
   providerEnvironment          PosPaymentEnvironment      @default(sandbox) @map("provider_environment")
-  manualMobileMoneyMode        PosManualMobileMoneyMode   @default(VERIFY) @map("manual_mobile_money_mode")
+  manualMobileMoneyMode        PosManualMobileMoneyMode   @default(INSTANT) @map("manual_mobile_money_mode")
   manualMobileMoneyReceivers   Json                       @default("{}") @map("manual_mobile_money_receivers")
   /// Stores encrypted provider credentials. Never return or log this field.
   providerConfig               Json?                      @map("provider_config")
@@ -1913,6 +2034,7 @@ model Category {
   defaultCogsAccount      String?      @map("default_cogs_account")
   defaultRevenueAccount   String?      @map("default_revenue_account")
   isActive                Boolean      @default(true) @map("is_active")
+  isNoDiscount            Boolean      @default(false) @map("is_no_discount")
   createdById             String?      @map("created_by") @db.Char(24)
   customFields            Json         @default("{}") @map("custom_fields")
   createdAt               DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -2216,6 +2338,7 @@ model Product {
   cogsAccount           String?                @map("cogs_account")
   revenueAccount        String?                @map("revenue_account")
   isArchived            Boolean                @default(false) @map("is_archived")
+  isNoDiscount          Boolean                @default(false) @map("is_no_discount")
   weight                Float                  @default(0)
   brand                 String?
   location              String?
@@ -3057,6 +3180,7 @@ model SalesOrderLine {
   unit          String?
   unitPrice     Decimal    @map("unit_price") @db.Decimal(19, 6)
   discountPct   Decimal    @default(0) @map("discount_pct") @db.Decimal(19, 4)
+  discountReason String?   @map("discount_reason")
   taxRate       Decimal    @default(0) @map("tax_rate") @db.Decimal(19, 4)
   lineTotal     Decimal    @default(0) @map("line_total") @db.Decimal(19, 2)
   lineTax       Decimal    @default(0) @map("line_tax") @db.Decimal(19, 2)
@@ -3114,11 +3238,13 @@ model Invoice {
   cancellationReason       String?                  @map("cancellation_reason")
   revenueJournalEntryId    String?                  @map("revenue_journal_entry_id") @db.Char(24)
   cogsJournalEntryId       String?                  @map("cogs_journal_entry_id") @db.Char(24)
+  posPostingStatus         String?                  @map("pos_posting_status") @db.VarChar(16)
   stockDeducted            Boolean                  @default(false) @map("stock_deducted")
   autoConfirm              Boolean                  @default(false) @map("auto_confirm")
   generatedFromRecurringId String?                  @map("generated_from_recurring_id") @db.Char(24)
   payments                 Json                     @default("[]")
   posPromotion             Json?                    @map("pos_promotion")
+  posPricingSnapshot       Json?                    @map("pos_pricing_snapshot")
   ebm                      Json                     @default("{}")
   terms                    String?
   notes                    String?
@@ -3196,6 +3322,7 @@ model InvoiceLine {
   unit          String?
   unitPrice     Decimal    @map("unit_price") @db.Decimal(19, 6)
   discountPct   Decimal    @default(0) @map("discount_pct") @db.Decimal(19, 4)
+  discountReason String?   @map("discount_reason")
   taxRate       Decimal    @default(0) @map("tax_rate") @db.Decimal(19, 4)
   taxCode       String     @default("A") @map("tax_code")
   lineSubtotal  Decimal    @default(0) @map("line_subtotal") @db.Decimal(19, 2)
@@ -3235,6 +3362,7 @@ model CreditNote {
   totalAmount                  Decimal          @default(0) @map("total_amount") @db.Decimal(19, 2)
   revenueReversalEntryId       String?          @map("revenue_reversal_entry_id") @db.Char(24)
   cogsReversalEntryId          String?          @map("cogs_reversal_entry_id") @db.Char(24)
+  writeOffReversalEntryId      String?          @map("write_off_reversal_entry_id") @db.Char(24)
   stockReversed                Boolean          @default(false) @map("stock_reversed")
   payments                     Json             @default("[]")
   ebm                          Json             @default("{}")
@@ -3284,6 +3412,9 @@ model CreditNoteLine {
   lineTotal           Decimal    @default(0) @map("line_total") @db.Decimal(19, 2)
   returnToWarehouseId String?    @map("return_to_warehouse_id") @db.Char(24)
   batchId             String?    @map("batch_id") @db.Char(24)
+  returnDisposition   String     @default("restock") @map("return_disposition") @db.VarChar(16)
+  writeOffReason      String?    @map("write_off_reason")
+  nonStockWriteOff    Boolean    @default(false) @map("non_stock_write_off")
   serialNumbers       Json       @default("[]") @map("serial_numbers")
   creditNote          CreditNote @relation(fields: [creditNoteId], references: [id], onDelete: Cascade)
   product             Product    @relation(fields: [productId], references: [id])

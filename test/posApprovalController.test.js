@@ -1,6 +1,7 @@
 jest.mock('../lib/prisma', () => ({
   prisma: {
     user: { findFirst: jest.fn() },
+    posApprovalPolicy: { findUnique: jest.fn().mockResolvedValue(null) },
     posAuditLog: { create: jest.fn() },
     $transaction: jest.fn(),
   },
@@ -66,6 +67,7 @@ describe('POS approval endpoint', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.posApprovalPolicy.findUnique.mockResolvedValue(null);
     tx = {
       posApproval: { create: jest.fn(async ({ data }) => ({ id: data.id })) },
       posAuditLog: { create: jest.fn(async ({ data }) => data) },
@@ -137,6 +139,30 @@ describe('POS approval endpoint', () => {
     expect(permissionForApprovalAction('VOID_SALE')).toBe('pos.till.void');
     expect(permissionForApprovalAction('NO_SALE')).toBe('pos.till.no_sale');
     expect(permissionForApprovalAction('DISCOUNT_OVER_LIMIT')).toBe('pos.till.discount');
+  });
+
+  test('applies company policy to PIN approval expiry and rejects disabled actions', async () => {
+    prisma.posApprovalPolicy.findUnique.mockResolvedValue({
+      enabled: true,
+      pinApprovalTtlSeconds: 120,
+    });
+    const issued = response();
+    const issuedAt = Date.now();
+    await create(request(), issued, jest.fn());
+    const ttl = new Date(issued.body.data.expiresAt).getTime() - Date.now();
+    expect(issued.statusCode).toBe(201);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(120_000);
+
+    prisma.posApprovalPolicy.findUnique.mockResolvedValue({
+      enabled: false,
+      pinApprovalTtlSeconds: 60,
+    });
+    const disabled = response();
+    await create(request(), disabled, jest.fn());
+    expect(disabled.statusCode).toBe(403);
+    expect(disabled.body.code).toBe('POS_APPROVAL_POLICY_DISABLED');
+    expect(verifyRegisterPin).toHaveBeenCalledTimes(1);
   });
 
   test('requires the credit-specific manager permission for over-limit credit approval', async () => {

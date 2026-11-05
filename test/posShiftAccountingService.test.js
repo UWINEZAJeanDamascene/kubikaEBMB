@@ -14,8 +14,14 @@ jest.mock('../services/journalService', () => ({
   createEntry: jest.fn(),
   getMappedAccountCode: jest.fn(async (_companyId, _module, _key, fallback) => fallback),
 }));
+jest.mock('../services/posAccountingProfileService', () => ({
+  getProfile: jest.fn(),
+  resolveAccount: jest.fn(),
+}));
+jest.mock('../lib/prisma', () => ({ prisma: {} }));
 
 const JournalService = require('../services/journalService');
+const posAccountingProfileService = require('../services/posAccountingProfileService');
 const {
   postCashMovement,
   postShiftVariance,
@@ -33,12 +39,29 @@ function transaction() {
       findFirst: jest.fn(),
       update: jest.fn().mockResolvedValue({}),
     },
+    posRegister: {
+      findFirst: jest.fn().mockResolvedValue({ id: 'register-id', systemTillType: 'retail' }),
+    },
+    chartOfAccount: {
+      findFirst: jest.fn().mockResolvedValue({
+        code: '1130',
+        type: 'asset',
+        isActive: true,
+        allowDirectPosting: true,
+      }),
+    },
   };
 }
 
 beforeEach(() => {
   jest.clearAllMocks();
   JournalService.getMappedAccountCode.mockImplementation(async (_companyId, _module, _key, fallback) => fallback);
+  posAccountingProfileService.getProfile.mockResolvedValue({
+    companyDefaults: { bankDepositClearing: '1130' },
+    tillTypeOverrides: {},
+    registerOverrides: {},
+  });
+  posAccountingProfileService.resolveAccount.mockReturnValue('1130');
 });
 
 describe('POS shift accounting service', () => {
@@ -78,6 +101,72 @@ describe('POS shift accounting service', () => {
         expect.objectContaining({ accountCode: credit, debit: 0, credit: movement.amount }),
       ],
     }));
+  });
+
+  test('posts bank deposits to the scoped asset clearing account and preserves the slip reference', async () => {
+    const tx = transaction();
+    const movement = {
+      id: '507f1f77bcf86cd799439015',
+      registerId: 'register-id',
+      type: 'cash_out',
+      amount: 12500,
+      reasonCode: 'BANK_DEPOSIT',
+      reference: 'SLIP-2026-001',
+      note: 'Sealed deposit bag.',
+    };
+    JournalService.createEntry.mockResolvedValue({ _id: 'journal-id' });
+
+    await postCashMovement({ tx, companyId: COMPANY_ID, userId: USER_ID, movement });
+
+    expect(posAccountingProfileService.getProfile).toHaveBeenCalledWith(COMPANY_ID, tx);
+    expect(posAccountingProfileService.resolveAccount).toHaveBeenCalledWith(
+      expect.any(Object),
+      'bankDepositClearing',
+      { tillType: 'retail', registerId: 'register-id' },
+    );
+    expect(tx.posRegister.findFirst).toHaveBeenCalledWith({
+      where: { id: 'register-id', companyId: COMPANY_ID },
+      select: { id: true, systemTillType: true },
+    });
+    expect(tx.chartOfAccount.findFirst).toHaveBeenCalledWith({
+      where: { companyId: COMPANY_ID, code: '1130' },
+      select: { code: true, type: true, isActive: true, allowDirectPosting: true },
+    });
+    expect(JournalService.createEntry).toHaveBeenCalledWith(COMPANY_ID, USER_ID, expect.objectContaining({
+      sourceType: 'pos_bank_deposit',
+      sourceReference: 'SLIP-2026-001',
+      lines: [
+        expect.objectContaining({ accountCode: '1130', debit: 12500, credit: 0, reference: 'SLIP-2026-001' }),
+        expect.objectContaining({ accountCode: '1000', debit: 0, credit: 12500, reference: 'SLIP-2026-001' }),
+      ],
+    }));
+  });
+
+  test('blocks a deposit when its register-scoped clearing mapping is missing or not an asset', async () => {
+    const tx = transaction();
+    const movement = {
+      id: '507f1f77bcf86cd799439015',
+      registerId: 'register-id',
+      type: 'cash_out',
+      amount: 12500,
+      reasonCode: 'BANK_DEPOSIT',
+    };
+    posAccountingProfileService.resolveAccount.mockReturnValue(null);
+
+    await expect(postCashMovement({ tx, companyId: COMPANY_ID, userId: USER_ID, movement }))
+      .rejects.toMatchObject({ code: 'POS_BANK_DEPOSIT_CLEARING_ACCOUNT_REQUIRED' });
+    expect(JournalService.createEntry).not.toHaveBeenCalled();
+
+    posAccountingProfileService.resolveAccount.mockReturnValue('1130');
+    tx.chartOfAccount.findFirst.mockResolvedValueOnce({
+      code: '1130',
+      type: 'liability',
+      isActive: true,
+      allowDirectPosting: true,
+    });
+    await expect(postCashMovement({ tx, companyId: COMPANY_ID, userId: USER_ID, movement }))
+      .rejects.toMatchObject({ code: 'POS_BANK_DEPOSIT_CLEARING_ACCOUNT_INVALID' });
+    expect(JournalService.createEntry).not.toHaveBeenCalled();
   });
 
   test.each([

@@ -26,6 +26,9 @@ function isUniqueReferenceError(error) {
 }
 
 function normalizeManualReference(value) {
+  if (value === undefined || value === null || (typeof value === 'string' && !value.trim())) {
+    return { reference: null, normalizedReference: null };
+  }
   if (typeof value !== 'string' || value.trim().length > 160) {
     throw paymentError('POS_PAYMENT_REFERENCE_INVALID', 'Enter a valid mobile money transaction ID.');
   }
@@ -78,7 +81,6 @@ async function recordManualMobileMoneyPayment({
   }
   const normalized = normalizeManualReference(reference);
   const normalizedPhone = normalizeRwandaPhone(payerPhone);
-  const settings = await posPaymentService.getPaymentSettings(scopedCompanyId);
   await posPaymentService.assertPaymentMethodEnabled({
     companyId: scopedCompanyId,
     registerId: String(registerId),
@@ -135,16 +137,18 @@ async function recordManualMobileMoneyPayment({
         throw paymentError('POS_IDEMPOTENCY_KEY_CONFLICT', 'This payment key was already used for a different payment.');
       }
 
-      const duplicate = await tx.posPayment.findFirst({
-        where: {
-          companyId: scopedCompanyId,
-          method: provider,
-          normalizedReference: normalized.normalizedReference,
-        },
-        select: { id: true },
-      });
-      if (duplicate) {
-        throw paymentError('POS_MOBILE_MONEY_REFERENCE_DUPLICATE', 'This transaction ID was already used on another sale.');
+      if (normalized.normalizedReference) {
+        const duplicate = await tx.posPayment.findFirst({
+          where: {
+            companyId: scopedCompanyId,
+            method: provider,
+            normalizedReference: normalized.normalizedReference,
+          },
+          select: { id: true },
+        });
+        if (duplicate) {
+          throw paymentError('POS_MOBILE_MONEY_REFERENCE_DUPLICATE', 'This transaction ID was already used on another sale.');
+        }
       }
 
       const existing = await tx.posPayment.findMany({
@@ -170,7 +174,6 @@ async function recordManualMobileMoneyPayment({
         );
       }
 
-      const instant = settings.manualMobileMoneyMode === 'INSTANT';
       const now = new Date();
       const payment = await tx.posPayment.create({
         data: {
@@ -181,7 +184,7 @@ async function recordManualMobileMoneyPayment({
           registerId: String(registerId),
           cashierId: String(cashierId),
           method: provider,
-          status: instant ? 'SUCCESS' : 'PENDING_VERIFICATION',
+          status: 'SUCCESS',
           amount,
           providerName: provider,
           providerTxId: normalized.reference,
@@ -189,9 +192,9 @@ async function recordManualMobileMoneyPayment({
           normalizedReference: normalized.normalizedReference,
           payerPhone: normalizedPhone,
           reconciliationStatus: 'UNMATCHED',
-          confirmedAt: instant ? now : null,
-          confirmedById: instant ? String(cashierId) : null,
-          completedAt: instant ? now : null,
+          confirmedAt: now,
+          confirmedById: String(cashierId),
+          completedAt: now,
           idempotencyKey,
         },
       });
@@ -206,7 +209,7 @@ async function recordManualMobileMoneyPayment({
           provider,
           amount,
           status: payment.status,
-          confirmationMode: settings.manualMobileMoneyMode,
+          confirmationMode: 'INSTANT',
         },
         ip,
       }, tx);
@@ -230,13 +233,12 @@ async function confirmManualMobileMoneyPayment({
   ip,
 }) {
   const scopedCompanyId = requireCompany(companyId);
-  if (typeof providerReference !== 'string' || !providerReference.trim()) {
-    throw paymentError('POS_PAYMENT_REFERENCE_INVALID', 'Enter the provider transaction reference before confirming this payment.');
-  }
   if (typeof approvalToken !== 'string' || !approvalToken.trim()) {
     throw paymentError('POS_APPROVAL_REQUIRED', 'A separate manager approval is required to confirm this payment.');
   }
-  const normalizedReference = normalizeMobileMoneyReference(providerReference);
+  const normalizedReference = providerReference == null || !String(providerReference).trim()
+    ? null
+    : normalizeMobileMoneyReference(String(providerReference));
   return runInTransaction(async (tx) => {
     await tx.$queryRawUnsafe(
       'SELECT id FROM pos_payments WHERE id = $1 AND company_id = $2 FOR UPDATE',
@@ -325,7 +327,6 @@ async function listManualMobileMoneyPayments({ companyId, day, provider, cashier
   const where = {
     companyId: scopedCompanyId,
     method: provider ? { equals: provider } : { in: [...MOBILE_MONEY_PROVIDERS] },
-    normalizedReference: { not: null },
     ...(createdAt ? { createdAt } : {}),
     ...(cashierId ? { cashierId: String(cashierId) } : {}),
     ...(status === 'UNMATCHED'

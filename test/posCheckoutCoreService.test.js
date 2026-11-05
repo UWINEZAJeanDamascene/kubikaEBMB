@@ -35,12 +35,14 @@ describe('POS checkout core service', () => {
 
   test('builds the same pending checkout snapshot and verifies saved calculated lines', () => {
     const body = {
-      items: [{ productId: 'product-1', quantity: 2, unitPrice: 100, discountPct: 5, serialNumbers: ['S1'] }],
+      items: [{ productId: 'product-1', quantity: 2, unitPrice: 100, discountPct: 5, discountReason: 'Damaged', serialNumbers: ['S1'] }],
       warehouseId: 'warehouse-1', notes: 'counter sale', promotionId: 'promo-1',
+      cartDiscountPct: 0, cartDiscountReason: '',
     };
     expect(pendingCheckoutPayload(body)).toEqual({
-      items: [{ productId: 'product-1', quantity: 2, unitPrice: 100, discountPct: 5, serialNumbers: ['S1'] }],
+      items: [{ productId: 'product-1', quantity: 2, unitPrice: 100, discountPct: 5, discountReason: 'Damaged', serialNumbers: ['S1'] }],
       warehouseId: 'warehouse-1', notes: 'counter sale', promotionId: 'promo-1',
+      cartDiscountPct: 0, cartDiscountReason: '',
     });
     expect(lineValuesMatch({
       productId: 'product-1', qty: 2, unitPrice: 100, discountPct: 5, taxRate: 18,

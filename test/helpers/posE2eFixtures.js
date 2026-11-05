@@ -71,6 +71,7 @@ function saleLine(overrides = {}) {
     unitPrice: 1000,
     catalogUnitPrice: 1000,
     discountPct: 0,
+    discountReason: 'Test discount',
     description: 'POS Widget',
     ...overrides,
   };

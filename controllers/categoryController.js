@@ -2,7 +2,7 @@ const Category = require('../models/Category');
 const Product = require('../models/Product');
 const { dbClient } = require('../lib/prisma');
 
-const CATEGORY_FIELDS = ['name', 'description', 'parent', 'defaultInventoryAccount', 'defaultCogsAccount', 'defaultRevenueAccount', 'isActive', 'customFields'];
+const CATEGORY_FIELDS = ['name', 'description', 'parent', 'defaultInventoryAccount', 'defaultCogsAccount', 'defaultRevenueAccount', 'isActive', 'isNoDiscount', 'customFields'];
 
 function normalizeCategoryPayload(body = {}) {
   const payload = {};

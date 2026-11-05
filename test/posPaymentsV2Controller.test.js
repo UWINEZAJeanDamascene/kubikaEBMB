@@ -145,6 +145,8 @@ function setupDatabase(invoice = pendingInvoice()) {
   const db = {
     invoice: { findFirst: jest.fn().mockResolvedValue(invoice) },
     posShift: { findFirst: jest.fn().mockResolvedValue({ id: SHIFT_ID }) },
+    posRegister: { findFirst: jest.fn().mockResolvedValue({ systemTillType: 'retail' }) },
+    systemSettings: { findUnique: jest.fn().mockResolvedValue({ posDiscountSettings: null }) },
     posPayment,
     $queryRawUnsafe: jest.fn().mockResolvedValue([{ id: SALE_ID }]),
     $executeRawUnsafe: jest.fn().mockResolvedValue(1),
@@ -660,6 +662,28 @@ describe('POS Payments V2 controller', () => {
 
     expect(res.statusCode).toBe(409);
     expect(res.body.code).toBe('POS_CREDIT_CUSTOMER_REQUIRED');
+    expect(db.posPayment.create).not.toHaveBeenCalled();
+  });
+
+  test('blocks V2 credit payment when the assigned till type disables customer credit', async () => {
+    const { db } = setupDatabase();
+    db.posRegister.findFirst.mockResolvedValue({ systemTillType: 'restaurant' });
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: {
+        systemTillTypes: ['retail', 'restaurant'],
+        tillTypeFeatures: {
+          retail: { manualDiscounts: true, promotions: true, vouchers: true, customerCredit: true },
+          restaurant: { manualDiscounts: true, promotions: true, vouchers: true, customerCredit: false },
+        },
+      },
+    });
+    const req = request({ body: { payments: [{ method: 'CREDIT', amount: 100 }] } });
+    const res = response();
+
+    await controller.recordCashPayment(req, res, jest.fn());
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body.code).toBe('POS_TILL_FEATURE_DISABLED');
     expect(db.posPayment.create).not.toHaveBeenCalled();
   });
 
@@ -1258,7 +1282,11 @@ describe('POS Payments V2 controller', () => {
     await controller.completeSale(req, res, jest.fn());
 
     expect(createDirectSale).toHaveBeenCalledWith(req, res, expect.any(Function));
-    expect(req.posV2Completion).toEqual({ invoiceId: SALE_ID, completionKey: 'complete-key-01' });
+    expect(req.posV2Completion).toEqual({
+      invoiceId: SALE_ID,
+      completionKey: 'complete-key-01',
+      voucherReservations: false,
+    });
     expect(req.body).toMatchObject({
       warehouseId: '507f1f77bcf86cd799439018',
       clientId: CLIENT_ID,
@@ -1599,5 +1627,95 @@ describe('POS Payments V2 controller', () => {
     expect(res.statusCode).toBe(400);
     expect(res.body.code).toBe('POS_REFUND_REFERENCE_REQUIRED');
     expect(tx.posPaymentRefund.update).not.toHaveBeenCalled();
+  });
+
+  test('bounds payment reconciliation detail reads and preserves full provider totals', async () => {
+    const payment = {
+      id: 'payment-1',
+      method: 'AIRTEL_MONEY',
+      amount: 225,
+      providerTxId: 'AIR-123',
+      normalizedReference: 'AIR123',
+      reconciliationStatus: 'MATCHED',
+      status: 'SUCCESS',
+      createdAt: new Date('2026-11-05T10:00:00.000Z'),
+    };
+    const event = {
+      id: 'event-1',
+      provider: 'AIRTEL_MONEY',
+      eventKey: 'event-key',
+      payload: {},
+      signatureOk: true,
+      matchedPaymentId: null,
+      createdAt: new Date('2026-11-05T10:00:00.000Z'),
+    };
+    const posPayment = {
+      findMany: jest.fn().mockResolvedValue([payment]),
+      groupBy: jest.fn().mockResolvedValue([{
+        method: 'AIRTEL_MONEY',
+        reconciliationStatus: 'MATCHED',
+        _count: { _all: 2 },
+        _sum: { amount: 450 },
+      }]),
+      count: jest.fn().mockResolvedValue(2),
+    };
+    const posProviderEvent = {
+      findMany: jest.fn().mockResolvedValue([event]),
+      groupBy: jest.fn().mockResolvedValue([{
+        provider: 'AIRTEL_MONEY',
+        _count: { _all: 3 },
+      }]),
+      count: jest.fn().mockResolvedValue(1),
+    };
+    dbClient.mockReturnValue({ posPayment, posProviderEvent });
+    const res = response();
+
+    await controller.reportPaymentReconciliation(request(), res, jest.fn());
+
+    expect(res.statusCode).toBe(200);
+    expect(posPayment.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 500 }));
+    expect(posProviderEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 500 }));
+    expect(res.body.data.providerTotals.AIRTEL_MONEY).toEqual({
+      paymentsCount: 2,
+      paymentAmount: 450,
+      matchedCount: 2,
+      unmatchedCount: 0,
+      eventsCount: 3,
+    });
+    expect(res.body.data.details).toEqual({
+      payments: { returned: 1, total: 2, limit: 500, hasMore: true },
+      unmatchedEvents: { returned: 1, total: 1, limit: 500, hasMore: false },
+    });
+  });
+
+  test('uses bounded detail reads for payment-method reports', async () => {
+    const posPayment = {
+      groupBy: jest.fn().mockResolvedValue([{
+        method: 'AIRTEL_MONEY',
+        status: 'SUCCESS',
+        _count: { _all: 4 },
+        _sum: { amount: 900 },
+      }]),
+      count: jest.fn().mockResolvedValue(501),
+      findMany: jest.fn().mockResolvedValue(Array.from({ length: 500 }, () => ({
+        method: 'AIRTEL_MONEY',
+        status: 'SUCCESS',
+        amount: 225,
+        cashierId: CASHIER_ID,
+      }))),
+    };
+    dbClient.mockReturnValue({ posPayment });
+    const res = response();
+
+    await controller.reportPaymentsByMethod(request(), res, jest.fn());
+
+    expect(res.statusCode).toBe(200);
+    expect(posPayment.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 500 }));
+    expect(res.body.data.byMethod.AIRTEL_MONEY).toMatchObject({
+      count: 4,
+      amount: 900,
+      statuses: { SUCCESS: { count: 4, amount: 900 } },
+    });
+    expect(res.body.data.details).toEqual({ returned: 500, total: 501, limit: 500, hasMore: true });
   });
 });

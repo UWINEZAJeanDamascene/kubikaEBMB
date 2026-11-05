@@ -3,6 +3,9 @@ const { createHash } = require('crypto');
 const { prisma, dbClient } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
+const { getApprovalPolicy } = require('../services/posApprovalPolicyService');
+const { writePosAuditLog, requestIp } = require('../services/posAuditService');
+const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
 
 const ACTIONS = {
   discount: { resource: 'pos.till', permission: 'discount' },
@@ -42,6 +45,10 @@ exports.createApproval = async (req, res, next) => {
     if (!companyId || !cashierId || !rule || !payload || typeof payload !== 'object' || Array.isArray(payload)
       || !managerEmail || managerPassword.length < 1 || managerPassword.length > 256) {
       return res.status(400).json({ success: false, message: 'Complete the manager approval details and retry.' });
+    }
+    const policy = await getApprovalPolicy(prisma, companyId, action);
+    if (!policy.enabled) {
+      return res.status(403).json({ success: false, code: 'POS_APPROVAL_POLICY_DISABLED', message: 'This action is not currently enabled for manager approval.' });
     }
 
     const manager = await prisma.user.findFirst({
@@ -176,10 +183,17 @@ exports.createApproval = async (req, res, next) => {
         where: { companyId, id: { in: productIds } },
         select: { id: true, name: true, sellingPrice: true, isActive: true },
       });
+      const priceListPricing = await getWarehousePriceListPrices(
+        companyId,
+        String(payload.warehouseId || ''),
+        productIds,
+      );
       const productsById = new Map(products.map((product) => [product.id, product]));
       for (const line of saleLines) {
         const product = productsById.get(String(line.productId || ''));
-        const catalogPrice = Number(product?.sellingPrice);
+        const catalogPrice = product
+          ? Number(effectivePrice(product.id, product.sellingPrice, priceListPricing.priceByProduct))
+          : NaN;
         const requestedPrice = Number(line.unitPrice);
         const submittedCatalogPrice = Number(line.catalogUnitPrice);
         const discountPct = Number(line.discountPct || 0);
@@ -193,24 +207,33 @@ exports.createApproval = async (req, res, next) => {
         }
       }
     }
-    const ttlMinutes = action === 'discount' ? 10 : 5;
-    const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+    const expiresAt = new Date(Date.now() + policy.managerApprovalTtlSeconds * 1000);
     const id = generateObjectId();
-    const approval = await prisma.posManagerApproval.create({
-      data: {
-        id,
+    const approval = await prisma.$transaction(async (tx) => {
+      const created = await tx.posManagerApproval.create({
+        data: {
+          id,
+          companyId,
+          cashierId,
+          managerId: manager.id,
+          tillSessionId: tillSessionId || null,
+          action,
+          subjectId,
+          payloadHash: hashPayload(payload),
+          expiresAt,
+        },
+        select: { id: true, action: true, expiresAt: true },
+      });
+      await tx.user.update({ where: { id: manager.id }, data: { failedLoginAttempts: 0, lockedUntil: null } });
+      await writePosAuditLog({
         companyId,
-        cashierId,
-        managerId: manager.id,
-        tillSessionId: tillSessionId || null,
-        action,
-        subjectId,
-        payloadHash: hashPayload(payload),
-        expiresAt,
-      },
-      select: { id: true, action: true, expiresAt: true },
+        userId: manager.id,
+        event: 'APPROVAL_GRANTED',
+        metadata: { approvalId: created.id, action, requestedBy: cashierId, expiresAt: created.expiresAt.toISOString() },
+        ip: requestIp(req),
+      }, tx);
+      return created;
     });
-    await prisma.user.update({ where: { id: manager.id }, data: { failedLoginAttempts: 0, lockedUntil: null } });
     return res.status(201).json({
       success: true,
       data: { approvalId: approval.id, action: approval.action, expiresAt: approval.expiresAt, managerName: manager.name },

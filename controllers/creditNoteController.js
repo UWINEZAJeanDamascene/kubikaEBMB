@@ -12,7 +12,20 @@ const TaxAutomationService = require("../services/taxAutomationService");
 const emailService = require("../services/emailService");
 const { BankAccount } = require("../models/BankAccount");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
-const { normalizeCreditNoteLines } = require("../utils/creditNoteLineNormalization");
+const {
+  getProfile: getPosAccountingProfile,
+  resolveAccount: resolvePosAccountingAccount,
+} = require("../services/posAccountingProfileService");
+const {
+  normalizeCreditNoteLines,
+  requiresReturnedBatch,
+} = require("../utils/creditNoteLineNormalization");
+const {
+  buildCreditNoteCostLines,
+  findOriginalSaleCostAccounts,
+  findOriginalVatAccountCode,
+} = require("../utils/creditNoteAccounting");
+const { resolveOriginalUnitCost } = require("../utils/creditNoteCost");
 const { toIdString } = require("../utils/objectId");
 
 const EBMSalesService = require("../services/ebmSalesService");
@@ -28,6 +41,47 @@ const {
   generateQrPng,
   lineTaxDetails,
 } = require("../utils/pdfUtils");
+
+async function hydrateCreditNoteJournalEntries(note, companyId) {
+  if (!note) return note;
+  const JournalEntry = require('../models/JournalEntry');
+  for (const field of ['revenueReversalEntry', 'cogsReversalEntry', 'writeOffReversalEntry']) {
+    const current = note[field];
+    const entryId = current && typeof current === 'object'
+      ? current._id || current.id
+      : current;
+    if (!entryId) {
+      note[field] = null;
+      continue;
+    }
+    note[field] = await JournalEntry.findOne({
+      _id: String(entryId),
+      company: companyId,
+    });
+  }
+  return note;
+}
+
+function getWriteOffApprovalDetails(creditNote, invoice) {
+  const lines = [];
+  let amountCents = 0;
+  for (const line of creditNote.lines || creditNote.items || []) {
+    if (String(line.returnDisposition || 'restock').toLowerCase() !== 'write_off') continue;
+    const invoiceLine = invoice.lines.id(line.invoiceLineId);
+    if (!invoiceLine || invoiceLine.product?.isStockable === false) continue;
+    const quantity = Number(line.quantity || 0);
+    const unitCost = Number(invoiceLine.unitCost || 0);
+    const amount = Math.round(quantity * unitCost * 100) / 100;
+    amountCents += Math.round(amount * 100);
+    lines.push({
+      invoiceLineId: String(line.invoiceLineId),
+      quantity,
+      unitCost,
+      reason: String(line.writeOffReason || creditNote.reason || '').trim(),
+    });
+  }
+  return { amount: amountCents / 100, lines };
+}
 
 const sendCreditNoteEmail = async (note, company, client, action) => {
   try {
@@ -118,6 +172,7 @@ exports.getCreditNotes = async (req, res, next) => {
 
     // Build query filter
     let query = { company: companyId };
+    if (req.creditNotePosScoped === true) query.posOrigin = true;
 
     // Status filter
     if (status && status !== "all") {
@@ -185,11 +240,13 @@ exports.getCreditNote = async (req, res, next) => {
     const note = await CreditNote.findOne({
       _id: req.params.id,
       company: companyId,
+      ...(req.creditNotePosScoped === true ? { posOrigin: true } : {}),
     })
       .populate("invoice client createdBy")
       .populate("lines.product");
     if (!note)
       return res.status(404).json({ success: false, message: "Not found" });
+    await hydrateCreditNoteJournalEntries(note, companyId);
     res.json({ success: true, data: note });
   } catch (err) {
     next(err);
@@ -199,7 +256,11 @@ exports.getCreditNote = async (req, res, next) => {
 exports.generateCreditNotePDF = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const note = await CreditNote.findOne({ _id: req.params.id, company: companyId })
+    const note = await CreditNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+      ...(req.creditNotePosScoped === true ? { posOrigin: true } : {}),
+    })
       .populate("invoice")
       .populate("client")
       .populate("lines.product")
@@ -381,7 +442,7 @@ exports.createCreditNote = async (req, res, next) => {
         : payload.items && Array.isArray(payload.items)
           ? payload.items
           : [];
-    const lineArray = normalizeCreditNoteLines(invoice, requestedLines, payload.type || 'goods_return');
+    const lineArray = normalizeCreditNoteLines(invoice, requestedLines, payload.type || 'goods_return', payload.reason);
     payload.lines = lineArray;
     payload.subtotal = lineArray.reduce((sum, line) => sum + line.lineSubtotal, 0);
     payload.taxAmount = lineArray.reduce((sum, line) => sum + line.lineTax, 0);
@@ -1205,7 +1266,7 @@ exports.updateCreditNote = async (req, res, next) => {
     if (lines && Array.isArray(lines)) {
       const sourceInvoice = await Invoice.findOne({ _id: note.invoice, company: companyId });
       if (!sourceInvoice) return res.status(404).json({ success: false, message: 'Original invoice not found.' });
-      note.lines = normalizeCreditNoteLines(sourceInvoice, lines, note.type);
+      note.lines = normalizeCreditNoteLines(sourceInvoice, lines, note.type, note.reason);
       note.subtotal = note.lines.reduce((sum, line) => sum + Number(line.lineSubtotal || 0), 0);
       note.taxAmount = note.lines.reduce((sum, line) => sum + Number(line.lineTax || 0), 0);
       note.totalAmount = note.lines.reduce((sum, line) => sum + Number(line.lineTotal || 0), 0);
@@ -1259,7 +1320,10 @@ exports.confirmCreditNote = async (req, res, next) => {
     }
 
     // ========== STEP 1: VALIDATION ==========
-    const invoice = await Invoice.findById(creditNote.invoice).populate(
+    const invoice = await Invoice.findOne({
+      _id: toIdString(creditNote.invoice),
+      company: companyId,
+    }).populate(
       "lines.product",
     );
     if (!invoice) {
@@ -1316,6 +1380,7 @@ exports.confirmCreditNote = async (req, res, next) => {
 
     const serialReturnPlans = new Map();
     const serialsReturnedByProduct = new Set();
+    const originalSaleCostMovements = new Map();
     for (const line of lineArray) {
       // Find original invoice line
       const invoiceLine = invoice.lines.id(line.invoiceLineId);
@@ -1325,6 +1390,26 @@ exports.confirmCreditNote = async (req, res, next) => {
           code: "ERR_INVALID_INVOICE_LINE",
           message: "Invoice line not found",
         });
+      }
+
+      const returnDisposition = String(line.returnDisposition || 'restock').trim().toLowerCase();
+      if (!['restock', 'write_off'].includes(returnDisposition)) {
+        return res.status(422).json({
+          success: false,
+          code: 'CREDIT_NOTE_DISPOSITION_INVALID',
+          message: 'Returned goods disposition must be Restock or Write off.',
+        });
+      }
+      line.returnDisposition = returnDisposition;
+      if (returnDisposition === 'write_off') {
+        line.writeOffReason = String(line.writeOffReason || creditNote.reason || '').trim();
+        if (!line.writeOffReason) {
+          return res.status(422).json({
+            success: false,
+            code: 'CREDIT_NOTE_WRITE_OFF_REASON_REQUIRED',
+            message: `Enter a write-off reason for ${line.productName || 'each returned item'}.`,
+          });
+        }
       }
 
       // Validate qty doesn't exceed remaining
@@ -1355,7 +1440,42 @@ exports.confirmCreditNote = async (req, res, next) => {
 
       const product = line.product;
       const trackingType = product?.trackingType || 'none';
-      if (creditNote.type === 'goods_return' && product?.isStockable !== false && !line.returnToWarehouse) {
+      if (creditNote.posOrigin && creditNote.type === 'goods_return' && product?.isStockable !== false) {
+        const invoiceLineId = toIdString(invoiceLine._id || invoiceLine.id);
+        let costMovements = [];
+        let originalUnitCost = resolveOriginalUnitCost(invoiceLine);
+        if (!originalUnitCost) {
+          const productId = toIdString(invoiceLine.product || product);
+          const movementKey = `${invoiceLineId}:${productId}`;
+          if (!originalSaleCostMovements.has(movementKey)) {
+            const movements = await require('../lib/prisma').dbClient().stockMovement.findMany({
+              where: {
+                companyId: String(companyId),
+                productId,
+                referenceDocumentId: String(invoice._id),
+                referenceModel: 'Invoice',
+                type: 'out',
+                reason: 'sale',
+              },
+              select: { quantity: true, unitCost: true, totalCost: true },
+            });
+            originalSaleCostMovements.set(movementKey, movements);
+          }
+          costMovements = originalSaleCostMovements.get(movementKey);
+          originalUnitCost = resolveOriginalUnitCost(invoiceLine, costMovements);
+        }
+        if (!originalUnitCost) {
+          return res.status(409).json({
+            success: false,
+            code: 'POS_RETURN_COST_UNAVAILABLE',
+            message: `The original inventory cost for ${product?.name || line.productName || 'this item'} could not be recovered. The return was not posted.`,
+          });
+        }
+        invoiceLine.unitCost = originalUnitCost;
+        line.unitCost = originalUnitCost;
+      }
+      if (creditNote.type === 'goods_return' && product?.isStockable !== false
+        && returnDisposition === 'restock' && !line.returnToWarehouse) {
         return res.status(422).json({ success: false, code: 'ERR_RETURN_WAREHOUSE_REQUIRED', message: `Select a return warehouse for ${product?.name || line.productName}.` });
       }
       if (trackingType === 'serial') {
@@ -1410,11 +1530,12 @@ exports.confirmCreditNote = async (req, res, next) => {
         }
         serialReturnPlans.set(line, { existingSerialIds, missingSerialNumbers });
       }
-      if (trackingType === 'batch' && !line.batchId) {
+      if (requiresReturnedBatch(product, returnDisposition) && !line.batchId) {
         return res.status(422).json({ success: false, code: 'ERR_BATCH_REQUIRED', message: `Select the returned batch for ${product.name}.` });
       }
     }
 
+    const writeOffApprovalDetails = getWriteOffApprovalDetails({ ...creditNote, lines: lineArray }, invoice);
     let preparedV2Refund = null;
     let v2RefundOutboxId = null;
     if (creditNote.posOrigin) {
@@ -1440,6 +1561,7 @@ exports.confirmCreditNote = async (req, res, next) => {
     const StockMovement = require("../models/StockMovement");
     const StockBatch = require("../models/StockBatch");
     const StockLevel = require("../models/StockLevel");
+    const JournalEntry = require("../models/JournalEntry");
     const Warehouse = require("../models/Warehouse");
     const ChartOfAccount = require("../models/ChartOfAccount");
     const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
@@ -1460,19 +1582,44 @@ exports.confirmCreditNote = async (req, res, next) => {
       }
       if (creditNote.posOrigin) {
         const refundAmount = Number(creditNote.totalAmount || creditNote.grandTotal || creditNote.total || 0);
+        const paymentSettings = await require('../services/posPaymentService').getPaymentSettings(String(companyId));
+        const registerId = String(invoice.registerId || '');
+        const register = registerId
+          ? await dbClient().posRegister.findFirst({
+            where: { id: registerId, companyId: String(companyId) },
+            select: { systemTillType: true },
+          })
+          : null;
+        const approvalThreshold = require('../services/posPaymentService').resolveWriteOffApprovalThreshold(
+          paymentSettings,
+          register?.systemTillType || 'retail',
+        );
+        if (writeOffApprovalDetails.amount > approvalThreshold && !req.body.posManagerApprovalId) {
+          const approvalError = new Error('A manager must approve this returned-goods write-off before it can be posted.');
+          approvalError.statusCode = 403;
+          approvalError.code = 'CREDIT_NOTE_WRITE_OFF_APPROVAL_REQUIRED';
+          throw approvalError;
+        }
         await consumePosManagerApproval({
           approvalId: req.body.posManagerApprovalId,
           companyId,
           cashierId: req.user.id,
           action: 'refund',
           subjectId: String(creditNote._id),
-          payload: { invoiceId: String(invoice._id), creditNoteId: String(creditNote._id), refundAmount },
+          payload: {
+            invoiceId: String(invoice._id),
+            creditNoteId: String(creditNote._id),
+            refundAmount,
+            writeOffAmount: writeOffApprovalDetails.amount,
+            writeOffLines: writeOffApprovalDetails.lines,
+          },
         });
       }
       // Calculate totals for journal entries
       let totalSubtotal = 0;
       let totalTax = 0;
       let totalCogs = 0;
+      let totalWriteOffCogs = 0;
 
       const isGoodsReturn = creditNote.type === "goods_return";
 
@@ -1480,6 +1627,12 @@ exports.confirmCreditNote = async (req, res, next) => {
       for (const line of lineArray) {
         const product = line.product;
         if (!product) throw new Error(`Product on credit note line ${line.productName || ''} is missing.`);
+        if (line.returnDisposition === 'write_off'
+          && (creditNote.type !== 'goods_return' || product.isStockable === false)) {
+          const dispositionError = new Error('Write off is only available for stockable goods-return lines.');
+          dispositionError.statusCode = 422;
+          throw dispositionError;
+        }
 
         // Get taxRate from credit note line or fall back to invoice line
         let taxRate = line.taxRate;
@@ -1501,7 +1654,11 @@ exports.confirmCreditNote = async (req, res, next) => {
         );
         const lineSubtotal = Number(line.lineSubtotal ?? ((line.quantity || 0) * (line.unitPrice || 0)));
         const lineTax = Number(line.lineTax ?? (lineSubtotal * ((taxRate || 0) / 100)));
-        const lineCogs = (line.unitCost || 0) * (line.quantity || 0);
+        const sourceInvoiceLine = invoice.lines.id(line.invoiceLineId);
+        const originalUnitCost = resolveOriginalUnitCost(sourceInvoiceLine)
+          || Number(line.unitCost || 0);
+        const lineCogs = Math.round(originalUnitCost * Number(line.quantity || 0) * 100) / 100;
+        line.unitCost = originalUnitCost;
 
         console.log(
           "DEBUG: lineSubtotal =",
@@ -1511,108 +1668,131 @@ exports.confirmCreditNote = async (req, res, next) => {
         );
         totalSubtotal += lineSubtotal;
         totalTax += lineTax;
-        totalCogs += lineCogs;
+        const returnDisposition = line.returnDisposition || 'restock';
 
         // ========== STEP 4: Return stock to warehouse (goods return only) ==========
-        if (isGoodsReturn && product.isStockable) {
-          const warehouseId = toIdString(line.returnToWarehouse);
-          const warehouse = warehouseId
-            ? await Warehouse.findOne({ _id: warehouseId, company: companyId, isActive: true }).session(session)
-            : null;
-          if (!warehouse) throw new Error(`Select an active return warehouse for ${product.name}.`);
-
-          // Add stock using inventory service createLayer
-          await inventoryService.createLayer(
-            companyId,
-            product._id,
-            line.quantity,
-            line.unitCost || 0,
-            { type: 'credit_note', reference: creditNote.referenceNo },
-            {
-              warehouse: warehouse._id,
-              session,
-              userId: req.user.id,
-            },
-          );
-          await StockLevel.recalculateWAC(companyId, product._id, warehouse._id, Number(line.quantity), Number(line.unitCost || 0));
-
-          // Update batch if batch-tracked
-          if (line.batchId) {
-            const batchUpdate = await StockBatch.updateMany(
-              { _id: line.batchId, company: companyId, product: product._id },
-              { $inc: { qtyOnHand: Number(line.quantity) } },
-            );
-            if (batchUpdate.matchedCount !== 1) throw new Error(`The batch selected for ${product.name} could not be found.`);
-          }
-
-          // Update serial numbers if serial-tracked
+        if (isGoodsReturn && product.isStockable !== false) {
           const serialReturnPlan = serialReturnPlans.get(line);
-          if (serialReturnPlan?.existingSerialIds.length) {
-            const serialUpdate = await StockSerialNumber.updateMany(
-              { _id: { $in: serialReturnPlan.existingSerialIds }, company: companyId, product: product._id, status: 'dispatched' },
+          if (returnDisposition === 'write_off') {
+            totalWriteOffCogs += lineCogs;
+            line.nonStockWriteOff = true;
+            if (serialReturnPlan?.existingSerialIds.length) {
+              const serialUpdate = await StockSerialNumber.updateMany(
+                {
+                  _id: { $in: serialReturnPlan.existingSerialIds },
+                  company: companyId,
+                  product: product._id,
+                  status: 'dispatched',
+                },
+                {
+                  status: 'scrapped',
+                  returnedVia: creditNote._id,
+                  returnedAt: new Date(),
+                  notes: `Written off through credit note ${creditNote.referenceNo}: ${line.writeOffReason}`,
+                  dispatchedVia: null,
+                  dispatchedAt: null,
+                },
+                { session },
+              );
+              if (serialUpdate.matchedCount !== serialReturnPlan.existingSerialIds.length) {
+                throw new Error(`One or more serial numbers for ${product.name} are not currently dispatched.`);
+              }
+            }
+          } else {
+            totalCogs += lineCogs;
+            const warehouseId = toIdString(line.returnToWarehouse);
+            const warehouse = warehouseId
+              ? await Warehouse.findOne({ _id: warehouseId, company: companyId, isActive: true }).session(session)
+              : null;
+            if (!warehouse) throw new Error(`Select an active return warehouse for ${product.name}.`);
+
+            // Add stock using inventory service createLayer
+            await inventoryService.createLayer(
+              companyId,
+              product._id,
+              line.quantity,
+              originalUnitCost,
+              { sourceType: 'credit_note', sourceId: creditNote._id },
               {
-                status: "in_stock",
-                returnedVia: creditNote._id,
-                returnedAt: new Date(),
                 warehouse: warehouse._id,
-                dispatchedVia: null,
-                dispatchedAt: null,
+                session,
+                userId: req.user.id,
               },
+            );
+            await StockLevel.recalculateWAC(companyId, product._id, warehouse._id, Number(line.quantity), originalUnitCost);
+
+            // Update batch if batch-tracked
+            if (line.batchId) {
+              const batchUpdate = await StockBatch.updateMany(
+                { _id: line.batchId, company: companyId, product: product._id },
+                { $inc: { qtyOnHand: Number(line.quantity) } },
+              );
+              if (batchUpdate.matchedCount !== 1) throw new Error(`The batch selected for ${product.name} could not be found.`);
+            }
+
+            // Update serial numbers if serial-tracked
+            if (serialReturnPlan?.existingSerialIds.length) {
+              const serialUpdate = await StockSerialNumber.updateMany(
+                { _id: { $in: serialReturnPlan.existingSerialIds }, company: companyId, product: product._id, status: 'dispatched' },
+                {
+                  status: "in_stock",
+                  returnedVia: creditNote._id,
+                  returnedAt: new Date(),
+                  warehouse: warehouse._id,
+                  dispatchedVia: null,
+                  dispatchedAt: null,
+                },
+                { session },
+              );
+              if (serialUpdate.matchedCount !== serialReturnPlan.existingSerialIds.length) throw new Error(`One or more serial numbers for ${product.name} are not currently dispatched.`);
+            }
+            if (serialReturnPlan?.missingSerialNumbers.length) {
+              for (const serialNo of serialReturnPlan.missingSerialNumbers) {
+                await StockSerialNumber.create({
+                  company: companyId,
+                  product: product._id,
+                  warehouse: warehouse._id,
+                  serialNo,
+                  unitCost: originalUnitCost,
+                  status: 'in_stock',
+                  returnedVia: creditNote._id,
+                  returnedAt: new Date(),
+                  notes: `Serial record restored through credit note ${creditNote.referenceNo}.`,
+                });
+              }
+            }
+
+            // Create stock movement
+            const previousStock = Number(product.currentStock) || 0;
+            const newStock = previousStock + Number(line.quantity);
+
+            await StockMovement.create(
+              [
+                {
+                  company: companyId,
+                  product: product._id,
+                  warehouse: warehouse._id,
+                  type: "in",
+                  reason: "return",
+                  quantity: line.quantity,
+                  previousStock,
+                  newStock,
+                  unitCost: originalUnitCost,
+                  totalCost: lineCogs,
+                  referenceType: "credit_note",
+                  referenceDocument: creditNote._id,
+                  referenceModel: "CreditNote",
+                  referenceNumber: creditNote.referenceNo || creditNote.creditNoteNumber,
+                  notes: "CN#" + (creditNote.referenceNo || creditNote.creditNoteNumber) + " - Return",
+                  performedBy: req.user.id,
+                  movementDate: new Date(),
+                },
+              ],
               { session },
             );
-            if (serialUpdate.matchedCount !== serialReturnPlan.existingSerialIds.length) throw new Error(`One or more serial numbers for ${product.name} are not currently dispatched.`);
+
+            await Product.findByIdAndUpdate(product._id, { $inc: { currentStock: Number(line.quantity) } }, { session });
           }
-          if (serialReturnPlan?.missingSerialNumbers.length) {
-            for (const serialNo of serialReturnPlan.missingSerialNumbers) {
-              await StockSerialNumber.create({
-                company: companyId,
-                product: product._id,
-                warehouse: warehouse._id,
-                serialNo,
-                unitCost: line.unitCost || 0,
-                status: 'in_stock',
-                returnedVia: creditNote._id,
-                returnedAt: new Date(),
-                notes: `Serial record restored through credit note ${creditNote.referenceNo}.`,
-              });
-            }
-          }
-
-          // Create stock movement
-          // Use Number() to avoid string concatenation (currentStock can be Decimal128 string)
-          const previousStock = Number(product.currentStock) || 0;
-          const newStock = previousStock + Number(line.quantity);
-
-          await StockMovement.create(
-            [
-              {
-                company: companyId,
-                product: product._id,
-              warehouse: warehouse._id,
-                type: "in",
-                reason: "return",
-                quantity: line.quantity,
-                previousStock,
-                newStock,
-                unitCost: line.unitCost || 0,
-                totalCost: lineCogs,
-                sourceType: "credit_note",
-                sourceId: creditNote._id,
-                referenceNumber:
-                  creditNote.referenceNo || creditNote.creditNoteNumber,
-                notes:
-                  "CN#" +
-                  (creditNote.referenceNo || creditNote.creditNoteNumber) +
-                  " - Return",
-                performedBy: req.user.id,
-                movementDate: new Date(),
-              },
-            ],
-            { session },
-          );
-
-          // Update product stock
-          await Product.findByIdAndUpdate(product._id, { $inc: { currentStock: Number(line.quantity) } }, { session });
         }
 
         // ========== Track qty credited on invoice line ==========
@@ -1696,6 +1876,35 @@ exports.confirmCreditNote = async (req, res, next) => {
         }
       }
 
+      const journalIdOf = (value) => String(value?._id || value?.id || value || '');
+      const originalRevenueEntryId = journalIdOf(invoice.revenueJournalEntry);
+      const originalCogsEntryId = journalIdOf(invoice.cogsJournalEntry);
+      const originalRevenueEntry = originalRevenueEntryId
+        ? await JournalEntry.findOne({ _id: originalRevenueEntryId, company: companyId }).session(session)
+        : null;
+      const originalCogsEntry = originalCogsEntryId
+        ? await JournalEntry.findOne({ _id: originalCogsEntryId, company: companyId }).session(session)
+        : originalRevenueEntry;
+      if (creditNote.posOrigin && !originalRevenueEntry) {
+        const missingSource = new Error('The original POS sale journal is unavailable. The credit note cannot be posted safely.');
+        missingSource.statusCode = 409;
+        throw missingSource;
+      }
+      let originalVatAccountCode = null;
+      if (creditNote.posOrigin && totalTax > 0) {
+        try {
+          originalVatAccountCode = findOriginalVatAccountCode(originalRevenueEntry, Number(invoice.taxAmount || 0));
+        } catch (error) {
+          error.statusCode = 409;
+          throw error;
+        }
+      }
+      if (creditNote.posOrigin && totalTax > 0 && !originalVatAccountCode) {
+        const missingVat = new Error('The original POS sale has no VAT account to reverse.');
+        missingVat.statusCode = 409;
+        throw missingVat;
+      }
+
       // Build revenue reversal lines with proper debit/credit amounts
       // Credit the open invoice first. Any value beyond its receivable becomes
       // a customer advance liability that can later be refunded or allocated.
@@ -1708,7 +1917,7 @@ exports.confirmCreditNote = async (req, res, next) => {
           credit: 0,
         },
         ...(totalTax > 0 ? [{
-          accountCode: DEFAULT_ACCOUNTS.vatOutput || '2220',
+          accountCode: originalVatAccountCode || DEFAULT_ACCOUNTS.vatOutput || '2220',
           accountName: 'VAT Output',
           description: narration,
           debit: totalTax,
@@ -1743,61 +1952,89 @@ exports.confirmCreditNote = async (req, res, next) => {
         }] : []),
       ];
 
-      // Build COGS lines if goods return
-      let cogsLines = null;
-      if (isGoodsReturn && totalCogs > 0) {
-        let inventoryAccount = DEFAULT_ACCOUNTS.inventory;
-        let cogsAccount = DEFAULT_ACCOUNTS.costOfGoodsSold;
-        if (lineArray[0] && lineArray[0].product) {
-          const firstProduct = await Product.findById(
-            lineArray[0].product._id,
-          ).session(session);
-          if (firstProduct) {
-            if (firstProduct.inventoryAccount) {
-              const invId = firstProduct.inventoryAccount;
-              const isValidInvId = /^[0-9a-fA-F]{24}$/.test(invId);
-              const invQuery = isValidInvId
-                ? { $or: [{ _id: invId }, { accountCode: invId }], company: companyId }
-                : { accountCode: invId, company: companyId };
-              const inventoryAcct = await ChartOfAccount.findOne(invQuery).session(session);
-              if (inventoryAcct && inventoryAcct.accountCode) {
-                inventoryAccount = inventoryAcct.accountCode;
-              }
-            }
-            if (firstProduct.cogsAccount) {
-              const cogsId = firstProduct.cogsAccount;
-              const isValidCogsId = /^[0-9a-fA-F]{24}$/.test(cogsId);
-              const cogsQuery = isValidCogsId
-                ? { $or: [{ _id: cogsId }, { accountCode: cogsId }], company: companyId }
-                : { accountCode: cogsId, company: companyId };
-              const cogsAcct = await ChartOfAccount.findOne(cogsQuery).session(session);
-              if (cogsAcct && cogsAcct.accountCode) {
-                cogsAccount = cogsAcct.accountCode;
-              }
-            }
-          }
+      const hasCostToReverse = isGoodsReturn && totalCogs + totalWriteOffCogs > 0;
+      let originalCostAccounts = { inventoryAccountCode: null, cogsAccountCode: null };
+      if (hasCostToReverse) {
+        try {
+          originalCostAccounts = findOriginalSaleCostAccounts(originalCogsEntry);
+        } catch (error) {
+          error.statusCode = 409;
+          throw error;
         }
-        const cogsNarration =
-          "COGS Reversal - " +
-          (creditNote.client?.name || "Client") +
-          " - CN#" +
-          (creditNote.referenceNo || creditNote.creditNoteNumber);
-        cogsLines = [
-          {
-            accountCode: inventoryAccount,
-            accountName: "Inventory",
-            debit: totalCogs,
-            credit: 0,
-            description: cogsNarration,
-          },
-          {
-            accountCode: cogsAccount,
-            accountName: "Cost of Goods Sold",
-            debit: 0,
-            credit: totalCogs,
-            description: cogsNarration,
-          },
-        ];
+        if (creditNote.posOrigin && !originalCostAccounts.cogsAccountCode) {
+          const missingCogs = new Error('The original POS sale has no COGS account to reverse.');
+          missingCogs.statusCode = 409;
+          throw missingCogs;
+        }
+
+        if (!creditNote.posOrigin && (!originalCostAccounts.cogsAccountCode || !originalCostAccounts.inventoryAccountCode)) {
+          const firstProductId = toIdString(lineArray.find((line) => line.product)?.product);
+          const firstProduct = firstProductId
+            ? await Product.findOne({ _id: firstProductId, company: companyId }).session(session)
+            : null;
+          const resolveProductAccount = async (value, fallback) => {
+            if (!value) return fallback;
+            const accountId = String(value);
+            const query = /^[0-9a-fA-F]{24}$/.test(accountId)
+              ? { $or: [{ _id: accountId }, { accountCode: accountId }], company: companyId }
+              : { accountCode: accountId, company: companyId };
+            const account = await ChartOfAccount.findOne(query).session(session);
+            return account?.accountCode || fallback;
+          };
+          originalCostAccounts = {
+            inventoryAccountCode: originalCostAccounts.inventoryAccountCode
+              || await resolveProductAccount(firstProduct?.inventoryAccount, DEFAULT_ACCOUNTS.inventory),
+            cogsAccountCode: originalCostAccounts.cogsAccountCode
+              || await resolveProductAccount(firstProduct?.cogsAccount, DEFAULT_ACCOUNTS.costOfGoodsSold),
+          };
+        }
+      }
+
+      const costLines = hasCostToReverse
+        ? lineArray.flatMap((line) => {
+          const sourceLine = invoice.lines.id(line.invoiceLineId);
+          if (!sourceLine || line.product?.isStockable === false) return [];
+          const unitCost = Number(sourceLine.unitCost || 0);
+          if (unitCost <= 0) return [];
+          return [{
+            quantity: Number(line.quantity || 0),
+            unitCost,
+            returnDisposition: line.returnDisposition || 'restock',
+            inventoryAccountCode: originalCostAccounts.inventoryAccountCode,
+            cogsAccountCode: originalCostAccounts.cogsAccountCode,
+            description: `CN#${creditNote.referenceNo || creditNote.creditNoteNumber} - ${line.productName || 'Returned goods'}`,
+          }];
+        })
+        : [];
+      let writeOffAccountCode = DEFAULT_ACCOUNTS.stockAdjustmentLoss;
+      if (creditNote.posOrigin) {
+        const registerId = String(invoice.registerId || '');
+        const register = registerId
+          ? await dbClient().posRegister.findFirst({
+            where: { id: registerId, companyId: String(companyId) },
+            select: { systemTillType: true },
+          })
+          : null;
+        const profile = await getPosAccountingProfile(String(companyId));
+        writeOffAccountCode = resolvePosAccountingAccount(profile, 'stockAdjustmentLoss', {
+          tillType: register?.systemTillType || 'retail',
+          registerId,
+        }) || writeOffAccountCode;
+      }
+
+      let costJournalLines;
+      try {
+        costJournalLines = buildCreditNoteCostLines({
+          lines: costLines,
+          writeOffAccountCode,
+        });
+      } catch (error) {
+        error.statusCode = error.statusCode || 409;
+        throw error;
+      }
+      const { restockLines: cogsLines, writeOffLines, writeOffAmount } = costJournalLines;
+      if (Math.round(writeOffAmount * 100) !== Math.round(totalWriteOffCogs * 100)) {
+        throw new Error('The returned-goods write-off total changed while the credit note was being posted.');
       }
 
       // Prepare entries array
@@ -1813,7 +2050,7 @@ exports.confirmCreditNote = async (req, res, next) => {
           isAutoGenerated: true,
         },
       ];
-      if (cogsLines) {
+      if (cogsLines.length) {
         entriesToCreate.push({
           date: new Date(),
           description: `COGS Reversal - ${creditNote.referenceNo || creditNote.creditNoteNumber}`,
@@ -1824,16 +2061,29 @@ exports.confirmCreditNote = async (req, res, next) => {
           isAutoGenerated: true,
         });
       }
+      if (writeOffLines.length) {
+        entriesToCreate.push({
+          date: new Date(),
+          description: `Stock Write-off Reversal - ${creditNote.referenceNo || creditNote.creditNoteNumber}`,
+          sourceType: "credit_note_writeoff",
+          sourceId: creditNote._id,
+          sourceReference: `CN-WRITEOFF-${creditNote.referenceNo || creditNote.creditNoteNumber}`,
+          lines: writeOffLines,
+          isAutoGenerated: true,
+        });
+      }
 
       const created = await JournalService.createEntriesAtomic(
         companyId,
         req.user.id,
         entriesToCreate,
-        { session },
+        { session, allowDuplicate: false },
       );
       if (Array.isArray(created) && created.length > 0) {
-        creditNote.revenueReversalEntry = created[0]._id;
-        if (created[1]) creditNote.cogsReversalEntry = created[1]._id;
+        let createdIndex = 0;
+        creditNote.revenueReversalEntry = created[createdIndex++]?._id || null;
+        creditNote.cogsReversalEntry = cogsLines.length ? created[createdIndex++]?._id || null : null;
+        creditNote.writeOffReversalEntry = writeOffLines.length ? created[createdIndex]?._id || null : null;
       }
 
       // ========== STEP 5: Update AR balance ==========

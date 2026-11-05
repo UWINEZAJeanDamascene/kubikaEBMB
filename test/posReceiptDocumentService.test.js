@@ -9,7 +9,7 @@ describe('POS canonical receipt document', () => {
     createdBy: { name: 'Cashier A' }, registerName: 'Till 1', tillType: 'retail',
     receiptSettings: { showCustomer: true, showCashier: true, showSku: true, showBarcode: true, footerNote: 'Thank you', returnPolicy: 'Returns in 7 days' },
     receiptLines: [
-      { itemName: 'Tea', quantity: 2, unit: 'box', unitPriceRwf: '1,000', discountAmountRwf: '100', lineTotalRwf: '1,900', itemCode: 'TEA-1', barcode: '123', taxClassCode: 'B' },
+      { itemName: 'Tea', quantity: 2, unit: 'box', unitPriceRwf: '1,000', discountAmountRwf: '100', discountPercent: 5, discountReason: 'Damaged packaging', lineTotalRwf: '1,900', itemCode: 'TEA-1', barcode: '123', taxClassCode: 'B' },
     ],
     subtotal: 2000, totalDiscount: 100, totalTax: 290, grandTotal: 2190, amountPaid: 2190, changeGiven: 0,
     rraTotals: { taxableByType: [{ code: 'B', label: 'VAT 18%', amountRwf: '1,900', taxAmountRwf: '290' }], totalVatRwf: '290', grandTotalRwf: '2,190' },
@@ -23,8 +23,8 @@ describe('POS canonical receipt document', () => {
     expect(result.version).toBe(VERSION);
     expect(result.receipt.timeZone).toBe(TIME_ZONE);
     expect(result.receipt.localDateTime).toContain('02/11/2026');
-    expect(result.lines[0]).toMatchObject({ unitPriceRwf: 1000, discountRwf: 100, totalRwf: 1900, sku: 'TEA-1', barcode: '123' });
-    expect(result.totals).toMatchObject({ subtotalRwf: 2000, discountRwf: 100, taxTotalRwf: 290, grandTotalRwf: 2190 });
+    expect(result.lines[0]).toMatchObject({ unitPriceRwf: 1000, discountRwf: 100, discountPercent: 5, discountReason: 'Damaged packaging', totalRwf: 1900, sku: 'TEA-1', barcode: '123' });
+    expect(result.totals).toMatchObject({ subtotalRwf: 2000, discountRwf: 100, totalSavedRwf: 100, taxTotalRwf: 290, grandTotalRwf: 2190 });
     expect(result.totals.taxes).toEqual([{ code: 'B', label: 'VAT 18%', taxableRwf: 1900, taxRwf: 290 }]);
     expect(result.payments).toEqual([{ method: 'CASH', amountRwf: 1000, reference: null, kind: null }, { method: 'CARD', amountRwf: 1190, reference: 'AUTH-1', kind: null }]);
     expect(result.paymentSummary).toEqual({ amountPaidRwf: 2190, changeGivenRwf: 0 });
@@ -150,6 +150,9 @@ describe('POS canonical receipt document', () => {
       currency: 'RWF',
       subtotalRwf: expected.subtotal,
       discountRwf: expected.discount,
+      totalSavedRwf: expected.discount,
+      voucherDiscountRwf: 0,
+      vouchers: [],
       taxes: expected.taxBuckets,
       taxTotalRwf: expected.tax,
       grandTotalRwf: expected.grandTotal,
@@ -157,6 +160,20 @@ describe('POS canonical receipt document', () => {
     expect(result.payments.map((payment) => payment.method)).toEqual(expected.methods);
     expect(result.paymentSummary).toEqual({ amountPaidRwf: expected.amountPaid, changeGivenRwf: expected.change });
     expect(result.flags.receiptType).toBe(savedValues.receiptType);
+  });
+
+  test('includes masked voucher codes and savings in the receipt totals', () => {
+    const result = buildPosReceiptDocument({
+      ...sale,
+      discountAmountRwf: 300,
+      totalDiscount: 300,
+      posPricingSnapshot: {
+        voucherRedemptions: [{ name: 'Spring Offer', maskedCode: '****AB12', amountRwf: 300 }],
+      },
+    });
+
+    expect(result.totals.voucherDiscountRwf).toBe(300);
+    expect(result.totals.vouchers).toEqual([{ name: 'Spring Offer', code: '****AB12', discountRwf: 300 }]);
   });
 
   test('uses recorded payment change and leaves it absent when the saved sale has no change value', () => {

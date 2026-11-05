@@ -216,6 +216,7 @@ exports.getReceipt = async (req, res, next) => {
     data.promotionLabel = data.posPromotion?.name || data.posPromotion?.code || null;
     data.receiptLines = (data.items || data.lines || []).map((line, index) => {
       const tax = lineTaxDetails(line);
+      const pricingLine = data.posPricingSnapshot?.lines?.[index];
       const fiscalLine = data.ebm?.salesPayload?.itemList?.[index] || {};
       const itemName = line.product?.name || line.productName || line.description || 'Item';
       return {
@@ -237,6 +238,11 @@ exports.getReceipt = async (req, res, next) => {
         quantity: reprintSubmission && fiscalLine.qty != null ? fiscalLine.qty : (line.quantity || line.qty || 0),
         unit: getReceiptUnit(itemName, line.unit || line.product?.unit),
         unitPriceRwf: formatRwf(reprintSubmission && fiscalLine.prc != null ? fiscalLine.prc : line.unitPrice),
+        discountPercent: Number(line.discountPct) || 0,
+        discountReason: line.discountReason || null,
+        discountAmountRwf: formatRwf(reprintSubmission && fiscalLine.dcAmt != null
+          ? fiscalLine.dcAmt
+          : pricingLine?.totalDiscountRwf ?? (Number(line.lineSubtotal) || 0) * (Number(line.discountPct) || 0) / 100),
         taxType: tax.taxTyCd,
         taxRate: fiscalLine.taxRt ?? line.taxRate ?? null,
         taxTypeLabel: tax.taxTypeLabel,

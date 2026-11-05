@@ -288,7 +288,11 @@ class JournalService {
         // Allow duplicates when creating multiple entries atomically so
         // creators can intentionally persist multiple balanced entries
         // for the same source (tests expect two journal docs for some flows).
-        const mergedOpts = Object.assign({}, entOpts, { session: sess, allowDuplicate: true, forceNoTransaction: !sess });
+        const mergedOpts = Object.assign({}, entOpts, {
+          session: sess,
+          allowDuplicate: options.allowDuplicate === undefined ? true : options.allowDuplicate,
+          forceNoTransaction: !sess,
+        });
         try {
           const res = await this.createEntry(companyId, userId, mergedOpts);
           results.push(res);

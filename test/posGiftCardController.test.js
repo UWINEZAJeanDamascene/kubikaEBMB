@@ -15,12 +15,20 @@ jest.mock('../services/posAuditService', () => ({
   requestIp: jest.fn(() => '127.0.0.1'),
   writePosAuditLog: jest.fn().mockResolvedValue(undefined),
 }));
+jest.mock('qrcode', () => ({ toDataURL: jest.fn(async (value) => `data:image/png;base64,${Buffer.from(value).toString('base64')}`) }));
+jest.mock('../services/smsService', () => ({
+  normalizePhoneNumber: jest.fn((value) => value.startsWith('+') ? value : null),
+  sendSMS: jest.fn().mockResolvedValue({ success: true }),
+}));
+jest.mock('../services/emailService', () => ({ sendEmail: jest.fn().mockResolvedValue(true) }));
 
 const { dbClient } = require('../lib/prisma');
 const { runInTransaction } = require('../services/transactionService');
 const JournalService = require('../services/journalService');
 const posPaymentService = require('../services/posPaymentService');
 const { writePosAuditLog } = require('../services/posAuditService');
+const smsService = require('../services/smsService');
+const { sendEmail } = require('../services/emailService');
 const { hashStoredValueCode } = require('../services/posStoredValueCodeService');
 const controller = require('../controllers/posGiftCardController');
 
@@ -61,11 +69,26 @@ function request({ body = {}, code, key = 'gift-card-key-01' } = {}) {
   };
 }
 
-function setupDatabase(queryHandler = async () => []) {
+function setupDatabase(queryHandler = async () => [], settings = {}) {
   const db = {
     $queryRawUnsafe: jest.fn(queryHandler),
     $executeRawUnsafe: jest.fn().mockResolvedValue(1),
     posCashMovement: { create: jest.fn().mockResolvedValue({ id: 'cash-movement-id' }) },
+    systemSettings: {
+      findUnique: jest.fn().mockResolvedValue({
+        posGiftCardSettings: {
+          maxPerCard: 100000,
+          dailyLimitPerCashier: 300000,
+          tillTypeOverrides: {},
+        },
+        posCashOutApprovalLimit: 50000,
+        ...settings,
+      }),
+    },
+    posApproval: {
+      findFirst: jest.fn(),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
   };
   dbClient.mockReturnValue(db);
   runInTransaction.mockImplementation((operation) => operation(db));
@@ -95,10 +118,8 @@ describe('POS gift card controller', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body.data).toEqual({
-      kind: 'gift_card',
       balance: 2500,
       currencyCode: 'RWF',
-      codeSuffix: 'EF01',
       expiresAt: null,
     });
     expect(JSON.stringify(res.body)).not.toContain(CARD_CODE);
@@ -123,17 +144,19 @@ describe('POS gift card controller', () => {
     const res = response();
 
     await controller.issueOrLoad(request({
-      body: { operation: 'ISSUE', amount: 5000, reason: 'Customer gift card purchase' },
+      body: { operation: 'ISSUE', paymentCaptured: true, amount: 5000, reason: 'Customer gift card purchase' },
     }), res, (error) => { throw error; });
     issuedCode = res.body.data.code;
 
     expect(res.statusCode).toBe(201);
-    expect(issuedCode).toMatch(/^KB-[A-F0-9]{24}$/);
+    expect(issuedCode).toMatch(/^KB-[2-9A-HJ-KM-NP-Z]{4}-[2-9A-HJ-KM-NP-Z]{4}$/);
     expect(res.body.data.balance).toBe(5000);
+    expect(res.body.data.qrDataUrl).toContain(Buffer.from(issuedCode).toString('base64'));
     expect(db.$queryRawUnsafe).toHaveBeenCalledWith(
       expect.stringContaining('INSERT INTO pos_stored_value_accounts'),
       expect.any(String),
       COMPANY_ID,
+      null,
       hashStoredValueCode(issuedCode),
       issuedCode.slice(-4),
       'RWF',
@@ -179,6 +202,11 @@ describe('POS gift card controller', () => {
       })],
       expect.objectContaining({ session: db }),
     );
+    expect(posPaymentService.assertPaymentMethodEnabled).toHaveBeenCalledWith({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      method: 'CASH',
+    });
     expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
       event: 'GIFT_CARD_ISSUED',
       metadata: expect.objectContaining({ codeSuffix: issuedCode.slice(-4), amount: 5000 }),
@@ -255,7 +283,7 @@ describe('POS gift card controller', () => {
     const res = response();
 
     await controller.issueOrLoad(request({
-      body: { operation: 'ISSUE', amount: 5000, reason: 'Customer gift card purchase' },
+      body: { operation: 'ISSUE', paymentCaptured: true, amount: 5000, reason: 'Customer gift card purchase' },
     }), res, jest.fn());
 
     expect(res.statusCode).toBe(200);
@@ -282,5 +310,235 @@ describe('POS gift card controller', () => {
     }), invalidExpiry, jest.fn());
     expect(invalidExpiry.statusCode).toBe(400);
     expect(db.$queryRawUnsafe).not.toHaveBeenCalled();
+  });
+
+  test('does not issue a cashier gift card until full cash payment is confirmed', async () => {
+    const db = setupDatabase();
+    const res = response();
+
+    await controller.issueCashier(request({
+      body: { amount: 1000, reason: 'Customer gift card purchase' },
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.code).toBe('POS_GIFT_CARD_REQUEST_INVALID');
+    expect(db.$queryRawUnsafe).not.toHaveBeenCalled();
+    expect(JournalService.createEntriesAtomic).not.toHaveBeenCalled();
+  });
+
+  test('rejects cashier issues above the configured per-card maximum', async () => {
+    const db = setupDatabase();
+    const res = response();
+
+    await controller.issueCashier(request({
+      body: { paymentCaptured: true, amount: 100001, reason: 'Large gift card' },
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('POS_GIFT_CARD_MAX_VALUE_EXCEEDED');
+    expect(runInTransaction).not.toHaveBeenCalled();
+    expect(JournalService.createEntriesAtomic).not.toHaveBeenCalled();
+    expect(db.posCashMovement.create).not.toHaveBeenCalled();
+  });
+
+  test('blocks cashier issue with a clear instruction when CASH is disabled', async () => {
+    const db = setupDatabase();
+    posPaymentService.assertPaymentMethodEnabled.mockRejectedValue(Object.assign(
+      new Error('CASH is not enabled.'),
+      { code: 'POS_PAYMENT_METHOD_DISABLED' },
+    ));
+    const res = response();
+
+    await controller.issueCashier(request({
+      body: { paymentCaptured: true, amount: 5000, reason: 'Customer gift card purchase' },
+    }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({
+      success: false,
+      code: 'POS_PAYMENT_METHOD_DISABLED',
+      message: 'Cash is turned off for this register. Ask a manager to enable it, or take another enabled payment method.',
+    });
+    expect(runInTransaction).not.toHaveBeenCalled();
+    expect(JournalService.createEntriesAtomic).not.toHaveBeenCalled();
+    expect(db.posCashMovement.create).not.toHaveBeenCalled();
+  });
+
+  test('replaces a gift card only after manager approval and disables the old code', async () => {
+      const oldCode = 'KB-ABCDEF0123456789ABCDEF01';
+      const db = setupDatabase(async (sql) => {
+        if (String(sql).includes('FOR UPDATE') && String(sql).includes('pos_stored_value_accounts')) {
+          return [{
+            id: 'old-card-id',
+            clientId: null,
+            balance: '4500',
+            currencyCode: 'RWF',
+            codeSuffix: 'EF01',
+            expiresAt: null,
+            isActive: true,
+            replacedByAccountId: null,
+          }];
+        }
+        if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
+          return [{ id: 'replacement-card-id', balance: '4500', currencyCode: 'RWF' }];
+        }
+        if (String(sql).includes('FROM pos_shifts')) return [{ id: 'open-shift-id' }];
+        return [];
+      });
+      db.posApproval.findFirst.mockResolvedValue({
+        id: 'approval-id',
+        approvedBy: 'manager-id',
+      });
+      const res = response();
+
+      await controller.reissue(request({
+        body: { code: oldCode, reason: 'Customer lost the card', approvalToken: 'approved-token' },
+        key: 'replacement-key-01',
+      }), res, (error) => { throw error; });
+
+      expect(res.statusCode).toBe(201);
+      expect(res.body.data.code).toMatch(/^KB-[2-9A-HJ-KM-NP-Z]{4}-[2-9A-HJ-KM-NP-Z]{4}$/);
+      expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+        expect.stringContaining('SET is_active = FALSE, replaced_by_account_id'),
+        'replacement-card-id',
+        COMPANY_ID,
+        'old-card-id',
+      );
+      expect(db.posApproval.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ action: 'GIFT_CARD_REISSUE', requestedBy: USER_ID }),
+      }));
+      expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'GIFT_CARD_REPLACED',
+        metadata: expect.objectContaining({
+          oldAccountId: 'old-card-id',
+          newAccountId: 'replacement-card-id',
+          oldCodeSuffix: 'EF01',
+          approvedById: 'manager-id',
+        }),
+      }), db);
+      const auditCalls = JSON.stringify(writePosAuditLog.mock.calls);
+      expect(auditCalls).not.toContain(oldCode);
+      expect(auditCalls).not.toContain(res.body.data.code);
+      expect(JSON.stringify(db.$queryRawUnsafe.mock.calls)).not.toContain(oldCode);
+  });
+
+  test('sends a requested gift-card delivery and audits only the masked suffix', async () => {
+      const code = 'KB-ABCD-EFGH';
+      const db = setupDatabase(async () => [{
+        id: 'gift-card-id',
+        balance: '2500',
+        currencyCode: 'RWF',
+        codeSuffix: 'EFGH',
+        expiresAt: null,
+      }]);
+      const res = response();
+      await controller.deliver({
+        ...request({ body: { channel: 'SMS', code, destination: '+250788123456' } }),
+        posAuthContext: {
+          company: { id: COMPANY_ID, name: 'Kubika Shop' },
+          register: { id: REGISTER_ID },
+          user: { id: USER_ID },
+        },
+      }, res, (error) => { throw error; });
+
+      expect(res.statusCode).toBe(200);
+      expect(smsService.sendSMS).toHaveBeenCalledWith(
+        '+250788123456',
+        expect.stringContaining(code),
+      );
+      expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'GIFT_CARD_DELIVERED',
+        metadata: expect.objectContaining({ codeSuffix: 'EFGH', channel: 'SMS' }),
+      }));
+      expect(JSON.stringify(writePosAuditLog.mock.calls)).not.toContain(code);
+  });
+
+  test('requires manager approval when an issue would exceed the cashier daily limit', async () => {
+    const db = setupDatabase(async (sql) => {
+      if (String(sql).includes('FROM pos_shifts')) return [{ id: 'open-shift-id' }];
+      if (String(sql).includes('COALESCE(SUM(amount), 0)')) return [{ total: '290000' }];
+      return [];
+    });
+    const res = response();
+
+    await controller.issueCashier(request({
+      body: { paymentCaptured: true, amount: 20000, reason: 'Customer gift card purchase' },
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatchObject({
+      code: 'POS_APPROVAL_REQUIRED',
+      approvalContext: {
+        shiftId: 'open-shift-id',
+        amount: 20000,
+        dailyTotal: 290000,
+        dailyLimit: 300000,
+      },
+    });
+    expect(JournalService.createEntriesAtomic).not.toHaveBeenCalled();
+    expect(db.posCashMovement.create).not.toHaveBeenCalled();
+  });
+
+  test('accepts a matching manager approval and posts the issue once', async () => {
+    let issuedCode;
+    const db = setupDatabase(async (sql) => {
+      if (String(sql).includes('FROM pos_stored_value_ledger l')) return [];
+      if (String(sql).includes('FROM pos_shifts')) return [{ id: 'open-shift-id' }];
+      if (String(sql).includes('COALESCE(SUM(amount), 0)')) return [{ total: '0' }];
+      if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
+        return [{ id: 'gift-card-id', balance: '50001', currencyCode: 'RWF' }];
+      }
+      return [];
+    });
+    db.posApproval.findFirst.mockResolvedValue({
+      id: 'approval-id',
+      approvedBy: 'manager-user-id',
+    });
+    const req = request({
+      body: { paymentCaptured: true, amount: 50001, reason: 'Customer gift card purchase' },
+    });
+    req.headers['x-pos-approval-token'] = 'manager-approval-token';
+    const res = response();
+
+    await controller.issueCashier(req, res, (error) => { throw error; });
+    issuedCode = res.body.data.code;
+
+    expect(res.statusCode).toBe(201);
+    expect(issuedCode).toMatch(/^KB-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/);
+    expect(db.posApproval.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        requestedBy: USER_ID,
+        action: 'GIFT_CARD_ISSUE',
+        context: { equals: expect.objectContaining({ shiftId: 'open-shift-id', amount: 50001 }) },
+      }),
+    }));
+    expect(db.posApproval.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 'approval-id' }),
+    }));
+    expect(db.posCashMovement.create).toHaveBeenCalledTimes(1);
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'GIFT_CARD_ISSUED',
+      metadata: expect.objectContaining({ approvedById: 'manager-user-id' }),
+    }), db);
+  });
+
+  test('requires the current cashier own open shift and corresponding till', async () => {
+    const db = setupDatabase(async () => []);
+    const res = response();
+
+    await controller.issueCashier(request({
+      body: { paymentCaptured: true, amount: 1000, reason: 'Customer gift card purchase' },
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('POS_SHIFT_NOT_OPEN');
+    expect(db.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('till.opened_by = shift.opened_by'),
+      COMPANY_ID,
+      REGISTER_ID,
+      USER_ID,
+    );
+    expect(JournalService.createEntriesAtomic).not.toHaveBeenCalled();
+    expect(db.posCashMovement.create).not.toHaveBeenCalled();
   });
 });

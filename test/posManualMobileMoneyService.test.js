@@ -4,7 +4,6 @@ jest.mock('../lib/prisma', () => ({ dbClient: jest.fn() }));
 jest.mock('../services/transactionService', () => ({ runInTransaction: jest.fn() }));
 jest.mock('../services/posAuditService', () => ({ writePosAuditLog: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/posPaymentService', () => ({
-  getPaymentSettings: jest.fn(),
   assertPaymentMethodEnabled: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -38,7 +37,7 @@ function request(overrides = {}) {
   };
 }
 
-function setup({ mode = 'VERIFY', totalAmount = 1000, existingPayments = [], prior = null, duplicate = null } = {}) {
+function setup({ totalAmount = 1000, existingPayments = [], prior = null, duplicate = null } = {}) {
   const payment = {
     findFirst: jest.fn(async ({ where }) => {
       if (where.idempotencyKey) return prior;
@@ -65,7 +64,6 @@ function setup({ mode = 'VERIFY', totalAmount = 1000, existingPayments = [], pri
   };
   dbClient.mockReturnValue({});
   runInTransaction.mockImplementation((operation) => operation(tx));
-  posPaymentService.getPaymentSettings.mockResolvedValue({ manualMobileMoneyMode: mode });
   posPaymentService.assertPaymentMethodEnabled.mockResolvedValue(undefined);
   return { tx, payment };
 }
@@ -75,8 +73,8 @@ describe('manual mobile money payment service', () => {
     jest.clearAllMocks();
   });
 
-  test('records an INSTANT payment as successful with normalized provider details and audit attribution', async () => {
-    const { payment } = setup({ mode: 'INSTANT' });
+  test('records a cashier-confirmed payment as successful with normalized provider details and audit attribution', async () => {
+    const { payment } = setup();
 
     const result = await service.recordManualMobileMoneyPayment(request());
 
@@ -102,13 +100,39 @@ describe('manual mobile money payment service', () => {
     );
   });
 
-  test('records VERIFY payments as pending and does not count them as received', async () => {
+  test('records manual mobile money as successful without a confirmation-mode setting', async () => {
     const { payment } = setup();
     const result = await service.recordManualMobileMoneyPayment(request());
 
-    expect(result.payment.status).toBe('PENDING_VERIFICATION');
-    expect(result.payment.confirmedById).toBeNull();
-    expect(result.payment.completedAt).toBeNull();
+    expect(result.payment).toMatchObject({
+      status: 'SUCCESS',
+      confirmedById: CASHIER_ID,
+    });
+    expect(result.payment.confirmedAt).toBeInstanceOf(Date);
+    expect(result.payment.completedAt).toBeInstanceOf(Date);
+    expect(payment.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'SUCCESS', confirmedById: CASHIER_ID }),
+    }));
+  });
+
+  test('records manual mobile money without a transaction ID when explicitly confirmed received', async () => {
+    const { payment } = setup();
+
+    const result = await service.recordManualMobileMoneyPayment(request({
+      reference: '',
+      payerPhone: '',
+    }));
+
+    expect(result.payment).toMatchObject({
+      status: 'SUCCESS',
+      amount: 1000,
+      reference: null,
+      providerTxId: null,
+      normalizedReference: null,
+      payerPhone: null,
+    });
+    expect(payment.findFirst).toHaveBeenCalledTimes(2);
+    expect(payment.findFirst.mock.calls.every(([query]) => !query.where.normalizedReference)).toBe(true);
   });
 
   test('requires the exact remaining whole-RWF amount and rejects overpayment', async () => {
@@ -160,5 +184,44 @@ describe('manual mobile money payment service', () => {
       replayed: true,
     });
     expect(payment.create).not.toHaveBeenCalled();
+  });
+
+  test('allows manager confirmation without a transaction ID for a payment recorded without one', async () => {
+    const payment = {
+      id: '507f1f77bcf86cd799439020',
+      companyId: COMPANY_ID,
+      saleId: SALE_ID,
+      method: 'AIRTEL_MONEY',
+      amount: 1000,
+      status: 'PENDING_VERIFICATION',
+      normalizedReference: null,
+      cashierId: CASHIER_ID,
+    };
+    const updatedPayment = { ...payment, status: 'SUCCESS' };
+    const tx = {
+      $queryRawUnsafe: jest.fn().mockResolvedValue([{ id: payment.id }]),
+      posPayment: {
+        findFirst: jest.fn().mockResolvedValue(payment),
+        update: jest.fn().mockResolvedValue(updatedPayment),
+      },
+      posApproval: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'approval-id' }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+    runInTransaction.mockImplementation((operation) => operation(tx));
+
+    await expect(service.confirmManualMobileMoneyPayment({
+      companyId: COMPANY_ID,
+      paymentId: payment.id,
+      managerId: '507f1f77bcf86cd799439099',
+      registerId: REGISTER_ID,
+      providerReference: '',
+      approvalToken: 'manager-approval-token',
+    })).resolves.toEqual({ payment: updatedPayment, replayed: false });
+
+    expect(tx.posApproval.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ context: { equals: { paymentId: payment.id, providerReference: null } } }),
+    }));
   });
 });

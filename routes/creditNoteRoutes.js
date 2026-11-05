@@ -4,6 +4,7 @@ const { protect } = require('../middleware/auth');
 const { requireAssignedPermissions: requirePermission } = require('../middleware/posAuthorization');
 const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
 const { requirePosSession, requirePermission: requirePosPermission } = require('../middleware/posAuthMiddleware');
+const { authorizeCreditNoteRead } = require('../middleware/creditNoteReadAuthorization');
 const CreditNote = require('../models/CreditNote');
 const controller = require('../controllers/creditNoteController');
 
@@ -48,15 +49,15 @@ function authorizeCreditNoteDraft(req, res, next) {
 }
 
 router.route('/')
-  .get(requirePermission('credit_notes', 'read'), controller.getCreditNotes)
+  .get(authorizeCreditNoteRead, controller.getCreditNotes)
   .post(authorizeCreditNoteDraft, controller.createCreditNote);
 
 router.route('/:id')
-  .get(requirePermission('credit_notes', 'read'), controller.getCreditNote)
+  .get(authorizeCreditNoteRead, controller.getCreditNote)
   .put(requirePermission('credit_notes', 'update'), controller.updateCreditNote)
   .delete(requirePermission('credit_notes', 'delete'), controller.deleteCreditNote);
 
-router.get('/:id/pdf', requirePermission('credit_notes', 'read'), controller.generateCreditNotePDF);
+router.get('/:id/pdf', authorizeCreditNoteRead, controller.generateCreditNotePDF);
 
 // Module 8: Confirm credit note - triggers dual journal reversal + stock return
 async function authorizeCreditNoteConfirmation(req, res, next) {

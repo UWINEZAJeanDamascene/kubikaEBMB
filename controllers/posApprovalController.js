@@ -4,6 +4,7 @@ const { generateObjectId } = require('../utils/objectId');
 const { verifyRegisterPin } = require('./posAuthController');
 const { hasPosPermission } = require('../middleware/posAuthMiddleware');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
+const { getApprovalPolicy } = require('../services/posApprovalPolicyService');
 
 const APPROVABLE_ACTIONS = new Set([
   'DISCOUNT_OVER_LIMIT',
@@ -15,6 +16,8 @@ const APPROVABLE_ACTIONS = new Set([
   'SHIFT_REOPEN',
   'SHIFT_CLOSE_VARIANCE',
   'CASH_OUT',
+  'GIFT_CARD_ISSUE',
+  'GIFT_CARD_REISSUE',
   'CANCEL_PAID_SALE',
   'REMOVE_PAYMENT',
   'MANUAL_PAYMENT_CONFIRM',
@@ -32,6 +35,7 @@ function permissionForApprovalAction(action) {
   if (normalized.includes('VOID')) return 'pos.till.void';
   if (normalized === 'NO_SALE') return 'pos.till.no_sale';
   if (['CASH_OUT', 'CASH_IN', 'SAFE_DROP'].includes(normalized)) return 'pos.till.cash_move';
+  if (['GIFT_CARD_ISSUE', 'GIFT_CARD_REISSUE'].includes(normalized)) return 'pos.giftcard.manage';
   return null;
 }
 
@@ -81,6 +85,17 @@ exports.create = async (req, res, next) => {
     const requesterId = String(context.session.userId);
     const companyId = String(context.session.companyId);
     const registerId = String(context.session.registerId);
+    const policy = await getApprovalPolicy(prisma, companyId, action);
+    if (!policy.enabled) {
+      await audit(prisma, req, {
+        companyId,
+        registerId,
+        userId: requesterId,
+        event: 'APPROVAL_DENIED',
+        metadata: { action, reason: 'POS_APPROVAL_POLICY_DISABLED' },
+      });
+      return invalidRequest(res, 403, 'POS_APPROVAL_POLICY_DISABLED', 'This action is not currently enabled for manager approval.');
+    }
     const manager = await prisma.user.findFirst({
       where: {
         id: String(approverUserId),
@@ -160,7 +175,7 @@ exports.create = async (req, res, next) => {
 
     const approvalToken = randomBytes(32).toString('base64url');
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + APPROVAL_TTL_MS);
+    const expiresAt = new Date(now.getTime() + policy.pinApprovalTtlSeconds * 1000);
     const tokenHash = createHash('sha256').update(approvalToken, 'utf8').digest('hex');
     const verified = await verifyRegisterPin({
       companyId,

@@ -16,6 +16,7 @@ const FIELD_MAP = {
   defaultInventoryAccount: { target: 'defaultInventoryAccount' },
   defaultCogsAccount: { target: 'defaultCogsAccount' },
   defaultRevenueAccount: { target: 'defaultRevenueAccount' },
+  isNoDiscount: { target: 'isNoDiscount' },
   customFields: { target: 'customFields' },
 };
 

@@ -22,7 +22,8 @@ jest.mock('../services/transactionService', () => ({
 const { prisma } = require('../lib/prisma');
 const { postShiftVariance } = require('../services/posShiftAccountingService');
 const { runInTransaction } = require('../services/transactionService');
-const { close, zReport } = require('../controllers/posShiftCloseController');
+const { close, zReport, movementTotals } = require('../controllers/posShiftCloseController');
+const { calculateExpectedCash } = require('../services/posShiftService');
 
 const COMPANY_ID = '507f1f77bcf86cd799439011';
 const REGISTER_ID = '507f1f77bcf86cd799439012';
@@ -213,6 +214,20 @@ beforeEach(() => {
 });
 
 describe('POS shift close and Z report', () => {
+  test('counts a bank deposit as one cash-out when calculating expected cash', () => {
+    const movements = movementTotals([{
+      type: 'cash_out',
+      amount: 4000,
+      reasonCode: 'BANK_DEPOSIT',
+    }]);
+
+    expect(movements).toEqual({ cashIn: 0, cashOut: 4000, safeDrops: 0 });
+    expect(calculateExpectedCash({
+      openingFloat: 10000,
+      cashOut: movements.cashOut,
+    })).toBe(6000);
+  });
+
   test('requires an idempotency key before touching the database', async () => {
     const res = createResponse();
 
