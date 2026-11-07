@@ -87,9 +87,13 @@ describe('POS stored value issuance', () => {
       expect(JournalService.createEntriesAtomic).toHaveBeenCalledWith(
         'company-id',
         'manager-id',
-        expect.any(Array),
+        expect.arrayContaining([
+          expect.objectContaining({
+            sourceData: { paymentMethod, bankAccountId: 'bank-account-id' },
+          }),
+        ]),
         expect.objectContaining({
-          sourceData: { paymentMethod, bankAccountId: 'bank-account-id' },
+          allowDuplicate: false,
         }),
       );
       expect(BankAccount.findOne).toHaveBeenCalledWith({
@@ -97,6 +101,13 @@ describe('POS stored value issuance', () => {
         company: 'company-id',
         isActive: true,
       });
+      expect(dbClient().$executeRawUnsafe).toHaveBeenCalledWith(
+        expect.stringContaining('UPDATE pos_stored_value_ledger'),
+        expect.anything(),
+        'posted',
+        expect.any(String),
+        'company-id',
+      );
       expect(findClaimedRegister).not.toHaveBeenCalled();
       expect(TillSession.findOne).not.toHaveBeenCalled();
       expect(dbClient().$queryRawUnsafe).not.toHaveBeenCalled();

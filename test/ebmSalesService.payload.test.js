@@ -66,6 +66,7 @@ jest.mock('../services/taxAutomationService', () => ({
 }));
 
 const { buildSalesTrnPayload } = require('../services/ebmSalesService');
+const posAccountingBuilders = require('../services/posAccountingBuilders');
 const EBMSalesService = require('../services/ebmSalesService');
 const ebmService = require('../services/ebmService');
 const EBMCode = require('../models/EBMCode');
@@ -231,6 +232,60 @@ async function build(invoice, options = {}) {
 }
 
 describe('EBM sales item rows', () => {
+  it('reconciles an explicitly discounted sale between the ledger and fiscal totals', async () => {
+    const invoice = makeInvoice({
+      subtotal: 1000,
+      totalDiscount: 100,
+      taxAmount: '162.00',
+      totalAmount: '1062.00',
+      lines: [{
+        ...BASE_LINE,
+        qty: '1.00',
+        unitPrice: '1000.00',
+        lineSubtotal: '1000.00',
+        discountPct: 10,
+        lineTax: '162.00',
+        lineTotal: '1062.00',
+        taxRate: '18.00',
+        pkg: '1.00',
+      }],
+    });
+    const payload = await build(invoice);
+    const entries = posAccountingBuilders.buildSaleJournalEntries({
+      invoice: {
+        ...invoice,
+        id: 'discounted-sale',
+        amountPaid: 1062,
+        amountOutstanding: 0,
+        lines: invoice.lines.map((line) => ({ ...line, cogsAmount: 420 })),
+      },
+      tenders: [{ paymentMethod: 'cash', amountRwf: 1062 }],
+      accounts: {
+        posRegisterCash: '1000',
+        accountsReceivable: '1300',
+        salesRevenue: '4000',
+        vatOutput: '2220',
+        costOfGoodsSold: '5000',
+        inventory: '1400',
+      },
+    });
+    const revenueLines = entries[0].lines;
+    const revenueCredit = revenueLines
+      .filter((line) => line.accountCode === '4000')
+      .reduce((sum, line) => sum + line.credit, 0);
+    const vatCredit = revenueLines
+      .filter((line) => line.accountCode === '2220')
+      .reduce((sum, line) => sum + line.credit, 0);
+
+    expect(payload).toMatchObject({
+      totTaxblAmt: '900.00',
+      totTaxAmt: '162.00',
+      totAmt: '1062.00',
+    });
+    expect(revenueCredit).toBe(Number(payload.totTaxblAmt));
+    expect(vatCredit).toBe(Number(payload.totTaxAmt));
+  });
+
   it('rejects an inactive cached tax code before sequence allocation, customer lookup, or queue creation', async () => {
     const invoice = makeInvoice({
       _id: 'invoice-preflight',

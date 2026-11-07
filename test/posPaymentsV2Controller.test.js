@@ -505,10 +505,10 @@ describe('POS Payments V2 controller', () => {
     expect(db.posPayment.create).not.toHaveBeenCalled();
   });
 
-  test('rejects split payment methods that are not integrated in this step', async () => {
+  test('rejects split payment methods reserved for pending-confirmation support', async () => {
     const { db } = setupDatabase();
     const req = request({
-      body: { payments: [{ method: 'CASH', amount: 500 }, { method: 'CARD', amount: 500 }] },
+      body: { payments: [{ method: 'CASH', amount: 500 }, { method: 'BANK_TRANSFER', amount: 500 }] },
     });
     const res = response();
 
@@ -517,6 +517,29 @@ describe('POS Payments V2 controller', () => {
     expect(res.statusCode).toBe(409);
     expect(res.body.code).toBe('POS_PAYMENT_METHOD_UNAVAILABLE');
     expect(db.posPayment.create).not.toHaveBeenCalled();
+  });
+
+  test('records a card allocation with its required reference', async () => {
+    const { db } = setupDatabase();
+    db.posPayment.aggregate.mockReset().mockResolvedValue({ _sum: { amount: 0 } });
+    db.posPayment.create.mockImplementation(({ data }) => Promise.resolve(data));
+    const req = request({
+      body: { method: 'CARD', amount: 1000, reference: 'CARD-REF-001' },
+    });
+    const res = response();
+
+    await controller.recordCashPayment(req, res, (error) => { throw error; });
+
+    expect(res.body).toMatchObject({ success: true });
+    expect(res.statusCode).toBe(201);
+    expect(db.posPayment.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        method: 'CARD',
+        amount: 1000,
+        reference: 'CARD-REF-001',
+        normalizedReference: 'CARD-REF-001',
+      }),
+    }));
   });
 
   test('records customer credit within the available limit as a split allocation', async () => {
@@ -550,6 +573,7 @@ describe('POS Payments V2 controller', () => {
     expect(posPaymentService.assertPaymentMethodEnabled).toHaveBeenCalledWith({
       companyId: COMPANY_ID,
       registerId: REGISTER_ID,
+      tillType: 'retail',
       method: 'CREDIT',
     });
   });
@@ -606,6 +630,9 @@ describe('POS Payments V2 controller', () => {
       'POS gift card redemption',
       CASHIER_ID,
     );
+    expect(db.$executeRawUnsafe.mock.calls.find(([sql]) => (
+      String(sql).includes('pos_payment_id, idempotency_key, operation_type, invoice_id')
+    ))[0]).toContain("'pending'");
     expect(db.posPayment.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         method: 'GIFT_CARD',
@@ -1286,6 +1313,7 @@ describe('POS Payments V2 controller', () => {
       invoiceId: SALE_ID,
       completionKey: 'complete-key-01',
       voucherReservations: false,
+      manualMobileMoneyPaymentIds: [],
     });
     expect(req.body).toMatchObject({
       warehouseId: '507f1f77bcf86cd799439018',
@@ -1663,14 +1691,16 @@ describe('POS Payments V2 controller', () => {
       findMany: jest.fn().mockResolvedValue([event]),
       groupBy: jest.fn().mockResolvedValue([{
         provider: 'AIRTEL_MONEY',
-        _count: { _all: 3 },
+        _count: { _all: 1 },
       }]),
       count: jest.fn().mockResolvedValue(1),
     };
     dbClient.mockReturnValue({ posPayment, posProviderEvent });
     const res = response();
 
-    await controller.reportPaymentReconciliation(request(), res, jest.fn());
+    await controller.reportPaymentReconciliation(request({
+      query: { from: '2026-11-05', to: '2026-11-05', provider: 'airtel_money' },
+    }), res, jest.fn());
 
     expect(res.statusCode).toBe(200);
     expect(posPayment.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 500 }));
@@ -1680,12 +1710,27 @@ describe('POS Payments V2 controller', () => {
       paymentAmount: 450,
       matchedCount: 2,
       unmatchedCount: 0,
-      eventsCount: 3,
+      eventsCount: 1,
     });
     expect(res.body.data.details).toEqual({
       payments: { returned: 1, total: 2, limit: 500, hasMore: true },
       unmatchedEvents: { returned: 1, total: 1, limit: 500, hasMore: false },
     });
+    expect(posPayment.findMany.mock.calls[0][0].where).toMatchObject({
+      method: { equals: 'AIRTEL_MONEY' },
+      createdAt: {
+        gte: new Date('2026-11-05T00:00:00.000Z'),
+        lte: new Date('2026-11-05T23:59:59.999Z'),
+      },
+    });
+    expect(posProviderEvent.findMany.mock.calls[0][0].where).toMatchObject({
+      provider: 'AIRTEL_MONEY',
+      matchedPaymentId: null,
+    });
+    expect(res.body.data.payments[0].reference).toBe('***R123');
+    expect(res.body.data.payments[0]).not.toHaveProperty('normalizedReference');
+    expect(res.body.data.unmatchedEvents[0]).not.toHaveProperty('payload');
+    expect(res.body.data.unmatchedEvents[0]).not.toHaveProperty('eventKey');
   });
 
   test('uses bounded detail reads for payment-method reports', async () => {
@@ -1707,10 +1752,26 @@ describe('POS Payments V2 controller', () => {
     dbClient.mockReturnValue({ posPayment });
     const res = response();
 
-    await controller.reportPaymentsByMethod(request(), res, jest.fn());
+    await controller.reportPaymentsByMethod(request({
+      query: {
+        from: '2026-11-05',
+        to: '2026-11-05',
+        method: 'airtel_money',
+        status: 'success',
+      },
+    }), res, jest.fn());
 
     expect(res.statusCode).toBe(200);
     expect(posPayment.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 500 }));
+    expect(posPayment.findMany.mock.calls[0][0].where).toMatchObject({
+      method: 'AIRTEL_MONEY',
+      status: 'SUCCESS',
+      createdAt: {
+        gte: new Date('2026-11-05T00:00:00.000Z'),
+        lte: new Date('2026-11-05T23:59:59.999Z'),
+      },
+    });
+    expect(res.body.data.payments).toHaveLength(500);
     expect(res.body.data.byMethod.AIRTEL_MONEY).toMatchObject({
       count: 4,
       amount: 900,

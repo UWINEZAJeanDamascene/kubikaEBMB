@@ -42,6 +42,7 @@ jest.mock('../services/posAccountingProfileService', () => ({
     registerOverrides: {},
   }),
   resolveAccount: jest.fn(() => null),
+  assertTenderMappings: jest.fn(),
 }));
 jest.mock('../services/CurrencyService', () => ({ getCompanyBase: jest.fn() }));
 jest.mock('../services/cacheService', () => ({ bumpCompanyFinancialCaches: jest.fn() }));
@@ -58,6 +59,20 @@ jest.mock('../services/posPaymentService', () => ({
   getPaymentSettings: jest.fn().mockResolvedValue({ paymentFlow: 'LEGACY', registerPaymentFlowOverrides: {} }),
   resolvePaymentFlow: jest.fn(() => 'LEGACY'),
   resolveEnabledMethods: jest.fn(() => ['CASH', 'MTN_MOMO', 'AIRTEL_MONEY']),
+  getEffectiveMethodRegistry: jest.fn(() => ({ methods: [] })),
+  assertPaymentMethodEnabled: jest.fn().mockResolvedValue(undefined),
+  validateTenderConfiguration: jest.fn((_settings, tender) => {
+    if (tender.method === 'CARD' && !tender.reference) {
+      throw Object.assign(new Error('Enter the card slip reference for Card.'), {
+        code: 'POS_PAYMENT_REFERENCE_REQUIRED',
+      });
+    }
+    if (tender.method === 'MTN_MOMO' && !tender.reference && !tender.allowOptionalReference) {
+      throw Object.assign(new Error('Enter the transaction id for Mobile money.'), {
+        code: 'POS_PAYMENT_REFERENCE_REQUIRED',
+      });
+    }
+  }),
 }));
 jest.mock('../services/posAuditService', () => ({
   writePosAuditLog: jest.fn().mockResolvedValue(undefined),
@@ -124,6 +139,7 @@ function emptyCheckoutDb() {
     systemSettings: { findUnique: jest.fn().mockResolvedValue(null) },
     userRole: { findMany: jest.fn().mockResolvedValue([]) },
     $queryRawUnsafe: checkoutQueryMock(),
+    $executeRawUnsafe: jest.fn().mockResolvedValue(1),
   };
 }
 
@@ -269,7 +285,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(runInTransaction).not.toHaveBeenCalled();
   });
 
-  test('blocks card tender until a terminal is configured', async () => {
+  test('requires a card slip reference for a manual card tender', async () => {
     CurrencyService.getCompanyBase.mockResolvedValue('RWF');
     TillSession.findOne.mockResolvedValue({ _id: IDS.till, status: 'open', openedBy: IDS.cashier });
     Warehouse.findOne.mockResolvedValue({ _id: IDS.warehouse });
@@ -282,8 +298,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       body: checkoutBody({ paymentMethod: 'card', paymentAmount: 1180 }),
     }), res, jest.fn());
 
-    expect(res.statusCode).toBe(409);
-    expect(res.body.code).toBe('POS_CARD_TERMINAL_NOT_CONFIGURED');
+    expect(res.statusCode).toBe(400);
+    expect(res.body.code).toBe('POS_PAYMENT_REFERENCE_REQUIRED');
     expect(runInTransaction).not.toHaveBeenCalled();
   });
 
@@ -361,7 +377,13 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     });
     expect(JournalService.createEntriesAtomic).toHaveBeenCalled();
     const [, , journalEntries, journalOptions] = JournalService.createEntriesAtomic.mock.calls[0];
-    expect(journalOptions).toEqual(expect.objectContaining({ session: null, allowDuplicate: false }));
+    expect(journalOptions).toEqual(expect.objectContaining({
+      session: expect.objectContaining({
+        $executeRawUnsafe: expect.any(Function),
+        $queryRawUnsafe: expect.any(Function),
+      }),
+      allowDuplicate: false,
+    }));
     expect(journalEntries[0].lines).toEqual(expect.arrayContaining([
       expect.objectContaining({ accountCode: '1005', debit: 1180 }),
       expect.objectContaining({ accountCode: '4010', credit: 1000 }),
@@ -544,6 +566,14 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     await createDirectSale(req, res, (err) => { throw err; });
 
     expect(res.statusCode).toBe(201);
+    expect(require('../services/posPaymentService').validateTenderConfiguration).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        method: 'AIRTEL_MONEY',
+        reference: '',
+        allowOptionalReference: true,
+      }),
+    );
     expect(Invoice.create).not.toHaveBeenCalled();
     expect(JournalService.createEntriesAtomic).toHaveBeenCalledTimes(1);
     const entries = JournalService.createEntriesAtomic.mock.calls[0][2];
@@ -859,7 +889,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     );
   });
 
-  test('V2 gift-card completion retries concurrently after failure with one journal, stock deduction, and EBM dispatch', async () => {
+  test('V2 gift-card completion keeps the sale after journal failure and replays without repeating business work', async () => {
     const { db } = stubHappyPathDeps();
     const completionKey = 'complete-retry-giftcard-0001';
     const shiftId = '777777777777777777777778';
@@ -1029,25 +1059,20 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     const retried = [mockRes(), mockRes()];
     await Promise.all(retried.map((res) => posPaymentsV2Controller.completeSale(req, res, next)));
 
-    expect(failed.statusCode).toBe(503);
-    expect(failed.body.code).toBe('POS_ACCOUNTING_POST_FAILED');
-    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
-      expect.stringContaining('SET pos_posting_status = $1'),
-      'failed',
-      IDS.invoice,
-      IDS.company,
-    );
-    expect(retried.map((res) => res.statusCode).sort()).toEqual([200, 201]);
+    expect(failed.statusCode).toBe(201);
+    expect(failed.body.success).toBe(true);
+    expect(failed.body.data.posPostingStatus).toBe('pending');
+    expect(retried.map((res) => res.statusCode)).toEqual([200, 200]);
     expect(retried.every((res) => res.body.success)).toBe(true);
-    expect(retried.filter((res) => res.body.replayed === true)).toHaveLength(1);
+    expect(retried.every((res) => res.body.replayed === true)).toBe(true);
     expect(retried.map((res) => res.body.data._id)).toEqual([IDS.invoice, IDS.invoice]);
     expect(retried[0].body.data).toBe(retried[1].body.data);
     expect(req.posV2Completion.completionKey).toBe(completionKey);
-    expect(JournalService.createEntriesAtomic).toHaveBeenCalledTimes(2);
+    expect(JournalService.createEntriesAtomic).toHaveBeenCalledTimes(1);
     expect(stockState).toEqual({
       warehouseQuantity: initialStock.warehouseQuantity - 1,
       productQuantity: initialStock.productQuantity - 1,
-      committedJournals: 1,
+      committedJournals: 0,
     });
     expect(EBMSalesService.submitInvoiceAsync).toHaveBeenCalledTimes(1);
   });
@@ -1177,6 +1202,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     await createDirectSale(makeReq({
       body: checkoutBody({
         paymentMethod: 'mobile_money',
+        paymentProvider: 'momo',
         paymentAmount: 1180,
         paymentReference: 'MOMO-TX-99',
         bankAccountId: IDS.bank,

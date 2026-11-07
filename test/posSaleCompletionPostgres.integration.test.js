@@ -21,6 +21,9 @@ jest.mock('../services/posPaymentService', () => {
       manualMobileMoneyMode: 'INSTANT',
       manualMobileMoneyReceivers: { MTN_MOMO: '*182*8#' },
       momoTimeoutSec: 120,
+      allowOverCreditLimit: false,
+      bankTransferNeedsConfirm: false,
+      providerEnvironment: 'sandbox',
     }),
     resolvePaymentFlow: jest.fn(() => 'PAYMENTS_V2'),
     assertPaymentMethodEnabled: jest.fn().mockResolvedValue(undefined),
@@ -28,6 +31,7 @@ jest.mock('../services/posPaymentService', () => {
 });
 
 jest.mock('../services/ebmService', () => ({
+  ...jest.requireActual('../services/ebmService'),
   getConfig: jest.fn(() => ({ mode: 'sandbox' })),
 }));
 
@@ -254,7 +258,6 @@ async function createFixture() {
       () => prisma.product.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.category.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.warehouse.deleteMany({ where: { companyId: fixture.companyId } }),
-      () => prisma.client.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.user.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.company.deleteMany({ where: { id: fixture.companyId } }),
     );
@@ -277,6 +280,41 @@ async function createFixture() {
         name: 'POS Sale Completion Integration Test',
         code: `POS-SALE-COMPLETE-${fixture.companyId}`,
       },
+    });
+    const accountingAccounts = [
+      { code: '1000', name: 'POS cash', type: 'asset' },
+      { code: '1200', name: 'MTN MoMo clearing', type: 'asset' },
+      { code: '1300', name: 'Accounts receivable', type: 'asset' },
+      { code: '1400', name: 'Inventory', type: 'asset' },
+      { code: '2220', name: 'VAT output', type: 'liability' },
+      { code: '2850', name: 'Gift card liability', type: 'liability' },
+      { code: '4000', name: 'Sales revenue', type: 'revenue' },
+      { code: '5000', name: 'Cost of goods sold', type: 'cogs' },
+    ];
+    await prisma.chartOfAccount.createMany({
+      data: accountingAccounts.map((account) => ({
+        id: objectId(),
+        companyId: fixture.companyId,
+        ...account,
+      })),
+    });
+    await prisma.accountMapping.createMany({
+      data: [
+        ['posRegisterCash', '1000'],
+        ['mtnMoMo', '1200'],
+        ['accountsReceivable', '1300'],
+        ['inventory', '1400'],
+        ['vatOutput', '2220'],
+        ['giftCardLiability', '2850'],
+        ['salesRevenue', '4000'],
+        ['costOfGoodsSold', '5000'],
+      ].map(([key, accountCode]) => ({
+        id: objectId(),
+        companyId: fixture.companyId,
+        module: 'pos_accounting',
+        key: `company:${key}`,
+        accountCode,
+      })),
     });
     await prisma.user.create({
       data: {
@@ -579,7 +617,7 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
     jest.restoreAllMocks();
   });
 
-  integrationTest('rolls back a failed posting, then concurrent same-key retries post once', async () => {
+  integrationTest('defers a failed posting, then retries once before replaying concurrent completions', async () => {
     const EBMSalesService = require('../services/ebmSalesService');
     const JournalService = require('../services/journalService');
     const emailService = require('../services/emailService');
@@ -605,9 +643,9 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
         expectedPostingFailureLog.mockRestore();
       }
 
-      expect(failedResponse.statusCode).toBe(503);
-      expect(failedResponse.body.code).toBe('POS_ACCOUNTING_POST_FAILED');
-      const [pendingInvoice, failedJournals, failedStock, failedProduct, failedLayer, failedMovements, failedPayments] = await Promise.all([
+      expect(failedResponse.statusCode).toBe(201);
+      expect(failedResponse.body.success).toBe(true);
+      const [pendingInvoice, deferredJournals, deferredStock, deferredProduct, deferredLayer, deferredMovements, deferredPayments] = await Promise.all([
         prisma.invoice.findUnique({ where: { id: fixture.saleId } }),
         prisma.journalEntry.findMany({ where: { companyId: fixture.companyId, sourceId: fixture.saleId } }),
         prisma.stockLevel.findUnique({ where: { id: fixture.stockLevelId } }),
@@ -616,21 +654,30 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
         prisma.stockMovement.findMany({ where: { companyId: fixture.companyId, productId: fixture.productId } }),
         prisma.posPayment.findMany({ where: { companyId: fixture.companyId, saleId: fixture.saleId } }),
       ]);
-      expect(pendingInvoice.status).toBe('PENDING_PAYMENT');
-      expect(pendingInvoice.posCompletionKey).toBeNull();
-      expect(failedJournals).toHaveLength(0);
-      expect(Number(failedStock.qtyOnHand)).toBe(5);
-      expect(Number(failedProduct.currentStock)).toBe(5);
-      expect(Number(failedLayer.qtyRemaining)).toBe(5);
-      expect(failedMovements).toHaveLength(0);
-      expect(failedPayments).toHaveLength(1);
-      expect(await fixture.countInvoiceFinalizations()).toBe(0);
-      expect(await prisma.ebmSubmissionQueue.count({ where: { companyId: fixture.companyId, documentId: fixture.saleId } })).toBe(0);
+      expect(pendingInvoice.status).toBe('fully_paid');
+      expect(pendingInvoice.posPostingStatus).toBe('pending');
+      expect(pendingInvoice.posCompletionKey).toBe(`completion-retry-${fixture.companyId}`);
+      expect(deferredJournals).toHaveLength(0);
+      expect(Number(deferredStock.qtyOnHand)).toBe(4);
+      expect(Number(deferredProduct.currentStock)).toBe(4);
+      expect(Number(deferredLayer.qtyRemaining)).toBe(4);
+      expect(deferredMovements).toHaveLength(1);
+      expect(deferredPayments).toHaveLength(1);
+      expect(await fixture.countInvoiceFinalizations()).toBe(1);
       expect(await fixture.readFailureMarker()).toBe(1);
-      expect(EBMSalesService.submitInvoiceAsync).not.toHaveBeenCalled();
       await assertLedgerMatchesBalance(fixture.companyId, fixture.accountId);
 
       await fixture.removeJournalFailureTrigger();
+      await prisma.$executeRawUnsafe(
+        `UPDATE "pos_accounting_postings"
+         SET "next_retry_at" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         WHERE "company_id" = $1 AND "source_type" = 'pos_sale' AND "source_id" = $2`,
+        fixture.companyId,
+        fixture.saleId,
+      );
+      await expect(require('../services/posAccountingPostingService').processDuePostings())
+        .resolves.toMatchObject({ processed: 1, posted: 1, deferred: 0, failed: 0 });
+
       const completionKey = `completion-retry-${fixture.companyId}`;
       const successfulResponses = [response(), response()];
       await Promise.all(successfulResponses.map((res) => controller.completeSale(
@@ -639,10 +686,10 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
         (error) => { if (error) throw error; },
       )));
 
-      expect(successfulResponses.map((res) => res.statusCode).sort()).toEqual([200, 201]);
+      expect(successfulResponses.map((res) => res.statusCode)).toEqual([200, 200]);
       expect(successfulResponses.every((res) => res.body.success)).toBe(true);
-      expect(successfulResponses.filter((res) => res.body.replayed === true)).toHaveLength(1);
-      expect(successfulResponses.map((res) => res.body.data._id)).toEqual([fixture.saleId, fixture.saleId]);
+      expect(successfulResponses.filter((res) => res.body.replayed === true)).toHaveLength(2);
+      expect(successfulResponses.map((res) => res.body.data.id)).toEqual([fixture.saleId, fixture.saleId]);
       const [completedInvoice, journals, stock, product, layer, movements] = await Promise.all([
         prisma.invoice.findUnique({ where: { id: fixture.saleId } }),
         prisma.journalEntry.findMany({
@@ -768,7 +815,7 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
     }
   });
 
-  integrationTest('rolls back all completion writes when journal posting fails after stock deduction', async () => {
+  integrationTest('defers journal posting after stock deduction and safely retries it', async () => {
     const fixture = await createFixture();
     try {
       await recordGiftCardPayment(fixture);
@@ -787,8 +834,8 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
         errorLog.mockRestore();
       }
 
-      expect(res.statusCode).toBe(503);
-      expect(res.body.code).toBe('POS_ACCOUNTING_POST_FAILED');
+      expect(res.statusCode).toBe(201);
+      expect(res.body.success).toBe(true);
       const [invoice, journals, stock, product, layer, movements, finalizations] = await Promise.all([
         prisma.invoice.findUnique({ where: { id: fixture.saleId } }),
         prisma.journalEntry.findMany({
@@ -802,16 +849,30 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
         }),
         fixture.countInvoiceFinalizations(),
       ]);
-      expect(invoice.status).toBe('PENDING_PAYMENT');
-      expect(invoice.posCompletionKey).toBeNull();
+      expect(invoice.status).toBe('fully_paid');
+      expect(invoice.posPostingStatus).toBe('pending');
+      expect(invoice.posCompletionKey).toBe(`complete-stock-rollback-${fixture.companyId}`);
       expect(journals).toHaveLength(0);
-      expect(Number(stock.qtyOnHand)).toBe(5);
-      expect(Number(product.currentStock)).toBe(5);
-      expect(Number(layer.qtyRemaining)).toBe(5);
-      expect(movements).toHaveLength(0);
-      expect(finalizations).toBe(0);
+      expect(Number(stock.qtyOnHand)).toBe(4);
+      expect(Number(product.currentStock)).toBe(4);
+      expect(Number(layer.qtyRemaining)).toBe(4);
+      expect(movements).toHaveLength(1);
+      expect(finalizations).toBe(1);
       expect(await fixture.readFailureMarker()).toBe(1);
       await assertLedgerMatchesBalance(fixture.companyId, fixture.accountId);
+      await fixture.removeJournalFailureTrigger();
+      await prisma.$executeRawUnsafe(
+        `UPDATE "pos_accounting_postings"
+         SET "next_retry_at" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         WHERE "company_id" = $1 AND "source_type" = 'pos_sale' AND "source_id" = $2`,
+        fixture.companyId,
+        fixture.saleId,
+      );
+      await expect(require('../services/posAccountingPostingService').processDuePostings())
+        .resolves.toMatchObject({ processed: 1, posted: 1, deferred: 0, failed: 0 });
+      expect(await prisma.journalEntry.count({
+        where: { companyId: fixture.companyId, sourceType: 'invoice', sourceId: fixture.saleId },
+      })).toBe(1);
     } finally {
       await fixture.cleanup();
     }

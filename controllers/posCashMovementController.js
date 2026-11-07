@@ -57,7 +57,7 @@ function sameMovementRequest(existing, expected) {
 function movementResponse(movement, replayed) {
   const movementWithStatus = {
     ...movement,
-    postingStatus: movement.journalEntryId ? 'posted' : 'pending',
+    postingStatus: movement.postingStatus || (movement.journalEntryId ? 'posted' : 'pending'),
   };
   return {
     success: true,
@@ -93,7 +93,7 @@ exports.list = async (req, res, next) => {
       data: {
         movements: movements.map((movement) => ({
           ...movement,
-          postingStatus: movement.journalEntryId ? 'posted' : 'pending',
+          postingStatus: movement.postingStatus || (movement.journalEntryId ? 'posted' : 'pending'),
         })),
       },
     });
@@ -295,10 +295,13 @@ exports.create = async (req, res, next) => {
           approvedById,
         },
       });
-      const journalEntryId = await postCashMovement({ tx, companyId, userId, movement });
+      const posting = await postCashMovement({ tx, companyId, userId, movement });
       const recordedMovement = await tx.posCashMovement.update({
         where: { id: movement.id },
-        data: { journalEntryId },
+        data: {
+          journalEntryId: posting.journalEntryId,
+          postingStatus: posting.postingStatus,
+        },
       });
       const shift = await tx.posShift.findFirst({
         where: { id: shiftId, companyId, registerId, status: { in: ['open', 'reopened'] } },
@@ -335,7 +338,8 @@ exports.create = async (req, res, next) => {
           reference: movement.reference,
           bankSlipReference,
           approvedById,
-          journalEntryId,
+          journalEntryId: posting.journalEntryId,
+          postingStatus: posting.postingStatus,
         },
         ip: requestIp(req),
       }, tx);

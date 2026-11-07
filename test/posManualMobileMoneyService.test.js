@@ -4,7 +4,9 @@ jest.mock('../lib/prisma', () => ({ dbClient: jest.fn() }));
 jest.mock('../services/transactionService', () => ({ runInTransaction: jest.fn() }));
 jest.mock('../services/posAuditService', () => ({ writePosAuditLog: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/posPaymentService', () => ({
+  getPaymentSettings: jest.fn().mockResolvedValue({}),
   assertPaymentMethodEnabled: jest.fn().mockResolvedValue(undefined),
+  validateTenderConfiguration: jest.fn(),
 }));
 
 const { dbClient } = require('../lib/prisma');
@@ -94,6 +96,10 @@ describe('manual mobile money payment service', () => {
       confirmedById: CASHIER_ID,
     });
     expect(payment.create).toHaveBeenCalledTimes(1);
+    expect(posPaymentService.validateTenderConfiguration).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ allowOptionalReference: true }),
+    );
     expect(writePosAuditLog).toHaveBeenCalledWith(
       expect.objectContaining({ companyId: COMPANY_ID, registerId: REGISTER_ID, userId: CASHIER_ID }),
       expect.any(Object),

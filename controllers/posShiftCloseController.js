@@ -11,6 +11,7 @@ const { releaseInvoiceReservations } = require('../services/posVoucherService');
 const { buildReport } = require('./tillZReportController');
 const {
   findRegisterForShift,
+  findTillSessionForShift,
   lockRegisterForZNumber,
   closeTillSessionForShift,
 } = require('../services/posShiftLinkService');
@@ -225,6 +226,7 @@ async function buildShiftReportSnapshot({
   heldSalesCount,
   heldSalesPolicy,
   journalEntryId,
+  postingStatus,
   cancelledAfterPaymentByCashier,
   fiscalClosePolicy,
   fiscalApprovedById,
@@ -244,6 +246,7 @@ async function buildShiftReportSnapshot({
   snapshot.cash.differenceReason = differenceReason;
   snapshot.cash.approvedById = approvedById;
   snapshot.cash.journalEntryId = journalEntryId;
+  snapshot.cash.postingStatus = postingStatus;
   snapshot.heldSales = { count: heldSalesCount, policy: heldSalesPolicy };
   snapshot.fiscalReceipts.policy = fiscalClosePolicy;
   snapshot.fiscalReceipts.closeApproval = fiscalApprovedById
@@ -507,6 +510,24 @@ exports.close = async (req, res, next) => {
       }
 
       const sales = invoiceTotals(shift.invoices);
+      const register = await findRegisterForShift(tx, companyId, registerId);
+      if (!register) return { code: 'POS_REGISTER_NOT_FOUND' };
+      const till = await findTillSessionForShift(tx, {
+        companyId,
+        registerCode: register.code,
+        shift,
+        status: 'open',
+      });
+      if (!till) {
+        const error = new Error('The POS shift has no matching open till session.');
+        error.code = 'POS_TILL_SHIFT_LINK_MISSING';
+        throw error;
+      }
+      const cashGiftCardIssues = centsOrWholeAmount(
+        (Array.isArray(till.cashActivity) ? till.cashActivity : [])
+          .filter((activity) => activity.type === 'gift_card_issue' && !activity.posShiftId)
+          .reduce((sum, activity) => sum + centsOrWholeAmount(activity.amount), 0),
+      );
       const refundRows = await findCashRefunds(tx, companyId, shiftId);
       const cashRefunds = centsOrWholeAmount(refundRows[0]?.amount);
       const movements = movementTotals(shift.cashMovements);
@@ -534,6 +555,7 @@ exports.close = async (req, res, next) => {
         expectedCash = calculateExpectedCash({
           openingFloat: shift.openingFloat,
           cashSales: sales.cashSales + pendingCashReceived,
+          cashGiftCardIssues,
           cashRefunds,
           cashIn: movements.cashIn,
           cashOut: movements.cashOut,
@@ -656,7 +678,7 @@ exports.close = async (req, res, next) => {
         : (await getPosZReportHighWaterMark(tx, companyId, registerId)) + 1;
       const now = new Date();
       const correctionReportId = shift.status === 'reopened' ? generateObjectId() : null;
-      const journalEntryId = await postShiftVariance({
+      const posting = await postShiftVariance({
         tx,
         companyId,
         userId,
@@ -666,6 +688,7 @@ exports.close = async (req, res, next) => {
         date: now,
         ...(correctionReportId ? { sourceId: correctionReportId } : {}),
       });
+      const { journalEntryId, postingStatus } = posting;
       const updatedShift = await tx.posShift.update({
         where: { id: shift.id },
         data: {
@@ -679,16 +702,11 @@ exports.close = async (req, res, next) => {
           differenceReason,
           approvedById,
           journalEntryId,
+          postingStatus,
           closeIdempotencyKey: key,
           closePayloadHash: payloadHash,
         },
       });
-      const register = await findRegisterForShift(tx, companyId, registerId);
-      if (!register) {
-        const error = new Error('The POS register for this shift is no longer active.');
-        error.code = 'POS_REGISTER_NOT_FOUND';
-        throw error;
-      }
       const closedTill = await closeTillSessionForShift(tx, {
         companyId,
         registerCode: register.code,
@@ -713,6 +731,7 @@ exports.close = async (req, res, next) => {
         heldSalesCount,
         heldSalesPolicy: settings.heldSalesOnClose,
         journalEntryId,
+        postingStatus,
         fiscalClosePolicy,
         fiscalApprovedById,
       });
@@ -784,6 +803,7 @@ exports.close = async (req, res, next) => {
           variance,
           approvedById,
           journalEntryId,
+          postingStatus,
         },
         ip: requestIpAddress(req),
       }, tx);

@@ -40,21 +40,26 @@ function tenderAccount(tender, accounts) {
   if (method === 'cash') return requiredAccount(accounts, 'posRegisterCash');
   if (method === 'card') return requiredAccount(accounts, 'cardClearing');
   if (method === 'mobile_money') {
-    if (tender.accountCode) return String(tender.accountCode);
     const provider = String(tender.provider || '').toLowerCase();
-    if (provider === 'airtel') return requiredAccount(accounts, 'airtelMoney');
-    if (provider === 'momo' || provider === 'mtn') return requiredAccount(accounts, 'mtnMoMo');
+    if (!provider && tender.accountCode) return String(tender.accountCode);
+    if (provider === 'airtel' || provider === 'airtel_money') return requiredAccount(accounts, 'airtelMoney');
+    if (provider === 'momo' || provider === 'mtn' || provider === 'mtn_momo') {
+      return requiredAccount(accounts, 'mtnMoMo');
+    }
     throw new TypeError('A mobile money tender must identify its provider as MTN MoMo or Airtel.');
   }
-  if (method === 'bank_transfer' || method === 'cheque') {
+  if (method === 'bank_transfer') {
     const accountCode = tender.accountCode || accounts?.cashAtBank;
     if (!accountCode) throw new TypeError(`${method} tender has no mapped bank account code.`);
     return String(accountCode);
   }
+  if (method === 'cheque') return requiredAccount(accounts, 'chequesInHand');
   if (method === 'gift_card') return requiredAccount(accounts, 'giftCardLiability');
-  if (method === 'store_credit' || method === 'loyalty' || method === 'loyalty_points') {
-    return requiredAccount(accounts, 'customerAdvances');
-  }
+  if (method === 'store_credit') return requiredAccount(accounts, 'storeCreditLiability');
+  if (method === 'loyalty_wallet') return requiredAccount(accounts, 'loyaltyWalletLiability');
+  if (method === 'loyalty_points') return requiredAccount(accounts, 'loyaltyPointsLiability');
+  if (method === 'loyalty') return requiredAccount(accounts, 'customerAdvances');
+  if (method === 'customer_credit' || method === 'credit') return requiredAccount(accounts, 'accountsReceivable');
   throw new TypeError(`Unsupported POS payment method: ${method || '(empty)'}.`);
 }
 
@@ -97,6 +102,7 @@ function buildSaleJournalEntries({ invoice, tenders, accounts }) {
   if (storedNetSales !== netSales) {
     throw new TypeError('Stored subtotal less discounts does not match invoice total less VAT.');
   }
+  // POS discounts, including voucher allocations, reduce revenue; do not post a second discount journal line.
   if (netSales > 0) addLine(revenueLines, requiredAccount(accounts, 'salesRevenue'), 0, fromCents(netSales), `Sales revenue - ${reference}`);
   if (tax > 0) addLine(revenueLines, requiredAccount(accounts, 'vatOutput'), 0, fromCents(tax), `VAT output - ${reference}`);
 
@@ -110,11 +116,33 @@ function buildSaleJournalEntries({ invoice, tenders, accounts }) {
   if (sourceLines.length && (lineTaxTotal !== tax || lineTotal !== total)) {
     throw new TypeError('Stored invoice line totals do not reconcile with the invoice header.');
   }
-  const cogs = invoice.cogsAmount != null
-    ? toCents(invoice.cogsAmount, 'invoice.cogsAmount')
-    : sourceLines.reduce((sum, line, index) => (
-      sum + toCents(line.cogsAmount || 0, `invoice.lines[${index}].cogsAmount`)
+  if (sourceLines.length && sourceLines.every((line) => line.lineSubtotal != null)) {
+    const lineSubtotal = sourceLines.reduce((sum, line, index) => (
+      sum + toCents(line.lineSubtotal, `invoice.lines[${index}].lineSubtotal`)
     ), 0);
+    const lineDiscount = sourceLines.reduce((sum, line, index) => (
+      sum + toCents(line.lineSubtotal, `invoice.lines[${index}].lineSubtotal`)
+      - toCents(line.lineTotal ?? 0, `invoice.lines[${index}].lineTotal`)
+      + toCents(line.lineTax ?? line.taxAmount ?? 0, `invoice.lines[${index}].lineTax`)
+    ), 0);
+    if (invoice.subtotal != null && lineSubtotal !== toCents(invoice.subtotal, 'invoice.subtotal')) {
+      throw new TypeError('Stored invoice line subtotals do not reconcile with the invoice subtotal.');
+    }
+    if (lineDiscount !== toCents(invoice.totalDiscount || 0, 'invoice.totalDiscount')) {
+      throw new TypeError('Stored invoice line discounts do not reconcile with the invoice discount total.');
+    }
+  }
+  const hasStoredLineCosts = sourceLines.length > 0
+    && sourceLines.every((line) => line.cogsAmount != null);
+  const cogs = hasStoredLineCosts
+    ? sourceLines.reduce((sum, line, index) => (
+      sum + toCents(line.cogsAmount, `invoice.lines[${index}].cogsAmount`)
+    ), 0)
+    : invoice.cogsAmount != null
+      ? toCents(invoice.cogsAmount, 'invoice.cogsAmount')
+      : sourceLines.reduce((sum, line, index) => (
+        sum + toCents(line.cogsAmount || 0, `invoice.lines[${index}].cogsAmount`)
+      ), 0);
   const cogsLines = cogs > 0 ? [{
     accountCode: requiredAccount(accounts, 'costOfGoodsSold'),
     debit: fromCents(cogs),

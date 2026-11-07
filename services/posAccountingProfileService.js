@@ -9,11 +9,15 @@ const ACCOUNT_FIELDS = Object.freeze([
   { key: 'cardClearing', label: 'Card clearing', allowedTypes: ['asset'] },
   { key: 'mtnMoMo', label: 'MTN MoMo clearing', allowedTypes: ['asset'] },
   { key: 'airtelMoney', label: 'Airtel Money clearing', allowedTypes: ['asset'] },
-  { key: 'cashAtBank', label: 'Bank transfer / cheque clearing', allowedTypes: ['asset'] },
+  { key: 'cashAtBank', label: 'Bank transfer clearing', allowedTypes: ['asset'] },
+  { key: 'chequesInHand', label: 'Cheques in hand', allowedTypes: ['asset'] },
   { key: 'bankDepositClearing', label: 'Bank deposit clearing (cash in transit)', allowedTypes: ['asset'] },
   { key: 'accountsReceivable', label: 'Accounts receivable', allowedTypes: ['asset'], required: true },
   { key: 'customerAdvances', label: 'Customer advances', allowedTypes: ['liability'] },
   { key: 'giftCardLiability', label: 'Gift card liability', allowedTypes: ['liability'] },
+  { key: 'storeCreditLiability', label: 'Store credit liability', allowedTypes: ['liability'] },
+  { key: 'loyaltyWalletLiability', label: 'Loyalty wallet liability', allowedTypes: ['liability'] },
+  { key: 'loyaltyPointsLiability', label: 'Loyalty points liability', allowedTypes: ['liability'] },
   { key: 'loyaltyRewardsExpense', label: 'Loyalty rewards expense', allowedTypes: ['expense'] },
   { key: 'stockAdjustmentLoss', label: 'Stock adjustment loss', allowedTypes: ['cogs', 'expense'] },
   { key: 'inventory', label: 'Inventory', allowedTypes: ['asset'], required: true },
@@ -255,6 +259,92 @@ function resolveAccount(profile, key, { tillType, registerId } = {}) {
   return profile.companyDefaults?.[key] || null;
 }
 
+function mappingForTender(tender) {
+  const method = String(tender.paymentMethod || tender.method || '').toLowerCase();
+  if (method === 'cash') return { method, key: 'posRegisterCash' };
+  if (method === 'card') return { method, key: 'cardClearing' };
+  if (method === 'mobile_money') {
+    const provider = String(tender.provider || '').toLowerCase();
+    if (provider === 'airtel' || provider === 'airtel_money') return { method, key: 'airtelMoney' };
+    if (provider === 'mtn' || provider === 'momo' || provider === 'mtn_momo') return { method, key: 'mtnMoMo' };
+    if (!provider && tender.accountCode) {
+      return { method, key: 'cashAtBank', accountCode: tender.accountCode };
+    }
+    throw Object.assign(new TypeError('A mobile money tender must identify its provider as MTN MoMo or Airtel.'), {
+      code: 'POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED',
+    });
+  }
+  if (method === 'bank_transfer') {
+    return { method, key: 'cashAtBank', accountCode: tender.accountCode || null };
+  }
+  if (method === 'cheque') return { method, key: 'chequesInHand' };
+  if (method === 'gift_card') return { method, key: 'giftCardLiability' };
+  if (method === 'store_credit') return { method, key: 'storeCreditLiability' };
+  if (method === 'loyalty_wallet') return { method, key: 'loyaltyWalletLiability' };
+  if (method === 'loyalty_points') return { method, key: 'loyaltyPointsLiability' };
+  if (method === 'customer_credit' || method === 'credit') return { method, key: 'accountsReceivable' };
+  if (method === 'loyalty') return { method, key: 'customerAdvances' };
+  return null;
+}
+
+async function assertTenderMappings(
+  profile,
+  tenders,
+  scope = {},
+  { requireAccountsReceivable = false } = {},
+  client = prisma,
+) {
+  const requiredMappings = (tenders || []).map(mappingForTender).filter(Boolean);
+  const directMappings = [];
+  if (requireAccountsReceivable) {
+    requiredMappings.push({ method: 'customer_credit', key: 'accountsReceivable' });
+  }
+  for (const mapping of requiredMappings) {
+    const accountCode = mapping.accountCode || resolveAccount(profile, mapping.key, scope);
+    if (!accountCode) {
+      throw Object.assign(new TypeError(
+        `Configure an account for ${FIELD_BY_KEY.get(mapping.key).label} in the POS accounting profile before posting this payment.`,
+      ), { code: 'POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED' });
+    }
+    const invalidMapping = (profile.validationErrors || []).find((error) => (
+      error.key === mapping.key && String(error.accountCode) === String(accountCode)
+    ));
+    if (invalidMapping) {
+      throw Object.assign(new TypeError(
+        `The ${FIELD_BY_KEY.get(mapping.key).label} account is invalid: ${invalidMapping.message}`,
+      ), { code: 'POS_PAYMENT_ACCOUNT_MAPPING_INVALID' });
+    }
+    if (mapping.accountCode) directMappings.push({ ...mapping, accountCode: String(accountCode) });
+  }
+  if (directMappings.length) {
+    if (!scope.companyId) {
+      throw Object.assign(new TypeError('A company is required to validate the selected POS payment account.'), {
+        code: 'POS_PAYMENT_ACCOUNT_MAPPING_INVALID',
+      });
+    }
+    const accounts = await client.chartOfAccount.findMany({
+      where: {
+        companyId: String(scope.companyId),
+        code: { in: [...new Set(directMappings.map((mapping) => mapping.accountCode))] },
+      },
+      select: { code: true, type: true, isActive: true, allowDirectPosting: true },
+    });
+    const accountsByCode = new Map(accounts.map((account) => [String(account.code), account]));
+    for (const mapping of directMappings) {
+      const account = accountsByCode.get(mapping.accountCode);
+      const definition = FIELD_BY_KEY.get(mapping.key);
+      if (!account
+        || account.isActive !== true
+        || account.allowDirectPosting !== true
+        || !definition.allowedTypes.includes(String(account.type).toLowerCase())) {
+        throw Object.assign(new TypeError(
+          `The selected account for ${definition.label} must be an active, directly-postable ${definition.allowedTypes.join(' or ')} account in this company.`,
+        ), { code: 'POS_PAYMENT_ACCOUNT_MAPPING_INVALID' });
+      }
+    }
+  }
+}
+
 module.exports = {
   ACCOUNT_FIELDS,
   MAPPING_MODULE,
@@ -265,4 +355,5 @@ module.exports = {
   getProfile,
   saveProfile,
   resolveAccount,
+  assertTenderMappings,
 };

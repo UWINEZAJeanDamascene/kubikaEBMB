@@ -13,7 +13,7 @@ jest.mock('../lib/prisma', () => ({
   },
 }));
 jest.mock('../services/posShiftAccountingService', () => ({
-  postShiftVariance: jest.fn().mockResolvedValue(null),
+  postShiftVariance: jest.fn().mockResolvedValue({ journalEntryId: null, postingStatus: 'not_required' }),
 }));
 jest.mock('../services/transactionService', () => ({
   runInTransaction: jest.fn(),
@@ -209,7 +209,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   prisma.systemSettings.findUnique.mockResolvedValue(null);
   prisma.posPayment.findMany.mockResolvedValue([]);
-  postShiftVariance.mockResolvedValue(null);
+  postShiftVariance.mockResolvedValue({ journalEntryId: null, postingStatus: 'not_required' });
   runInTransaction.mockImplementation((callback) => callback(createTransaction()));
 });
 
@@ -278,6 +278,7 @@ describe('POS shift close and Z report', () => {
         cash: {
           openingFloat: 10000,
           cashSales: 5000,
+          cashGiftCardIssues: 0,
           cashRefunds: 500,
           cashIn: 500,
           cashOut: 200,
@@ -317,7 +318,7 @@ describe('POS shift close and Z report', () => {
   });
 
   test('links a non-zero cash variance posting to the shift and Z-report snapshot', async () => {
-    postShiftVariance.mockResolvedValue('variance-journal-id');
+    postShiftVariance.mockResolvedValue({ journalEntryId: 'variance-journal-id', postingStatus: 'posted' });
     const tx = createTransaction();
     const res = createResponse();
     runInTransaction.mockImplementation((callback) => callback(tx));
@@ -332,9 +333,71 @@ describe('POS shift close and Z report', () => {
       reportNumber: 1,
     }));
     expect(tx.posShift.update).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ journalEntryId: 'variance-journal-id' }),
+      data: expect.objectContaining({ journalEntryId: 'variance-journal-id', postingStatus: 'posted' }),
     }));
     expect(res.body.data.zReport.snapshot.cash.journalEntryId).toBe('variance-journal-id');
+    expect(res.body.data.zReport.snapshot.cash.postingStatus).toBe('posted');
+  });
+
+  test.each(['pending', 'failed'])('stores and reports a %s shift-variance status without a journal ID', async (postingStatus) => {
+    postShiftVariance.mockResolvedValue({ journalEntryId: null, postingStatus });
+    const tx = createTransaction();
+    const res = createResponse();
+    runInTransaction.mockImplementation((callback) => callback(tx));
+
+    await close(createRequest({
+      closingCount: { 5000: 2, 2000: 1, 1000: 1, 500: 1, 100: 1, 50: 0, other: 250 },
+    }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(200);
+    expect(tx.posShift.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ postingStatus, journalEntryId: null }),
+    }));
+    expect(res.body.data.shift.postingStatus).toBe(postingStatus);
+    expect(res.body.data.zReport.snapshot.cash.postingStatus).toBe(postingStatus);
+  });
+
+  test('includes legacy cash-funded gift cards in expected drawer cash exactly once', async () => {
+    const shift = openShift();
+    shift.cashMovements.push({ type: 'cash_in', amount: 900, reasonCode: 'GIFT_CARD_SALE' });
+    const tx = createTransaction({ shift });
+    const defaultQuery = tx.$queryRawUnsafe.getMockImplementation();
+    tx.$queryRawUnsafe.mockImplementation((sql, ...args) => (
+      String(sql).includes('FROM pos_cash_movements movement')
+        ? Promise.resolve([
+          { type: 'cash_in', amount: 1400 },
+          { type: 'cash_out', amount: 200 },
+          { type: 'safe_drop', amount: 1000 },
+        ])
+        : defaultQuery(sql, ...args)
+    ));
+    tx.tillSession.findFirst.mockResolvedValue({
+      id: 'till-id',
+      companyId: COMPANY_ID,
+      openedById: USER_ID,
+      registerId: 'POS-1',
+      status: 'open',
+      openingFloat: 10000,
+      expectedCash: 14300,
+      cashActivity: [
+        { type: 'cash_sale', amount: 5000, posShiftId: SHIFT_ID, recordedBy: USER_ID },
+        { type: 'gift_card_issue', amount: 500, recordedBy: USER_ID },
+        { type: 'gift_card_issue', amount: 900, posShiftId: SHIFT_ID, recordedBy: USER_ID },
+      ],
+      openedAt: new Date('2026-10-29T08:00:00.000Z'),
+    });
+    const res = createResponse();
+    runInTransaction.mockImplementation((callback) => callback(tx));
+
+    await close(createRequest({
+      closingCount: { 5000: 2, 2000: 1, 1000: 1, 500: 1, 100: 1, 50: 0, other: 1600 },
+    }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.shift.expectedCash).toBe(15200);
+    expect(res.body.data.zReport.snapshot.cash.cashGiftCardIssues).toBe(500);
+    expect(res.body.data.zReport.snapshot.cash.cashIn).toBe(1400);
+    expect(res.body.data.zReport.snapshot.cash.ledgerDifference).toBe(0);
   });
 
   test('does not close the shift when its accounting period is locked', async () => {

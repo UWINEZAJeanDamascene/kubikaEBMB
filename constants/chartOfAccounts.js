@@ -42,6 +42,13 @@ const CHART_OF_ACCOUNTS = {
     normalBalance: "debit",
     allowDirectPosting: true,
   },
+  1130: {
+    name: "Cheques in Hand (Undeposited Cheques)",
+    type: "asset",
+    subtype: "current",
+    normalBalance: "debit",
+    allowDirectPosting: true,
+  },
   1200: {
     name: "MTN MoMo Clearing",
     type: "asset",
@@ -340,6 +347,13 @@ const CHART_OF_ACCOUNTS = {
   },
   2860: {
     name: "Customer Deposits and Advances",
+    type: "liability",
+    subtype: "current",
+    normalBalance: "credit",
+    allowDirectPosting: true,
+  },
+  2870: {
+    name: "Loyalty Points Liability",
     type: "liability",
     subtype: "current",
     normalBalance: "credit",

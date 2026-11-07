@@ -105,7 +105,7 @@ function createTransaction() {
 beforeEach(() => {
   jest.clearAllMocks();
   prisma.systemSettings.findUnique.mockResolvedValue(null);
-  postCashMovement.mockResolvedValue('journal-entry-id');
+  postCashMovement.mockResolvedValue({ journalEntryId: 'journal-entry-id', postingStatus: 'posted' });
   runInTransaction.mockImplementation((callback) => callback(createTransaction()));
 });
 
@@ -135,7 +135,11 @@ describe('POS cash movement endpoint', () => {
     const movement = { id: 'movement-id', companyId: COMPANY_ID, registerId: REGISTER_ID, shiftId: SHIFT_ID };
     tx.posCashMovement.findFirst.mockResolvedValue(null);
     tx.posCashMovement.create.mockResolvedValue(movement);
-    tx.posCashMovement.update.mockResolvedValue({ ...movement, journalEntryId: 'journal-entry-id' });
+    tx.posCashMovement.update.mockResolvedValue({
+      ...movement,
+      journalEntryId: 'journal-entry-id',
+      postingStatus: 'posted',
+    });
     runInTransaction.mockImplementation((callback) => callback(tx));
     const res = createResponse();
 
@@ -174,7 +178,7 @@ describe('POS cash movement endpoint', () => {
     }));
     expect(tx.posCashMovement.update).toHaveBeenCalledWith({
       where: { id: movement.id },
-      data: { journalEntryId: 'journal-entry-id' },
+      data: { journalEntryId: 'journal-entry-id', postingStatus: 'posted' },
     });
     expect(tx.tillSession.update).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'till-id' },
@@ -183,6 +187,26 @@ describe('POS cash movement endpoint', () => {
     expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'CASH_MOVEMENT_RECORDED' }),
     }));
+  });
+
+  test('returns failed posting status instead of reporting an exhausted retry as pending', async () => {
+    const tx = createTransaction();
+    const movement = { id: 'movement-id', companyId: COMPANY_ID, registerId: REGISTER_ID, shiftId: SHIFT_ID };
+    tx.posCashMovement.findFirst.mockResolvedValue(null);
+    tx.posCashMovement.create.mockResolvedValue(movement);
+    tx.posCashMovement.update.mockResolvedValue({
+      ...movement,
+      journalEntryId: null,
+      postingStatus: 'failed',
+    });
+    postCashMovement.mockResolvedValue({ journalEntryId: null, postingStatus: 'failed' });
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const res = createResponse();
+
+    await create(createRequest(), res, jest.fn());
+
+    expect(res.statusCode).toBe(201);
+    expect(res.body.data.movement.postingStatus).toBe('failed');
   });
 
   test('replays the matching movement and rejects key reuse with another payload', async () => {
@@ -548,5 +572,15 @@ describe('POS cash movement endpoint', () => {
       id: 'movement-id',
       postingStatus: 'pending',
     }]);
+  });
+
+  test('preserves failed posting status when listing movements', async () => {
+    prisma.posShift.findFirst.mockResolvedValue({ id: SHIFT_ID });
+    prisma.posCashMovement.findMany.mockResolvedValue([{ id: 'movement-id', postingStatus: 'failed' }]);
+    const res = createResponse();
+
+    await list(createRequest(), res, jest.fn());
+
+    expect(res.body.data.movements).toEqual([{ id: 'movement-id', postingStatus: 'failed' }]);
   });
 });

@@ -89,7 +89,7 @@ describe('POS shift accounting service', () => {
 
     const result = await postCashMovement({ tx, companyId: COMPANY_ID, userId: USER_ID, movement });
 
-    expect(result).toBe('journal-id');
+    expect(result).toEqual({ journalEntryId: 'journal-id', postingStatus: 'posted' });
     expect(JournalService.createEntry).toHaveBeenCalledWith(COMPANY_ID, USER_ID, expect.objectContaining({
       sourceType: 'pos_cash_movement',
       sourceId: movement.id,
@@ -186,7 +186,7 @@ describe('POS shift accounting service', () => {
       date: new Date('2026-10-29T18:00:00.000Z'),
     });
 
-    expect(result).toBe('variance-entry-id');
+    expect(result).toEqual({ journalEntryId: 'variance-entry-id', postingStatus: 'posted' });
     expect(JournalService.createEntry).toHaveBeenCalledWith(COMPANY_ID, USER_ID, expect.objectContaining({
       sourceType: 'pos_shift_close',
       sourceId: SHIFT_ID,
@@ -207,7 +207,7 @@ describe('POS shift accounting service', () => {
       variance: 0,
       reportNumber: 11,
       date: new Date(),
-    })).resolves.toBeNull();
+    })).resolves.toEqual({ journalEntryId: null, postingStatus: 'not_required' });
     expect(JournalService.createEntry).not.toHaveBeenCalled();
   });
 

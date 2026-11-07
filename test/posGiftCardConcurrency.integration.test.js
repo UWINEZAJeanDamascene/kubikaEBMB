@@ -18,7 +18,13 @@ jest.mock('../services/posPaymentService', () => {
   const actual = jest.requireActual('../services/posPaymentService');
   return {
     ...actual,
-    getPaymentSettings: jest.fn().mockResolvedValue({ paymentFlow: 'PAYMENTS_V2' }),
+    getPaymentSettings: jest.fn().mockResolvedValue({
+      paymentFlow: 'PAYMENTS_V2',
+      momoTimeoutSec: 120,
+      providerEnvironment: 'sandbox',
+      allowOverCreditLimit: false,
+      bankTransferNeedsConfirm: false,
+    }),
     resolvePaymentFlow: jest.fn(() => 'PAYMENTS_V2'),
     assertPaymentMethodEnabled: jest.fn().mockResolvedValue(undefined),
   };
@@ -197,7 +203,6 @@ async function createFixture({ userCount = 2, saleAmount = 80, balance = 100 } =
         () => prisma.posStoredValueAccount.deleteMany({ where: { companyId } }),
         () => prisma.posShift.deleteMany({ where: { companyId } }),
         () => prisma.posRegister.deleteMany({ where: { companyId } }),
-        () => prisma.client.deleteMany({ where: { companyId } }),
         () => prisma.user.deleteMany({ where: { companyId } }),
         () => prisma.company.deleteMany({ where: { id: companyId } }),
       );
@@ -435,6 +440,10 @@ describe('POS gift-card redemption concurrency (PostgreSQL integration)', () => 
       const removeReq = fixture.requestFor(0, `gift-card-refund-race-${fixture.companyId}-remove`);
       removeReq.params.paymentId = paymentId;
       removeReq.body = { reasonCode: 'WRONG_SALE', note: 'Concurrent refund regression.' };
+      removeReq.posAuthContext.user.role = {
+        name: 'supervisor',
+        permissions: ['pos.till.refund'],
+      };
       const refundResponse = response();
       const redeemRequest = fixture.requestFor(1, `gift-card-refund-race-${fixture.companyId}-2`);
 

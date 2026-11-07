@@ -49,6 +49,30 @@ function findOriginalSaleCostAccounts(entry) {
   };
 }
 
+function findOriginalLoyaltyAccounts(entry) {
+  const lines = entry?.lines || [];
+  const expenseLines = lines.filter((line) => (
+    Number(line.debit || 0) > 0
+    && /\bloyalty credit earned\b/i.test(`${line.description || ''} ${line.accountName || ''}`)
+  ));
+  const liabilityLines = lines.filter((line) => (
+    Number(line.credit || 0) > 0
+    && /\bloyalty credit liability\b/i.test(`${line.description || ''} ${line.accountName || ''}`)
+  ));
+  const expenseAccountCodes = accountCodesForLines(expenseLines, () => true);
+  const liabilityAccountCodes = accountCodesForLines(liabilityLines, () => true);
+  const debitCents = expenseLines.reduce((sum, line) => sum + amountInCents(line.debit, 'Loyalty expense debit'), 0);
+  const creditCents = liabilityLines.reduce((sum, line) => sum + amountInCents(line.credit, 'Loyalty liability credit'), 0);
+  if (expenseAccountCodes.length !== 1 || liabilityAccountCodes.length !== 1
+    || debitCents <= 0 || debitCents !== creditCents) {
+    throw new Error('The original POS sale journal does not contain a matching loyalty reward expense and liability pair.');
+  }
+  return {
+    expenseAccountCode: expenseAccountCodes[0],
+    liabilityAccountCode: liabilityAccountCodes[0],
+  };
+}
+
 function buildCreditNoteCostLines({ lines, writeOffAccountCode }) {
   const restockLines = [];
   const writeOffLines = [];
@@ -116,6 +140,7 @@ function buildCreditNoteCostLines({ lines, writeOffAccountCode }) {
 
 module.exports = {
   buildCreditNoteCostLines,
+  findOriginalLoyaltyAccounts,
   findOriginalSaleCostAccounts,
   findOriginalVatAccountCode,
 };

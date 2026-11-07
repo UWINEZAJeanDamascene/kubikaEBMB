@@ -48,10 +48,16 @@ function requirePositiveWholeRwf(value) {
   }
 }
 
+function maskPayerPhone(value) {
+  if (!value) return null;
+  return `${value.slice(0, 3)}****${value.slice(-3)}`;
+}
+
 async function recordManualMobileMoneyPayment({
   companyId,
   saleId,
   registerId,
+  tillType,
   shiftId,
   cashierId,
   provider,
@@ -81,9 +87,12 @@ async function recordManualMobileMoneyPayment({
   }
   const normalized = normalizeManualReference(reference);
   const normalizedPhone = normalizeRwandaPhone(payerPhone);
+  const maskedPhone = maskPayerPhone(normalizedPhone);
+  const settings = await posPaymentService.getPaymentSettings(scopedCompanyId);
   await posPaymentService.assertPaymentMethodEnabled({
     companyId: scopedCompanyId,
     registerId: String(registerId),
+    ...(tillType ? { tillType } : {}),
     method: provider,
   });
 
@@ -97,7 +106,7 @@ async function recordManualMobileMoneyPayment({
           && priorBeforeLock.method === provider
           && priorBeforeLock.amount === amount
           && priorBeforeLock.normalizedReference === normalized.normalizedReference
-          && (priorBeforeLock.payerPhone || null) === normalizedPhone) {
+          && [maskedPhone, normalizedPhone].includes(priorBeforeLock.payerPhone || null)) {
           return { payment: priorBeforeLock, replayed: true };
         }
         throw paymentError('POS_IDEMPOTENCY_KEY_CONFLICT', 'This payment key was already used for a different payment.');
@@ -114,7 +123,7 @@ async function recordManualMobileMoneyPayment({
       }
       const invoice = await tx.invoice.findFirst({
         where: { id: String(saleId), companyId: scopedCompanyId, posOrigin: true },
-        select: { id: true, status: true, totalAmount: true, registerId: true, cashierId: true, shiftId: true },
+        select: { id: true, status: true, totalAmount: true, registerId: true, cashierId: true, shiftId: true, clientId: true },
       });
       if (!invoice || invoice.status !== 'PENDING_PAYMENT'
         || String(invoice.registerId) !== String(registerId)
@@ -122,6 +131,15 @@ async function recordManualMobileMoneyPayment({
         || String(invoice.shiftId) !== String(shiftId)) {
         throw paymentError('POS_PAYMENT_CONTEXT_MISMATCH', 'This sale is no longer available for payment on this till.');
       }
+      posPaymentService.validateTenderConfiguration(settings, {
+        registerId: String(registerId),
+        tillType,
+        method: provider,
+        amount,
+        reference: normalized.reference || '',
+        customerId: invoice.clientId,
+        allowOptionalReference: true,
+      });
 
       const prior = await tx.posPayment.findFirst({
         where: { companyId: scopedCompanyId, idempotencyKey },
@@ -131,7 +149,7 @@ async function recordManualMobileMoneyPayment({
           && prior.method === provider
           && prior.amount === amount
           && prior.normalizedReference === normalized.normalizedReference
-          && (prior.payerPhone || null) === normalizedPhone) {
+          && [maskedPhone, normalizedPhone].includes(prior.payerPhone || null)) {
           return { payment: prior, replayed: true };
         }
         throw paymentError('POS_IDEMPOTENCY_KEY_CONFLICT', 'This payment key was already used for a different payment.');
@@ -190,7 +208,7 @@ async function recordManualMobileMoneyPayment({
           providerTxId: normalized.reference,
           reference: normalized.reference,
           normalizedReference: normalized.normalizedReference,
-          payerPhone: normalizedPhone,
+          payerPhone: maskedPhone,
           reconciliationStatus: 'UNMATCHED',
           confirmedAt: now,
           confirmedById: String(cashierId),

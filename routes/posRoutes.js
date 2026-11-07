@@ -35,6 +35,7 @@ const {
 const posShiftController = require('../controllers/posShiftController');
 const posCashMovementController = require('../controllers/posCashMovementController');
 const posShiftCloseController = require('../controllers/posShiftCloseController');
+const posAccountingPostingController = require('../controllers/posAccountingPostingController');
 const posShiftLifecycleController = require('../controllers/posShiftLifecycleController');
 const posPaymentSettingsRoutes = require('./posPaymentSettingsRoutes');
 const posPaymentSettingsController = require('../controllers/posPaymentSettingsController');
@@ -44,9 +45,11 @@ const posAccountingProfileController = require('../controllers/posAccountingProf
 const posBackOfficeController = require('../controllers/posBackOfficeController');
 const posRemoteApprovalController = require('../controllers/posRemoteApprovalController');
 const posDiscountReportsController = require('../controllers/posDiscountReportsController');
+const posAccountingReportsController = require('../controllers/posAccountingReportsController');
 const posPaymentsV2Controller = require('../controllers/posPaymentsV2Controller');
 const posGiftCardController = require('../controllers/posGiftCardController');
 const posCreditAccountController = require('../controllers/posCreditAccountController');
+const posChequeController = require('../controllers/posChequeController');
 const canManagePosRegisters = requirePermissionOrRoles('pos.admin', 'registers', ['admin', 'manager', 'store_manager']);
 const posPrintAgentRoutes = require('./posPrintAgentRoutes');
 
@@ -86,6 +89,9 @@ router.post('/payments-v2/payments/:paymentId/manual-confirm', requirePosSession
 router.get('/payments-v2/manual-mobile-money/reconciliation', requirePosSession(), requirePermission('pos.payment.manual_confirm'), posPaymentsV2Controller.listManualMobileMoneyPayments);
 router.post('/payments-v2/manual-mobile-money/:paymentId/reconcile', requirePosSession(), requirePermission('pos.payment.manual_confirm'), posPaymentsV2Controller.reconcileManualMobileMoneyPayment);
 router.get('/payments-v2/manual-mobile-money/report', requirePosSession(), requirePermission('pos.payment.manual_confirm'), posPaymentsV2Controller.manualMobileMoneyReport);
+router.get('/cheques', requirePosSession(), requirePermission('pos.payment.reconcile'), posChequeController.list);
+router.post('/cheques/deposits', requirePosSession(), requirePermission('pos.payment.reconcile'), posChequeController.deposit);
+router.post('/cheques/:chequeId/bounce', requirePosSession(), requirePermission('pos.payment.reconcile'), posChequeController.bounce);
 // Cashiers may request removal; the controller requires a one-use manager
 // approval before performing any refund unless the active role may refund.
 router.post('/payments-v2/sales/:saleId/payments/:paymentId/remove', requirePosSession(), requirePermission('pos.payment.take'), posPaymentsV2Controller.removePayment);
@@ -132,6 +138,7 @@ router.delete('/shifts/:shiftId', requirePosSession(), requirePermission('pos.sh
 router.post('/shifts/:shiftId/reopen', requirePosSession(), requirePermission('pos.shift.reopen'), posShiftLifecycleController.reopen);
 router.post('/shifts/:shiftId/handover', requirePosSession(), requirePermission('pos.shift.close'), posShiftLifecycleController.handover);
 router.get('/shifts/history', requirePosSession(), requirePermission('pos.report.history'), posShiftController.history);
+router.get('/accounting-postings/:sourceType/:sourceId', requirePosSession(), requirePermission('pos.report.x'), posAccountingPostingController.get);
 router.get('/shifts/:shiftId/z-report', requirePosSession(), requirePermission('pos.report.z'), posShiftCloseController.zReport);
 router.get('/shifts/:shiftId/corrections', requirePosSession(), requirePermission('pos.report.x'), posShiftLifecycleController.corrections);
 router.get('/shifts/:shiftId/cash-movements', requirePosSession(), requirePermission('pos.report.x'), posCashMovementController.list);
@@ -154,6 +161,9 @@ router.post('/admin/approval-requests/:requestId/decision', requirePermissionOrR
 router.get('/admin/approval-policies', requirePermissionOrRoles('pos.admin', 'approvals', ['admin', 'manager', 'store_manager']), posRemoteApprovalController.listPolicies);
 router.put('/admin/approval-policies/:action', requirePermissionOrRoles('pos.admin', 'approvals', ['admin', 'manager', 'store_manager']), posRemoteApprovalController.updatePolicy);
 router.get('/admin/discount-reports', requirePermissionOrRoles('pos.admin', 'reports', ['admin', 'manager', 'store_manager']), posDiscountReportsController.getReports);
+router.get('/admin/accounting-postings', requirePermissionOrRoles('pos.admin', 'reports', ['admin', 'manager', 'store_manager']), posAccountingReportsController.listPostings);
+router.post('/admin/accounting-postings/:postingId/retry', requirePermissionOrRoles('pos.admin', 'reports', ['admin', 'manager', 'store_manager']), posAccountingReportsController.retryPosting);
+router.get('/admin/accounting-reports', requirePermissionOrRoles('pos.admin', 'reports', ['admin', 'manager', 'store_manager']), posAccountingReportsController.getReport);
 
 router.post('/sale', requirePermissionOrRoles('point_of_sale', 'create', ['admin', 'manager', 'sales']), logAction('pos_sale_retired'), createSale);
 router.post('/sale/:id/pay', requirePermissionOrRoles('point_of_sale', 'pay', ['admin', 'accountant', 'sales']), logAction('pos_payment_retired'), addPayment);

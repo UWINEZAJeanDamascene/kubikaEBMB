@@ -1,6 +1,6 @@
 jest.mock('../lib/prisma', () => ({
   prisma: {
-    systemSettings: { upsert: jest.fn(), update: jest.fn() },
+    systemSettings: { upsert: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
     $transaction: jest.fn((callback) => callback(require('../lib/prisma').prisma)),
     $queryRaw: jest.fn(),
     $executeRaw: jest.fn(),
@@ -35,6 +35,8 @@ const completeSettings = {
   heldSalesOnClose: 'BLOCK',
   idleLockMinutes: 4,
   receipt: { paperWidth: 58, showCashier: true, showCustomer: false, showSku: true, showBarcode: false, headerNote: 'Shop note', footerNote: 'Welcome back' },
+  loyalty: { pointValueRwf: 1, walletCreditEnabled: true, walletCreditEarnRatePercent: 1 },
+  giftCardLimits: { maxPerCard: 100000, dailyLimitPerCashier: 300000, terms: '', tillTypeOverrides: {} },
 };
 
 describe('POS till administration settings', () => {
@@ -54,7 +56,7 @@ describe('POS till administration settings', () => {
     });
     prisma.$queryRaw.mockResolvedValue([{ settings: null }]);
     const res = response();
-    await controller.getSettings({ user: { company: { _id: 'company-a' } } }, res, (error) => { throw error; });
+    await controller.getSettings({ user: { company: { _id: 'company-a' } }, query: {} }, res, (error) => { throw error; });
     expect(prisma.systemSettings.upsert).toHaveBeenCalledWith(expect.objectContaining({
       where: { companyId: 'company-a' },
     }));
@@ -64,6 +66,7 @@ describe('POS till administration settings', () => {
 
   test('saves validated values under the active company and writes an audit event', async () => {
     prisma.systemSettings.upsert.mockResolvedValue({});
+    prisma.systemSettings.findUnique.mockResolvedValue({});
     prisma.systemSettings.update.mockResolvedValue({
       posIdleLockMinutes: 4,
       posCashAccountability: 'CASHIER',
@@ -80,6 +83,7 @@ describe('POS till administration settings', () => {
     await controller.updateSettings({
       user: { id: 'manager-id', companyId: 'company-a' },
       body: completeSettings,
+      query: {},
     }, res, (error) => { throw error; });
 
     expect(prisma.systemSettings.update).toHaveBeenCalledWith(expect.objectContaining({

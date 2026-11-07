@@ -21,6 +21,8 @@ const POLICY_ACTIONS = Object.freeze([
   'CREDIT_ADJUST',
   'CREDIT_WRITEOFF',
   'CREDIT_REFUND',
+  'CHEQUE_DEPOSIT',
+  'CHEQUE_BOUNCE',
   'discount',
   'void',
   'refund',

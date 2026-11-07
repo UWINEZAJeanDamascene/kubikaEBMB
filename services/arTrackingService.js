@@ -335,9 +335,10 @@ class ARTrackingService {
         direction: 'decrease',
         invoiceBalanceAfter: newInvoiceBalance,
         clientBalanceAfter: newClientBalance,
-        sourceType: 'credit_note',
-        sourceId: creditNote._id,
+        sourceType: options.sourceId ? 'credit_note_application' : 'credit_note',
+        sourceId: options.sourceId || creditNote._id,
         sourceReference: creditNote.creditNoteNumber || creditNote.referenceNo,
+        journalEntryId: options.journalEntryId || null,
         createdBy: userId,
         metadata: {
           creditNoteNumber: creditNote.creditNoteNumber || creditNote.referenceNo
@@ -376,8 +377,9 @@ class ARTrackingService {
         invoiceBalanceAfter: Number(options.invoiceBalanceAfter ?? invoice.amountOutstanding ?? 0),
         clientBalanceAfter: Number(options.clientBalanceAfter ?? 0),
         sourceType: 'credit_note_refund',
-        sourceId: creditNote._id,
+        sourceId: options.sourceId || creditNote._id,
         sourceReference: creditNote.referenceNo || creditNote.creditNoteNumber,
+        journalEntryId: options.journalEntryId || null,
         createdBy: userId,
         metadata: { creditNoteId: String(creditNote._id), refundAmount },
       });

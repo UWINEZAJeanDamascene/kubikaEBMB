@@ -4,11 +4,21 @@ const express = require('express');
 const request = require('supertest');
 
 const mockPermissionChecks = [];
+let mockRegisterTillType = 'retail';
+const mockMethodRegistry = {
+  methods: [],
+  company: {},
+  tillTypeOverrides: {},
+  registerOverrides: {},
+};
 jest.mock('../middleware/posAuthMiddleware', () => ({
   requirePosSession: () => (req, _res, next) => {
     req.posAuthContext = {
       company: { id: req.get('x-session-company') || 'company-a' },
-      register: { id: '507f1f77bcf86cd799439012' },
+      register: {
+        id: '507f1f77bcf86cd799439012',
+        systemTillType: mockRegisterTillType,
+      },
       user: { id: '507f1f77bcf86cd799439013' },
     };
     next();
@@ -38,6 +48,7 @@ jest.mock('../services/posPaymentService', () => ({
   resolvePaymentFlow: jest.fn((settings, registerId) => (
     settings.registerPaymentFlowOverrides?.[registerId] ?? settings.paymentFlow ?? 'LEGACY'
   )),
+  getEffectiveMethodRegistry: jest.fn(() => mockMethodRegistry),
   savePaymentSettings: jest.fn(),
 }));
 
@@ -86,6 +97,7 @@ function response() {
 describe('POS payment settings routes', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRegisterTillType = 'retail';
   });
 
   test('uses the POS session and method-specific permissions', async () => {
@@ -106,6 +118,24 @@ describe('POS payment settings routes', () => {
     expect(deniedSettings.body.requiredPermission).toBe('pos.payment.settings');
   });
 
+  test('returns a clear service error when the method registry migration is missing', async () => {
+    posPaymentService.getPaymentSettings.mockRejectedValue({
+      code: 'POS_PAYMENT_METHOD_REGISTRY_MIGRATION_REQUIRED',
+      message: 'Migration required.',
+    });
+
+    const result = await request(app)
+      .get('/api/pos/payment-settings')
+      .set('x-pos-permissions', 'pos.payment.settings');
+
+    expect(result.status).toBe(503);
+    expect(result.body).toMatchObject({
+      success: false,
+      code: 'POS_PAYMENT_METHOD_REGISTRY_MIGRATION_REQUIRED',
+      message: expect.stringContaining('database migrations'),
+    });
+  });
+
   test('returns only the effective methods for the current POS register', async () => {
     const settings = safeSettings({
       registerOverrides: { '507f1f77bcf86cd799439012': ['CASH'] },
@@ -120,6 +150,7 @@ describe('POS payment settings routes', () => {
     expect(response.body.data).toEqual({
       registerId: '507f1f77bcf86cd799439012',
       methods: ['CASH'],
+      methodRegistry: mockMethodRegistry,
       paymentFlow: 'LEGACY',
       providerEnvironment: 'sandbox',
       automaticConfirmationAvailable: false,
@@ -128,7 +159,29 @@ describe('POS payment settings routes', () => {
     expect(posPaymentService.resolveEnabledMethods).toHaveBeenCalledWith(
       settings,
       '507f1f77bcf86cd799439012',
+      'retail',
     );
+  });
+
+  test('passes the current restaurant till type to payment-method resolution', async () => {
+    mockRegisterTillType = 'restaurant';
+    const settings = safeSettings();
+    posPaymentService.getPaymentSettings.mockResolvedValue(settings);
+
+    const response = await request(app)
+      .get('/api/pos/payment-settings/methods')
+      .set('x-pos-permissions', 'pos.payment.take');
+
+    expect(response.status).toBe(200);
+    expect(posPaymentService.resolveEnabledMethods).toHaveBeenCalledWith(
+      settings,
+      '507f1f77bcf86cd799439012',
+      'restaurant',
+    );
+    expect(posPaymentService.getEffectiveMethodRegistry).toHaveBeenCalledWith(settings, {
+      registerId: '507f1f77bcf86cd799439012',
+      tillType: 'restaurant',
+    });
   });
 
   test('rejects invalid provider saves with the friendly setup message', async () => {
@@ -280,6 +333,29 @@ describe('POS payment settings routes', () => {
       systemTillType: 'retail',
     })]);
     expect(posPaymentService.getPaymentSettings).toHaveBeenCalledWith('company-admin');
+  });
+
+  test('returns an actionable validation response when enabling an unmapped method', async () => {
+    const registerId = '507f1f77bcf86cd799439012';
+    posPaymentService.listPaymentRegisters.mockResolvedValue([{ id: registerId, isActive: true }]);
+    posPaymentService.savePaymentSettings.mockRejectedValue(Object.assign(
+      new TypeError('Configure Card clearing before enabling this payment method.'),
+      { code: 'POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED' },
+    ));
+    const res = response();
+
+    await paymentSettingsController.updateAdminSettings({
+      user: { id: 'manager-user', companyId: 'company-admin' },
+      body: { registerId, settings: safeSettings({ enabledMethods: ['CASH', 'CARD'] }) },
+      headers: {},
+    }, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({
+      success: false,
+      code: 'POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED',
+      message: expect.stringContaining('Card clearing'),
+    });
   });
 
   test('admin payment settings save is tied to a company register and authenticated manager audit identity', async () => {

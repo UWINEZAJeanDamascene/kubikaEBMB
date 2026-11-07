@@ -5,6 +5,14 @@ const { runInTransaction } = require('./transactionService');
 const { writePosAuditLog } = require('./posAuditService');
 const { DEFAULT_SYSTEM_TILL_TYPES } = require('./posDiscountSettingsService');
 const {
+  PAYMENT_METHOD_REGISTRY,
+  normalizeMethodRegistry,
+  resolveMethodRegistry,
+  registryToLegacyMethods,
+  registryToLegacyOverrides,
+} = require('./posPaymentMethodRegistry');
+const posAccountingProfileService = require('./posAccountingProfileService');
+const {
   API_UNAVAILABLE_MESSAGE,
   MOBILE_MONEY_PROVIDERS,
   MANUAL_MOBILE_MONEY_PROVIDERS,
@@ -17,9 +25,12 @@ const PAYMENT_METHODS = Object.freeze([
   'AIRTEL_MONEY',
   'CARD',
   'BANK_TRANSFER',
+  'CHEQUE',
   'CREDIT',
   'GIFT_CARD',
   'STORE_CREDIT',
+  'LOYALTY',
+  'LOYALTY_WALLET',
   'LOYALTY_POINTS',
 ]);
 const PAYMENT_METHOD_SET = new Set(PAYMENT_METHODS);
@@ -47,6 +58,7 @@ const PAYMENT_SETTINGS_SELECT = Object.freeze({
   providerEnvironment: true,
   manualMobileMoneyMode: true,
   manualMobileMoneyReceivers: true,
+  methodRegistry: true,
 });
 const PAYMENT_SETTINGS_FIELDS = new Set([
   'enabledMethods',
@@ -67,6 +79,7 @@ const PAYMENT_SETTINGS_FIELDS = new Set([
   'providerEnvironment',
   'manualMobileMoneyMode',
   'manualMobileMoneyReceivers',
+  'methodRegistry',
   'providers',
 ]);
 
@@ -85,6 +98,71 @@ function validateMethod(method) {
   if (!PAYMENT_METHOD_SET.has(method)) {
     throw paymentError('POS_PAYMENT_METHOD_INVALID', `Unsupported POS payment method: ${String(method)}.`);
   }
+}
+
+function paymentMethodRegistryId(method) {
+  if (method === 'MTN_MOMO' || method === 'AIRTEL_MONEY') return 'MOBILE_MONEY';
+  if (method === 'CREDIT') return 'CUSTOMER_CREDIT';
+  if (method === 'LOYALTY' || method === 'LOYALTY_WALLET') return 'LOYALTY_WALLET';
+  return method;
+}
+
+function validateTenderConfiguration(settings, {
+  registerId,
+  tillType,
+  method,
+  amount,
+  reference,
+  customerId,
+  tendered,
+  allowOptionalReference = false,
+} = {}) {
+  validateMethod(method);
+  const normalized = normalizeSettings(settings);
+  const config = resolveMethodRegistry(normalized.methodRegistry, { registerId, tillType })[
+    paymentMethodRegistryId(method)
+  ];
+  if (!config) {
+    throw paymentError('POS_PAYMENT_METHOD_INVALID', `Unsupported POS payment method: ${method}.`);
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw paymentError('POS_PAYMENT_AMOUNT_INVALID', 'Payment amounts must be positive.');
+  }
+  if (amount < config.minAmount) {
+    throw paymentError(
+      'POS_PAYMENT_AMOUNT_BELOW_MINIMUM',
+      `${config.displayName} requires a minimum payment of ${config.minAmount} RWF.`,
+    );
+  }
+  if (config.maxAmount !== null && amount > config.maxAmount) {
+    throw paymentError(
+      'POS_PAYMENT_AMOUNT_ABOVE_MAXIMUM',
+      `${config.displayName} allows a maximum payment of ${config.maxAmount} RWF.`,
+    );
+  }
+  if (config.requiresCustomer && (!customerId || customerId === 'walk-in')) {
+    throw paymentError('POS_PAYMENT_CUSTOMER_REQUIRED', `Select a named customer to pay with ${config.displayName}.`);
+  }
+  const normalizedReference = typeof reference === 'string' ? reference.normalize('NFKC').trim() : '';
+  if (config.requiresReference && !normalizedReference && !allowOptionalReference) {
+    throw paymentError(
+      'POS_PAYMENT_REFERENCE_REQUIRED',
+      `Enter the ${config.referenceLabel.toLowerCase()} for ${config.displayName}.`,
+    );
+  }
+  if (normalizedReference.length > 160 || /[\u0000-\u001f\u007f]/.test(normalizedReference)) {
+    throw paymentError('POS_PAYMENT_REFERENCE_INVALID', 'Payment references must be valid and no more than 160 characters.');
+  }
+  if (tendered !== undefined && tendered > amount && !config.changeAllowed) {
+    throw paymentError('POS_PAYMENT_CHANGE_NOT_ALLOWED', `${config.displayName} does not allow change.`);
+  }
+  if (config.confirmationMode === 'pending') {
+    throw paymentError(
+      'POS_PAYMENT_CONFIRMATION_UNAVAILABLE',
+      `${config.displayName} is configured for pending confirmation, which is not available in this checkout yet.`,
+    );
+  }
+  return config;
 }
 
 function normalizeWriteOffApprovalThresholds(value) {
@@ -150,6 +228,54 @@ function validateProviderStatusEcho(value) {
     ))) {
     throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'Provider status fields are read-only.');
   }
+}
+
+function accountingTendersForMethod(method) {
+  if (method === 'MTN_MOMO') return [{ paymentMethod: 'mobile_money', provider: 'mtn' }];
+  if (method === 'AIRTEL_MONEY') return [{ paymentMethod: 'mobile_money', provider: 'airtel' }];
+  if (method === 'CREDIT') return [{ paymentMethod: 'customer_credit' }];
+  if (method === 'LOYALTY') {
+    return [{ paymentMethod: 'loyalty' }, { paymentMethod: 'loyalty_wallet' }];
+  }
+  if (method === 'LOYALTY_WALLET') return [{ paymentMethod: 'loyalty_wallet' }];
+  return [{ paymentMethod: method.toLowerCase() }];
+}
+
+async function assertPaymentAccountingReady({
+  companyId,
+  registerId,
+  tillType,
+  method,
+  client = dbClient(),
+}) {
+  const profile = await posAccountingProfileService.getProfile(companyId, client);
+  const missingBaseMappings = profile.missingMappings || [];
+  if (missingBaseMappings.length) {
+    throw paymentError(
+      'POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED',
+      `Configure required POS accounting mappings before enabling payments: ${missingBaseMappings.map(({ label }) => label).join(', ')}.`,
+    );
+  }
+  const requiredBaseKeys = new Set(
+    posAccountingProfileService.ACCOUNT_FIELDS
+      .filter((field) => field.required)
+      .map((field) => field.key),
+  );
+  const invalidBaseMapping = (profile.validationErrors || []).find((error) => (
+    error.scope === 'company'
+    && requiredBaseKeys.has(error.key)
+    && String(error.accountCode) === String(profile.companyDefaults?.[error.key] || '')
+  ));
+  if (invalidBaseMapping) {
+    throw paymentError('POS_PAYMENT_ACCOUNT_MAPPING_INVALID', invalidBaseMapping.message);
+  }
+  await posAccountingProfileService.assertTenderMappings(
+    profile,
+    accountingTendersForMethod(method),
+    { companyId, registerId, tillType },
+    {},
+    client,
+  );
 }
 
 function normalizeMethodList(methods, fieldName) {
@@ -220,12 +346,20 @@ function normalizeSettings(settings) {
       providerEnvironment: 'sandbox',
       manualMobileMoneyMode: 'INSTANT',
       manualMobileMoneyReceivers: {},
+      methodRegistry: normalizeMethodRegistry({}, [], {}),
       providers: providerStatuses({}, 'INSTANT'),
     };
   }
 
-  const enabledMethods = normalizeMethodList(settings.enabledMethods, 'enabledMethods');
-  const registerOverrides = normalizeRegisterOverrides(settings.registerOverrides);
+  const legacyEnabledMethods = normalizeMethodList(settings.enabledMethods ?? [], 'enabledMethods');
+  const legacyRegisterOverrides = normalizeRegisterOverrides(settings.registerOverrides ?? {});
+  const methodRegistry = normalizeMethodRegistry(
+    settings.methodRegistry,
+    legacyEnabledMethods,
+    legacyRegisterOverrides,
+  );
+  const enabledMethods = registryToLegacyMethods(methodRegistry.company);
+  const registerOverrides = legacyRegisterOverrides;
   const paymentFlow = settings.paymentFlow ?? 'LEGACY';
   if (!PAYMENT_FLOWS.includes(paymentFlow)) {
     throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'paymentFlow must be LEGACY or PAYMENTS_V2.');
@@ -302,6 +436,7 @@ function normalizeSettings(settings) {
     providerEnvironment: settings.providerEnvironment,
     manualMobileMoneyMode,
     manualMobileMoneyReceivers,
+    methodRegistry,
     providers: providerStatuses(manualMobileMoneyReceivers, manualMobileMoneyMode),
   };
 }
@@ -319,16 +454,27 @@ async function getPaymentSettings(companyId) {
     // tenant database. Keep POS refunds usable with the documented safe
     // default until `pos_return_window_days` is migrated, while surfacing all
     // unrelated schema/database errors normally.
-    const missingReturnWindowColumn = error?.code === 'P2022'
+    const missingMethodRegistry = error?.code === 'P2022'
+      && String(error?.meta?.column || '').includes('method_registry');
+    if (missingMethodRegistry) {
+      throw paymentError(
+        'POS_PAYMENT_METHOD_REGISTRY_MIGRATION_REQUIRED',
+        'POS payment method settings are unavailable because the method registry database migration has not been applied.',
+      );
+    }
+    const missingSettingsColumn = error?.code === 'P2022'
       && String(error?.meta?.column || '').includes('pos_return_window_days');
-    if (!missingReturnWindowColumn) throw error;
+    if (!missingSettingsColumn) throw error;
     const legacySelect = { ...PAYMENT_SETTINGS_SELECT };
     delete legacySelect.posReturnWindowDays;
     settings = await dbClient().posPaymentSettings.findUnique({
       where: { companyId: scopedCompanyId },
       select: legacySelect,
     });
-    return normalizeSettings(settings ? { ...settings, posReturnWindowDays: 30 } : null);
+    return normalizeSettings(settings ? {
+      ...settings,
+      posReturnWindowDays: settings.posReturnWindowDays ?? 30,
+    } : null);
   }
   if (!settings) return normalizeSettings(null);
   return normalizeSettings(settings);
@@ -351,8 +497,14 @@ async function listPaymentRegisters(companyId) {
 }
 
 function safeSettingsSnapshot(settings) {
-  const { providers, ...safeSettings } = normalizeSettings(settings);
-  return { ...safeSettings, providers };
+  const { providers, manualMobileMoneyReceivers, ...safeSettings } = normalizeSettings(settings);
+  return {
+    ...safeSettings,
+    manualMobileMoneyReceivers: Object.fromEntries(
+      Object.keys(manualMobileMoneyReceivers).map((method) => [method, '***']),
+    ),
+    providers,
+  };
 }
 
 async function savePaymentSettings({ companyId, settings, userId, registerId, ip }) {
@@ -390,8 +542,9 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
   }
 
   const data = {
-    enabledMethods: normalized.enabledMethods,
+    enabledMethods: registryToLegacyMethods(normalized.methodRegistry.company),
     registerOverrides: normalized.registerOverrides,
+    methodRegistry: normalized.methodRegistry,
     paymentFlow: normalized.paymentFlow,
     registerPaymentFlowOverrides: normalized.registerPaymentFlowOverrides,
     pendingSaleExpiryPolicy: normalized.pendingSaleExpiryPolicy,
@@ -419,37 +572,27 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
     }
     const registers = await tx.posRegister.findMany({
       where: { companyId: scopedCompanyId },
-      select: { id: true, isActive: true },
+      select: { id: true, isActive: true, systemTillType: true },
       take: 500,
     });
     const registerById = new Map(registers.map((register) => [register.id, register]));
-    const unknownRegister = [...registerIds, ...flowRegisterIds].find((id) => !registerById.has(id));
+    const methodRegisterIds = Object.keys(normalized.methodRegistry.registerOverrides);
+    const unknownRegister = [...registerIds, ...flowRegisterIds, ...methodRegisterIds]
+      .find((id) => !registerById.has(id));
     if (unknownRegister) {
       throw paymentError(
         'POS_PAYMENT_REGISTER_OVERRIDE_INVALID',
         'A register payment override refers to a register that does not belong to this company.',
       );
     }
-    for (const [id, methods] of Object.entries(normalized.registerOverrides)) {
-      const disabledMethod = methods.find((method) => (
-        method !== 'CASH' && !normalized.enabledMethods.includes(method)
-      ));
-      if (disabledMethod) {
-        throw paymentError(
-          'POS_PAYMENT_REGISTER_METHOD_DISABLED',
-          `Register overrides cannot enable ${disabledMethod} when the company has disabled it. Only cash can be controlled independently per register.`,
-        );
-      }
-      if (registerById.get(id)?.isActive && methods.length === 0) {
-        throw paymentError(
-          'POS_PAYMENT_REGISTER_METHOD_REQUIRED',
-          'Each active POS register must have at least one enabled payment method.',
-        );
-      }
-    }
+    data.registerOverrides = registryToLegacyOverrides(normalized.methodRegistry, registers);
     for (const register of registers) {
       const flow = normalized.registerPaymentFlowOverrides[register.id] ?? normalized.paymentFlow;
-      const methods = normalized.registerOverrides[register.id] ?? normalized.enabledMethods;
+      const methods = resolveEnabledMethods(
+        normalized,
+        String(register.id),
+        String(register.systemTillType || 'retail'),
+      );
       if (register.isActive && flow === 'PAYMENTS_V2' && !methods.includes('CASH')) {
         throw paymentError(
           'POS_PAYMENT_REGISTER_METHOD_REQUIRED',
@@ -458,7 +601,11 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
       }
     }
     const emptyRegister = registers.find((register) => register.isActive
-      && (normalized.registerOverrides[register.id] ?? normalized.enabledMethods).length === 0);
+      && resolveEnabledMethods(
+        normalized,
+        String(register.id),
+        String(register.systemTillType || 'retail'),
+      ).length === 0);
     if (emptyRegister) {
       throw paymentError(
         'POS_PAYMENT_REGISTER_METHOD_REQUIRED',
@@ -470,12 +617,46 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
       where: { companyId: scopedCompanyId },
       select: PAYMENT_SETTINGS_SELECT,
     });
+    const previousSettings = normalizeSettings(beforeRow);
+    const activeRegisters = registers.filter((register) => register.isActive);
+    const accountingScopes = [
+      ...DEFAULT_SYSTEM_TILL_TYPES.map((tillType) => ({ tillType })),
+      ...activeRegisters.map((register) => ({
+        registerId: String(register.id),
+        tillType: String(register.systemTillType || 'retail'),
+      })),
+    ];
+    for (const scope of accountingScopes) {
+      const previousMethods = new Set(resolveEnabledMethods(
+        previousSettings,
+        scope.registerId,
+        scope.tillType,
+      ));
+      const nextMethods = resolveEnabledMethods(normalized, scope.registerId, scope.tillType);
+      for (const method of nextMethods) {
+        if (!previousMethods.has(method)) {
+          await assertPaymentAccountingReady({
+            companyId: scopedCompanyId,
+            ...scope,
+            method,
+            client: tx,
+          });
+        }
+      }
+    }
     assertProviderMethodsConfigured(
-      normalized.enabledMethods,
+      registryToLegacyMethods(normalized.methodRegistry.company),
       normalized.manualMobileMoneyReceivers,
     );
-    for (const methods of Object.values(normalized.registerOverrides)) {
-      assertProviderMethodsConfigured(methods, normalized.manualMobileMoneyReceivers);
+    for (const register of registers) {
+      assertProviderMethodsConfigured(
+        resolveEnabledMethods(
+          normalized,
+          String(register.id),
+          String(register.systemTillType || 'retail'),
+        ),
+        normalized.manualMobileMoneyReceivers,
+      );
     }
     const before = safeSettingsSnapshot(beforeRow);
     const savedSettings = await tx.posPaymentSettings.upsert({
@@ -485,6 +666,7 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
       select: PAYMENT_SETTINGS_SELECT,
     });
     const after = safeSettingsSnapshot(savedSettings);
+    const updatedSettings = normalizeSettings(savedSettings);
     await writePosAuditLog({
       companyId: scopedCompanyId,
       registerId,
@@ -493,18 +675,33 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
       metadata: { before, after },
       ip,
     }, tx);
-    return after;
+    return updatedSettings;
   });
 }
 
-function resolveEnabledMethods(settings, registerId) {
+function resolveEnabledMethods(settings, registerId, tillType) {
   const normalized = normalizeSettings(settings);
-  const methods = registerId && Object.hasOwn(normalized.registerOverrides, registerId)
-    ? normalized.registerOverrides[registerId]
-    : normalized.enabledMethods;
+  const methods = registryToLegacyMethods(resolveMethodRegistry(
+    normalized.methodRegistry,
+    { registerId, tillType },
+  ));
   return methods.filter((method) => {
     return !PROVIDER_ADAPTERS[method] || normalized.providers[method]?.configured === true;
   });
+}
+
+function getEffectiveMethodRegistry(settings, { registerId, tillType } = {}) {
+  const normalized = normalizeSettings(settings);
+  const resolved = resolveMethodRegistry(normalized.methodRegistry, { registerId, tillType });
+  return {
+    methods: PAYMENT_METHOD_REGISTRY.map((method) => ({
+      ...method,
+      ...resolved[method.id],
+    })),
+    company: normalized.methodRegistry.company,
+    tillTypeOverrides: normalized.methodRegistry.tillTypeOverrides,
+    registerOverrides: normalized.methodRegistry.registerOverrides,
+  };
 }
 
 function resolvePaymentFlow(settings, registerId) {
@@ -514,26 +711,54 @@ function resolvePaymentFlow(settings, registerId) {
     : normalized.paymentFlow;
 }
 
-async function isPaymentMethodEnabled({ companyId, registerId, method }) {
+async function isPaymentMethodEnabled({ companyId, registerId, method, tillType }) {
   validateMethod(method);
   const settings = await getPaymentSettings(companyId);
-  return resolveEnabledMethods(settings, registerId).includes(method);
+  return resolveEnabledMethods(settings, registerId, tillType).includes(method);
 }
 
-async function assertPaymentMethodEnabled({ companyId, registerId, method }) {
-  const settings = await getPaymentSettings(companyId);
+async function assertPaymentMethodEnabled({ companyId, registerId, method, tillType }) {
+  validateMethod(method);
+  const scopedCompanyId = requireCompanyId(companyId);
+  let effectiveTillType = tillType;
+  if (!effectiveTillType) {
+    const register = await dbClient().posRegister.findFirst({
+      where: { id: String(registerId || ''), companyId: scopedCompanyId },
+      select: { systemTillType: true },
+    });
+    if (!register) {
+      throw paymentError('POS_PAYMENT_REGISTER_OVERRIDE_INVALID', 'The selected POS register does not belong to this company.');
+    }
+    effectiveTillType = register.systemTillType || 'retail';
+  }
+  const settings = await getPaymentSettings(scopedCompanyId);
   if (PROVIDER_ADAPTERS[method] && settings.providers[method]?.configured !== true) {
     throw paymentError(
       'POS_PAYMENT_PROVIDER_NOT_CONFIGURED',
       `${method === 'MTN_MOMO' ? 'MTN MoMo' : 'Airtel Money'} needs a receiving number or merchant code in POS payment settings.`,
     );
   }
-  if (!resolveEnabledMethods(settings, registerId).includes(method)) {
+  const enabledCode = method === 'LOYALTY_WALLET' ? 'LOYALTY' : method;
+  if (!resolveEnabledMethods(settings, registerId, effectiveTillType).includes(enabledCode)) {
+    const code = method === 'MTN_MOMO' || method === 'AIRTEL_MONEY'
+      ? 'MOBILE_MONEY'
+      : method === 'CREDIT' ? 'CUSTOMER_CREDIT'
+        : method === 'LOYALTY_WALLET' ? 'LOYALTY_WALLET' : method;
+    const displayName = resolveMethodRegistry(settings.methodRegistry, {
+      registerId,
+      tillType: effectiveTillType,
+    })[code]?.displayName || method.replace(/_/g, ' ').toLowerCase();
     throw paymentError(
       'POS_PAYMENT_METHOD_DISABLED',
-      `${method} is not enabled for this company or register. Ask a manager to review POS payment settings.`,
+      `${displayName} is turned off for this register. Ask a manager to enable it.`,
     );
   }
+  await assertPaymentAccountingReady({
+    companyId: scopedCompanyId,
+    registerId,
+    tillType: effectiveTillType,
+    method,
+  });
 }
 
 async function getProviderStatus({ payment, attempt }) {
@@ -621,6 +846,7 @@ function calculatePaymentTotals(invoiceTotal, payments) {
 
 module.exports = {
   PAYMENT_METHODS,
+  PAYMENT_METHOD_REGISTRY,
   PROVIDER_ADAPTERS,
   API_UNAVAILABLE_MESSAGE,
   getPaymentSettings,
@@ -628,9 +854,11 @@ module.exports = {
   listPaymentRegisters,
   savePaymentSettings,
   resolveEnabledMethods,
+  getEffectiveMethodRegistry,
   resolvePaymentFlow,
   isPaymentMethodEnabled,
   assertPaymentMethodEnabled,
+  validateTenderConfiguration,
   requestProviderPayment,
   calculatePaymentTotals,
   normalizeWriteOffApprovalThresholds,

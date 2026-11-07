@@ -1,5 +1,6 @@
 const {
   buildCreditNoteCostLines,
+  findOriginalLoyaltyAccounts,
   findOriginalSaleCostAccounts,
   findOriginalVatAccountCode,
 } = require('../utils/creditNoteAccounting');
@@ -25,6 +26,36 @@ describe('credit note accounting builders', () => {
         { accountCode: '1205', accountName: 'Inventory', debit: 0, credit: 400 },
       ],
     })).toEqual({ cogsAccountCode: '5105', inventoryAccountCode: '1205' });
+  });
+
+  test('reverses loyalty using the same original liability and rewards-expense accounts', () => {
+    expect(findOriginalLoyaltyAccounts({
+      lines: [
+        {
+          accountCode: '6150',
+          accountName: 'Loyalty Expense',
+          description: 'Loyalty credit earned - Invoice INV-1',
+          debit: 12.5,
+          credit: 0,
+        },
+        {
+          accountCode: '2875',
+          accountName: 'Loyalty Wallet Liability',
+          description: 'Loyalty credit liability - Invoice INV-1',
+          debit: 0,
+          credit: 12.5,
+        },
+      ],
+    })).toEqual({ expenseAccountCode: '6150', liabilityAccountCode: '2875' });
+  });
+
+  test('rejects loyalty reversals when the original earn accounts do not balance', () => {
+    expect(() => findOriginalLoyaltyAccounts({
+      lines: [
+        { accountCode: '6150', description: 'Loyalty credit earned', debit: 12, credit: 0 },
+        { accountCode: '2875', description: 'Loyalty credit liability', debit: 0, credit: 10 },
+      ],
+    })).toThrow('does not contain a matching loyalty reward expense and liability pair');
   });
 
   test('balances restock, write-off, and mixed return lines at original cost', () => {

@@ -20,12 +20,30 @@ jest.mock('../services/CurrencyService', () => ({
 
 const { prisma } = require('../lib/prisma');
 const { syncCompanyChartOfAccounts } = require('../services/systemBootstrapService');
+const { CHART_OF_ACCOUNTS: canonicalChart } = jest.requireActual('../constants/chartOfAccounts');
 
 describe('system bootstrap chart-of-accounts sync', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.chartOfAccount.findUnique.mockResolvedValue(null);
     prisma.chartOfAccount.upsert.mockResolvedValue({});
+  });
+
+  it('defines undeposited cheques and loyalty points as distinct postable accounts', () => {
+    expect(canonicalChart['1130']).toEqual({
+      name: 'Cheques in Hand (Undeposited Cheques)',
+      type: 'asset',
+      subtype: 'current',
+      normalBalance: 'debit',
+      allowDirectPosting: true,
+    });
+    expect(canonicalChart['2870']).toEqual({
+      name: 'Loyalty Points Liability',
+      type: 'liability',
+      subtype: 'current',
+      normalBalance: 'credit',
+      allowDirectPosting: true,
+    });
   });
 
   it('reconciles a retry-safe upsert when the database closes its connection', async () => {

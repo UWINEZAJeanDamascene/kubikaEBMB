@@ -5,7 +5,7 @@ const { prisma } = require('../lib/prisma');
 const slowQueryMonitor = require('../utils/slowQueryMonitor');
 const { requestIp } = require('../services/posAuditService');
 const { createReceiptCopy } = require('../services/posReceiptReprintService');
-const { buildPosReceiptDocument } = require('../services/posReceiptDocumentService');
+const { buildPosReceiptDocument, maskPaymentReference } = require('../services/posReceiptDocumentService');
 const { resolveReceiptSettings } = require('../services/posReceiptSettingsService');
 const {
   extractPayloadTotals,
@@ -263,7 +263,10 @@ exports.getReceipt = async (req, res, next) => {
     data.rraPurchaseAccepted = salesPayload.prchrAcptcYn || null;
     data.rraValidatedAt = salesPayload.cfmDt || null;
     data.rraSaleDate = salesPayload.salesDt || null;
-    data.rraCustomerPhone = salesPayload.receipt?.custMblNo || data.client?.contact?.phone || null;
+    const customerPhone = String(salesPayload.receipt?.custMblNo || data.client?.contact?.phone || '').replace(/\D/g, '');
+    data.rraCustomerPhone = customerPhone
+      ? `${customerPhone.slice(0, 3)}****${customerPhone.slice(-3)}`
+      : null;
     const totals = extractPayloadTotals(data.ebm, data);
     data.rraTotals = {
       taxableByType: ['A', 'B', 'C', 'D']
@@ -277,11 +280,21 @@ exports.getReceipt = async (req, res, next) => {
     const recordedChange = recordedChangePayments.length
       ? recordedChangePayments.reduce((sum, payment) => sum + (Number(payment.changeGiven) || 0), 0)
       : null;
+    data.payments = (data.payments || []).map((payment) => {
+      const payerPhone = String(payment.payerPhone || '').replace(/\D/g, '');
+      return {
+        ...payment,
+        reference: maskPaymentReference(payment.reference),
+        ...(payment.payerPhone ? {
+          payerPhone: payerPhone ? `${payerPhone.slice(0, 3)}****${payerPhone.slice(-3)}` : null,
+        } : {}),
+      };
+    });
     data.paymentReceipt = {
       methods: (data.payments || []).filter((payment) => Number(payment.amount) > 0).map((payment) => ({
         method: String(payment.paymentMethod || 'cash').replace(/_/g, ' '),
         amountRwf: formatRwf(payment.amount),
-        reference: payment.reference || null,
+        reference: maskPaymentReference(payment.reference),
       })),
       amountPaidRwf: formatRwf(data.amountPaid),
       changeGivenRwf: recordedChange == null ? null : formatRwf(recordedChange),

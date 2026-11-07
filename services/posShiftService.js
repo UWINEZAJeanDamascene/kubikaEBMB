@@ -96,6 +96,7 @@ function cashAmount(value, name, optional = false) {
 function calculateExpectedCash({
   openingFloat,
   cashSales = 0,
+  cashGiftCardIssues = 0,
   cashRefunds = 0,
   cashIn = 0,
   cashOut = 0,
@@ -103,6 +104,7 @@ function calculateExpectedCash({
 } = {}) {
   const expectedCash = cashAmount(openingFloat, 'openingFloat')
     + cashAmount(cashSales, 'cashSales', true)
+    + cashAmount(cashGiftCardIssues, 'cashGiftCardIssues', true)
     - cashAmount(cashRefunds, 'cashRefunds', true)
     + cashAmount(cashIn, 'cashIn', true)
     - cashAmount(cashOut, 'cashOut', true)

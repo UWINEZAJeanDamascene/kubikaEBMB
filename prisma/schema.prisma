@@ -892,6 +892,9 @@ model Company {
   posPaymentAttempts          PosPaymentAttempt[]
   posProviderEvents           PosProviderEvent[]
   posPaymentRefunds           PosPaymentRefund[]
+  posAccountingPostings       PosAccountingPosting[]
+  posChequeDeposits           PosChequeDeposit[]
+  posCheques                  PosCheque[]
   posPaymentSettings          PosPaymentSettings?
   posManagerApprovals         PosManagerApproval[]
   posApprovalRequests         PosApprovalRequest[]
@@ -1386,7 +1389,8 @@ model PosShift {
   differenceReason    String?                    @map("difference_reason")
   approvedById        String?                    @map("approved_by") @db.Char(24)
   journalEntryId      String?                    @map("journal_entry_id") @db.Char(24)
-  idempotencyKey      String?                    @map("idempotency_key") @db.VarChar(100)
+  postingStatus  String              @default("pending") @map("posting_status") @db.VarChar(16)
+  idempotencyKey String?             @map("idempotency_key") @db.VarChar(100)
   closeIdempotencyKey String?                    @map("close_idempotency_key") @db.VarChar(100)
   closePayloadHash    String?                    @map("close_payload_hash") @db.Char(64)
   handoverFromShiftId String?                    @map("handover_from_shift_id") @db.Char(24)
@@ -1425,6 +1429,7 @@ model PosCashMovement {
   performedById  String              @map("performed_by") @db.Char(24)
   approvedById   String?             @map("approved_by") @db.Char(24)
   journalEntryId String?             @map("journal_entry_id") @db.Char(24)
+  postingStatus  String              @default("pending") @map("posting_status") @db.VarChar(16)
   idempotencyKey String?             @map("idempotency_key") @db.VarChar(100)
   createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
   company        Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
@@ -1809,6 +1814,8 @@ model PosStoredValueLedger {
   reference      String?                  @db.VarChar(120)
   notes          String?
   createdById    String?                  @map("created_by_id") @db.Char(24)
+  journalEntryId String?                  @map("journal_entry_id") @db.Char(24)
+  postingStatus  String                   @default("not_required") @map("posting_status") @db.VarChar(16)
   createdAt      DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
   company        Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
   account        PosStoredValueAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
@@ -1818,6 +1825,7 @@ model PosStoredValueLedger {
   @@index([companyId, accountId, createdAt(sort: Desc)])
   @@index([companyId, invoiceId])
   @@index([companyId, posPaymentId])
+  @@index([companyId, postingStatus])
   @@map("pos_stored_value_ledger")
 }
 
@@ -1861,6 +1869,7 @@ model PosPayment {
   providerEvents       PosProviderEvent[]
   refunds              PosPaymentRefund[]
   storedValueLedger    PosStoredValueLedger[]
+  cheque              PosCheque?
 
   @@unique([companyId, idempotencyKey])
   @@unique([companyId, externalRef])
@@ -1871,6 +1880,67 @@ model PosPayment {
   @@index([companyId, method, reconciliationStatus, createdAt], map: "pos_payments_company_id_method_reconciliation_status_created_at")
   @@index([companyId, cashierId, createdAt])
   @@map("pos_payments")
+}
+
+model PosChequeDeposit {
+  id                 String      @id @db.Char(24)
+  companyId          String      @map("company_id") @db.Char(24)
+  bankAccountId      String      @map("bank_account_id") @db.Char(24)
+  bankAccountCode    String      @map("bank_account_code") @db.VarChar(32)
+  idempotencyKey     String      @map("idempotency_key") @db.VarChar(100)
+  payloadHash        String      @map("payload_hash") @db.Char(64)
+  depositDate        DateTime    @map("deposit_date") @db.Timestamptz(3)
+  bankSlipReference  String      @map("bank_slip_reference") @db.VarChar(100)
+  totalAmount        Int         @map("total_amount")
+  postingStatus      String      @default("pending") @map("posting_status") @db.VarChar(16)
+  journalEntryId     String?     @map("journal_entry_id") @db.Char(24)
+  createdById        String      @map("created_by_id") @db.Char(24)
+  approvedById       String?     @map("approved_by_id") @db.Char(24)
+  createdAt          DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  company            Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount        BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Restrict)
+  cheques            PosCheque[]
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId, depositDate])
+  @@index([companyId, postingStatus])
+  @@map("pos_cheque_deposits")
+}
+
+model PosCheque {
+  id                      String           @id @db.Char(24)
+  companyId               String           @map("company_id") @db.Char(24)
+  invoiceId               String           @map("invoice_id") @db.Char(24)
+  paymentId               String?          @unique @map("payment_id") @db.Char(24)
+  tenderIndex             Int              @map("tender_index")
+  reference               String           @db.VarChar(160)
+  amount                  Int
+  status                  String           @default("in_hand") @db.VarChar(16)
+  chequesInHandAccountCode String?          @map("cheques_in_hand_account_code") @db.VarChar(32)
+  salePostingStatus       String           @default("pending") @map("sale_posting_status") @db.VarChar(16)
+  saleJournalEntryId      String?          @map("sale_journal_entry_id") @db.Char(24)
+  depositId               String?          @map("deposit_id") @db.Char(24)
+  depositedAt             DateTime?        @map("deposited_at") @db.Timestamptz(3)
+  bouncedAt               DateTime?        @map("bounced_at") @db.Timestamptz(3)
+  bouncedById             String?          @map("bounced_by_id") @db.Char(24)
+  bounceReason            String?          @map("bounce_reason") @db.VarChar(500)
+  bounceIdempotencyKey    String?          @map("bounce_idempotency_key") @db.VarChar(100)
+  bouncePayloadHash       String?          @map("bounce_payload_hash") @db.Char(64)
+  bouncePostingStatus     String?          @map("bounce_posting_status") @db.VarChar(16)
+  bounceJournalEntryId    String?          @map("bounce_journal_entry_id") @db.Char(24)
+  createdAt               DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company                 Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoice                 Invoice          @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  payment                 PosPayment?      @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  deposit                 PosChequeDeposit? @relation(fields: [depositId], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, invoiceId, tenderIndex])
+  @@unique([companyId, bounceIdempotencyKey])
+  @@index([companyId, status, createdAt])
+  @@index([companyId, invoiceId])
+  @@index([companyId, depositId])
+  @@map("pos_cheques")
 }
 
 model PosPaymentAttempt {
@@ -1935,6 +2005,35 @@ model PosPaymentRefund {
   @@map("pos_payment_refunds")
 }
 
+model PosAccountingPosting {
+  id              String    @id @db.Char(24)
+  companyId       String    @map("company_id") @db.Char(24)
+  sourceType      String    @map("source_type") @db.VarChar(64)
+  sourceId        String    @map("source_id") @db.Char(24)
+  status          String    @default("pending") @db.VarChar(16)
+  journalEntryId  String?   @map("journal_entry_id") @db.Char(24)
+  journalEntryIds Json      @default("[]") @map("journal_entry_ids")
+  attemptCount    Int       @default(0) @map("attempt_count")
+  maxAttempts     Int       @default(8) @map("max_attempts")
+  nextRetryAt     DateTime? @map("next_retry_at") @db.Timestamptz(3)
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(3)
+  postedAt        DateTime? @map("posted_at") @db.Timestamptz(3)
+  failedAt        DateTime? @map("failed_at") @db.Timestamptz(3)
+  lastError       Json?     @map("last_error")
+  payload         Json
+  payloadHash     String    @map("payload_hash") @db.Char(64)
+  idempotencyKey  String    @map("idempotency_key") @db.VarChar(160)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, sourceType, sourceId])
+  @@unique([companyId, idempotencyKey])
+  @@index([status, nextRetryAt, createdAt])
+  @@index([companyId, status, createdAt(sort: Desc)])
+  @@map("pos_accounting_postings")
+}
+
 model PosPaymentSettings {
   companyId                    String                     @id @map("company_id") @db.Char(24)
   enabledMethods               Json                       @map("enabled_methods")
@@ -1955,6 +2054,7 @@ model PosPaymentSettings {
   providerEnvironment          PosPaymentEnvironment      @default(sandbox) @map("provider_environment")
   manualMobileMoneyMode        PosManualMobileMoneyMode   @default(INSTANT) @map("manual_mobile_money_mode")
   manualMobileMoneyReceivers   Json                       @default("{}") @map("manual_mobile_money_receivers")
+  methodRegistry               Json                       @default("{}") @map("method_registry")
   /// Stores encrypted provider credentials. Never return or log this field.
   providerConfig               Json?                      @map("provider_config")
   company                      Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
@@ -3267,6 +3367,7 @@ model Invoice {
   shift                    PosShift?                @relation(fields: [shiftId], references: [id], onDelete: SetNull)
   cashier                  User?                    @relation("PosInvoiceCashier", fields: [cashierId], references: [id], onDelete: SetNull)
   posPayments              PosPayment[]
+  posCheques               PosCheque[]
   posPaymentRefunds        PosPaymentRefund[]
 
   @@unique([companyId, referenceNo])
@@ -3363,6 +3464,9 @@ model CreditNote {
   revenueReversalEntryId       String?          @map("revenue_reversal_entry_id") @db.Char(24)
   cogsReversalEntryId          String?          @map("cogs_reversal_entry_id") @db.Char(24)
   writeOffReversalEntryId      String?          @map("write_off_reversal_entry_id") @db.Char(24)
+  posPostingStatus             String?          @map("pos_posting_status") @db.VarChar(16)
+  loyaltyRewardReversed        Decimal          @default(0) @map("loyalty_reward_reversed") @db.Decimal(19, 2)
+  loyaltyRewardConsumed        Decimal          @default(0) @map("loyalty_reward_consumed") @db.Decimal(19, 2)
   stockReversed                Boolean          @default(false) @map("stock_reversed")
   payments                     Json             @default("[]")
   ebm                          Json             @default("{}")
@@ -4055,6 +4159,7 @@ model BankAccount {
   statementLines            BankStatementLine[]
   statementTransactions     BankStatementTransaction[]
   transactions              BankTransaction[]
+  chequeDeposits            PosChequeDeposit[]
   arReceipts                ARReceipt[]
   pettyCashReplenishments   PettyCashReplenishment[]
 
@@ -6527,9 +6632,11 @@ enum PosPaymentMethod {
   AIRTEL_MONEY
   CARD
   BANK_TRANSFER
+  CHEQUE
   CREDIT
   GIFT_CARD
   STORE_CREDIT
+  LOYALTY_WALLET
   LOYALTY_POINTS
 }
 

@@ -134,6 +134,7 @@ exports.current = async (req, res, next) => {
         openingFloat: true,
         openingCount: true,
         note: true,
+        postingStatus: true,
         register: { select: { code: true, name: true } },
         cashMovements: {
           select: {
@@ -145,6 +146,7 @@ exports.current = async (req, res, next) => {
             bankSlipReference: true,
             note: true,
             journalEntryId: true,
+            postingStatus: true,
             createdAt: true,
           },
         },
@@ -217,10 +219,11 @@ exports.current = async (req, res, next) => {
           openingFloat: shift.openingFloat,
           openingCount: shift.openingCount,
           note: shift.note,
+          postingStatus: shift.postingStatus,
         },
         cashMovements: shift.cashMovements.map((movement) => ({
           ...movement,
-          postingStatus: movement.journalEntryId ? 'posted' : 'pending',
+          postingStatus: movement.postingStatus || (movement.journalEntryId ? 'posted' : 'pending'),
         })),
         bankDepositClearingBalance: depositClearingBalances.get(registerId) || 0,
         totals,

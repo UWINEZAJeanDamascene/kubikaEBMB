@@ -99,6 +99,18 @@ async function buildReport(companyId, till, queryClient = prisma) {
     linkedShiftIds,
   )
   : [];
+  const posPaymentRows = linkedShiftIds.length
+    ? await queryClient.$queryRawUnsafe(
+      `SELECT v2_payment.sale_id AS "saleId", v2_payment.cashier_id AS "cashierId",
+              v2_payment.method, v2_payment.amount
+         FROM pos_payments AS v2_payment
+        WHERE v2_payment.company_id = $1
+          AND v2_payment.shift_id = ANY($2::char(24)[])
+          AND v2_payment.status = 'SUCCESS'`,
+      companyId,
+      linkedShiftIds,
+    )
+    : [];
   const cancelledAfterPaymentByCashier = linkedShiftIds.length
   ? await queryClient.$queryRawUnsafe(
     `SELECT paid_sales."cashierId",
@@ -144,6 +156,7 @@ async function buildReport(companyId, till, queryClient = prisma) {
   const cashierIds = [...new Set([
     till.openedById,
     ...invoices.flatMap((invoice) => [invoice.cashier_id, invoice.created_by]),
+    ...posPaymentRows.map((payment) => payment.cashierId),
     ...refundRows.map((refund) => refund.refunded_by),
     ...(Array.isArray(till.cashActivity) ? till.cashActivity.map((item) => item.recordedBy) : []),
   ].filter(Boolean).map(String))];
@@ -230,6 +243,7 @@ async function buildReport(companyId, till, queryClient = prisma) {
   const tenderTotals = new Map();
   const paymentMethods = emptyPaymentMethods();
   const cashierTotals = new Map();
+  const invoicesWithEmbeddedPayments = new Set();
   for (const invoice of invoices) {
     if (invoice.status === 'cancelled') continue;
     const cashierId = String(invoice.cashier_id || invoice.created_by || till.openedById);
@@ -255,6 +269,7 @@ async function buildReport(companyId, till, queryClient = prisma) {
       cashier.tenders.credit += outstanding;
     }
     const payments = Array.isArray(invoice.payments) ? invoice.payments : [];
+    if (payments.length) invoicesWithEmbeddedPayments.add(String(invoice.id));
     for (const payment of payments) {
       const amount = number(payment?.amount);
       if (amount <= 0) continue;
@@ -264,6 +279,32 @@ async function buildReport(companyId, till, queryClient = prisma) {
       paymentMethods[category] += amount;
       cashier.tenders[category] += amount;
     }
+  }
+  const reportableInvoiceIds = new Set(invoices
+    .filter((invoice) => invoice.status !== 'cancelled' && invoice.status !== 'PENDING_PAYMENT')
+    .map((invoice) => String(invoice.id)));
+  for (const payment of posPaymentRows) {
+    const saleId = String(payment.saleId);
+    if (!reportableInvoiceIds.has(saleId) || invoicesWithEmbeddedPayments.has(saleId)) continue;
+    const amount = number(payment.amount);
+    if (amount <= 0) continue;
+    const method = String(payment.method || 'unknown').toLowerCase();
+    tenderTotals.set(method, (tenderTotals.get(method) || 0) + amount);
+    const category = paymentCategory(method);
+    paymentMethods[category] += amount;
+    const cashierId = String(payment.cashierId || till.openedById);
+    if (!cashierTotals.has(cashierId)) {
+      cashierTotals.set(cashierId, {
+        cashier: cashiersById.get(cashierId) || { id: cashierId, name: 'Cashier', email: null },
+        transactionCount: 0,
+        gross: 0,
+        discounts: 0,
+        refunds: 0,
+        netSales: 0,
+        tenders: emptyPaymentMethods(),
+      });
+    }
+    cashierTotals.get(cashierId).tenders[category] += amount;
   }
   const refundsByMethod = new Map();
   const refundsByCashier = new Map();
@@ -304,7 +345,7 @@ async function buildReport(companyId, till, queryClient = prisma) {
     .filter((activity) => activity.type === 'cash_sale')
     .reduce((sum, activity) => sum + number(activity.amount), 0));
   const cashGiftCardIssues = roundMoney(cashActivity
-    .filter((activity) => activity.type === 'gift_card_issue')
+    .filter((activity) => activity.type === 'gift_card_issue' && !activity.posShiftId)
     .reduce((sum, activity) => sum + number(activity.amount), 0));
   const openingFloat = roundMoney(till.openingFloat);
   const expectedCash = roundMoney(till.expectedCash ?? openingFloat);

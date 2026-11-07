@@ -114,6 +114,7 @@ describe('POS approval endpoint', () => {
     expect([...APPROVABLE_ACTIONS]).toContain('CANCEL_PAID_SALE');
     expect([...APPROVABLE_ACTIONS]).toContain('CREDIT_OVER_LIMIT');
     expect([...APPROVABLE_ACTIONS]).toEqual(expect.arrayContaining(['CREDIT_ADJUST', 'CREDIT_WRITEOFF', 'CREDIT_REFUND']));
+    expect([...APPROVABLE_ACTIONS]).toEqual(expect.arrayContaining(['CHEQUE_DEPOSIT', 'CHEQUE_BOUNCE']));
 
     const unsupported = response();
     await create(request({ action: 'UNKNOWN_ACTION' }), unsupported, jest.fn());
@@ -139,6 +140,8 @@ describe('POS approval endpoint', () => {
     expect(permissionForApprovalAction('VOID_SALE')).toBe('pos.till.void');
     expect(permissionForApprovalAction('NO_SALE')).toBe('pos.till.no_sale');
     expect(permissionForApprovalAction('DISCOUNT_OVER_LIMIT')).toBe('pos.till.discount');
+    expect(permissionForApprovalAction('CHEQUE_DEPOSIT')).toBe('pos.payment.reconcile');
+    expect(permissionForApprovalAction('CHEQUE_BOUNCE')).toBe('pos.payment.reconcile');
   });
 
   test('applies company policy to PIN approval expiry and rejects disabled actions', async () => {

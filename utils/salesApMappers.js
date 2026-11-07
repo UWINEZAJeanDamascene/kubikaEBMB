@@ -217,7 +217,7 @@ function invoiceToApi(row) {
     posOrigin: Boolean(row.posOrigin),
     posPostingStatus: row.posOrigin
       ? (row.posPostingStatus
-        || (row.revenueJournalEntryId ? 'posted' : ['draft', 'PENDING_PAYMENT'].includes(row.status) ? 'pending' : 'failed'))
+       || (row.revenueJournalEntryId ? 'posted' : ['draft', 'PENDING_PAYMENT'].includes(row.status) ? 'not_required' : 'failed'))
       : null,
     tillSessionId: row.tillSessionId ?? null,
     registerId: row.registerId ?? null,
@@ -756,15 +756,17 @@ function creditNoteToApi(row) {
     && line.product?.isStockable !== false
     && Number(line.quantity) * Number(line.unitCost) > 0
   ));
-  const postingStatus = row.status === 'confirmed'
-    ? (row.revenueReversalEntryId
+  const postingStatus = row.posOrigin && row.posPostingStatus
+    ? row.posPostingStatus
+    : row.status === 'confirmed'
+      ? (row.revenueReversalEntryId
       && (!hasRestockCost || row.cogsReversalEntryId)
       && (!hasWriteOffCost || row.writeOffReversalEntryId)
       ? 'posted'
       : 'failed')
-    : ['draft', 'processing'].includes(String(row.status || '').toLowerCase())
-      ? 'pending'
-      : null;
+      : ['draft', 'processing'].includes(String(row.status || '').toLowerCase())
+        ? 'pending'
+        : null;
   return {
     _id: row.id,
     company: row.companyId,
@@ -793,6 +795,8 @@ function creditNoteToApi(row) {
     writeOffReversalEntry: row.writeOffReversalEntry
       ? relationRef(row.writeOffReversalEntry, row.writeOffReversalEntryId)
       : row.writeOffReversalEntryId ?? null,
+    loyaltyRewardReversed: qtyNum(row.loyaltyRewardReversed),
+    loyaltyRewardConsumed: qtyNum(row.loyaltyRewardConsumed),
     confirmedBy: row.confirmedById ?? null,
     confirmedAt: row.confirmedAt ?? null,
     amountRefunded: qtyNum(row.amountRefunded),
@@ -1364,6 +1368,9 @@ const CREDIT_NOTE_HEADER = {
   revenueReversalEntry: 'revenueReversalEntryId',
   cogsReversalEntry: 'cogsReversalEntryId',
   writeOffReversalEntry: 'writeOffReversalEntryId',
+  posPostingStatus: 'posPostingStatus',
+  loyaltyRewardReversed: 'loyaltyRewardReversed',
+  loyaltyRewardConsumed: 'loyaltyRewardConsumed',
   creditDate: 'creditDate',
   reason: 'reason',
   type: 'type',

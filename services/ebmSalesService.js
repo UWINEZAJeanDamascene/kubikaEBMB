@@ -642,14 +642,34 @@ function buildLinePayload(line, itemSeq) {
   const lineSubtotal = salesDecimal(decimalValue(line.lineSubtotal, `itemList[${itemSeq}].lineSubtotal`), `itemList[${itemSeq}].lineSubtotal`);
   const taxAmt = salesDecimal(decimalValue(line.lineTax, `itemList[${itemSeq}].lineTax`), `itemList[${itemSeq}].lineTax`);
   const lineTotal = salesDecimal(decimalValue(line.lineTotal, `itemList[${itemSeq}].lineTotal`), `itemList[${itemSeq}].lineTotal`);
-  const discountAmount = supplyAmount.sub(lineSubtotal);
-  if (discountAmount.isNegative()) {
-    throw sourceFieldError('EBM_SALES_LINE_SUBTOTAL_INVALID', `Item ${getLineName(line)} saved subtotal exceeds its quantity multiplied by unit price.`);
+  const savedDiscountPct = line.discountPct ?? line.discount;
+  let discountAmount;
+  let taxableAmount;
+  let effectiveDiscountPct;
+  if (savedDiscountPct != null) {
+    const discountPct = decimalValue(savedDiscountPct, `itemList[${itemSeq}].discountPct`);
+    if (discountPct.isNegative() || discountPct.gt(100)) {
+      throw sourceFieldError('EBM_SALES_DISCOUNT_INVALID', `Item ${getLineName(line)} discount percentage must be between zero and one hundred.`);
+    }
+    if (!new Decimal(lineSubtotal).eq(salesDecimal(supplyAmount, `itemList[${itemSeq}].lineSubtotal`))) {
+      throw sourceFieldError('EBM_SALES_LINE_SUBTOTAL_INVALID', `Item ${getLineName(line)} saved subtotal does not match its quantity multiplied by unit price.`);
+    }
+    discountAmount = supplyAmount.mul(discountPct).div(100).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+    taxableAmount = supplyAmount.minus(discountAmount).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+    effectiveDiscountPct = supplyAmount.isZero()
+      ? new Decimal(0)
+      : discountAmount.mul(100).div(supplyAmount).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+  } else {
+    discountAmount = supplyAmount.sub(lineSubtotal);
+    if (discountAmount.isNegative()) {
+      throw sourceFieldError('EBM_SALES_LINE_SUBTOTAL_INVALID', `Item ${getLineName(line)} saved subtotal exceeds its quantity multiplied by unit price.`);
+    }
+    taxableAmount = lineSubtotal;
+    effectiveDiscountPct = supplyAmount.isZero()
+      ? new Decimal(0)
+      : discountAmount.mul(100).div(supplyAmount).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
   }
-  const effectiveDiscountPct = supplyAmount.isZero()
-    ? new Decimal(0)
-    : discountAmount.mul(100).div(supplyAmount).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
-  const reconciledTotal = new Decimal(lineSubtotal).plus(taxAmt).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+  const reconciledTotal = new Decimal(taxableAmount).plus(taxAmt).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
   if (!reconciledTotal.eq(lineTotal)) {
     throw sourceFieldError('EBM_SALES_LINE_TOTAL_MISMATCH', `Item ${getLineName(line)} saved total does not equal saved subtotal plus tax.`);
   }
@@ -704,7 +724,7 @@ function buildLinePayload(line, itemSeq) {
 
   const taxRateInput = line.taxRate ?? product?.taxRate;
   const taxRate = salesDecimal(decimalValue(taxRateInput, `itemList[${itemSeq}].taxRate`), `itemList[${itemSeq}].taxRate`);
-  const expectedTax = new Decimal(lineSubtotal).mul(taxRate).div(100).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+  const expectedTax = new Decimal(taxableAmount).mul(taxRate).div(100).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
   if (!expectedTax.eq(taxAmt)) {
     throw sourceFieldError('EBM_SALES_LINE_TAX_MISMATCH', `Item ${getLineName(line)} saved tax does not agree with its stored taxable amount and rate.`);
   }
@@ -744,7 +764,7 @@ function buildLinePayload(line, itemSeq) {
     ...(optionalInsuranceAmount !== undefined ? { isrcAmt: optionalInsuranceAmount } : {}),
     taxTyCd,
     __salesTaxRate: taxRate,
-    taxblAmt: lineSubtotal,
+    taxblAmt: salesDecimal(taxableAmount, `itemList[${itemSeq}].taxblAmt`),
     totTaxAmt: taxAmt,
     totAmt: lineTotal,
   };

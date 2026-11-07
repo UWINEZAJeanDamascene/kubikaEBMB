@@ -53,6 +53,7 @@ beforeEach(() => {
         { type: 'safe_drop', amount: 20 },
       ];
     }
+    if (sql.includes('FROM pos_payments AS v2_payment')) return [];
     if (sql.includes('FROM pos_payments payment')) return [{ amount: 0 }];
     if (sql.includes('FROM pos_payment_refunds refund')) return [];
     if (sql.includes('FROM invoices') && sql.includes('till_session_id = $2')) {
@@ -228,6 +229,7 @@ describe('POS X/Z report snapshot', () => {
   test('does not count a POS cash movement twice when it is also mirrored in till activity', async () => {
     prisma.$queryRawUnsafe.mockImplementation(async (sql) => {
       if (sql.includes('FROM pos_cash_movements movement')) return [{ type: 'cash_in', amount: 50 }];
+      if (sql.includes('FROM pos_payments AS v2_payment')) return [];
       if (sql.includes('FROM pos_payments payment')) return [{ amount: 0 }];
       if (sql.includes('FROM pos_payment_refunds refund')) return [];
       if (sql.includes('FROM ebm_submission_queues')) return [];
@@ -263,5 +265,43 @@ describe('POS X/Z report snapshot', () => {
     expect(report.shift).not.toHaveProperty('closedAt');
     expect(report.cash.count).toBeNull();
     expect(report.cash.variance).toBeNull();
+  });
+
+  test('includes V2 payment rows in shift tender totals when the invoice has no embedded tenders', async () => {
+    const defaultQuery = prisma.$queryRawUnsafe.getMockImplementation();
+    prisma.$queryRawUnsafe.mockImplementation(async (sql, ...parameters) => {
+      if (sql.includes('FROM pos_payments AS v2_payment')) {
+        return [{
+          saleId: 'invoice-v2',
+          cashierId: CASHIER_ID,
+          method: 'CARD',
+          amount: 4000,
+        }];
+      }
+      if (sql.includes('FROM invoices') && sql.includes('till_session_id = $2')) {
+        return [{
+          id: 'invoice-v2',
+          shift_id: SHIFT_ID,
+          reference_no: 'INV-V2',
+          status: 'confirmed',
+          subtotal: 4000,
+          total_discount: 0,
+          tax_amount: 0,
+          total_amount: 4000,
+          amount_outstanding: 0,
+          payments: [],
+          cashier_id: CASHIER_ID,
+          created_by: CASHIER_ID,
+        }];
+      }
+      if (sql.includes('FROM credit_notes')) return [];
+      return defaultQuery(sql, ...parameters);
+    });
+
+    const report = await buildReport(COMPANY_ID, till());
+
+    expect(report.paymentMethods.card).toBe(4000);
+    expect(report.tenders).toEqual([{ method: 'card', received: 4000, refunded: 0, net: 4000 }]);
+    expect(report.cashiers[0].tenders.card).toBe(4000);
   });
 });

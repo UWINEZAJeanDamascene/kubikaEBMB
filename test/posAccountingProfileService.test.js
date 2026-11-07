@@ -103,6 +103,97 @@ describe('POS accounting profile service', () => {
     })]);
   });
 
+  test('validates cheque and stored-value payment mappings against required account types', () => {
+    const profile = service.normalizeProfile({
+      companyDefaults: {
+        chequesInHand: '1100',
+        storeCreditLiability: '2860',
+        loyaltyWalletLiability: '2860',
+        loyaltyPointsLiability: '2860',
+      },
+    });
+    const status = service.buildProfileStatus(profile, [
+      { code: '1100', type: 'asset', isActive: true, allowDirectPosting: true },
+      { code: '2860', type: 'liability', isActive: true, allowDirectPosting: true },
+    ]);
+
+    expect(status.validationErrors).toEqual([]);
+    expect(service.ACCOUNT_FIELDS).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'chequesInHand', allowedTypes: ['asset'] }),
+      expect.objectContaining({ key: 'storeCreditLiability', allowedTypes: ['liability'] }),
+      expect.objectContaining({ key: 'loyaltyWalletLiability', allowedTypes: ['liability'] }),
+      expect.objectContaining({ key: 'loyaltyPointsLiability', allowedTypes: ['liability'] }),
+    ]));
+    expect(service.buildProfileStatus(service.normalizeProfile({
+      companyDefaults: {
+        chequesInHand: '2860',
+        storeCreditLiability: '1000',
+      },
+    }), [
+      { code: '2860', type: 'liability', isActive: true, allowDirectPosting: true },
+      { code: '1000', type: 'asset', isActive: true, allowDirectPosting: true },
+    ]).validationErrors).toHaveLength(2);
+  });
+
+  test('requires a valid resolved mapping for every posted payment tender', async () => {
+    const profile = service.normalizeProfile({
+      companyDefaults: {
+        cardClearing: '1120',
+        chequesInHand: '1130',
+        giftCardLiability: '2850',
+        storeCreditLiability: '2860',
+        loyaltyWalletLiability: '2860',
+        loyaltyPointsLiability: '2860',
+        airtelMoney: '1210',
+      },
+      tillTypeOverrides: { retail: { cardClearing: '1125' } },
+      registerOverrides: {},
+    });
+
+    await expect(service.assertTenderMappings(profile, [
+      { paymentMethod: 'card' },
+      { paymentMethod: 'cheque' },
+      { paymentMethod: 'gift_card' },
+      { paymentMethod: 'store_credit' },
+      { paymentMethod: 'loyalty_wallet' },
+      { paymentMethod: 'loyalty_points' },
+      { paymentMethod: 'mobile_money', provider: 'airtel', accountCode: '9999' },
+    ], { tillType: 'retail' })).resolves.toBeUndefined();
+    await expect(service.assertTenderMappings(profile, [
+      { paymentMethod: 'bank_transfer' },
+    ])).rejects.toThrow(/Bank transfer clearing/);
+    await expect(service.assertTenderMappings({
+      ...profile,
+      validationErrors: [{
+        key: 'chequesInHand',
+        accountCode: '1130',
+        message: 'Cheques in hand must use asset accounts; 1130 is liability.',
+      }],
+    }, [{ paymentMethod: 'cheque' }])).rejects.toThrow(/invalid/);
+  });
+
+  test('validates directly selected bank accounts as company-owned assets', async () => {
+    prisma.chartOfAccount = {
+      findMany: jest.fn().mockResolvedValue([{
+        code: '1122',
+        type: 'liability',
+        isActive: true,
+        allowDirectPosting: true,
+      }]),
+    };
+
+    await expect(service.assertTenderMappings({
+      companyDefaults: {},
+      tillTypeOverrides: {},
+      registerOverrides: {},
+    }, [{ paymentMethod: 'bank_transfer', accountCode: '1122' }], {
+      companyId: 'company-a',
+    })).rejects.toMatchObject({ code: 'POS_PAYMENT_ACCOUNT_MAPPING_INVALID' });
+    expect(prisma.chartOfAccount.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { companyId: 'company-a', code: { in: ['1122'] } },
+    }));
+  });
+
   test('validates bank deposit clearing as an asset without requiring it for unrelated POS use', () => {
     const profile = {
       companyDefaults: { bankDepositClearing: '2850' },
@@ -174,9 +265,14 @@ describe('pure POS accounting builders', () => {
     cardClearing: '1120',
     mtnMoMo: '1200',
     airtelMoney: '1210',
+    cashAtBank: '1100',
+    chequesInHand: '1130',
     accountsReceivable: '1300',
     customerAdvances: '2860',
     giftCardLiability: '2850',
+    storeCreditLiability: '2860',
+    loyaltyWalletLiability: '2861',
+    loyaltyPointsLiability: '2870',
     inventory: '1400',
     salesRevenue: '4000',
     vatOutput: '2220',
@@ -237,6 +333,55 @@ describe('pure POS accounting builders', () => {
     ]));
     expect(entries[0].lines.reduce((sum, line) => sum + line.debit, 0)).toBe(300);
     expect(entries[0].lines.reduce((sum, line) => sum + line.credit, 0)).toBe(300);
+  });
+
+  test('posts cheque, store credit, wallet, and loyalty points to separate mappings', () => {
+    const tenders = [
+      { paymentMethod: 'cheque', amountRwf: 100 },
+      { paymentMethod: 'store_credit', amountRwf: 100 },
+      { paymentMethod: 'loyalty_wallet', amountRwf: 100 },
+      { paymentMethod: 'loyalty_points', amountRwf: 100 },
+    ];
+    const entries = builders.buildSaleJournalEntries({
+      invoice: {
+        id: 'invoice-separated-liabilities',
+        totalAmount: 400,
+        subtotal: 400,
+        totalDiscount: 0,
+        taxAmount: 0,
+        amountPaid: 400,
+        amountOutstanding: 0,
+        lines: [{ lineTax: 0, lineTotal: 400, cogsAmount: 0 }],
+      },
+      tenders,
+      accounts,
+    });
+
+    expect(entries[0].lines).toEqual(expect.arrayContaining([
+      expect.objectContaining({ accountCode: '1130', debit: 100 }),
+      expect.objectContaining({ accountCode: '2860', debit: 100 }),
+      expect.objectContaining({ accountCode: '2861', debit: 100 }),
+      expect.objectContaining({ accountCode: '2870', debit: 100 }),
+    ]));
+    expect(entries[0].lines.reduce((sum, line) => sum + line.debit, 0)).toBe(400);
+    expect(entries[0].lines.reduce((sum, line) => sum + line.credit, 0)).toBe(400);
+  });
+
+  test('does not let a bank account tender override the mapped mobile-money clearing account', () => {
+    expect(() => builders.buildSaleJournalEntries({
+      invoice: {
+        id: 'invoice-mobile-money-missing-mapping',
+        totalAmount: 100,
+        subtotal: 100,
+        totalDiscount: 0,
+        taxAmount: 0,
+        amountPaid: 100,
+        amountOutstanding: 0,
+        lines: [{ lineTax: 0, lineTotal: 100, cogsAmount: 0 }],
+      },
+      tenders: [{ paymentMethod: 'mobile_money', provider: 'airtel', accountCode: '9999', amountRwf: 100 }],
+      accounts: { ...accounts, airtelMoney: null },
+    })).toThrow(/airtelMoney is not configured/);
   });
 
   test('keeps V2 COGS lines in the invoice entry as the existing POS flow does', () => {
@@ -310,5 +455,97 @@ describe('pure POS accounting builders', () => {
     expect(entries[0].lines).toContainEqual(expect.objectContaining({ accountCode: '1300', debit: 400 }));
     expect(entries[1].lines.reduce((sum, line) => sum + line.debit, 0)).toBe(300);
     expect(entries[1].lines.reduce((sum, line) => sum + line.credit, 0)).toBe(300);
+  });
+
+  test.each([
+    ['cash', {}, '1000'],
+    ['card', {}, '1120'],
+    ['mobile_money', { provider: 'mtn' }, '1200'],
+    ['mobile_money', { provider: 'airtel' }, '1210'],
+    ['bank_transfer', {}, '1100'],
+    ['cheque', {}, '1130'],
+    ['credit', {}, '1300'],
+    ['gift_card', {}, '2850'],
+    ['store_credit', {}, '2860'],
+    ['loyalty_wallet', {}, '2861'],
+    ['loyalty_points', {}, '2870'],
+    ['loyalty', {}, '2860'],
+  ])('posts %s tender to its configured account', (paymentMethod, tenderFields, accountCode) => {
+    const entries = builders.buildSaleJournalEntries({
+      invoice: {
+        id: `invoice-${paymentMethod}`,
+        totalAmount: 100,
+        subtotal: 100,
+        totalDiscount: 0,
+        taxAmount: 0,
+        amountPaid: 100,
+        amountOutstanding: 0,
+        lines: [{ lineSubtotal: 100, lineTax: 0, lineTotal: 100, cogsAmount: 0 }],
+      },
+      tenders: [{ paymentMethod, ...tenderFields, amountRwf: 100 }],
+      accounts,
+    });
+
+    expect(entries[0].lines).toContainEqual(expect.objectContaining({ accountCode, debit: 100 }));
+    expect(entries[0].lines).toContainEqual(expect.objectContaining({ accountCode: '4000', credit: 100 }));
+    expect(entries[0].lines.reduce((sum, line) => sum + line.debit, 0))
+      .toBe(entries[0].lines.reduce((sum, line) => sum + line.credit, 0));
+  });
+
+  test('posts discounted revenue once and uses persisted line costs for COGS and inventory', () => {
+    const entries = builders.buildSaleJournalEntries({
+      invoice: {
+        id: 'invoice-discounted-voucher',
+        totalAmount: 1062,
+        subtotal: 1000,
+        totalDiscount: 100,
+        taxAmount: 162,
+        amountPaid: 900,
+        amountOutstanding: 162,
+        cogsAmount: 999,
+        ebm: { paymentFlow: 'PAYMENTS_V2' },
+        lines: [
+          { lineSubtotal: 600, lineTax: 108, lineTotal: 708, cogsAmount: 250 },
+          { lineSubtotal: 400, lineTax: 54, lineTotal: 354, cogsAmount: 170 },
+        ],
+      },
+      tenders: [
+        { paymentMethod: 'cash', amountRwf: 500 },
+        { paymentMethod: 'card', amountRwf: 400 },
+      ],
+      accounts,
+    });
+    const lines = entries[0].lines;
+    const accountTotal = (accountCode, side) => lines
+      .filter((line) => line.accountCode === accountCode)
+      .reduce((sum, line) => sum + line[side], 0);
+
+    expect(entries).toHaveLength(1);
+    expect(accountTotal('1000', 'debit')).toBe(500);
+    expect(accountTotal('1120', 'debit')).toBe(400);
+    expect(accountTotal('1300', 'debit')).toBe(162);
+    expect(accountTotal('4000', 'credit')).toBe(900);
+    expect(accountTotal('2220', 'credit')).toBe(162);
+    expect(accountTotal('5000', 'debit')).toBe(420);
+    expect(accountTotal('1400', 'credit')).toBe(420);
+    expect(lines.reduce((sum, line) => sum + line.debit, 0)).toBe(1482);
+    expect(lines.reduce((sum, line) => sum + line.credit, 0)).toBe(1482);
+  });
+
+  test('rejects line totals that do not reconcile with the stored invoice header', () => {
+    expect(() => builders.buildSaleJournalEntries({
+      invoice: {
+        id: 'invoice-discount-mismatch',
+        totalAmount: 95,
+        subtotal: 100,
+        totalDiscount: 5,
+        taxAmount: 0,
+        amountPaid: 95,
+        amountOutstanding: 0,
+        lines: [{ lineSubtotal: 100, lineTax: 0, lineTotal: 90, cogsAmount: 0 }],
+      },
+      tenders: [{ paymentMethod: 'cash', amountRwf: 95 }],
+      accounts,
+    })).toThrow(/line totals do not reconcile with the invoice header/);
   });
 });

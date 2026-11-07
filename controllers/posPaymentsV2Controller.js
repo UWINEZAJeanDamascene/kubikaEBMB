@@ -11,7 +11,11 @@ const { restoreGiftCardBalance } = require('../services/posGiftCardRefundService
 const posManualMobileMoneyService = require('../services/posManualMobileMoneyService');
 const { generateObjectId } = require('../utils/objectId');
 const { createDirectSale } = require('./salesLegacyController');
-const { normalizeMobileMoneyReference, MOBILE_MONEY_PROVIDERS } = require('../services/posPaymentProviders/manualMobileMoney');
+const {
+  normalizeMobileMoneyReference,
+  normalizeRwandaPhone,
+  MOBILE_MONEY_PROVIDERS,
+} = require('../services/posPaymentProviders/manualMobileMoney');
 const { hasPosPermission } = require('../middleware/posAuthMiddleware');
 const {
   DEFAULT_DISCOUNT_SETTINGS,
@@ -21,6 +25,19 @@ const {
 
 const IDEMPOTENCY_KEY_PATTERN = /^[a-zA-Z0-9_-]{8,100}$/;
 const MAX_SPLIT_PAYMENT_LINES = 10;
+const POS_PAYMENT_METHODS = new Set([
+  'CASH',
+  'MTN_MOMO',
+  'AIRTEL_MONEY',
+  'CARD',
+  'BANK_TRANSFER',
+  'CHEQUE',
+  'CREDIT',
+  'GIFT_CARD',
+  'STORE_CREDIT',
+  'LOYALTY_WALLET',
+  'LOYALTY_POINTS',
+]);
 const PAID_SALE_CANCELLATION_REASONS = new Set([
   'CUSTOMER_REQUEST',
   'WRONG_SALE',
@@ -48,6 +65,24 @@ function bindPosUser(req, auth) {
 
 function invalid(res, status, code, message) {
   return res.status(status).json({ success: false, code, message });
+}
+
+function reportDate(value, endOfDate = false) {
+  if (value === undefined || value === null || value === '') return null;
+  const input = String(value);
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) return new Date(Number.NaN);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) {
+    if (date.toISOString().slice(0, 10) !== input) return new Date(Number.NaN);
+    if (endOfDate) date.setUTCHours(23, 59, 59, 999);
+  }
+  return date;
+}
+
+function maskedPaymentReference(value) {
+  if (typeof value !== 'string' || !value) return null;
+  const normalized = value.trim();
+  return normalized ? `***${normalized.slice(-4)}` : null;
 }
 
 function paymentFlowError(res, error) {
@@ -114,6 +149,17 @@ function refundIdempotencyKey(companyId, saleId, requestKey, paymentId) {
 
 function splitPaymentIdempotencyKey(requestKey, index) {
   return createHash('sha256').update(`${requestKey}:split:${index}`).digest('hex');
+}
+
+function normalizePaymentReference(value) {
+  const reference = String(value || '').normalize('NFKC').trim();
+  if (!reference) return null;
+  return reference.replace(/\s+/g, '').toUpperCase();
+}
+
+function maskPayerPhone(value) {
+  if (!value) return null;
+  return `${value.slice(0, 3)}****${value.slice(-3)}`;
 }
 
 function refundReasonText(reasonCode, note) {
@@ -222,25 +268,38 @@ exports.recordCashPayment = async (req, res, next) => {
         tendered: payment?.tendered,
         reference: typeof payment?.reference === 'string' ? payment.reference.trim() : '',
         giftCardCode: typeof payment?.giftCardCode === 'string' ? payment.giftCardCode.trim() : '',
+        providerName: typeof payment?.providerName === 'string' ? payment.providerName.normalize('NFKC').trim() : '',
+        payerPhone: typeof payment?.payerPhone === 'string' ? payment.payerPhone : '',
       }))
       : [{
         method: String(req.body?.method || 'CASH').toUpperCase(),
         amount: req.body?.amount,
-        tendered: req.body?.tendered === undefined ? req.body?.amount : req.body.tendered,
+        tendered: req.body?.tendered === undefined
+          ? (String(req.body?.method || 'CASH').toUpperCase() === 'CASH' ? req.body?.amount : undefined)
+          : req.body.tendered,
         reference: typeof req.body?.reference === 'string' ? req.body.reference.trim() : '',
         giftCardCode: typeof req.body?.giftCardCode === 'string' ? req.body.giftCardCode.trim() : '',
+        providerName: typeof req.body?.providerName === 'string' ? req.body.providerName.normalize('NFKC').trim() : '',
+        payerPhone: typeof req.body?.payerPhone === 'string' ? req.body.payerPhone : '',
       }];
     if (isSplitRequest && (allocations.length < 1 || allocations.length > MAX_SPLIT_PAYMENT_LINES)) {
       return invalid(res, 400, 'POS_PAYMENT_SPLIT_INVALID', `Provide between 1 and ${MAX_SPLIT_PAYMENT_LINES} payment allocations.`);
     }
-    if (allocations.some((payment) => !['CASH', 'CREDIT', 'GIFT_CARD'].includes(payment.method))) {
+    const supportedSplitMethods = new Set([
+      'CASH', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT', 'GIFT_CARD', 'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS',
+    ]);
+    if (allocations.some((payment) => !supportedSplitMethods.has(payment.method))) {
       return invalid(res, 409, 'POS_PAYMENT_METHOD_UNAVAILABLE', 'This payment method is not yet available in this flow.');
     }
     if (allocations.filter((payment) => payment.method === 'CREDIT').length > 1) {
       return invalid(res, 400, 'POS_CREDIT_SPLIT_INVALID', 'Add customer credit as a single payment amount.');
     }
-    if (allocations.some((payment) => payment.reference.length > 160)) {
+    if (allocations.some((payment) => payment.reference.length > 160
+      || payment.providerName.length > 80)) {
       return invalid(res, 400, 'POS_PAYMENT_REFERENCE_INVALID', 'Payment references must be no more than 160 characters.');
+    }
+    if (allocations.some((payment) => payment.method === 'CHEQUE' && !Number.isSafeInteger(payment.amount))) {
+      return invalid(res, 400, 'POS_CHEQUE_AMOUNT_INVALID', 'Cheque amounts must be whole-number RWF values.');
     }
     if (allocations.some((payment) => payment.method === 'GIFT_CARD'
       ? payment.giftCardCode.length < 8 || payment.giftCardCode.length > 80
@@ -274,8 +333,32 @@ exports.recordCashPayment = async (req, res, next) => {
       await posPaymentService.assertPaymentMethodEnabled({
         companyId,
         registerId: String(register.id),
+        tillType: String(register.systemTillType || 'retail'),
         method,
       });
+    }
+    const maskedPayerPhones = allocations.map((payment) => {
+      const normalizedPhone = normalizeRwandaPhone(payment.payerPhone);
+      return maskPayerPhone(normalizedPhone);
+    });
+    const tenderConfigs = [];
+    for (const [index, payment] of allocations.entries()) {
+      const tenderReference = payment.method === 'GIFT_CARD' ? payment.giftCardCode : payment.reference;
+      const config = posPaymentService.validateTenderConfiguration(settings, {
+        registerId: String(register.id),
+        tillType: String(register.systemTillType || 'retail'),
+        method: payment.method,
+        amount: payment.amount,
+        reference: tenderReference,
+        customerId: invoice.clientId,
+        tendered: payment.tendered,
+      });
+      tenderConfigs[index] = config;
+      if (payment.method === 'STORE_CREDIT'
+        && (payment.reference.length < 8 || payment.reference.length > 80)) {
+        return invalid(res, 400, 'POS_STORED_VALUE_CODE_REQUIRED', 'Enter a valid store credit code.');
+      }
+      allocations[index].payerPhone = maskedPayerPhones[index] || '';
     }
     const paymentKeys = isSplitRequest
       ? Array.from({ length: MAX_SPLIT_PAYMENT_LINES }, (_, index) => splitPaymentIdempotencyKey(key, index))
@@ -288,6 +371,21 @@ exports.recordCashPayment = async (req, res, next) => {
       );
       if (!locked.length) {
         return { error: { status: 409, code: 'POS_SALE_NOT_PENDING', message: 'This sale is no longer waiting for payment.' } };
+      }
+      if (allocations.some((allocation) => allocation.method === 'CHEQUE')) {
+        const customer = await tx.client.findFirst({
+          where: { id: String(invoice.clientId || ''), companyId },
+          select: { id: true, isWalkIn: true },
+        });
+        if (!customer || customer.isWalkIn) {
+          return {
+            error: {
+              status: 400,
+              code: 'POS_CHEQUE_CUSTOMER_REQUIRED',
+              message: 'Select a registered customer before accepting a cheque.',
+            },
+          };
+        }
       }
 
       const priorPayments = isSplitRequest
@@ -307,7 +405,11 @@ exports.recordCashPayment = async (req, res, next) => {
               && prior.method === allocation.method
               && prior.amount === allocation.amount
               && prior.tendered === expectedTendered
-              && (allocation.method === 'GIFT_CARD' || (prior.reference || '') === allocation.reference);
+              && (allocation.method === 'GIFT_CARD'
+                ? true
+                : (prior.reference || '') === allocation.reference)
+              && (prior.providerName || '') === allocation.providerName
+              && (prior.payerPhone || '') === allocation.payerPhone;
           });
         if (sameRequest) {
           for (const [index, allocation] of allocations.entries()) {
@@ -497,6 +599,7 @@ exports.recordCashPayment = async (req, res, next) => {
       const createdPayments = [];
       for (const [index, allocation] of totals.payments.entries()) {
         const requestAllocation = allocations[index];
+        const tenderConfig = tenderConfigs[index];
         const giftCardHash = allocation.method === 'GIFT_CARD'
           ? hashStoredValueCode(requestAllocation.giftCardCode)
           : null;
@@ -516,6 +619,12 @@ exports.recordCashPayment = async (req, res, next) => {
             tendered: allocation.tendered,
             changeGiven: allocation.changeGiven,
             reference: giftCard ? String(giftCard.account.codeSuffix || '') : requestAllocation.reference || null,
+            providerName: requestAllocation.providerName || null,
+            payerPhone: requestAllocation.payerPhone || null,
+            normalizedReference: tenderConfig.referenceUniqueness === 'warn_only'
+              || !['CARD', 'BANK_TRANSFER', 'CHEQUE'].includes(allocation.method)
+              ? null
+              : normalizePaymentReference(requestAllocation.reference),
             idempotencyKey: isSplitRequest ? paymentKeys[index] : key,
             completedAt: new Date(),
           },
@@ -537,7 +646,7 @@ exports.recordCashPayment = async (req, res, next) => {
             };
           }
           await tx.$executeRawUnsafe(
-            'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, pos_payment_id, idempotency_key, operation_type, invoice_id, kind, entry_type, amount, balance_after, reference, notes, created_by_id, created_at) VALUES ($1, $2, $3, $4, $5, \'REDEEM\'::"PosStoredValueOperation", $6, \'gift_card\', \'redeem\', $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)',
+            'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, pos_payment_id, idempotency_key, operation_type, invoice_id, kind, entry_type, amount, balance_after, reference, notes, created_by_id, posting_status, created_at) VALUES ($1, $2, $3, $4, $5, \'REDEEM\'::"PosStoredValueOperation", $6, \'gift_card\', \'redeem\', $7, $8, $9, $10, $11, \'pending\', CURRENT_TIMESTAMP)',
             generateObjectId(),
             companyId,
             String(giftCard.account.id),
@@ -602,12 +711,26 @@ exports.recordCashPayment = async (req, res, next) => {
     if (response) return response;
     if ([
       'POS_PAYMENT_AMOUNT_INVALID',
+      'POS_PAYMENT_AMOUNT_BELOW_MINIMUM',
+      'POS_PAYMENT_AMOUNT_ABOVE_MAXIMUM',
       'POS_CASH_TENDERED_INSUFFICIENT',
       'POS_PAYMENT_TOTAL_EXCEEDS_INVOICE',
       'POS_PAYMENT_METHOD_DISABLED',
       'POS_PAYMENT_PROVIDER_NOT_CONFIGURED',
+      'POS_PAYMENT_REFERENCE_REQUIRED',
+      'POS_PAYMENT_REFERENCE_INVALID',
+      'POS_PAYMENT_CUSTOMER_REQUIRED',
+      'POS_PAYMENT_CHANGE_NOT_ALLOWED',
+      'POS_PAYMENT_CONFIRMATION_UNAVAILABLE',
+      'POS_PAYMENT_PHONE_INVALID',
+      'POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED',
+      'POS_PAYMENT_ACCOUNT_MAPPING_INVALID',
     ].includes(error?.code)) {
       return invalid(res, 400, error.code, error.message);
+    }
+    if (error?.code === 'P2002'
+      && String(error?.meta?.target || '').includes('normalized_reference')) {
+      return invalid(res, 409, 'POS_PAYMENT_REFERENCE_DUPLICATE', 'This payment reference was already used for this method.');
     }
     return next(error);
   }
@@ -633,7 +756,10 @@ exports.recordPayment = async (req, res, next) => {
     };
     return exports.recordManualMobileMoneyPayment(req, res, next);
   }
-  if (['CASH', 'CREDIT', 'GIFT_CARD'].includes(method)) {
+  if ([
+    'CASH', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT', 'GIFT_CARD',
+    'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS',
+  ].includes(method)) {
     return exports.recordCashPayment(req, res, next);
   }
   return invalid(res, 400, 'POS_PAYMENT_METHOD_INVALID', 'This payment method is not supported by the POS payment API.');
@@ -908,6 +1034,7 @@ exports.recordManualMobileMoneyPayment = async (req, res, next) => {
       companyId,
       saleId: String(req.params.saleId || ''),
       registerId: String(register.id),
+      tillType: String(register.systemTillType || 'retail'),
       shiftId: String(shift.id),
       cashierId: String(user.id),
       provider: String(req.body?.provider || '').toUpperCase(),
@@ -931,8 +1058,12 @@ exports.recordManualMobileMoneyPayment = async (req, res, next) => {
     const statusByCode = {
       POS_IDEMPOTENCY_KEY_INVALID: 400,
       POS_PAYMENT_AMOUNT_INVALID: 400,
+      POS_PAYMENT_AMOUNT_BELOW_MINIMUM: 400,
+      POS_PAYMENT_AMOUNT_ABOVE_MAXIMUM: 400,
       POS_PAYMENT_REFERENCE_INVALID: 400,
+      POS_PAYMENT_REFERENCE_REQUIRED: 400,
       POS_PAYMENT_PHONE_INVALID: 400,
+      POS_PAYMENT_CUSTOMER_REQUIRED: 400,
       POS_PAYMENT_RECEIPT_CONFIRMATION_REQUIRED: 400,
       POS_PAYMENT_REQUEST_INVALID: 400,
       POS_PAYMENT_AMOUNT_NOT_DUE: 409,
@@ -940,6 +1071,8 @@ exports.recordManualMobileMoneyPayment = async (req, res, next) => {
       POS_PAYMENT_METHOD_DISABLED: 409,
       POS_PAYMENT_PROVIDER_NOT_CONFIGURED: 409,
       POS_PAYMENT_METHOD_UNRESOLVED: 409,
+      POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED: 400,
+      POS_PAYMENT_ACCOUNT_MAPPING_INVALID: 400,
       POS_IDEMPOTENCY_KEY_CONFLICT: 409,
       POS_SALE_NOT_PENDING: 409,
       POS_PAYMENT_CONTEXT_MISMATCH: 403,
@@ -1044,13 +1177,23 @@ exports.manualMobileMoneyReport = async (req, res, next) => {
 exports.reportPaymentsByMethod = async (req, res, next) => {
   const { companyId } = context(req);
   try {
-    const dateFrom = req.query?.dateFrom ? new Date(String(req.query.dateFrom)) : null;
-    const dateTo = req.query?.dateTo ? new Date(String(req.query.dateTo)) : null;
-    if ((dateFrom && Number.isNaN(dateFrom.getTime())) || (dateTo && Number.isNaN(dateTo.getTime()))) {
+    const dateFrom = reportDate(req.query?.dateFrom ?? req.query?.from);
+    const dateTo = reportDate(req.query?.dateTo ?? req.query?.to, true);
+    if ((dateFrom && Number.isNaN(dateFrom.getTime()))
+      || (dateTo && Number.isNaN(dateTo.getTime()))
+      || (dateFrom && dateTo && dateFrom > dateTo)) {
       return invalid(res, 400, 'POS_REPORT_DATE_INVALID', 'Use valid report dates.');
+    }
+    const method = req.query?.method ? String(req.query.method).toUpperCase() : null;
+    const status = req.query?.status ? String(req.query.status).toUpperCase() : null;
+    if ((method && !POS_PAYMENT_METHODS.has(method))
+      || (status && !['PENDING', 'SUCCESS', 'FAILED', 'CANCELLED', 'EXPIRED', 'VOIDED'].includes(status))) {
+      return invalid(res, 400, 'POS_REPORT_FILTER_INVALID', 'Choose a supported payment method and status.');
     }
     const where = {
       companyId,
+      ...(method ? { method } : {}),
+      ...(status ? { status } : {}),
       ...(req.query?.shiftId ? { shiftId: String(req.query.shiftId) } : {}),
       ...(req.query?.cashierId ? { cashierId: String(req.query.cashierId) } : {}),
       ...(((dateFrom || dateTo) ? { createdAt: {
@@ -1068,7 +1211,18 @@ exports.reportPaymentsByMethod = async (req, res, next) => {
       dbClient().posPayment.count({ where }),
       dbClient().posPayment.findMany({
         where,
-        select: { method: true, status: true, amount: true, reconciliationStatus: true, cashierId: true },
+        select: {
+          id: true,
+          saleId: true,
+          shiftId: true,
+          registerId: true,
+          method: true,
+          status: true,
+          amount: true,
+          reconciliationStatus: true,
+          cashierId: true,
+          createdAt: true,
+        },
         take: 500,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       }),
@@ -1076,7 +1230,7 @@ exports.reportPaymentsByMethod = async (req, res, next) => {
     const byMethod = {};
     for (const group of paymentGroups) {
       const method = String(group.method);
-      if (!byMethod[method]) byMethod[method] = { count: 0, amount: 0, cashierCount: 0, statuses: {} };
+      if (!byMethod[method]) byMethod[method] = { count: 0, amount: 0, statuses: {} };
       const count = Number(group._count?._all || 0);
       const amount = Number(group._sum?.amount || 0);
       byMethod[method].count += count;
@@ -1090,8 +1244,19 @@ exports.reportPaymentsByMethod = async (req, res, next) => {
       success: true,
       data: {
         byMethod,
+        payments: payments.map((payment) => ({
+          ...payment,
+          createdAt: payment.createdAt?.toISOString(),
+        })),
         details: { returned: payments.length, total: totalPayments, limit: 500, hasMore: totalPayments > payments.length },
-        filters: { dateFrom: dateFrom?.toISOString() || null, dateTo: dateTo?.toISOString() || null, shiftId: req.query?.shiftId || null, cashierId: req.query?.cashierId || null },
+        filters: {
+          dateFrom: dateFrom?.toISOString() || null,
+          dateTo: dateTo?.toISOString() || null,
+          shiftId: req.query?.shiftId || null,
+          cashierId: req.query?.cashierId || null,
+          method,
+          status,
+        },
       },
     });
   } catch (error) {
@@ -1102,26 +1267,49 @@ exports.reportPaymentsByMethod = async (req, res, next) => {
 exports.reportPaymentReconciliation = async (req, res, next) => {
   const { companyId } = context(req);
   try {
+    const dateFrom = reportDate(req.query?.dateFrom ?? req.query?.from);
+    const dateTo = reportDate(req.query?.dateTo ?? req.query?.to, true);
+    const provider = req.query?.provider ? String(req.query.provider).toUpperCase() : null;
+    if ((dateFrom && Number.isNaN(dateFrom.getTime()))
+      || (dateTo && Number.isNaN(dateTo.getTime()))
+      || (dateFrom && dateTo && dateFrom > dateTo)) {
+      return invalid(res, 400, 'POS_REPORT_DATE_INVALID', 'Use valid report dates.');
+    }
+    if (provider && !MOBILE_MONEY_PROVIDERS.includes(provider)) {
+      return invalid(res, 400, 'POS_PAYMENT_METHOD_INVALID', 'Choose MTN MoMo or Airtel Money.');
+    }
     const paymentWhere = {
       companyId,
-      method: { in: ['MTN_MOMO', 'AIRTEL_MONEY'] },
+      method: provider ? { equals: provider } : { in: ['MTN_MOMO', 'AIRTEL_MONEY'] },
       normalizedReference: { not: null },
+      ...((dateFrom || dateTo) ? { createdAt: {
+        ...(dateFrom ? { gte: dateFrom } : {}),
+        ...(dateTo ? { lte: dateTo } : {}),
+      } } : {}),
+    };
+    const eventWhere = {
+      companyId,
+      matchedPaymentId: null,
+      ...(provider ? { provider } : {}),
+      ...((dateFrom || dateTo) ? { createdAt: {
+        ...(dateFrom ? { gte: dateFrom } : {}),
+        ...(dateTo ? { lte: dateTo } : {}),
+      } } : {}),
     };
     const [payments, events, paymentGroups, eventGroups, paymentCount, eventCount] = await Promise.all([
       dbClient().posPayment.findMany({
         where: paymentWhere,
         select: {
-          id: true, method: true, amount: true, providerTxId: true, normalizedReference: true,
+          id: true, method: true, amount: true, normalizedReference: true,
           reconciliationStatus: true, status: true, createdAt: true,
         },
         take: 500,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       }),
       dbClient().posProviderEvent.findMany({
-        where: { companyId, matchedPaymentId: null },
+        where: eventWhere,
         select: {
-          id: true, provider: true, eventKey: true, payload: true, signatureOk: true,
-          matchedPaymentId: true, createdAt: true,
+          id: true, provider: true, signatureOk: true, createdAt: true,
         },
         take: 500,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -1134,11 +1322,11 @@ exports.reportPaymentReconciliation = async (req, res, next) => {
       }),
       dbClient().posProviderEvent.groupBy({
         by: ['provider'],
-        where: { companyId },
+        where: eventWhere,
         _count: { _all: true },
       }),
       dbClient().posPayment.count({ where: paymentWhere }),
-      dbClient().posProviderEvent.count({ where: { companyId, matchedPaymentId: null } }),
+      dbClient().posProviderEvent.count({ where: eventWhere }),
     ]);
     const providerTotals = {
       MTN_MOMO: { paymentsCount: 0, paymentAmount: 0, matchedCount: 0, unmatchedCount: 0, eventsCount: 0 },
@@ -1163,16 +1351,29 @@ exports.reportPaymentReconciliation = async (req, res, next) => {
       data: {
         providerTotals,
         payments: payments.map((payment) => ({
-          ...payment,
+          id: payment.id,
+          method: payment.method,
+          amount: payment.amount,
+          reference: maskedPaymentReference(payment.normalizedReference),
+          reconciliationStatus: payment.reconciliationStatus,
+          status: payment.status,
           createdAt: payment.createdAt?.toISOString(),
         })),
         unmatchedEvents: events.map((event) => ({
-          ...event,
+          id: event.id,
+          provider: event.provider,
+          signatureOk: event.signatureOk,
+          matchedPaymentId: event.matchedPaymentId,
           createdAt: event.createdAt?.toISOString(),
         })),
         details: {
           payments: { returned: payments.length, total: paymentCount, limit: 500, hasMore: paymentCount > payments.length },
           unmatchedEvents: { returned: events.length, total: eventCount, limit: 500, hasMore: eventCount > events.length },
+        },
+        filters: {
+          dateFrom: dateFrom?.toISOString() || null,
+          dateTo: dateTo?.toISOString() || null,
+          provider,
         },
       },
     });
@@ -1250,7 +1451,10 @@ exports.completeSale = async (req, res, next) => {
       where: { companyId, saleId, status: 'SUCCESS' },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
-    const supportedCompletionMethods = ['CASH', 'CREDIT', 'GIFT_CARD', 'MTN_MOMO', 'AIRTEL_MONEY'];
+    const supportedCompletionMethods = [
+      'CASH', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT', 'GIFT_CARD',
+      'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS', 'MTN_MOMO', 'AIRTEL_MONEY',
+    ];
     const unsupportedPayment = payments.find((payment) => !supportedCompletionMethods.includes(payment.method));
     if (unsupportedPayment) {
       return invalid(
@@ -1303,6 +1507,9 @@ exports.completeSale = async (req, res, next) => {
       deviceId: register.claimedDeviceId,
       tillSession: { id: invoice.tillSessionId },
       payments: payments.flatMap((payment) => {
+        if (payment.method === 'CREDIT') {
+          return [];
+        }
         if (payment.method === 'CASH') {
           return [{
             paymentMethod: 'cash',
@@ -1329,7 +1536,23 @@ exports.completeSale = async (req, res, next) => {
             manualMobileMoneyPaymentId: String(payment.id),
           }];
         }
-        return [];
+        const method = {
+          CARD: 'card',
+          BANK_TRANSFER: 'bank_transfer',
+          CHEQUE: 'cheque',
+          CREDIT: 'credit',
+          STORE_CREDIT: 'store_credit',
+          LOYALTY_WALLET: 'loyalty',
+          LOYALTY_POINTS: 'loyalty_points',
+        }[payment.method];
+        return method ? [{
+          paymentMethod: method,
+          amount: payment.amount,
+          reference: payment.reference || '',
+          providerName: payment.providerName || '',
+          payerPhone: payment.payerPhone || '',
+          posPaymentId: String(payment.id),
+        }] : [];
       }),
     };
     req.posPaymentFlow = 'PAYMENTS_V2';
@@ -1704,6 +1927,7 @@ exports.removePayment = async (req, res, next) => {
           note: `Sale ${saleId}; ${reason}`,
           performedById: String(user.id),
           approvedById,
+          postingStatus: 'not_required',
           idempotencyKey: key,
         },
       });
@@ -1854,7 +2078,11 @@ exports.listPendingShiftSales = async (req, res, next) => {
         giftCardHeldPaymentCount,
         manualMobileMoneyMode: paymentSettings.manualMobileMoneyMode,
         manualMobileMoneyReceivers: paymentSettings.manualMobileMoneyReceivers,
-        enabledMethods: posPaymentService.resolveEnabledMethods(paymentSettings, String(register.id)),
+        enabledMethods: posPaymentService.resolveEnabledMethods(
+          paymentSettings,
+          String(register.id),
+          String(register.systemTillType || 'retail'),
+        ),
       },
     });
   } catch (error) {
@@ -2159,6 +2387,7 @@ exports.refundAndCancel = async (req, res, next) => {
             note: `Sale ${saleId}; ${refundReasonText(reasonCode, note)}`,
             performedById: String(user.id),
             approvedById,
+            postingStatus: 'not_required',
             idempotencyKey: key,
           },
         });

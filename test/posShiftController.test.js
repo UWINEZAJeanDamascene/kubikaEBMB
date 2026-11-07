@@ -242,6 +242,7 @@ describe('POS current shift endpoint', () => {
       openingFloat: 10000,
       openingCount: {},
       note: null,
+      postingStatus: 'pending',
       register: { code: 'POS-1', name: 'Front Register' },
       invoices: [{ totalAmount: 12500 }],
       cashMovements: [
@@ -253,6 +254,7 @@ describe('POS current shift endpoint', () => {
           reference: null,
           note: 'Gift card issue',
           journalEntryId: 'journal-id',
+          postingStatus: 'failed',
           createdAt: new Date('2026-10-29T08:30:00.000Z'),
         },
         { type: 'cash_out', amount: 250 },
@@ -272,10 +274,11 @@ describe('POS current shift endpoint', () => {
       safeDrops: 500,
     });
     expect(res.body.data.shift).not.toHaveProperty('expectedCash');
+    expect(res.body.data.shift.postingStatus).toBe('pending');
     expect(res.body.data.cashMovements[0]).toEqual(expect.objectContaining({
       id: 'movement-1',
       journalEntryId: 'journal-id',
-      postingStatus: 'posted',
+      postingStatus: 'failed',
     }));
     expect(res.body.data.bankDepositClearingBalance).toBe(0);
     expect(res.body.data).not.toHaveProperty('expectedCash');

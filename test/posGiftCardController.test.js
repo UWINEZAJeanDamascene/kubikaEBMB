@@ -190,6 +190,13 @@ describe('POS gift card controller', () => {
         idempotencyKey: 'gift-card-key-01',
       }),
     });
+    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE pos_stored_value_ledger'),
+      'journal-entry-id',
+      'posted',
+      expect.any(String),
+      COMPANY_ID,
+    );
     expect(JournalService.createEntriesAtomic).toHaveBeenCalledWith(
       COMPANY_ID,
       USER_ID,
@@ -205,6 +212,7 @@ describe('POS gift card controller', () => {
     expect(posPaymentService.assertPaymentMethodEnabled).toHaveBeenCalledWith({
       companyId: COMPANY_ID,
       registerId: REGISTER_ID,
+      tillType: 'retail',
       method: 'CASH',
     });
     expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({

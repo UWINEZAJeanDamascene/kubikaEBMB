@@ -18,6 +18,7 @@
     "seed:platform-admin": "node scripts/seedPlatformAdmin.js",
     "delivery-notes:backfill": "node scripts/backfillDeliveryNotes.js",
     "repair:pos-opening-stock-levels": "node scripts/backfill-pos-opening-stock-levels.js",
+    "pos:accounting-backfill": "node scripts/backfill-pos-accounting-postings.js --dry-run",
     "test:pos-momo-sandbox": "jest --runInBand test/provisionMtnMomoSandbox.test.js test/mtnMomoConfig.test.js test/posMtnMomoProvider.test.js test/posMobileMoneyService.test.js test/posPaymentService.test.js",
     "db:generate": "prisma generate --schema=./prisma/schema.prisma",
     "db:migrate": "prisma migrate dev",

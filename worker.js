@@ -49,6 +49,7 @@ async function startWorker() {
   startSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').startScheduler());
   startSafely('ebm-retry', () => require('./services/ebmRetryJob').startRetryJob());
   startSafely('pos-ebm-v2-sweeper', () => require('./services/posEbmV2RetryJob').start());
+  startSafely('pos-accounting-posting-retry', () => require('./services/posAccountingPostingService').start());
   startSafely('report-snapshots', () => require('./services/reportSchedulerService').initializeScheduler());
   startSafely('tenant-backups', () => require('./services/backupScheduler').startScheduler());
   startSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').startMonitoringScheduler());
@@ -119,6 +120,7 @@ async function shutdown(signal) {
     };
     stopSafely('ebm-retry', () => require('./services/ebmRetryJob').stopRetryJob());
     stopSafely('pos-ebm-v2-sweeper', () => require('./services/posEbmV2RetryJob').stop());
+    stopSafely('pos-accounting-posting-retry', () => require('./services/posAccountingPostingService').stop());
     stopSafely('report-snapshots', () => require('./services/reportSchedulerService').stopScheduler());
     stopSafely('tenant-backups', () => require('./services/backupScheduler').stopScheduler());
     stopSafely('notifications', () => require('./services/notificationScheduler').stopScheduler());

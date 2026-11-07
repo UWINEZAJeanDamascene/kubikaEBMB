@@ -46,6 +46,12 @@ function printableDateTime(value) {
   }).format(date);
 }
 
+function maskPaymentReference(value) {
+  const reference = String(value || '').normalize('NFKC').trim();
+  if (!reference) return null;
+  return `****${reference.replace(/\s+/g, '').slice(-4)}`;
+}
+
 function selectTemplate(tillType) {
   const key = String(tillType || 'retail').trim().toLowerCase();
   // Other till templates can provide their own extension without changing the core receipt shape.
@@ -206,7 +212,7 @@ function buildPosReceiptDocument(sale, context = {}) {
     payments: payments.map((payment) => ({
       method: String(payment.method || payment.paymentMethod || 'cash'),
       amountRwf: savedMoney(payment.amountRwf ?? payment.amount, currency),
-      reference: payment.reference || null,
+      reference: maskPaymentReference(payment.reference),
       kind: payment.kind || null,
     })),
     paymentSummary: {
@@ -234,4 +240,4 @@ function buildPosReceiptDocument(sale, context = {}) {
   };
 }
 
-module.exports = { VERSION, TIME_ZONE, buildPosReceiptDocument, registerPosReceiptTemplate };
+module.exports = { VERSION, TIME_ZONE, buildPosReceiptDocument, maskPaymentReference, registerPosReceiptTemplate };

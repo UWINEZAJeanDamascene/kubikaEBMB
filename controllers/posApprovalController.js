@@ -25,6 +25,8 @@ const APPROVABLE_ACTIONS = new Set([
   'CREDIT_ADJUST',
   'CREDIT_WRITEOFF',
   'CREDIT_REFUND',
+  'CHEQUE_DEPOSIT',
+  'CHEQUE_BOUNCE',
 ]);
 const APPROVAL_TTL_MS = 60 * 1000;
 
@@ -35,6 +37,7 @@ function permissionForApprovalAction(action) {
   if (normalized.includes('VOID')) return 'pos.till.void';
   if (normalized === 'NO_SALE') return 'pos.till.no_sale';
   if (['CASH_OUT', 'CASH_IN', 'SAFE_DROP'].includes(normalized)) return 'pos.till.cash_move';
+  if (['CHEQUE_DEPOSIT', 'CHEQUE_BOUNCE'].includes(normalized)) return 'pos.payment.reconcile';
   if (['GIFT_CARD_ISSUE', 'GIFT_CARD_REISSUE'].includes(normalized)) return 'pos.giftcard.manage';
   return null;
 }

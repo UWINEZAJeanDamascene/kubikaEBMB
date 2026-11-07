@@ -12,9 +12,19 @@ const SETTINGS_VALIDATION_ERRORS = new Set([
   'POS_PAYMENT_REGISTER_OVERRIDE_INVALID',
   'POS_PAYMENT_AUDIT_CONTEXT_REQUIRED',
   'POS_PAYMENT_SETTINGS_INVALID',
+  'POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED',
+  'POS_PAYMENT_ACCOUNT_MAPPING_INVALID',
 ]);
 
 function sendKnownError(res, error) {
+  if (error.code === 'POS_PAYMENT_METHOD_REGISTRY_MIGRATION_REQUIRED'
+    || (error.code === 'P2022' && String(error.meta?.column || '').includes('method_registry'))) {
+    return res.status(503).json({
+      success: false,
+      code: 'POS_PAYMENT_METHOD_REGISTRY_MIGRATION_REQUIRED',
+      message: 'POS payment method settings are unavailable because the method registry database migration has not been applied. Run the backend database migrations, then retry.',
+    });
+  }
   if (SETTINGS_VALIDATION_ERRORS.has(error.code)) return sendValidationError(res, error);
   if (['POS_PROVIDER_ENCRYPTION_KEY_REQUIRED', 'POS_PROVIDER_ENCRYPTION_KEY_INVALID', 'POS_PROVIDER_CONFIG_DECRYPT_FAILED'].includes(error.code)) {
     return res.status(503).json({ success: false, code: error.code, message: error.message });
@@ -60,6 +70,7 @@ function publicSettings(settings) {
     providerEnvironment: settings.providerEnvironment,
     manualMobileMoneyMode: settings.manualMobileMoneyMode,
     manualMobileMoneyReceivers: settings.manualMobileMoneyReceivers,
+    methodRegistry: posPaymentService.getEffectiveMethodRegistry(settings),
     automaticConfirmationAvailable: false,
     providers: Object.fromEntries(providerMethods.map((method) => [
       method,
@@ -107,7 +118,15 @@ exports.getMethods = async (req, res, next) => {
       success: true,
       data: {
         registerId: String(context.register.id),
-        methods: posPaymentService.resolveEnabledMethods(settings, String(context.register.id)),
+        methods: posPaymentService.resolveEnabledMethods(
+          settings,
+          String(context.register.id),
+          String(context.register.systemTillType || 'retail'),
+        ),
+        methodRegistry: posPaymentService.getEffectiveMethodRegistry(settings, {
+          registerId: String(context.register.id),
+          tillType: String(context.register.systemTillType || 'retail'),
+        }),
         paymentFlow: posPaymentService.resolvePaymentFlow(settings, String(context.register.id)),
         providerEnvironment: settings.providerEnvironment,
         manualMobileMoneyMode: settings.manualMobileMoneyMode,

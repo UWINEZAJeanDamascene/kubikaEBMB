@@ -23,9 +23,8 @@ const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
 const CurrencyService = require('../services/CurrencyService');
 const cacheService = require('../services/cacheService');
-const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
-const posAccountingProfileService = require('../services/posAccountingProfileService');
-const { buildSaleJournalEntries } = require('../services/posAccountingBuilders');
+const posAccountingPostingService = require('../services/posAccountingPostingService');
+const { buildPosSaleJournalEntries } = require('../services/posSaleJournalBuilder');
 const { createHash, randomBytes } = require('crypto');
 const { dbClient } = require('../lib/prisma');
 const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
@@ -874,6 +873,8 @@ exports.createDirectSale = async (req, res, next) => {
         provider: paymentProvider,
         amount: paymentAmount,
         reference: normalizedPaymentReference,
+        providerName: req.body.providerName,
+        payerPhone: req.body.payerPhone,
         bankAccountId,
       }];
     if (rawPayments.length > 5) {
@@ -887,13 +888,11 @@ exports.createDirectSale = async (req, res, next) => {
     for (const [index, entry] of rawPayments.entries()) {
       const method = String(entry?.paymentMethod || (rawPayments.length === 1 ? paymentMethod : '')).toLowerCase();
       const provider = String(entry?.provider || '').trim().toLowerCase();
+      const providerName = String(entry?.providerName || '').normalize('NFKC').trim();
       const amount = entry?.amount == null || entry.amount === '' ? 0 : Number(entry.amount);
       const reference = String(entry?.reference || '').trim();
       if (!Number.isFinite(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
         return res.status(400).json({ success: false, code: 'ERR_INVALID_PAYMENT_AMOUNT', message: `Payment ${index + 1} must have a valid non-negative amount.` });
-      }
-      if (amount > 0 && method === 'card') {
-        return res.status(409).json({ success: false, code: 'POS_CARD_TERMINAL_NOT_CONFIGURED', message: 'Card payments are unavailable because no payment terminal is configured. No card payment was recorded.' });
       }
       if (amount > 0 && !supportedPaymentMethods.includes(method)) {
         return res.status(400).json({ success: false, code: 'ERR_INVALID_PAYMENT_METHOD', message: `Select a supported method for payment ${index + 1}.` });
@@ -912,8 +911,8 @@ exports.createDirectSale = async (req, res, next) => {
         && placeholderReferences.has(reference.toLowerCase().replace(/\s+/g, ''))) {
         return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_INVALID', message: `Enter the actual provider or bank reference for payment ${index + 1}; placeholder values are not accepted.` });
       }
-      if (reference.length > 120) {
-        return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_TOO_LONG', message: 'Payment references must be 120 characters or fewer.' });
+      if (reference.length > 160 || providerName.length > 80) {
+        return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_TOO_LONG', message: 'Payment references must be 160 characters or fewer, and provider names must be 80 characters or fewer.' });
       }
       if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method) && reference) {
         const referenceKey = reference.toLowerCase();
@@ -936,15 +935,61 @@ exports.createDirectSale = async (req, res, next) => {
       if (amount > 0 && method === 'loyalty_points' && (!clientId || clientId === 'walk-in')) {
         return res.status(400).json({ success: false, code: 'POS_LOYALTY_POINTS_CUSTOMER_REQUIRED', message: 'Select a registered customer to redeem loyalty points.' });
       }
+      if (amount > 0 && method === 'cheque' && (!client || client.isWalkIn)) {
+        return res.status(400).json({ success: false, code: 'POS_CHEQUE_CUSTOMER_REQUIRED', message: 'Select a registered customer before accepting a cheque.' });
+      }
+      if (amount > 0 && method === 'cheque' && !Number.isSafeInteger(amount)) {
+        return res.status(400).json({ success: false, code: 'POS_CHEQUE_AMOUNT_INVALID', message: 'Cheque amounts must be whole-number RWF values.' });
+      }
       if (amount > 0 && method === 'loyalty_points' && req.posV2Completion) {
         return res.status(409).json({ success: false, code: 'POS_LOYALTY_POINTS_V2_UNAVAILABLE', message: 'Loyalty points are not available in this checkout until their fiscal payment treatment is confirmed.' });
       }
       if (amount > 0 && (storedValueMethods.includes(method) || method === 'loyalty_points') && offlineContext) {
         return res.status(400).json({ success: false, code: 'POS_STORED_VALUE_OFFLINE_UNAVAILABLE', message: 'Gift card, store credit, and loyalty payments require an online balance check.' });
       }
+      if (amount > 0) {
+        const methodCode = method === 'mobile_money'
+          ? provider === 'momo' ? 'MTN_MOMO' : provider === 'airtel' ? 'AIRTEL_MONEY' : ''
+          : method === 'credit' ? 'CREDIT'
+            : method === 'loyalty' ? 'LOYALTY'
+              : method.toUpperCase();
+        if (!methodCode) {
+          return res.status(400).json({ success: false, code: 'POS_MOBILE_MONEY_PROVIDER_INVALID', message: `Select MoMo or Airtel as the provider for payment ${index + 1}.` });
+        }
+        try {
+          await posPaymentService.assertPaymentMethodEnabled({
+            companyId: String(companyId),
+            registerId: String(claimedRegister.id),
+            tillType: String(claimedRegister.systemTillType || 'retail'),
+            method: methodCode,
+          });
+          posPaymentService.validateTenderConfiguration(paymentSettings, {
+            registerId: String(claimedRegister.id),
+            tillType: String(claimedRegister.systemTillType || 'retail'),
+            method: methodCode,
+            amount,
+            reference,
+            customerId: clientId,
+            tendered: method === 'cash' ? amount : undefined,
+            allowOptionalReference: savedV2ManualMobileMoneyPayment,
+          });
+        } catch (error) {
+          const status = error?.code === 'POS_PAYMENT_METHOD_DISABLED'
+            || error?.code === 'POS_PAYMENT_CONFIRMATION_UNAVAILABLE'
+            || error?.code === 'POS_PAYMENT_PROVIDER_NOT_CONFIGURED'
+            ? 409
+            : 400;
+          return res.status(status).json({
+            success: false,
+            code: error?.code || 'POS_PAYMENT_SETTINGS_INVALID',
+            message: error?.message || 'Payment settings could not be validated.',
+          });
+        }
+      }
       normalizedPayments.push({
         paymentMethod: method,
         ...(method === 'mobile_money' ? { provider } : {}),
+        ...(providerName ? { providerName } : {}),
         amount,
         reference,
         bankAccountId: entry?.bankAccountId || (rawPayments.length === 1 ? bankAccountId : null) || null,
@@ -1034,6 +1079,9 @@ exports.createDirectSale = async (req, res, next) => {
     const financialAccountCodes = new Set();
 
     await runInTransaction(async (session) => {
+      const postingClient = session?.$executeRawUnsafe && session?.$queryRawUnsafe
+        ? session
+        : dbClient();
       if (requestKey) {
         const reservation = await dbClient().$queryRawUnsafe(
           'INSERT INTO pos_sale_requests (company_id, request_key, created_by_id, payload_hash, status, created_at, updated_at) VALUES ($1, $2, $3, $4, \'processing\', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, request_key) DO NOTHING RETURNING request_key AS "requestKey"',
@@ -1300,7 +1348,7 @@ exports.createDirectSale = async (req, res, next) => {
         }
         storedLinesForPosting = savedLines;
         invoice.status = paymentStatus;
-        invoice.posPostingStatus = 'pending';
+        invoice.posPostingStatus = isV2Pending ? 'not_required' : 'pending';
         invoice.amountPaid = amountPaid;
         invoice.amountOutstanding = amountOutstanding;
         invoice.confirmedAt = saleConfirmedAt;
@@ -1327,7 +1375,7 @@ exports.createDirectSale = async (req, res, next) => {
           lines: invoiceLines,
           status: paymentStatus,
           posOrigin: true,
-          posPostingStatus: 'pending',
+          posPostingStatus: isV2Pending ? 'not_required' : 'pending',
           posCheckoutPayload: isV2Pending
             ? pendingCheckoutPayload(req.body)
             : {
@@ -1846,177 +1894,101 @@ exports.createDirectSale = async (req, res, next) => {
         }
       }
 
-      // 3. Post balanced revenue and COGS entries in the same transaction as
-      // the invoice and inventory changes. Any posting error must roll back it all.
-      const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
-      const paymentAccounts = new Map();
-      for (const tender of appliedPayments) {
-        if (!bankPaymentMethods.includes(tender.paymentMethod)) continue;
-        const manualPosMobileMoney = tender.paymentMethod === 'mobile_money'
-          && req.posV2Completion
-          && ['momo', 'airtel'].includes(String(tender.provider || '').toLowerCase());
-        if (manualPosMobileMoney) continue;
-        if (!tender.bankAccountId) {
-          const error = new Error(`Select the bank or mobile money account used for ${tender.paymentMethod}`);
-          error.code = 'POS_PAYMENT_ACCOUNT_REQUIRED';
-          throw error;
-        }
-        const accountKey = String(tender.bankAccountId);
-        if (!paymentAccounts.has(accountKey)) {
-          const account = await BankAccount.findOne({ _id: tender.bankAccountId, company: companyId, isActive: true })
-            .select('_id ledgerAccountId name').lean();
-          if (!account) {
-            const error = new Error('A selected payment account is unavailable');
-            error.code = 'POS_PAYMENT_ACCOUNT_INVALID';
-            throw error;
-          }
-          paymentAccounts.set(accountKey, account);
-        }
-      }
-
-      let accountingProfile;
-      try {
-        accountingProfile = await posAccountingProfileService.getProfile(String(companyId));
-      } catch (error) {
-        error.accountingPostingFailure = true;
-        throw error;
-      }
-      const scope = {
-        tillType: String(claimedRegister.systemTillType || 'retail').toLowerCase(),
-        registerId: String(claimedRegister.id),
-      };
-      const mappedAccount = async (profileKey, moduleName, mappingKey, fallback) => {
-        try {
-          return posAccountingProfileService.resolveAccount(accountingProfile, profileKey, scope)
-            || await JournalService.getMappedAccountCode(companyId, moduleName, mappingKey, fallback);
-        } catch (error) {
-          error.accountingPostingFailure = true;
-          throw error;
-        }
-      };
-      const postingAccounts = {
-        posRegisterCash: await mappedAccount('posRegisterCash', 'cash', 'cashOnHand', DEFAULT_ACCOUNTS.posRegisterCash),
-        cardClearing: await mappedAccount('cardClearing', 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank),
-        mtnMoMo: await mappedAccount('mtnMoMo', 'cash', 'mtnMoMo', DEFAULT_ACCOUNTS.mtnMoMo),
-        airtelMoney: await mappedAccount('airtelMoney', 'cash', 'airtelMoney', DEFAULT_ACCOUNTS.airtelMoney),
-        cashAtBank: await mappedAccount('cashAtBank', 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank),
-        accountsReceivable: await mappedAccount('accountsReceivable', 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable),
-        customerAdvances: await mappedAccount('customerAdvances', 'sales', 'customerAdvances', DEFAULT_ACCOUNTS.customerAdvances),
-        giftCardLiability: await mappedAccount('giftCardLiability', 'sales', 'giftCardLiability', DEFAULT_ACCOUNTS.deferredRevenue),
-        loyaltyRewardsExpense: await mappedAccount('loyaltyRewardsExpense', 'expenses', 'marketing', DEFAULT_ACCOUNTS.marketing),
-        inventory: await mappedAccount('inventory', 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory),
-        salesRevenue: await mappedAccount('salesRevenue', 'sales', 'salesRevenue', DEFAULT_ACCOUNTS.salesRevenue),
-        vatOutput: await mappedAccount('vatOutput', 'tax', 'vatOutput', DEFAULT_ACCOUNTS.vatOutput),
-        costOfGoodsSold: await mappedAccount('costOfGoodsSold', 'inventory', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold),
-      };
-      const salesAccount = postingAccounts.salesRevenue;
-      const vatAccount = postingAccounts.vatOutput;
-      const postingInvoice = {
-        id: String(invoice._id),
-        referenceNo: invoice.referenceNo,
-        ebm: invoice.ebm,
+      const buildContext = {
+        companyId: String(companyId),
+        userId: String(req.user.id),
+        invoice: {
+          id: String(invoice._id),
+          referenceNo: invoice.referenceNo,
+          invoiceDate: invoice.invoiceDate,
+          ebm: invoice.ebm,
+        },
+        register: {
+          id: String(claimedRegister.id || claimedRegister._id),
+          systemTillType: claimedRegister.systemTillType,
+        },
+        tenders: appliedPayments,
+        lines: storedLinesForPosting,
         totalAmount: grandTotal,
         subtotal,
         totalDiscount,
         taxAmount: totalTax,
         amountPaid,
         amountOutstanding,
-        lines: storedLinesForPosting,
         cogsAmount: totalCOGS,
+        loyaltyEarned,
+        paymentFlow: req.posV2Completion ? 'PAYMENTS_V2' : 'LEGACY',
       };
-      const postingTenders = appliedPayments.map((tender) => ({
-        ...tender,
-        amountRwf: tender.amount,
-        accountCode: tender.bankAccountId
-          ? paymentAccounts.get(String(tender.bankAccountId))?.ledgerAccountId
-          : undefined,
-      }));
-      let builtEntries;
+      let postingBuild;
+      let posting;
       try {
-        builtEntries = buildSaleJournalEntries({
-          invoice: postingInvoice,
-          tenders: postingTenders,
-          accounts: postingAccounts,
-        });
+        postingBuild = await buildPosSaleJournalEntries(buildContext);
       } catch (error) {
-        error.accountingPostingFailure = true;
-        throw error;
+        if (!error?.accountingPostingFailure) throw error;
+        posting = await posAccountingPostingService.enqueueSaleBuildRetry({
+          tx: postingClient,
+          companyId,
+          userId: req.user.id,
+          sourceId: String(invoice._id),
+          buildContext,
+          error,
+        });
+        postingBuild = { journalEntries: [], salesAccount: null, taxAccount: null };
       }
-      const revenueLines = builtEntries[0].lines.map((line) => (
-        line.debit > 0
-          ? JournalService.createDebitLine(line.accountCode, line.debit, line.description)
-          : JournalService.createCreditLine(line.accountCode, line.credit, line.description)
-      ));
-      if (loyaltyEarned > 0) {
-        const loyaltyLiability = postingAccounts.customerAdvances;
-        revenueLines.push(JournalService.createDebitLine(
-          postingAccounts.loyaltyRewardsExpense, loyaltyEarned, `Loyalty credit earned - Invoice ${invoice.referenceNo}`,
-        ));
-        revenueLines.push(JournalService.createCreditLine(
-          loyaltyLiability, loyaltyEarned, `Loyalty credit liability - Invoice ${invoice.referenceNo}`,
-        ));
-      }
-      if (revenueLines.length < 2) {
-        const error = new Error('The sale cannot be posted because it has no positive amount to account for');
-        error.code = 'POS_ZERO_VALUE_SALE';
-        throw error;
-      }
-
-      const journalEntries = builtEntries.map((entry, index) => ({
-        date: invoice.invoiceDate,
-        description: index === 0
-          ? `Direct sale - Invoice ${invoice.referenceNo}`
-          : `COGS for Invoice ${invoice.referenceNo}`,
-        sourceType: entry.sourceType,
-        sourceId: invoice._id,
-        sourceReference: invoice.referenceNo,
-        lines: index === 0
-          ? revenueLines
-          : entry.lines.map((line) => (
-            line.debit > 0
-              ? JournalService.createDebitLine(line.accountCode, line.debit, line.description)
-              : JournalService.createCreditLine(line.accountCode, line.credit, line.description)
-          )),
-        isAutoGenerated: true,
-        ...(index === 0 ? { sourceData: {
-          payments: appliedPayments.map((tender) => ({
-            amount: tender.amount,
-            paymentMethod: tender.paymentMethod,
-            reference: tender.reference || null,
-            bankAccountId: tender.bankAccountId || null,
-            storedValueAccountId: tender.storedValueAccountId || null,
-            loyaltyPointsRedeemed: tender.loyaltyPointsRedeemed || null,
-            loyaltyPointValueRwf: tender.loyaltyPointValueRwf || null,
-          })),
-          loyaltyCreditEarned: loyaltyEarned,
-          ...(req.posV2Completion ? { paymentFlow: 'PAYMENTS_V2' } : {}),
-        } } : {}),
-      }));
+      const { journalEntries, salesAccount, taxAccount: vatAccount } = postingBuild;
       for (const line of journalEntries.flatMap((entry) => entry.lines)) {
         financialAccountCodes.add(line.accountCode);
       }
 
-      let createdEntries;
-      try {
-        createdEntries = await JournalService.createEntriesAtomic(
-          companyId, req.user.id, journalEntries, { session, allowDuplicate: false },
-        );
-      } catch (error) {
-        error.accountingPostingFailure = true;
-        throw error;
+      if (!posting) {
+        posting = await posAccountingPostingService.postOrQueue({
+          tx: postingClient,
+          companyId,
+          userId: req.user.id,
+          sourceType: 'pos_sale',
+          sourceId: String(invoice._id),
+          entries: journalEntries,
+          metadata: {
+            chequesInHandAccountCode: postingBuild.accounts?.chequesInHand || null,
+          },
+        });
       }
-      if (!Array.isArray(createdEntries) || createdEntries.length !== journalEntries.length
-        || createdEntries.some((entry) => !entry?._id)) {
-        const error = new Error('Accounting did not confirm all journal entries for the sale');
-        error.code = 'POS_ACCOUNTING_POST_FAILED';
-        error.accountingPostingFailure = true;
-        throw error;
-      }
-
-      invoice.revenueJournalEntry = createdEntries[0]._id;
-      invoice.cogsJournalEntry = req.posV2Completion ? null : createdEntries[1]?._id || null;
-      invoice.posPostingStatus = 'posted';
+      const createdEntries = posting.entries || [];
+      invoice.revenueJournalEntry = createdEntries[0]?._id || createdEntries[0]?.id || null;
+      invoice.cogsJournalEntry = req.posV2Completion
+        ? null
+        : createdEntries[1]?._id || createdEntries[1]?.id || null;
+      invoice.posPostingStatus = posting.status;
       await invoice.save({ session });
+      await postingClient.$executeRawUnsafe(
+        `UPDATE pos_stored_value_ledger
+         SET posting_status = $1,
+             journal_entry_id = COALESCE($2, journal_entry_id)
+         WHERE company_id = $3 AND invoice_id = $4 AND entry_type IN ('redeem', 'earn')`,
+        posting.status,
+        invoice.revenueJournalEntry,
+        String(companyId),
+        String(invoice._id),
+      );
+
+      for (const [tenderIndex, tender] of appliedPayments.entries()) {
+        if (tender.paymentMethod !== 'cheque') continue;
+        await postingClient.posCheque.create({
+          data: {
+            id: randomBytes(12).toString('hex'),
+            companyId: String(companyId),
+            invoiceId: String(invoice._id),
+            paymentId: tender.posPaymentId ? String(tender.posPaymentId) : null,
+            tenderIndex,
+            reference: String(tender.reference || ''),
+            amount: tender.amount,
+            status: 'in_hand',
+            chequesInHandAccountCode: postingBuild.accounts?.chequesInHand || null,
+            salePostingStatus: posting.status,
+            saleJournalEntryId: invoice.revenueJournalEntry || null,
+          },
+        });
+      }
 
       // 4. Add payment record if provided
       if (appliedPayments.length > 0) {
@@ -2026,6 +1998,7 @@ exports.createDirectSale = async (req, res, next) => {
           paymentMethod: tender.paymentMethod,
           reference: tender.reference || '',
           ...(tender.provider ? { provider: tender.provider } : {}),
+          ...(tender.providerName ? { providerName: tender.providerName } : {}),
           bankAccountId: tender.bankAccountId || null,
           ...(tender.storedValueAccountId ? { storedValueAccountId: tender.storedValueAccountId } : {}),
           ...(tender.loyaltyPointsRedeemed ? { loyaltyPointsRedeemed: tender.loyaltyPointsRedeemed, loyaltyPointValueRwf: tender.loyaltyPointValueRwf } : {}),
@@ -2125,7 +2098,7 @@ exports.createDirectSale = async (req, res, next) => {
             sourceType: 'invoice',
             sourceId: String(invoice._id),
             sourceReference: invoice.referenceNo,
-            journalEntryId: String(createdEntries[0]._id),
+            journalEntryId: createdEntries[0]?._id || createdEntries[0]?.id || null,
             metadata: {
               paymentFlow: 'PAYMENTS_V2',
               paymentIds: req.posV2Completion.creditPaymentIds || [],
@@ -2192,7 +2165,7 @@ exports.createDirectSale = async (req, res, next) => {
             const prepared = await EBMSalesService.prepareV2SaleSubmission(invoice._id, {
               companyId,
               modifierUserId: posCashierId || req.user._id,
-              journalLines: createdEntries[0].lines || journalEntries[0].lines,
+              journalLines: createdEntries[0]?.lines || journalEntries[0]?.lines || [],
               salesAccountCode: salesAccount,
               taxAccountCode: vatAccount,
             });
@@ -2340,6 +2313,13 @@ exports.createDirectSale = async (req, res, next) => {
           return next(statusError);
         }
       }
+      if (['POS_PAYMENT_ACCOUNT_MAPPING_REQUIRED', 'POS_PAYMENT_ACCOUNT_MAPPING_INVALID'].includes(error?.code)) {
+        return res.status(400).json({
+          success: false,
+          code: error.code,
+          message: error.message,
+        });
+      }
       console.error('[createDirectSale] Accounting posting failed; sale rolled back:', error);
       return res.status(503).json({
         success: false,
@@ -2480,8 +2460,16 @@ exports.getCheckoutPaymentFlow = async (req, res, next) => {
       data: {
         registerId: String(register.id),
         paymentFlow: posPaymentService.resolvePaymentFlow(settings, String(register.id)),
-        methods: posPaymentService.resolveEnabledMethods(settings, String(register.id))
+        methods: posPaymentService.resolveEnabledMethods(
+          settings,
+          String(register.id),
+          String(register.systemTillType || 'retail'),
+        )
           .filter((method) => method !== 'CREDIT' || tillFeatures.customerCredit),
+        effectivePaymentMethods: posPaymentService.getEffectiveMethodRegistry(settings, {
+          registerId: String(register.id),
+          tillType: String(register.systemTillType || 'retail'),
+        }).methods,
         manualMobileMoneyMode: settings.manualMobileMoneyMode,
         manualMobileMoneyReceivers: settings.manualMobileMoneyReceivers,
         discountLimits: getApplicableDiscountLimits(
