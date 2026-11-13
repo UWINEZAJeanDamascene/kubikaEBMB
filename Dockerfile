@@ -64,6 +64,7 @@ COPY --from=builder /app/plugins ./plugins
 COPY --from=builder /app/lib ./lib
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/ai-engine ./ai-engine
+COPY --from=builder /app/fixtures ./fixtures
 
 # Change ownership
 RUN chown -R nodejs:nodejs /app
