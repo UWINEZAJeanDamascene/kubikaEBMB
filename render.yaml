@@ -59,9 +59,9 @@ services:
       - key: EMAIL_FROM_NAME
         value: KUBIKA system
       - key: FRONTEND_URL
-        value: https://kubika.techmat.rw
+        value: https://kubika-ebmf.vercel.app
       - key: CORS_ORIGINS
-        value: https://kubika.techmat.rw
+        value: https://kubika-ebmf.vercel.app
     autoDeploy: true
 
   # Background tasks run in a dedicated process; the API process intentionally

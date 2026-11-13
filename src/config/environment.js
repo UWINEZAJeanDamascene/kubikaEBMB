@@ -13,6 +13,7 @@
 const REQUIRED_ENV_VARS = [];
 
 const REQUIRED_IN_PRODUCTION = [];
+const PRODUCTION_FRONTEND_ORIGIN = 'https://kubika-ebmf.vercel.app';
 
 const RETIRED_AI_MODELS = Object.freeze({
   groq: Object.freeze({
@@ -133,13 +134,15 @@ function buildConfig() {
     server: {
       env: nodeEnv,
       port: number(process.env.PORT, 3000),
-      frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
+      frontendUrl: process.env.FRONTEND_URL || (
+        nodeEnv === 'production' ? PRODUCTION_FRONTEND_ORIGIN : 'http://localhost:5173'
+      ),
       allowedOrigins: array(
         process.env.ALLOWED_ORIGINS,
-        nodeEnv === 'production' ? [] : ['http://localhost:3000', 'http://localhost:5173'],
+        nodeEnv === 'production' ? [PRODUCTION_FRONTEND_ORIGIN] : ['http://localhost:3000', 'http://localhost:5173'],
       ).filter((origin) => nodeEnv !== 'production' || !/^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(origin)),
       corsOrigins: array(process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS,
-        nodeEnv === 'production' ? [] : ['http://localhost:3000', 'http://localhost:5173'])
+        nodeEnv === 'production' ? [PRODUCTION_FRONTEND_ORIGIN] : ['http://localhost:3000', 'http://localhost:5173'])
         .filter((origin) => nodeEnv !== 'production' || !/^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(origin)),
     },
     
