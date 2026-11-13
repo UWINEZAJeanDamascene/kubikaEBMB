@@ -50,7 +50,7 @@ async function verifyPin(pin, pinHash) {
   return bcrypt.compare(pin, pinHash);
 }
 
-function getPinFailureState(failedAttempts, lockedUntil, now = new Date()) {
+function getPinFailureState(failedAttempts, lockedUntil, now = new Date(), options = {}) {
   if (!Number.isInteger(failedAttempts) || failedAttempts < 0 || !(now instanceof Date) || Number.isNaN(now.getTime())) {
     throw new TypeError('PIN failure state requires a non-negative attempt count and valid time.');
   }
@@ -60,24 +60,31 @@ function getPinFailureState(failedAttempts, lockedUntil, now = new Date()) {
     throw new TypeError('PIN lock expiry must be a valid date.');
   }
   if (lockExpiry && lockExpiry > now) {
-    return { failedAttempts, lockedUntil: lockExpiry, isLocked: true };
+    return { failedAttempts, lockedUntil: lockExpiry, isLocked: true, lockoutCount: Math.max(0, Number(options.lockoutCount) || 0) };
   }
 
   const attempts = lockExpiry ? 0 : failedAttempts;
   const nextAttempts = attempts + 1;
-  const nextLockExpiry = nextAttempts >= PIN_FAILURE_LIMIT
-    ? new Date(now.getTime() + PIN_LOCKOUT_DURATION_MS)
-    : null;
+  const failureLimit = Number.isInteger(options.failureLimit) && options.failureLimit >= 3 && options.failureLimit <= 20
+    ? options.failureLimit : PIN_FAILURE_LIMIT;
+  const lockoutDurationMs = Number.isInteger(options.lockoutDurationMs) && options.lockoutDurationMs >= 60_000 && options.lockoutDurationMs <= 3_600_000
+    ? options.lockoutDurationMs : PIN_LOCKOUT_DURATION_MS;
+  const isLocked = nextAttempts >= failureLimit;
+  const lockoutCount = isLocked ? Math.max(0, Number(options.lockoutCount) || 0) + 1 : Math.max(0, Number(options.lockoutCount) || 0);
+  const progressiveDurationMs = Math.min(60 * 60 * 1000, lockoutDurationMs * (2 ** Math.min(10, Math.max(0, lockoutCount - 1))));
+  const nextLockExpiry = isLocked ? new Date(now.getTime() + progressiveDurationMs) : null;
 
   return {
     failedAttempts: nextAttempts,
     lockedUntil: nextLockExpiry,
-    isLocked: Boolean(nextLockExpiry),
+    isLocked,
+    lockoutCount,
+    lockoutDurationMs: isLocked ? progressiveDurationMs : 0,
   };
 }
 
 function resetPinFailureState() {
-  return { failedAttempts: 0, lockedUntil: null, isLocked: false };
+  return { failedAttempts: 0, lockedUntil: null, isLocked: false, lockoutCount: 0 };
 }
 
 module.exports = {

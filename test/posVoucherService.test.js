@@ -4,6 +4,7 @@ const {
   buildPricing,
   canonicalCart,
   cartHash,
+  createVouchers,
   generateCode,
   hash,
   prepareVoucherRules,
@@ -15,11 +16,12 @@ jest.mock('../lib/prisma', () => ({ dbClient: jest.fn() }));
 jest.mock('../services/transactionService', () => ({ runInTransaction: jest.fn() }));
 jest.mock('../services/posAuditService', () => ({
   writePosAuditLog: jest.fn().mockResolvedValue(undefined),
+  writePosDenialAudit: jest.fn().mockResolvedValue(undefined),
 }));
 
 const { dbClient } = require('../lib/prisma');
 const { runInTransaction } = require('../services/transactionService');
-const { writePosAuditLog } = require('../services/posAuditService');
+const { writePosAuditLog, writePosDenialAudit } = require('../services/posAuditService');
 
 describe('POS voucher service', () => {
   afterEach(() => {
@@ -31,6 +33,32 @@ describe('POS voucher service', () => {
 
     expect(code).toMatch(/^VCH-[2-9A-HJ-NP-Z]{5}-[2-9A-HJ-NP-Z]{5}$/);
     expect(code).toHaveLength(15);
+  });
+
+  test('commits voucher creation and its audit event in one transaction', async () => {
+    const tx = {
+      posVoucher: {
+        create: jest.fn(async ({ data }) => ({ ...data, createdAt: new Date(), updatedAt: new Date() })),
+      },
+    };
+    dbClient.mockReturnValue({ $transaction: jest.fn(async (callback) => callback(tx)) });
+
+    const result = await createVouchers('company-1', 'manager-1', {
+      name: 'Spring voucher',
+      discountType: 'fixed',
+      value: 100,
+      startsAt: new Date(Date.now() + 60_000).toISOString(),
+      endsAt: new Date(Date.now() + 86_400_000).toISOString(),
+    }, 1);
+
+    expect(result).toHaveLength(1);
+    expect(tx.posVoucher.create).toHaveBeenCalledTimes(1);
+    expect(writePosAuditLog).toHaveBeenCalledTimes(1);
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'VOUCHER_CREATED',
+      companyId: 'company-1',
+      userId: 'manager-1',
+    }), tx);
   });
 
   test('normalizes cart data and hashes all pricing-relevant fields', () => {
@@ -231,8 +259,10 @@ describe('POS voucher service', () => {
 
     expect(attempt.attemptCount).toBe(3);
     expect(client.posVoucher.findFirst).toHaveBeenCalledTimes(3);
-    expect(writePosAuditLog).not.toHaveBeenCalledWith(expect.objectContaining({
-      metadata: expect.objectContaining({ code: 'SECRET-CODE' }),
+    expect(writePosDenialAudit).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'VOUCHER_INVALID_ATTEMPT',
+      metadata: expect.objectContaining({ result: 'NOT_FOUND' }),
     }));
+    expect(writePosDenialAudit.mock.calls[0][0].metadata).not.toHaveProperty('code', 'SECRET-CODE');
   });
 });

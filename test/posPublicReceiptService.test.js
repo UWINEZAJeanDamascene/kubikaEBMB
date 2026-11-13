@@ -145,6 +145,21 @@ describe('public POS receipt protections', () => {
     expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
 
+  it('conceals a token whose stored invoice is no longer available in its recorded tenant', async () => {
+    Invoice.findOne.mockReturnValue(invoiceQuery(null));
+    const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([{ id: '333333333333333333333333', companyId: COMPANY_A, invoiceId: INVOICE_A }]),
+      $executeRaw: jest.fn(),
+    };
+    mockPrisma.$transaction.mockImplementation((callback) => callback(tx));
+
+    await expect(publicReceiptDocument(TOKEN)).rejects.toBe(PUBLIC_RECEIPT_NOT_FOUND);
+
+    expect(Invoice.findOne).toHaveBeenCalledWith({ _id: INVOICE_A, company: COMPANY_A });
+    expect(Company.findById).not.toHaveBeenCalled();
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+  });
+
   it('masks customer TIN and omits cashier, payment reference, and internal warehouse data', async () => {
     configureSavedSale();
     const tx = {

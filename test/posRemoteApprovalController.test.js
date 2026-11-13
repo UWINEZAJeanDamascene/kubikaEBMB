@@ -54,6 +54,10 @@ describe('POS remote approval queue', () => {
     expect(data).toMatchObject({ companyId: 'company-1', registerId: 'register-1', cashierId: 'cashier-1', tillSessionId: 'shift-1', action: 'discount' });
     expect(data.payloadHash).toMatch(/^[a-f0-9]{64}$/);
     expect(res.status).toHaveBeenCalledWith(201);
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'APPROVAL_REQUESTED',
+      metadata: expect.objectContaining({ approvalRequestId: 'request-1', correlationId: 'request-1' }),
+    }), expect.any(Object));
   });
 
   test('uses the company policy request lifetime and blocks disabled actions', async () => {
@@ -222,6 +226,10 @@ describe('POS remote approval queue', () => {
     expect(tx.posManagerApproval.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
       companyId: 'company-1', cashierId: 'cashier-1', managerId: 'manager-1', action: 'discount', payloadHash: request.payloadHash,
     }) }));
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'APPROVAL_GRANTED',
+      metadata: expect.objectContaining({ approvalRequestId: request.id, correlationId: request.id }),
+    }), tx);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, data: expect.objectContaining({ decision: 'APPROVE' }) }));
   });
 

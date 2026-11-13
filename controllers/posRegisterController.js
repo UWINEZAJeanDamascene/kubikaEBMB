@@ -2,6 +2,13 @@ const { createHash, randomBytes } = require('crypto');
 const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
+const {
+  deviceKeyFingerprint,
+  hashDeviceToken: hashEnrolledDeviceToken,
+  newDeviceId,
+  newDeviceToken,
+  validateEnrollment,
+} = require('../services/posDeviceService');
 
 const companyIdFor = (req) => String(req.user.company?._id || req.user.companyId || '');
 const normalizeDeviceId = (value) => {
@@ -9,8 +16,6 @@ const normalizeDeviceId = (value) => {
   return /^[a-f0-9-]{36}$/.test(id) ? id : null;
 };
 const hashClaimCode = (code) => createHash('sha256').update(String(code)).digest('hex');
-const createDeviceToken = () => randomBytes(32).toString('base64url');
-const hashDeviceToken = (token) => createHash('sha256').update(String(token)).digest('hex');
 const publicRegister = (register) => ({
   _id: register.id,
   registerId: register.code,
@@ -27,6 +32,23 @@ const publicRegister = (register) => ({
   claimedAt: register.claimedAt,
   claimExpiresAt: register.claimExpiresAt,
   createdAt: register.createdAt,
+});
+const publicDevice = (device) => ({
+  deviceId: device.deviceId,
+  companyId: device.companyId,
+  registerId: device.registerId,
+  registerCode: device.register?.code || '',
+  registerName: device.register?.name || '',
+  status: device.status,
+  appVersion: device.appVersion || null,
+  queueDepth: Number(device.queueDepth || 0),
+  storageUsageBytes: device.storageUsageBytes == null ? null : String(device.storageUsageBytes),
+  storageQuotaBytes: device.storageQuotaBytes == null ? null : String(device.storageQuotaBytes),
+  storagePersistent: device.storagePersistent ?? null,
+  storageCheckedAt: device.storageCheckedAt || null,
+  lastSyncAt: device.lastSyncAt,
+  wipeRequestedAt: device.wipeRequestedAt,
+  publicKeyFingerprint: deviceKeyFingerprint(device.publicKey),
 });
 async function withBranchName(register) {
   if (!register?.branchId) return { ...register, branchName: '' };
@@ -239,6 +261,25 @@ exports.activateRegister = async (req, res, next) => {
   try {
     const companyId = companyIdFor(req);
     const registerId = String(req.params.registerId || '');
+    const deviceId = normalizeDeviceId(req.body?.deviceId);
+    if (!deviceId) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_DEVICE_ID_INVALID',
+        message: 'A valid browser device identity is required for enrollment.',
+      });
+    }
+    const enrollmentError = validateEnrollment({
+      publicKey: req.body?.publicKey,
+      appVersion: req.body?.appVersion,
+    });
+    if (enrollmentError) {
+      return res.status(enrollmentError.status).json({
+        success: false,
+        code: enrollmentError.code,
+        message: enrollmentError.message,
+      });
+    }
     const existing = await prisma.posRegister.findFirst({
       where: { id: registerId, companyId, isActive: true },
     });
@@ -246,9 +287,24 @@ exports.activateRegister = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Active POS register not found.' });
     }
 
-    const deviceToken = createDeviceToken();
+    const deviceToken = newDeviceToken();
     const now = new Date();
-    const updated = await prisma.$transaction(async (tx) => {
+    let updated;
+    try {
+      updated = await prisma.$transaction(async (tx) => {
+      const activeDevice = await tx.posDevice.findFirst({
+        where: { companyId, deviceId, status: 'active' },
+        select: { registerId: true },
+      });
+      if (activeDevice && activeDevice.registerId !== existing.id) {
+        return { code: 'POS_DEVICE_ALREADY_CLAIMED' };
+      }
+      if (existing.claimedDeviceId && existing.claimedDeviceId !== deviceId) {
+        await tx.posDevice.updateMany({
+          where: { companyId, deviceId: existing.claimedDeviceId, status: { not: 'revoked' } },
+          data: { status: 'revoked', wipeRequestedAt: now, wipeAcknowledgedAt: null },
+        });
+      }
       const ended = await tx.posSession.updateMany({
         where: { companyId, registerId: existing.id, status: { in: ['active', 'locked'] } },
         data: { status: 'ended', endedAt: now, endReason: 'REVOKED' },
@@ -265,7 +321,38 @@ exports.activateRegister = async (req, res, next) => {
       }
       const register = await tx.posRegister.update({
         where: { id: existing.id },
-        data: { deviceTokenHash: hashDeviceToken(deviceToken), lastSeenAt: now },
+        data: {
+          claimedDeviceId: deviceId,
+          claimedAt: now,
+          deviceTokenHash: hashEnrolledDeviceToken(deviceToken),
+          lastSeenAt: now,
+        },
+      });
+      const device = await tx.posDevice.upsert({
+        where: { companyId_deviceId: { companyId, deviceId } },
+        create: {
+          id: newDeviceId(),
+          companyId,
+          registerId: existing.id,
+          deviceId,
+          publicKey: req.body.publicKey,
+          deviceTokenHash: hashEnrolledDeviceToken(deviceToken),
+          status: 'active',
+          appVersion: req.body.appVersion,
+          queueDepth: Math.max(0, Math.min(10000, Number(req.body.queueDepth) || 0)),
+          lastSyncAt: now,
+        },
+        update: {
+          registerId: existing.id,
+          publicKey: req.body.publicKey,
+          deviceTokenHash: hashEnrolledDeviceToken(deviceToken),
+          status: 'active',
+          appVersion: req.body.appVersion,
+          queueDepth: Math.max(0, Math.min(10000, Number(req.body.queueDepth) || 0)),
+          lastSyncAt: now,
+          wipeRequestedAt: null,
+          wipeAcknowledgedAt: null,
+        },
       });
       await writePosAuditLog({
         companyId,
@@ -275,10 +362,32 @@ exports.activateRegister = async (req, res, next) => {
         metadata: { registerCode: existing.code },
         ip: requestIp(req),
       }, tx);
-      return register;
-    });
+      return { register, device };
+      });
+    } catch (error) {
+      if (error?.code === 'P2002') {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_DEVICE_ALREADY_CLAIMED',
+          message: 'This browser device is already enrolled at another active register.',
+        });
+      }
+      throw error;
+    }
+    if (updated.code === 'POS_DEVICE_ALREADY_CLAIMED') {
+      return res.status(409).json({
+        success: false,
+        code: updated.code,
+        message: 'This browser device is already enrolled at another active register.',
+      });
+    }
 
-    return res.json({ success: true, data: publicRegister(await withBranchName(updated)), deviceToken });
+    return res.json({
+      success: true,
+      data: publicRegister(await withBranchName(updated.register)),
+      deviceToken,
+      device: publicDevice({ ...updated.device, register: updated.register }),
+    });
   } catch (error) {
     next(error);
   }
@@ -512,6 +621,20 @@ exports.issueClaimCode = async (req, res, next) => {
     const claimCode = createClaimCode();
     const expiresAt = new Date(Date.now() + CLAIM_CODE_TTL_MS);
     const register = await prisma.$transaction(async (tx) => {
+      if (existing.claimedDeviceId) {
+        await tx.posDevice.updateMany({
+          where: {
+            companyId,
+            deviceId: existing.claimedDeviceId,
+            status: { not: 'revoked' },
+          },
+          data: {
+            status: 'revoked',
+            wipeRequestedAt: new Date(),
+            wipeAcknowledgedAt: null,
+          },
+        });
+      }
       const updated = await tx.posRegister.update({
         where: { id: existing.id },
         data: {
@@ -564,6 +687,17 @@ exports.claimRegister = async (req, res, next) => {
     if (!deviceId || claimCode.length < 20 || claimCode.length > 40) {
       return res.status(400).json({ success: false, message: 'Enter a valid device pairing code.' });
     }
+    const enrollmentError = validateEnrollment({
+      publicKey: req.body.publicKey,
+      appVersion: req.body.appVersion,
+    });
+    if (enrollmentError) {
+      return res.status(enrollmentError.status).json({
+        success: false,
+        code: enrollmentError.code,
+        message: enrollmentError.message,
+      });
+    }
 
     const now = new Date();
     const register = await prisma.posRegister.findFirst({
@@ -584,18 +718,77 @@ exports.claimRegister = async (req, res, next) => {
       return res.status(410).json({ success: false, code: 'POS_REGISTER_CLAIM_CODE_EXPIRED', message: 'This pairing code has expired. Ask a manager for a new code.' });
     }
 
-    let claimed;
-    const deviceToken = createDeviceToken();
+    const deviceToken = newDeviceToken();
+    let claimResult;
     try {
-      claimed = await prisma.posRegister.updateMany({
-        where: { id: register.id, companyId, isActive: true, claimedDeviceId: null, claimCodeHash: hashClaimCode(claimCode), claimCodeUsedAt: null, claimExpiresAt: { gt: now } },
-        data: { claimedDeviceId: deviceId, claimedAt: now, claimCodeUsedAt: now, deviceTokenHash: hashDeviceToken(deviceToken) },
+      claimResult = await prisma.$transaction(async (tx) => {
+        const alreadyActive = await tx.posDevice.findFirst({
+          where: { companyId, deviceId, status: 'active' },
+          select: { registerId: true },
+        });
+        if (alreadyActive && alreadyActive.registerId !== register.id) {
+          return { code: 'POS_DEVICE_ALREADY_CLAIMED' };
+        }
+        const claimed = await tx.posRegister.updateMany({
+          where: {
+            id: register.id,
+            companyId,
+            isActive: true,
+            claimedDeviceId: null,
+            claimCodeHash: hashClaimCode(claimCode),
+            claimCodeUsedAt: null,
+            claimExpiresAt: { gt: now },
+          },
+          data: {
+            claimedDeviceId: deviceId,
+            claimedAt: now,
+            claimCodeUsedAt: now,
+            deviceTokenHash: hashEnrolledDeviceToken(deviceToken),
+          },
+        });
+        if (claimed.count !== 1) return { code: 'POS_REGISTER_CLAIM_CODE_USED' };
+        const device = await tx.posDevice.upsert({
+          where: { companyId_deviceId: { companyId, deviceId } },
+          create: {
+            id: newDeviceId(),
+            companyId,
+            registerId: register.id,
+            deviceId,
+            publicKey: req.body.publicKey,
+            deviceTokenHash: hashEnrolledDeviceToken(deviceToken),
+            status: 'active',
+            appVersion: req.body.appVersion,
+            queueDepth: Math.max(0, Math.min(10000, Number(req.body.queueDepth) || 0)),
+            lastSyncAt: now,
+            wipeRequestedAt: null,
+            wipeAcknowledgedAt: null,
+          },
+          update: {
+            registerId: register.id,
+            publicKey: req.body.publicKey,
+            deviceTokenHash: hashEnrolledDeviceToken(deviceToken),
+            status: 'active',
+            appVersion: req.body.appVersion,
+            queueDepth: Math.max(0, Math.min(10000, Number(req.body.queueDepth) || 0)),
+            lastSyncAt: now,
+            wipeRequestedAt: null,
+            wipeAcknowledgedAt: null,
+          },
+        });
+        return { device };
       });
     } catch (error) {
       if (error?.code === 'P2002') return res.status(409).json({ success: false, code: 'POS_DEVICE_ALREADY_CLAIMED', message: 'This browser device already has another active POS register assigned to it.' });
       throw error;
     }
-    if (claimed.count !== 1) {
+    if (claimResult.code === 'POS_DEVICE_ALREADY_CLAIMED') {
+      return res.status(409).json({
+        success: false,
+        code: claimResult.code,
+        message: 'This device is already enrolled at another active register.',
+      });
+    }
+    if (claimResult.code) {
       const latest = await prisma.posRegister.findFirst({
         where: { id: register.id, companyId },
         select: { claimCodeUsedAt: true, claimedDeviceId: true, claimExpiresAt: true },
@@ -605,7 +798,12 @@ exports.claimRegister = async (req, res, next) => {
       return res.status(409).json({ success: false, code: 'POS_REGISTER_CLAIM_CODE_INVALID', message: 'This pairing code could not be used. Ask a manager for a new code.' });
     }
     const updated = await prisma.posRegister.findUnique({ where: { id: register.id } });
-    return res.json({ success: true, data: publicRegister(await withBranchName(updated)), deviceToken });
+    return res.json({
+      success: true,
+      data: publicRegister(await withBranchName(updated)),
+      deviceToken,
+      device: publicDevice({ ...claimResult.device, register }),
+    });
   } catch (error) {
     next(error);
   }
@@ -645,6 +843,21 @@ exports.deleteRegister = async (req, res, next) => {
           deviceTokenHash: null,
         },
       });
+      if (register.claimedDeviceId) {
+        await tx.posDevice.updateMany({
+          where: {
+            companyId,
+            registerId: register.id,
+            deviceId: register.claimedDeviceId,
+            status: { not: 'revoked' },
+          },
+          data: {
+            status: 'revoked',
+            wipeRequestedAt: now,
+            wipeAcknowledgedAt: null,
+          },
+        });
+      }
       const ended = await tx.posSession.updateMany({
         where: { companyId, registerId: register.id, status: { in: ['active', 'locked'] } },
         data: { status: 'ended', endedAt: now, endReason: 'REVOKED' },
@@ -675,6 +888,178 @@ exports.deleteRegister = async (req, res, next) => {
   }
 };
 
+exports.listDevices = async (req, res, next) => {
+  try {
+    const companyId = companyIdFor(req);
+    const devices = await prisma.posDevice.findMany({
+      where: { companyId },
+      include: { register: { select: { code: true, name: true } } },
+      orderBy: [{ updatedAt: 'desc' }, { deviceId: 'asc' }],
+    });
+    return res.json({ success: true, data: devices.map(publicDevice) });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.setDeviceStatus = async (req, res, next) => {
+  try {
+    const companyId = companyIdFor(req);
+    const deviceId = normalizeDeviceId(req.params.deviceId);
+    const status = String(req.body?.status || '');
+    if (!deviceId || !['active', 'disabled', 'revoked'].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_DEVICE_STATUS_INVALID',
+        message: 'Select a valid POS device and status.',
+      });
+    }
+    const existing = await prisma.posDevice.findFirst({
+      where: { companyId, deviceId },
+      include: { register: { select: { id: true, code: true, isActive: true } } },
+    });
+    if (!existing) {
+      return res.status(404).json({ success: false, code: 'POS_DEVICE_NOT_FOUND', message: 'POS device not found.' });
+    }
+    if (existing.status === 'revoked' && status !== 'revoked') {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_DEVICE_REENROLL_REQUIRED',
+        message: 'A revoked device must be enrolled again with a new pairing code.',
+      });
+    }
+    if (status === 'active' && (!existing.publicKey
+      || !existing.register.isActive
+      || existing.status === 'needs_enrollment')) {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_DEVICE_REENROLL_REQUIRED',
+        message: 'This device must complete enrollment before it can be enabled.',
+      });
+    }
+
+    const now = new Date();
+    const updated = await prisma.$transaction(async (tx) => {
+      if (status === 'active') {
+        const register = await tx.posRegister.findFirst({
+          where: {
+            id: existing.registerId,
+            companyId,
+            isActive: true,
+            claimedDeviceId: deviceId,
+            deviceTokenHash: existing.deviceTokenHash,
+          },
+          select: { id: true },
+        });
+        if (!register) return { code: 'POS_DEVICE_REENROLL_REQUIRED' };
+      }
+      const changed = await tx.posDevice.update({
+        where: { companyId_deviceId: { companyId, deviceId } },
+        data: {
+          status,
+          ...(status === 'revoked'
+            ? { wipeRequestedAt: now, wipeAcknowledgedAt: null }
+            : {}),
+        },
+        include: { register: { select: { code: true, name: true } } },
+      });
+      if (status !== 'active') {
+        await tx.posSession.updateMany({
+          where: { companyId, registerId: existing.registerId, status: { in: ['active', 'locked'] } },
+          data: { status: 'ended', endedAt: now, endReason: 'REVOKED' },
+        });
+      }
+      if (status === 'revoked') {
+        await tx.posRegister.updateMany({
+          where: { id: existing.registerId, companyId, claimedDeviceId: deviceId },
+          data: {
+            claimedDeviceId: null,
+            claimedAt: null,
+            claimCodeHash: null,
+            claimExpiresAt: null,
+            claimCodeUsedAt: null,
+            deviceTokenHash: null,
+          },
+        });
+      }
+      await writePosAuditLog({
+        companyId,
+        registerId: existing.registerId,
+        userId: req.user.id || req.user._id,
+        event: status === 'revoked' ? 'REGISTER_DEVICE_REVOKED' : 'REGISTER_DEVICE_STATUS_UPDATED',
+        metadata: { deviceId, status },
+        ip: requestIp(req),
+      }, tx);
+      return { device: changed };
+    });
+    if (updated.code === 'POS_DEVICE_REENROLL_REQUIRED') {
+      return res.status(409).json({
+        success: false,
+        code: updated.code,
+        message: 'This device must be paired again before it can be enabled.',
+      });
+    }
+    return res.json({ success: true, data: publicDevice(updated.device) });
+  } catch (error) {
+    if (error?.code === 'P2002') {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_REGISTER_DEVICE_ALREADY_ACTIVE',
+        message: 'This register already has an active POS device.',
+      });
+    }
+    return next(error);
+  }
+};
+
+exports.requestDeviceWipe = async (req, res, next) => {
+  try {
+    const companyId = companyIdFor(req);
+    const deviceId = normalizeDeviceId(req.params.deviceId);
+    const existing = deviceId
+      ? await prisma.posDevice.findFirst({ where: { companyId, deviceId } })
+      : null;
+    if (!existing) {
+      return res.status(404).json({ success: false, code: 'POS_DEVICE_NOT_FOUND', message: 'POS device not found.' });
+    }
+    const now = new Date();
+    const device = await prisma.$transaction(async (tx) => {
+      const changed = await tx.posDevice.update({
+        where: { companyId_deviceId: { companyId, deviceId } },
+        data: { status: 'revoked', wipeRequestedAt: now, wipeAcknowledgedAt: null },
+        include: { register: { select: { code: true, name: true } } },
+      });
+      await tx.posRegister.updateMany({
+        where: { id: existing.registerId, companyId, claimedDeviceId: deviceId },
+        data: {
+          claimedDeviceId: null,
+          claimedAt: null,
+          claimCodeHash: null,
+          claimExpiresAt: null,
+          claimCodeUsedAt: null,
+          deviceTokenHash: null,
+        },
+      });
+      await tx.posSession.updateMany({
+        where: { companyId, registerId: existing.registerId, status: { in: ['active', 'locked'] } },
+        data: { status: 'ended', endedAt: now, endReason: 'REVOKED' },
+      });
+      await writePosAuditLog({
+        companyId,
+        registerId: existing.registerId,
+        userId: req.user.id || req.user._id,
+        event: 'REGISTER_DEVICE_WIPE_REQUESTED',
+        metadata: { deviceId },
+        ip: requestIp(req),
+      }, tx);
+      return changed;
+    });
+    return res.json({ success: true, data: publicDevice(device) });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.revokeDevice = async (req, res, next) => {
   try {
     const companyId = companyIdFor(req);
@@ -684,6 +1069,16 @@ exports.revokeDevice = async (req, res, next) => {
 
     const now = new Date();
     const updated = await prisma.$transaction(async (tx) => {
+      if (register.claimedDeviceId) {
+        await tx.posDevice.updateMany({
+          where: { companyId, deviceId: register.claimedDeviceId },
+          data: {
+            status: 'revoked',
+            wipeRequestedAt: now,
+            wipeAcknowledgedAt: null,
+          },
+        });
+      }
       const revoked = await tx.posRegister.update({
         where: { id: register.id },
         data: {

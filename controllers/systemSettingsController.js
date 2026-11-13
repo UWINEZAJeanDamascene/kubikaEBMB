@@ -57,6 +57,8 @@ exports.updateSettings = async (req, res) => {
       'pos_offline_enabled',
       'pos_offline_max_hours',
       'pos_offline_queue_limit',
+      'pos_offline_max_sales',
+      'pos_offline_max_single_sale',
       'pos_negative_stock_escalation_days'
     ]
 
@@ -121,8 +123,24 @@ exports.updateSettings = async (req, res) => {
       return res.status(400).json({ success: false, message: 'pos_offline_max_hours must be an integer from 1 to 720' })
     }
     if (filteredData.pos_offline_queue_limit !== undefined
-      && (typeof filteredData.pos_offline_queue_limit !== 'number' || !Number.isFinite(filteredData.pos_offline_queue_limit) || filteredData.pos_offline_queue_limit < 1 || filteredData.pos_offline_queue_limit > 1000000000)) {
-      return res.status(400).json({ success: false, message: 'pos_offline_queue_limit must be between 1 and 1,000,000,000' })
+      && (!Number.isSafeInteger(filteredData.pos_offline_queue_limit) || filteredData.pos_offline_queue_limit < 1 || filteredData.pos_offline_queue_limit > 1000000000)) {
+      return res.status(400).json({ success: false, message: 'pos_offline_queue_limit must be a whole RWF amount from 1 to 1,000,000,000' })
+    }
+    if (filteredData.pos_offline_max_sales !== undefined
+      && (!Number.isInteger(filteredData.pos_offline_max_sales) || filteredData.pos_offline_max_sales < 1 || filteredData.pos_offline_max_sales > 1000000)) {
+      return res.status(400).json({ success: false, message: 'pos_offline_max_sales must be a whole number from 1 to 1,000,000' })
+    }
+    if (filteredData.pos_offline_max_single_sale !== undefined
+      && (!Number.isSafeInteger(filteredData.pos_offline_max_single_sale) || filteredData.pos_offline_max_single_sale < 1 || filteredData.pos_offline_max_single_sale > 1000000000)) {
+      return res.status(400).json({ success: false, message: 'pos_offline_max_single_sale must be a whole RWF amount from 1 to 1,000,000,000' })
+    }
+    if (filteredData.pos_offline_queue_limit !== undefined || filteredData.pos_offline_max_single_sale !== undefined) {
+      const current = await SystemSettingsService.get(companyId)
+      const totalLimit = filteredData.pos_offline_queue_limit ?? Number(current.pos_offline_queue_limit)
+      const singleSaleLimit = filteredData.pos_offline_max_single_sale ?? Number(current.pos_offline_max_single_sale)
+      if (singleSaleLimit > totalLimit) {
+        return res.status(400).json({ success: false, message: 'The maximum single offline sale cannot exceed the total offline value limit.' })
+      }
     }
     if (filteredData.pos_negative_stock_escalation_days !== undefined
       && (!Number.isInteger(filteredData.pos_negative_stock_escalation_days) || filteredData.pos_negative_stock_escalation_days < 1 || filteredData.pos_negative_stock_escalation_days > 365)) {

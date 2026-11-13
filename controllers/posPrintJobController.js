@@ -223,8 +223,8 @@ exports.fail = async (req, res, next) => {
 function printAgentReleasePaths(fileName) {
   const candidates = [
     process.env.KUBIKA_PRINT_AGENT_RELEASE_DIR,
-    path.join(__dirname, '..', 'downloads', 'print-agent'),
     path.resolve(__dirname, '..', '..', 'packages', 'kubika-print-agent', 'release'),
+    path.join(__dirname, '..', 'downloads', 'print-agent'),
   ].filter(Boolean);
   for (const directory of candidates) {
     const filePath = path.join(directory, fileName);
@@ -256,13 +256,13 @@ exports.getRelease = async (_req, res, next) => {
     const manifestPath = printAgentReleasePaths('manifest.json');
     if (!manifestPath) return res.status(404).json({ success: false, code: 'PRINT_AGENT_RELEASE_NOT_FOUND', message: 'The Print Agent release is not installed on this server.' });
     const manifest = readPrintAgentManifest(manifestPath);
-    const setupPath = printAgentReleasePaths(manifest.setup || 'KubikaPrintAgent-0.1.0-setup.exe');
+    const setupPath = printAgentReleasePaths(manifest.setup || 'KubikaPrintAgent-0.1.1-setup.exe');
     return res.json({
       success: true,
       data: {
         version: manifest.version,
         signed: Boolean(manifest.signed),
-        filename: manifest.setup || 'KubikaPrintAgent-0.1.0-setup.exe',
+        filename: manifest.setup || 'KubikaPrintAgent-0.1.1-setup.exe',
         sizeBytes: setupPath ? fs.statSync(setupPath).size : null,
         sha256: manifest.setupSha256 || null,
       },
@@ -273,7 +273,7 @@ exports.getRelease = async (_req, res, next) => {
 exports.downloadSetup = async (_req, res, next) => {
   try {
     const manifestPath = printAgentReleasePaths('manifest.json');
-    let filename = 'KubikaPrintAgent-0.1.0-setup.exe';
+    let filename = 'KubikaPrintAgent-0.1.1-setup.exe';
     if (manifestPath) {
       try {
         const manifest = readPrintAgentManifest(manifestPath);

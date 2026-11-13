@@ -267,13 +267,6 @@ async function initializeServer() {
         return callback(null, true);
       }
 
-      // Hardcoded production whitelist (exact matches only in production)
-      const hardcoded = [
-        'http://localhost:5173',
-        'http://localhost:3000',
-      ];
-      if (hardcoded.includes(origin)) return callback(null, true);
-
       // Block all other origins
       return callback(new Error('Not allowed by CORS'));
     },

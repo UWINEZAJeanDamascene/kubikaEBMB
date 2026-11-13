@@ -2,7 +2,7 @@ const { createHash, timingSafeEqual } = require('crypto');
 const { prisma } = require('../lib/prisma');
 const { verifyPosSessionToken } = require('../services/posSessionTokenService');
 const { resolveUserRoles } = require('./authorize');
-const { requestIp, writePosAuditLog } = require('../services/posAuditService');
+const { requestIp, writePosAuditLog, withPosAuditCorrelation } = require('../services/posAuditService');
 const { getPosSessionPermissionCandidates } = require('../utils/posPermissionCompatibility');
 
 const CASHIER_POS_PERMISSIONS = [
@@ -14,6 +14,9 @@ const CASHIER_POS_PERMISSIONS = [
   'pos.voucher.redeem',
   // A cashier must be able to start the shift before the till can sell.
   'pos.till.open_shift',
+  // Reprinting is available to cashiers, but every copy requires a reason
+  // and is recorded by the signed-copy service in the POS audit log.
+  'pos.till.reprint',
   'pos.receipt.share',
   'pos.giftcard.issue',
   'pos.giftcard.redeem',
@@ -47,6 +50,14 @@ const STORE_MANAGER_POS_PERMISSIONS = [
   'pos.admin.printers',
   'pos.admin.settings',
   'pos.admin.audit',
+  'pos.admin.security',
+  'pos.admin.audit.read',
+  'pos.admin.audit.export',
+  'pos.admin.audit.verify',
+  'pos.admin.security.read',
+  'pos.admin.security.update',
+  'pos.admin.security.sessions.read',
+  'pos.admin.security.sessions.revoke',
   'pos.shift.settings',
   'pos.payment.settings',
   'pos.payment.reconcile',
@@ -137,7 +148,7 @@ function configuredPermissions(matrix, roles) {
     if (Array.isArray(permissions)) {
       const configured = permissions.filter((permission) => typeof permission === 'string');
       return roleName === 'cashier' || roleName === 'sales'
-      ? [...new Set([...configured, 'pos.receipt.share', 'pos.giftcard.redeem'])]
+      ? [...new Set([...configured, 'pos.receipt.share', 'pos.giftcard.redeem', 'pos.till.reprint'])]
         : configured;
     }
     if (roleName === 'cashier' || roleName === 'sales') return CASHIER_POS_PERMISSIONS;
@@ -217,6 +228,22 @@ async function resolvePosSession(req, allowedStatuses = ['active']) {
   if (!register || !deviceTokenMatches(register, token)) {
     return { error: responseError(401, 'POS_DEVICE_INVALID', 'This POS device is not active or its device token is invalid.') };
   }
+  const posDevice = await prisma.posDevice.findFirst({
+    where: {
+      companyId: String(register.companyId),
+      registerId: String(register.id),
+      deviceId: String(register.claimedDeviceId || ''),
+    },
+  });
+  if (!posDevice || !posDevice.publicKey || posDevice.status === 'needs_enrollment') {
+    return { error: responseError(403, 'POS_DEVICE_ENROLLMENT_REQUIRED', 'Enroll this POS device before signing in.') };
+  }
+  if (posDevice.status === 'disabled') {
+    return { error: responseError(403, 'POS_DEVICE_DISABLED', 'This POS device has been disabled by a manager.') };
+  }
+  if (posDevice.status !== 'active') {
+    return { error: responseError(403, 'POS_SYNC_DEVICE_REVOKED', 'This POS device has been revoked.') };
+  }
   if (!user || !company?.isActive || company.approvalStatus !== 'approved') {
     return { error: responseError(401, 'POS_USER_INACTIVE', 'Cashier or company is inactive.') };
   }
@@ -259,9 +286,41 @@ async function resolvePosSession(req, allowedStatuses = ['active']) {
     claims,
     session,
     register,
+    posDevice,
     user,
     company,
     settings,
+  };
+}
+
+function requirePosDeviceContact() {
+  return async (req, res, next) => {
+    try {
+      const token = deviceTokenFrom(req);
+      if (!token) {
+        return res.status(401).json({
+          success: false,
+          code: 'POS_DEVICE_INVALID',
+          message: 'A valid enrolled POS device token is required.',
+        });
+      }
+      const device = await prisma.posDevice.findUnique({
+        where: { deviceTokenHash: hashToken(token) },
+        include: { register: true },
+      });
+      if (!device) {
+        return res.status(401).json({
+          success: false,
+          code: 'POS_DEVICE_INVALID',
+          message: 'This POS device is not enrolled or its device token is invalid.',
+        });
+      }
+      req.posDevice = device;
+      req.posRegister = device.register;
+      return next();
+    } catch (error) {
+      return next(error);
+    }
   };
 }
 
@@ -300,7 +359,24 @@ function requireDevice() {
           message: 'This POS device is not active or its device token is invalid.',
         });
       }
+      const posDevice = await prisma.posDevice.findFirst({
+        where: {
+          companyId: String(register.companyId),
+          registerId: String(register.id),
+          deviceId: String(register.claimedDeviceId || ''),
+          status: 'active',
+          publicKey: { not: null },
+        },
+      });
+      if (!posDevice) {
+        return res.status(403).json({
+          success: false,
+          code: 'POS_DEVICE_ENROLLMENT_REQUIRED',
+          message: 'Enroll this POS device before continuing.',
+        });
+      }
       req.posRegister = register;
+      req.posDevice = posDevice;
       return next();
     } catch (error) {
       return next(error);
@@ -475,7 +551,7 @@ function requireApproval(action, getContext = (req) => req.body?.context ?? null
             registerId: posContext.session.registerId,
             userId: posContext.session.userId,
             event: 'APPROVAL_USED',
-            metadata: { approvalId: approval.id, action: requiredAction, approvedBy: approval.approvedBy },
+            metadata: { approvalId: approval.id, correlationId: approval.id, action: requiredAction, approvedBy: approval.approvedBy },
           });
         }
         return changed;
@@ -495,7 +571,7 @@ function requireApproval(action, getContext = (req) => req.body?.context ?? null
         });
       }
       req.posApproval = approval;
-      return next();
+      return withPosAuditCorrelation(approval.id, () => next());
     } catch (error) {
       return next(error);
     }
@@ -504,6 +580,7 @@ function requireApproval(action, getContext = (req) => req.body?.context ?? null
 
 module.exports = {
   requireDevice,
+  requirePosDeviceContact,
   requirePosSession,
   requirePermission,
   requireCashMovementPermission,

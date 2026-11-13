@@ -36,6 +36,16 @@ const POS_PERMISSION_COMPATIBILITY = Object.freeze({
   'pos.admin.approvals': { rbac: [['tills', 'read']] },
   'pos.admin.reports': { rbac: [['reports', 'read']] },
   'pos.admin.audit': { rbac: [['audit_trail', 'read']] },
+  // Fine-grained audit/security actions are first-class permissions. Only the
+  // legacy workspace-level grants map to the read views during rollout;
+  // export, integrity verification, and policy changes require explicit grants.
+  'pos.admin.audit.read': { rbac: [['pos.admin', 'audit']] },
+  'pos.admin.audit.export': {},
+  'pos.admin.audit.verify': {},
+  'pos.admin.security.read': { rbac: [['pos.admin', 'security']] },
+  'pos.admin.security.update': {},
+  'pos.admin.security.sessions.read': {},
+  'pos.admin.security.sessions.revoke': {},
 });
 
 function capabilityName(resource, action) {

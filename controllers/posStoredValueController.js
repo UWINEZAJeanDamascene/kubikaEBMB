@@ -9,6 +9,7 @@ const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { generateObjectId } = require('../utils/objectId');
 const CurrencyService = require('../services/CurrencyService');
 const { findClaimedRegister } = require('../services/posRegisterService');
+const { writePosAuditLog, requestIp } = require('../services/posAuditService');
 const {
   normalizeStoredValueCode,
   hashStoredValueCode,
@@ -171,6 +172,25 @@ exports.issue = async (req, res) => {
         );
         if (!result.length) throw new Error('Till was closed while the gift card was being issued.');
       }
+      await writePosAuditLog({
+        companyId,
+        registerId: req.posAuthContext?.register?.id || req.posAuthContext?.session?.registerId || null,
+        userId: actorId,
+        event: 'POS_STORED_VALUE_ISSUED',
+        metadata: {
+          accountId,
+          ledgerEntryId: entryId,
+          kind,
+          amount,
+          currencyCode,
+          clientId,
+          fundingMethod,
+          paymentReference: String(req.body.reference || '').trim() || null,
+          postingStatus,
+          shiftId: till?._id ? String(till._id) : null,
+        },
+        ip: requestIp(req),
+      }, session);
     });
 
     return res.status(201).json({ success: true, message: 'Stored value issued.', data: { kind, code, amount, currencyCode, customerName: client?.name || null, postingStatus } });

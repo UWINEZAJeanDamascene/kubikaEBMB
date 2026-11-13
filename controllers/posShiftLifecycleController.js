@@ -7,6 +7,7 @@ const { runInTransaction } = require('../services/transactionService');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const { getPosZReportHighWaterMark } = require('../services/posZReportSequence');
 const shiftCloseController = require('./posShiftCloseController');
+const { retireUnusedReceiptNumbersForShift } = require('../services/posOfflineReceiptNumberService');
 const {
   findRegisterForShift,
   lockRegisterForZNumber,
@@ -547,6 +548,9 @@ exports.handover = async (req, res, next) => {
         closeNotes: differenceReason,
         zReport: null,
       });
+      const unusedOfflineReceiptNumbers = await retireUnusedReceiptNumbersForShift(tx, {
+        companyId, tillSessionId: closedTill.id, at: now,
+      });
       const snapshot = await shiftCloseController.buildShiftReportSnapshot({
         queryClient: tx,
         companyId,
@@ -561,6 +565,10 @@ exports.handover = async (req, res, next) => {
         heldSalesPolicy: settings.heldSalesOnClose,
         journalEntryId,
       });
+      snapshot.offlineReceiptNumbers = {
+        unusedAtClose: unusedOfflineReceiptNumbers,
+        accounting: 'Unused reservations for this shift were retired and cannot be used by a later shift.',
+      };
       await tx.tillSession.update({
         where: { id: closedTill.id },
         data: { zReport: snapshot, zReportGeneratedAt: now },

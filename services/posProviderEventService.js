@@ -7,6 +7,7 @@ const { generateObjectId } = require('../utils/objectId');
 const { createHmac, timingSafeEqual } = require('crypto');
 
 const PROVIDERS = new Set(['MTN_MOMO', 'AIRTEL_MONEY']);
+const PROVIDER_WEBHOOK_TOLERANCE_MS = 5 * 60 * 1000;
 
 function safeEventPayload({ eventKey, providerTxId, amount }) {
   return {
@@ -42,7 +43,8 @@ async function recordProviderSuccess({
     });
   }
 
-  return runInTransaction(async (tx) => {
+  try {
+    return await runInTransaction(async (tx) => {
     const existing = await tx.posProviderEvent.findFirst({
       where: { companyId: scopedCompanyId, provider: providerName, eventKey: eventKeyValue },
     });
@@ -130,8 +132,20 @@ async function recordProviderSuccess({
       }, tx);
     }
 
-    return { event, replayed: false, unmatched };
-  });
+      return { event, replayed: false, unmatched };
+    });
+  } catch (error) {
+    // Two correctly signed deliveries can race past the initial read. The
+    // unique (company, provider, event key) constraint is the serialization
+    // boundary; translate the losing insert into the same replay response.
+    if (error?.code === 'P2002' || error?.code === '23505') {
+      const existing = await dbClient().posProviderEvent.findFirst({
+        where: { companyId: scopedCompanyId, provider: providerName, eventKey: eventKeyValue },
+      });
+      if (existing) return { event: existing, replayed: true, unmatched: !existing.matchedPaymentId };
+    }
+    throw error;
+  }
 }
 
 async function listUnmatchedProviderEvents(companyId) {
@@ -166,12 +180,16 @@ function canonicalPayload(payload) {
   return JSON.stringify(ordered);
 }
 
-function verifyProviderWebhookSignature({ provider, payload, signature, secret }) {
+function verifyProviderWebhookSignature({ provider, payload, signature, secret, timestamp, now = Date.now() }) {
   const providerName = String(provider || '').toUpperCase();
   if (!PROVIDERS.has(providerName) || typeof secret !== 'string' || !secret.trim()) return false;
+  const timestampText = String(timestamp || '').trim();
+  if (!/^\d{10}$/.test(timestampText)) return false;
+  const timestampMs = Number(timestampText) * 1000;
+  if (!Number.isSafeInteger(timestampMs) || Math.abs(Number(now) - timestampMs) > PROVIDER_WEBHOOK_TOLERANCE_MS) return false;
   const supplied = String(signature || '').trim().replace(/^sha256=/i, '');
   if (!/^[a-f\d]{64}$/i.test(supplied)) return false;
-  const expected = createHmac('sha256', secret.trim()).update(canonicalPayload(payload)).digest('hex');
+  const expected = createHmac('sha256', secret.trim()).update(`${timestampText}.${canonicalPayload(payload)}`).digest('hex');
   const suppliedBuffer = Buffer.from(supplied, 'hex');
   const expectedBuffer = Buffer.from(expected, 'hex');
   return suppliedBuffer.length === expectedBuffer.length && timingSafeEqual(suppliedBuffer, expectedBuffer);
@@ -181,4 +199,5 @@ module.exports = {
   recordProviderSuccess,
   listUnmatchedProviderEvents,
   verifyProviderWebhookSignature,
+  PROVIDER_WEBHOOK_TOLERANCE_MS,
 };

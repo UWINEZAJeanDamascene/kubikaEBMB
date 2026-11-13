@@ -32,6 +32,8 @@ const { writePosAuditLog, requestIp } = require('../services/posAuditService');
 const ebmService = require('../services/ebmService');
 const EBMSalesService = require('../services/ebmSalesService');
 const { verifyCapability: verifyPosOfflineCapability } = require('../services/posOfflineCapabilityService');
+const { shouldBlockOfflineFiscalSale } = require('../services/posOfflinePolicyService');
+const { reserveOfflineActionUsage } = require('../services/posOfflineActionUsageService');
 const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
 const { getWarehouseTransferVisibility } = require('../services/posTransferVisibilityService');
 const notificationDeliveryService = require('../services/notificationDeliveryService');
@@ -49,7 +51,11 @@ const {
   roundMoney,
 } = require('../services/posCheckoutCoreService');
 
-const { consumeTrackedBatches, findAvailableSerialsOutsideQuarantine } = require('../services/posTrackedStockService');
+const {
+  consumeTrackedBatches,
+  consumeOfflineTrackedBatches,
+  findAvailableSerialsOutsideQuarantine,
+} = require('../services/posTrackedStockService');
 
 const { replayPosSale } = require('../services/posSaleReplayService');
 const {
@@ -156,11 +162,20 @@ exports.createDirectSale = async (req, res, next) => {
         clientInfo: savedDocument.clientInfo || undefined,
       };
     }
-    requestKey = req.posV2Completion ? '' : String(proformaDocument?.conversionKey || req.get('Idempotency-Key') || '').trim();
-    if (requestKey && !/^[a-zA-Z0-9_-]{16,100}$/.test(requestKey)) {
+    // Legacy checkout, pending V2 creation, and online/offline V2 completion
+    // all reserve this company-scoped request row inside the sale transaction.
+    // The invoice completion key remains as a domain-level recovery check.
+    requestKey = req.posV2Completion
+      ? String(req.posV2Completion.offlineOperationId || req.posV2Completion.completionKey || '').trim()
+      : String(proformaDocument?.conversionKey || req.get('Idempotency-Key') || '').trim();
+    if (requestKey && !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,99}$/.test(requestKey)) {
       return res.status(400).json({ success: false, code: 'POS_INVALID_IDEMPOTENCY_KEY', message: 'Checkout idempotency key is invalid.' });
     }
     const requestedRegisterId = String(req.body.registerId || '');
+    const hasOfflineOperation = Boolean(
+      req.body.offlineSnapshotCapability || req.body.offlineSaleId
+      || req.body.offlineCreatedAt || req.body.offlineOperationId,
+    );
     const claimedRegister = await findClaimedRegister(companyId, requestedRegisterId, req.body.deviceId);
     if (!claimedRegister) throw registerClaimRequiredError();
     if (claimedRegister.trainingMode) {
@@ -182,14 +197,14 @@ exports.createDirectSale = async (req, res, next) => {
     }
     const paymentSettings = await posPaymentService.getPaymentSettings(String(companyId));
     const configuredPaymentFlow = posPaymentService.resolvePaymentFlow(paymentSettings, String(claimedRegister.id));
-    if (req.posPaymentFlow === 'PAYMENTS_V2' && configuredPaymentFlow !== 'PAYMENTS_V2') {
+    if (!hasOfflineOperation && req.posPaymentFlow === 'PAYMENTS_V2' && configuredPaymentFlow !== 'PAYMENTS_V2') {
       return res.status(409).json({
         success: false,
         code: 'POS_PAYMENT_FLOW_DISABLED',
         message: 'V2 payments are not enabled for this register. Ask a manager to review POS payment settings.',
       });
     }
-    if (!req.posPaymentFlow && configuredPaymentFlow === 'PAYMENTS_V2') {
+    if (!hasOfflineOperation && !req.posPaymentFlow && configuredPaymentFlow === 'PAYMENTS_V2') {
       return res.status(409).json({
         success: false,
         code: 'POS_PAYMENT_V2_REQUIRED',
@@ -197,7 +212,7 @@ exports.createDirectSale = async (req, res, next) => {
       });
     }
     const isV2Pending = req.posPaymentFlow === 'PAYMENTS_V2' && !req.posV2Completion;
-    payloadHash = req.posV2Completion ? '' : hashPosSalePayload(req.body);
+    payloadHash = hashPosSalePayload(req.body);
     if (isV2Pending && !requestKey) {
       return res.status(400).json({
         success: false,
@@ -205,12 +220,15 @@ exports.createDirectSale = async (req, res, next) => {
         message: 'Provide an Idempotency-Key before creating a pending POS sale.',
       });
     }
-    if (requestKey && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
-    if (req.body.offlineSnapshotCapability || req.body.offlineSaleId || req.body.offlineCreatedAt) {
+    if (requestKey && !hasOfflineOperation && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
+    if (hasOfflineOperation) {
       const claims = verifyPosOfflineCapability(req.body.offlineSnapshotCapability);
       const offlineSaleId = String(req.body.offlineSaleId || '').trim();
+      const offlineOperationId = String(req.body.offlineOperationId || offlineSaleId).trim();
       const saleCreatedAt = new Date(req.body.offlineCreatedAt);
-      if (!/^[a-zA-Z0-9_-]{16,100}$/.test(offlineSaleId) || !Number.isFinite(saleCreatedAt.getTime())
+      if (!/^[a-zA-Z0-9_-]{16,100}$/.test(offlineSaleId)
+        || !/^[a-zA-Z0-9_-]{16,100}$/.test(offlineOperationId)
+        || !Number.isFinite(saleCreatedAt.getTime())
         || saleCreatedAt.getTime() < claims.issuedAt || saleCreatedAt.getTime() > claims.expiresAt
         || String(claims.companyId) !== String(companyId)
         || String(claims.userId) !== String(req.user.id)
@@ -223,26 +241,112 @@ exports.createDirectSale = async (req, res, next) => {
         claims.id, companyId, req.user.id, req.body.deviceId, requestedRegisterId,
       );
       const snapshot = snapshots[0];
+      const snapshotData = typeof snapshot?.snapshotData === 'string'
+        ? JSON.parse(snapshot.snapshotData)
+        : snapshot?.snapshotData;
+      const expectedPaymentFlow = claims.paymentFlow || snapshotData?.paymentFlow || 'LEGACY';
+      const queuedPaymentFlow = req.body.offlinePaymentFlow || 'LEGACY';
       if (!snapshot || String(snapshot.warehouseId) !== String(req.body.warehouseId || '')
-        || String(snapshot.tillSessionId) !== String(req.body.tillSession?.id || '')
+        || String(snapshot.tillSessionId) !== String(claims.tillSessionId || '')
+        || !req.posV2Completion && String(snapshot.tillSessionId) !== String(req.body.tillSession?.id || '')
         || new Date(snapshot.expiresAt).getTime() !== claims.expiresAt) {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_SNAPSHOT_UNAVAILABLE', message: 'The signed offline catalog snapshot is unavailable or does not match this sale.' });
+      }
+      const fiscalPolicyRows = await dbClient().$queryRawUnsafe(
+        `SELECT c.ebm_enabled AS "ebmEnabled", s.pos_offline_policy AS "offlinePolicy"
+           FROM companies c LEFT JOIN system_settings s ON s.company_id = c.id
+          WHERE c.id = $1 LIMIT 1`, String(companyId),
+      );
+      const fiscalPolicyRow = fiscalPolicyRows[0];
+      const storedOfflinePolicy = typeof fiscalPolicyRow?.offlinePolicy === 'string'
+        ? JSON.parse(fiscalPolicyRow.offlinePolicy)
+        : fiscalPolicyRow?.offlinePolicy;
+      if (shouldBlockOfflineFiscalSale({
+        ebmEnabled: fiscalPolicyRow?.ebmEnabled,
+        snapshotRequiresFiscalSubmission: snapshotData?.offlinePolicy?.requiresFiscalSubmission,
+        capabilityAllowsProvisionalReceipt: claims.provisionalFiscalReceiptsAllowed,
+        companyAllowsProvisionalReceipt: storedOfflinePolicy?.provisionalFiscalReceiptsAllowed,
+      })) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_OFFLINE_FISCAL_SALE_BLOCKED',
+          message: 'This shop requires an RRA fiscal receipt. Offline fiscal sales are not approved yet. Keep the cart and reconnect before completing the sale.',
+        });
+      }
+      if (!['LEGACY', 'PAYMENTS_V2'].includes(queuedPaymentFlow)
+        || queuedPaymentFlow !== expectedPaymentFlow
+        || queuedPaymentFlow !== configuredPaymentFlow
+        || queuedPaymentFlow !== (req.posPaymentFlow === 'PAYMENTS_V2' ? 'PAYMENTS_V2' : 'LEGACY')) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_OFFLINE_PAYMENT_FLOW_CHANGED',
+          message: 'The POS payment flow changed after this sale was queued. The sale was not rerouted; review or retry it only after restoring its original payment flow.',
+        });
+      }
+      const priorReceiptAllocation = await dbClient().$queryRawUnsafe(
+        `SELECT receipt_number AS "receiptNumber"
+           FROM pos_receipt_number_allocations
+          WHERE company_id = $1 AND device_id = $2 AND register_id = $3
+            AND operation_id = $4
+          LIMIT 1`,
+        String(companyId),
+        String(req.body.deviceId),
+        String(claimedRegister.id),
+        offlineOperationId,
+      );
+      let receiptNumber = String(
+        priorReceiptAllocation[0]?.receiptNumber || req.body.offlineReceiptNumber || '',
+      );
+      const hasSignedReceiptList = Array.isArray(claims.receiptNumbers);
+      const signedReceiptNumbers = hasSignedReceiptList
+        ? claims.receiptNumbers.filter((number) => typeof number === 'string')
+        : [];
+      const validReceiptNumber = /^[A-Z]{2,8}-\d{4}-\d{5,}$/.test(receiptNumber);
+      if (!validReceiptNumber || !priorReceiptAllocation.length
+        && hasSignedReceiptList && !signedReceiptNumbers.includes(receiptNumber)) {
+        const availableReceipts = hasSignedReceiptList
+          ? signedReceiptNumbers.filter((number) => (
+          /^[A-Z]{2,8}-\d{4}-\d{5,}$/.test(number)
+          ))
+          : null;
+        const allocations = !hasSignedReceiptList || availableReceipts.length
+          ? await dbClient().$queryRawUnsafe(
+            `SELECT receipt_number AS "receiptNumber"
+               FROM pos_receipt_number_allocations
+              WHERE company_id = $1 AND device_id = $2 AND register_id = $3
+                AND operation_id IS NULL AND used_at IS NULL AND retired_at IS NULL
+                AND expires_at > $4::timestamptz
+                AND ($5::text[] IS NULL OR receipt_number = ANY($5::text[]))
+              ORDER BY created_at ASC, block_index ASC
+              LIMIT 1`,
+            String(companyId),
+            String(req.body.deviceId),
+            String(claimedRegister.id),
+            saleCreatedAt,
+            availableReceipts,
+          )
+          : [];
+        receiptNumber = String(allocations[0]?.receiptNumber || '');
+      }
+      if (!/^[A-Z]{2,8}-\d{4}-\d{5,}$/.test(receiptNumber)) {
+        return res.status(403).json({
+          success: false,
+          code: 'POS_OFFLINE_RECEIPT_NUMBER_INVALID',
+          message: 'No unused valid receipt number is available in this sale’s signed offline block. Refresh the POS receipt block before retrying.',
+        });
       }
       offlineContext = {
         claims,
         snapshotId: String(snapshot.id),
-        snapshotData: typeof snapshot.snapshotData === 'string' ? JSON.parse(snapshot.snapshotData) : snapshot.snapshotData,
+        snapshotData,
         queueLimit: Number(snapshot.queueLimit),
         offlineSaleId,
+        operationId: offlineOperationId,
+        receiptNumber,
+        paymentFlow: queuedPaymentFlow,
         saleCreatedAt,
       };
-    }
-    if (isV2Pending && offlineContext) {
-      return res.status(400).json({
-        success: false,
-        code: 'POS_PAYMENT_V2_ONLINE_REQUIRED',
-        message: 'V2 payments require an online POS session. Use the legacy checkout while offline.',
-      });
+      if (requestKey && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
     }
 
     const invoiceCurrency = await CurrencyService.getCompanyBase(companyId);
@@ -275,8 +379,19 @@ exports.createDirectSale = async (req, res, next) => {
         message: 'Create the pending sale first, then record cash through the POS Payments V2 payment screen.',
       });
     }
-    if (offlineContext && (paymentMethod !== 'cash' || Array.isArray(req.body.payments) && req.body.payments.length
-      || req.body.splitTender === true)) {
+    const offlineV2NonCashPayment = req.posV2Completion
+      && Array.isArray(req.body.payments)
+      && req.body.payments.some((payment) => String(payment?.paymentMethod || '').toLowerCase() !== 'cash');
+    const hasUnsupportedOfflineTender = req.posV2Completion
+      ? offlineV2NonCashPayment
+      : Array.isArray(req.body.payments) && req.body.payments.length > 0 || req.body.splitTender === true;
+    const v2OfflinePaymentMethods = req.posV2Completion && Array.isArray(req.body.payments)
+      ? req.body.payments.map((payment) => String(payment?.paymentMethod || '').toLowerCase())
+      : [];
+    const offlinePaymentIsCash = req.posV2Completion
+      ? v2OfflinePaymentMethods.length === 1 && v2OfflinePaymentMethods[0] === 'cash'
+      : paymentMethod === 'cash' && !hasUnsupportedOfflineTender;
+    if (offlineContext && (!offlinePaymentIsCash || hasUnsupportedOfflineTender)) {
       return res.status(400).json({ success: false, code: 'POS_OFFLINE_CASH_ONLY', message: 'Offline POS accepts only a single cash payment.' });
     }
 
@@ -413,9 +528,14 @@ exports.createDirectSale = async (req, res, next) => {
       roleAssignments.map((assignment) => assignment.roleId),
       claimedRegister.discountLabel || null,
     );
-    const priceListPricing = offlineContext
-      ? { priceListId: null, priceByProduct: new Map() }
-      : await getWarehousePriceListPrices(companyId, warehouseId, productIds);
+    const priceListPricing = await getWarehousePriceListPrices(
+      companyId,
+      warehouseId,
+      productIds,
+      offlineContext ? offlineContext.saleCreatedAt : new Date(),
+      offlineContext?.snapshotData.priceListId || null,
+      Boolean(offlineContext),
+    );
     let allowNegativeStock = Boolean(offlineContext?.snapshotData.negativeStockAllowed);
     if (!offlineContext) {
       const stockPolicy = await dbClient().$queryRawUnsafe(
@@ -529,6 +649,8 @@ exports.createDirectSale = async (req, res, next) => {
     const stockUpdates = [];
     const missingProducts = [];
     const offlineConflicts = [];
+    const offlineBatchUsageByProduct = new Map();
+    let offlineTaxPayloadMismatch = false;
     const selectedWarehouseLevels = await StockLevel.find({
       company_id: companyId,
       warehouse_id: warehouseId,
@@ -566,9 +688,10 @@ exports.createDirectSale = async (req, res, next) => {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_PRODUCT_NOT_IN_SNAPSHOT', message: 'A sale item was not included in the signed offline catalog snapshot.' });
       }
       const quantity = Number(item.quantity);
-      const productPrice = offlineContext
-        ? Number(snapshotProduct.price)
-        : effectivePrice(String(product._id), product.sellingPrice, priceListPricing.priceByProduct);
+      const productPrice = effectivePrice(String(product._id), product.sellingPrice, priceListPricing.priceByProduct);
+      if (offlineContext && Math.abs(Number(snapshotProduct.price) - productPrice) > 0.000001) {
+        return res.status(403).json({ success: false, code: 'POS_OFFLINE_PRICE_SNAPSHOT_MISMATCH', message: `${snapshotProduct.name} price no longer matches the signed offline catalog.` });
+      }
       const requestedUnitPrice = item.unitPrice == null ? productPrice : Number(item.unitPrice);
       const requestedDiscountPct = item.discountPct == null ? 0 : Number(item.discountPct);
       const isRestrictedProduct = isDiscountRestricted(product);
@@ -649,8 +772,121 @@ exports.createDirectSale = async (req, res, next) => {
         : product.trackingType === 'batch' || product.trackBatch
           ? 'batch'
           : (product.trackingType || 'none');
+      let batchAllocations = [];
+      let batchSnapshot = Array.isArray(snapshotProduct?.batches) ? snapshotProduct.batches : null;
+      let reconstructedLegacyBatchAllocation = false;
       if (offlineContext && productTrackingType === 'batch') {
-        return res.status(409).json({ success: false, code: 'POS_OFFLINE_BATCH_TRACKING_UNSUPPORTED', message: `${product.name} uses batch tracking and cannot be sold from this offline POS snapshot.` });
+        if (!batchSnapshot) {
+          const currentBatches = await dbClient().stockBatch.findMany({
+            where: {
+              companyId: String(companyId),
+              productId: String(product._id),
+              warehouseId: String(warehouseId),
+              isQuarantined: false,
+              qtyOnHand: { gt: 0 },
+            },
+            select: {
+              id: true,
+              batchNo: true,
+              qtyOnHand: true,
+              reservedQuantity: true,
+              unitCost: true,
+              expiryDate: true,
+              createdAt: true,
+            },
+            orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
+            take: 500,
+          });
+          batchSnapshot = currentBatches
+            .map((batch) => ({
+              id: String(batch.id),
+              batchNo: String(batch.batchNo || ''),
+              availableQuantity: Math.max(0, Number(batch.qtyOnHand || 0) - Number(batch.reservedQuantity || 0)),
+              expiryDate: batch.expiryDate ? new Date(batch.expiryDate).toISOString() : null,
+              unitCost: Number(batch.unitCost) || 0,
+              createdAt: batch.createdAt ? new Date(batch.createdAt).getTime() : 0,
+            }))
+            .filter((batch) => batch.availableQuantity > 0
+              && (!batch.expiryDate
+                || (new Date(batch.expiryDate).getTime() >= offlineContext.saleCreatedAt.getTime()
+                  && new Date(batch.expiryDate).getTime() >= Date.now())))
+            .sort((left, right) => (
+              (left.expiryDate ? new Date(left.expiryDate).getTime() : Number.MAX_SAFE_INTEGER)
+                - (right.expiryDate ? new Date(right.expiryDate).getTime() : Number.MAX_SAFE_INTEGER)
+              || left.createdAt - right.createdAt
+              || left.id.localeCompare(right.id)
+            ));
+          reconstructedLegacyBatchAllocation = true;
+        }
+        const snapshotBatchesById = new Map(batchSnapshot.map((batch) => [String(batch.id), batch]));
+        let requestedAllocations = Array.isArray(item.batchAllocations) ? item.batchAllocations : [];
+        if (!requestedAllocations.length) {
+          let remaining = quantity;
+          requestedAllocations = [];
+          const usedByCart = offlineBatchUsageByProduct.get(String(product._id)) || new Map();
+          for (const batch of batchSnapshot) {
+            const availableQuantity = Math.max(
+              0,
+              (Number(batch.availableQuantity) || 0) - (Number(usedByCart.get(String(batch.id))) || 0),
+            );
+            const amount = Math.min(availableQuantity, remaining);
+            if (amount <= 0) continue;
+            requestedAllocations.push({ batchId: String(batch.id), quantity: amount });
+            remaining -= amount;
+            if (remaining <= 0.0000001) break;
+          }
+          if (remaining > 0.0000001) {
+            return res.status(409).json({
+              success: false,
+              code: 'POS_OFFLINE_BATCH_ALLOCATION_UNAVAILABLE',
+              message: `Eligible batch stock is no longer available to sync ${product.name}. Manager review is required.`,
+            });
+          }
+        }
+        const seenBatchIds = new Set();
+        let allocatedQuantity = 0;
+        for (const allocation of requestedAllocations) {
+          const batchId = String(allocation?.batchId || '').trim();
+          const allocationQuantity = Number(allocation?.quantity);
+          const snapshotBatch = snapshotBatchesById.get(batchId);
+          if (!isObjectIdString(batchId) || !snapshotBatch || seenBatchIds.has(batchId)
+            || !Number.isFinite(allocationQuantity) || allocationQuantity <= 0) {
+            return res.status(403).json({
+              success: false,
+              code: 'POS_OFFLINE_BATCH_ALLOCATION_INVALID',
+              message: `A batch allocation for ${product.name} is missing, duplicated, or was not in the signed offline snapshot.`,
+            });
+          }
+          const expiryTime = snapshotBatch.expiryDate ? new Date(snapshotBatch.expiryDate).getTime() : null;
+          if (expiryTime != null && expiryTime < offlineContext.saleCreatedAt.getTime()) {
+            return res.status(403).json({
+              success: false,
+              code: 'POS_OFFLINE_BATCH_EXPIRED',
+              message: `A batch allocated to ${product.name} had expired before the offline sale was recorded.`,
+            });
+          }
+          const usedByCart = offlineBatchUsageByProduct.get(String(product._id)) || new Map();
+          const allocatedForBatch = (usedByCart.get(batchId) || 0) + allocationQuantity;
+          if (allocatedForBatch > Number(snapshotBatch.availableQuantity) + 0.00005) {
+            return res.status(403).json({
+              success: false,
+              code: 'POS_OFFLINE_BATCH_SNAPSHOT_STOCK_EXCEEDED',
+              message: `The allocated batch quantity for ${product.name} exceeds the signed offline snapshot.`,
+            });
+          }
+          seenBatchIds.add(batchId);
+          allocatedQuantity += allocationQuantity;
+          usedByCart.set(batchId, allocatedForBatch);
+          offlineBatchUsageByProduct.set(String(product._id), usedByCart);
+          batchAllocations.push({ batchId, quantity: allocationQuantity });
+        }
+        if (Math.abs(allocatedQuantity - quantity) > 0.00005) {
+          return res.status(403).json({
+            success: false,
+            code: 'POS_OFFLINE_BATCH_ALLOCATION_INVALID',
+            message: `Select signed batch allocations totaling ${quantity} for ${product.name}.`,
+          });
+        }
       }
       if (isStockable && productTrackingType === 'serial') {
         if (serialNumbers.length !== quantity || new Set(serialNumbers).size !== serialNumbers.length) {
@@ -701,9 +937,7 @@ exports.createDirectSale = async (req, res, next) => {
         });
       }
       const taxCode = offlineContext ? snapshotProduct.taxCode : (product.taxCode || (taxRate > 0 ? 'B' : 'A'));
-      if (offlineContext && (Number(item.taxRate) !== taxRate || String(item.taxCode || '') !== String(taxCode))) {
-        return res.status(403).json({ success: false, code: 'POS_OFFLINE_TAX_SNAPSHOT_MISMATCH', message: `${product.name} tax settings do not match the signed offline catalog.` });
-      }
+      if (offlineContext && Number(item.taxRate) !== taxRate) offlineTaxPayloadMismatch = true;
       const { subtotal, discountAmount, netAmount, taxAmount, lineTotal } = calculatePosLineAmounts({
         quantity, unitPrice, discountPct, taxRate,
       });
@@ -749,6 +983,9 @@ exports.createDirectSale = async (req, res, next) => {
             lineOrder: invoiceLines.length - 1,
             unitCost: offlineContext ? Number(snapshotProduct.averageCost) || 0 : Number(product.averageCost) || 0,
             serialNumbers,
+            batchAllocations,
+            batchSnapshot: batchSnapshot || [],
+            reconstructedLegacyBatchAllocation,
           },
           offlineAvailableStock: offlineContext ? Number(snapshotProduct.availableStock) || 0 : undefined,
         });
@@ -841,6 +1078,23 @@ exports.createDirectSale = async (req, res, next) => {
     const netSales = roundMoney(subtotal - totalDiscount);
     const totalTax = roundMoney(invoiceLines.reduce((sum, line) => sum + line.taxAmount, 0));
     const grandTotal = roundMoney(invoiceLines.reduce((sum, line) => sum + line.lineTotal, 0));
+    if (offlineContext) {
+      const savedDisplayTotal = Number(req.body.displayTotal);
+      if (Number.isFinite(savedDisplayTotal) && Math.abs(savedDisplayTotal - grandTotal) > 0.009) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_OFFLINE_TOTAL_SNAPSHOT_MISMATCH',
+          message: `The saved sale total (${savedDisplayTotal.toFixed(2)}) differs from the signed-catalog total (${grandTotal.toFixed(2)}). Manager review is required; the sale was not changed.`,
+        });
+      }
+      if (offlineTaxPayloadMismatch && !Number.isFinite(savedDisplayTotal)) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_OFFLINE_TAX_SNAPSHOT_MISMATCH',
+          message: 'The queued tax rate differs from the signed offline catalog, and the saved sale total is unavailable to verify. Manager review is required.',
+        });
+      }
+    }
     const breachedDiscountCaps = evaluateDiscountCaps({
       limits: applicableDiscountLimits,
       lineDiscounts: invoiceLines.map((line) => ({ percent: Number(line.discountCapPercent) || 0 })),
@@ -1009,9 +1263,25 @@ exports.createDirectSale = async (req, res, next) => {
         message: 'Payment amount must be a valid non-negative number',
       });
     }
-    if (offlineContext && (normalizedPayments.some((tender) => tender.paymentMethod !== 'cash')
-      || amountTendered < grandTotal - 0.009 || !requestKey)) {
-      return res.status(400).json({ success: false, code: 'POS_OFFLINE_CASH_ONLY', message: 'Offline POS requires an idempotency key and full cash payment.' });
+    const offlineNonCashTotal = normalizedPayments
+      .filter((tender) => tender.paymentMethod !== 'cash')
+      .reduce((sum, tender) => sum + tender.amount, 0);
+    const offlineMobileMoneyCount = normalizedPayments
+      .filter((tender) => tender.paymentMethod === 'mobile_money' && tender.amount > 0).length;
+    if (offlineContext && !isV2Pending && (
+      !normalizedPayments.length
+      || normalizedPayments.some((tender) => (
+        tender.amount <= 0 || !['cash', 'card', 'mobile_money'].includes(tender.paymentMethod)
+        || tender.paymentMethod === 'card'
+          && placeholderReferences.has(tender.reference.toLowerCase().replace(/\s+/g, ''))
+      ))
+      || offlineMobileMoneyCount > 1
+      || amountTendered < grandTotal - 0.009
+      || offlineNonCashTotal > grandTotal + 0.009
+      || offlineMobileMoneyCount > 0 && Math.abs(amountTendered - grandTotal) > 0.009
+      || !(requestKey || req.posV2Completion && offlineContext.operationId)
+    )) {
+      return res.status(400).json({ success: false, code: 'POS_OFFLINE_PAYMENT_INVALID', message: 'Offline POS requires full payment using cash, card, or manual mobile money. Mobile money may be used once per sale, and any change must come from cash.' });
     }
     // Card is not a cash-equivalent tender. Until a terminal/provider
     // confirms authorization and settlement, accepting it here would mark an
@@ -1082,6 +1352,28 @@ exports.createDirectSale = async (req, res, next) => {
       const postingClient = session?.$executeRawUnsafe && session?.$queryRawUnsafe
         ? session
         : dbClient();
+      if (offlineContext) {
+        const allocation = await postingClient.$queryRawUnsafe(
+          `UPDATE pos_receipt_number_allocations
+              SET operation_id = $6, used_at = CURRENT_TIMESTAMP
+            WHERE company_id = $1 AND device_id = $2 AND register_id = $3
+              AND receipt_number = $4 AND (operation_id IS NULL OR operation_id = $6)
+              AND expires_at > $5::timestamptz
+          RETURNING id`,
+          String(companyId),
+          String(req.body.deviceId),
+          String(claimedRegister.id),
+          offlineContext.receiptNumber,
+          offlineContext.saleCreatedAt,
+          offlineContext.operationId,
+        );
+        if (!allocation.length) {
+          throw Object.assign(new Error('This offline receipt number has already been used or expired. Refresh the POS receipt block and retry only if the sale was not recorded.'), {
+            code: 'POS_OFFLINE_RECEIPT_NUMBER_UNAVAILABLE',
+            statusCode: 409,
+          });
+        }
+      }
       if (requestKey) {
         const reservation = await dbClient().$queryRawUnsafe(
           'INSERT INTO pos_sale_requests (company_id, request_key, created_by_id, payload_hash, status, created_at, updated_at) VALUES ($1, $2, $3, $4, \'processing\', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, request_key) DO NOTHING RETURNING request_key AS "requestKey"',
@@ -1103,7 +1395,7 @@ exports.createDirectSale = async (req, res, next) => {
           throw Object.assign(new Error('This proforma has already been converted or changed.'), { code: 'POS_PROFORMA_NOT_OPEN' });
         }
       }
-      if (offlineContext) {
+      if (offlineContext && !req.posV2Completion) {
         const snapshotRows = await dbClient().$queryRawUnsafe(
           'SELECT queue_limit AS "queueLimit", used_value AS "usedValue" FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE',
           offlineContext.snapshotId, String(companyId),
@@ -1119,6 +1411,29 @@ exports.createDirectSale = async (req, res, next) => {
           'UPDATE pos_offline_snapshots SET used_value = used_value + $1::numeric WHERE id = $2 AND company_id = $3',
           grandTotal, offlineContext.snapshotId, String(companyId),
         );
+      }
+      if (offlineContext && !isV2Pending) {
+        const actionAmounts = ['card', 'mobile_money']
+          .map((action) => ({
+            action,
+            amount: Math.round(appliedPayments
+              .filter((tender) => tender.paymentMethod === action)
+              .reduce((sum, tender) => sum + tender.amount, 0)),
+          }))
+          .filter((entry) => entry.amount > 0);
+        for (const { action, amount } of actionAmounts) {
+          await reserveOfflineActionUsage({
+            tx: postingClient,
+            companyId: String(companyId),
+            snapshotId: offlineContext.snapshotId,
+            operationId: offlineContext.operationId,
+            deviceId: String(req.body.deviceId),
+            registerId: String(requestedRegisterId),
+            action,
+            amount,
+            occurredAt: offlineContext.saleCreatedAt,
+          });
+        }
       }
 
       if (requiresManagerApproval && !req.posV2Completion) {
@@ -1368,6 +1683,7 @@ exports.createDirectSale = async (req, res, next) => {
       } else {
         invoice = await Invoice.create([{
           company: companyId,
+          ...(offlineContext ? { referenceNo: offlineContext.receiptNumber } : {}),
           client: client._id,
           customerName: client.name,
           customerTin: client.taxId,
@@ -1660,6 +1976,20 @@ exports.createDirectSale = async (req, res, next) => {
           });
         }
         createdPending = true;
+        await writePosAuditLog({
+          companyId,
+          registerId: String(claimedRegister.id),
+          userId: posCashierId,
+          event: 'POS_SALE_PAYMENT_PENDING',
+          metadata: {
+            invoiceId: String(invoice._id),
+            invoiceNumber: String(invoice.invoiceNumber || invoice.referenceNo || ''),
+            amountDue: Number(invoice.totalAmount || invoice.grandTotal || 0),
+            paymentFlow: 'PAYMENTS_V2',
+            shiftId: String(activePosShift.id),
+          },
+          ip: requestIp(req),
+        }, postingClient);
         return;
       }
 
@@ -1752,12 +2082,49 @@ exports.createDirectSale = async (req, res, next) => {
             cogsAmount = unitCost * quantity;
           }
         } else if (trackingType === 'batch') {
-          const batchConsumption = await consumeTrackedBatches(
-            companyId, product._id, selectedWarehouseId, quantity, session,
-          );
+          const batchConsumption = offlineContext
+            ? await consumeOfflineTrackedBatches(
+              companyId,
+              product._id,
+              selectedWarehouseId,
+              lineData.batchAllocations,
+              lineData.batchSnapshot || offlineContext.snapshotData.products[String(product._id)]?.batches || [],
+              offlineContext.saleCreatedAt,
+              session,
+            )
+            : await consumeTrackedBatches(
+              companyId, product._id, selectedWarehouseId, quantity, session,
+            );
           batchAllocations = batchConsumption.allocations;
           unitCost = quantity > 0 ? batchConsumption.totalCost / quantity : 0;
           cogsAmount = batchConsumption.totalCost;
+          if (offlineContext && batchConsumption.shortfall > 0) {
+            const snapshotBatchById = new Map(
+              (lineData.batchSnapshot || offlineContext.snapshotData.products[String(product._id)]?.batches || [])
+                .map((batch) => [String(batch.id), batch]),
+            );
+            offlineConflicts.push({
+              conflictType: 'batch',
+              productId: String(product._id),
+              productName: product.name,
+              warehouseId: String(selectedWarehouseId),
+              details: {
+                quantity,
+                available: quantity - batchConsumption.shortfall,
+                shortage: batchConsumption.shortfall,
+                reconstructedLegacyBatchAllocation: Boolean(lineData.reconstructedLegacyBatchAllocation),
+                requestedBatchAllocations: lineData.batchAllocations.map((allocation) => {
+                  const snapshotBatch = snapshotBatchById.get(String(allocation.batchId));
+                  return {
+                    batchId: String(allocation.batchId),
+                    batchNo: String(snapshotBatch?.batchNo || ''),
+                    quantity: Number(allocation.quantity),
+                  };
+                }),
+                unavailableBatches: batchConsumption.unavailableBatches,
+              },
+            });
+          }
           await inventoryService.reduceLayers(companyId, product._id, quantity, {
             session,
             warehouse: selectedWarehouseId,
@@ -1858,8 +2225,10 @@ exports.createDirectSale = async (req, res, next) => {
           batchNumber: batchAllocations.map((allocation) => `${allocation.batchNo}:${allocation.quantity}`).join(', ') || undefined,
           serialNumbers: offlineConflicts.some((conflict) => conflict.conflictType === 'serial'
             && conflict.productId === String(product._id)) ? [] : (lineData.serialNumbers || []),
-          notes: `Direct sale - Invoice ${invoice.referenceNo}${offlineConflicts.some((conflict) => conflict.conflictType === 'serial'
-            && conflict.productId === String(product._id)) ? ' (serial assignment pending manager resolution)' : ''}`,
+          notes: `Direct sale - Invoice ${invoice.referenceNo}${lineData.reconstructedLegacyBatchAllocation
+            ? ' (legacy offline batch allocation reconstructed at sync)'
+            : ''}${offlineConflicts.some((conflict) => conflict.conflictType === 'serial'
+              && conflict.productId === String(product._id)) ? ' (serial assignment pending manager resolution)' : ''}`,
           performedBy: posCashierId,
           movementDate: new Date(),
         });
@@ -1876,7 +2245,7 @@ exports.createDirectSale = async (req, res, next) => {
         await dbClient().$executeRawUnsafe(
           'INSERT INTO pos_offline_sales (id, company_id, snapshot_id, offline_sale_id, request_key, cashier_id, device_id, register_id, warehouse_id, invoice_id, total, payload_hash, reported_sale_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::numeric, $12, $13::timestamptz)',
           randomBytes(12).toString('hex'), String(companyId), offlineContext.snapshotId,
-          offlineContext.offlineSaleId, requestKey, String(req.user.id), String(req.body.deviceId),
+          offlineContext.offlineSaleId, requestKey || offlineContext.operationId, String(req.user.id), String(req.body.deviceId),
           String(requestedRegisterId), String(warehouseId), String(invoice._id), grandTotal,
           payloadHash, offlineContext.saleCreatedAt,
         );
@@ -2222,6 +2591,27 @@ exports.createDirectSale = async (req, res, next) => {
           fiscalOutboxId = createdOutbox.id;
         }
       }
+
+      // A sale's financial, stock, and tender effects commit with exactly one
+      // completion event. Idempotent replays return before opening this path.
+      await writePosAuditLog({
+        companyId,
+        registerId: String(claimedRegister?.id || activeTill?.registerId || ''),
+        userId: posCashierId,
+        event: 'POS_SALE_COMPLETED',
+        metadata: {
+          invoiceId: String(invoice._id),
+          invoiceNumber: String(invoice.invoiceNumber || invoice.referenceNo || ''),
+          total: Number(invoice.totalAmount || invoice.grandTotal || invoice.total || 0),
+          paid: Number(invoice.amountPaid || 0),
+          outstanding: Number(invoice.amountOutstanding || 0),
+          paymentFlow: req.posV2Completion ? 'PAYMENTS_V2' : 'LEGACY',
+          shiftId: String(activePosShift?.id || ''),
+          fiscalSubmissionId: fiscalOutboxId,
+          offline: Boolean(offlineContext),
+        },
+        ip: requestIp(req),
+      }, postingClient);
     }, { maxWait: 10000, timeout: 90000 });
 
     if (completionReplayed) {
@@ -2429,16 +2819,13 @@ exports.createDirectSale = async (req, res, next) => {
 
 exports.getCheckoutPaymentFlow = async (req, res, next) => {
   try {
-    const companyId = String(req.user?.company?._id || '');
-    const registerId = String(req.query.registerId || '').trim();
-    const deviceId = String(req.query.deviceId || '').trim();
-    if (!companyId || !registerId || !deviceId) throw registerClaimRequiredError();
-
-    const register = await findClaimedRegister(companyId, registerId, deviceId);
-    if (!register) throw registerClaimRequiredError();
+    const posContext = req.posAuthContext;
+    const companyId = String(posContext?.company?.id || '');
+    const register = posContext?.register;
+    if (!companyId || !register?.id) throw registerClaimRequiredError();
 
     const settings = await posPaymentService.getPaymentSettings(companyId);
-    const cashierId = String(req.user?.id || req.user?._id || '');
+    const cashierId = String(posContext.session?.userId || '');
     const [discountSettingsRow, roleAssignments] = await Promise.all([
       dbClient().systemSettings.findUnique({
         where: { companyId },
@@ -2627,7 +3014,7 @@ exports.getPosProducts = async (req, res, next) => {
         standardSellingPrice: toNumber(p.sellingPrice),
         unit: p.unit,
         taxRate: resolveProductTaxRate(p),
-        taxCode: p.taxCode || 'A',
+        taxCode: p.taxCode || (resolveProductTaxRate(p) > 0 ? 'B' : 'A'),
         currentStock,
         onHandStock,
         reservedStock,

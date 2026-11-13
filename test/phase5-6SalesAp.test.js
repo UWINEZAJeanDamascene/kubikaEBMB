@@ -170,6 +170,25 @@ describe('Phase 5+6 sales/AP mappers', () => {
     expect(api.posPricingSnapshot).toEqual(pricingSnapshot);
   });
 
+  test('invoiceToApi reports zero balance for invoices already marked fully paid', () => {
+    const api = invoiceToApi({
+      id: 'inv-paid',
+      referenceNo: 'INV-PAID',
+      status: 'fully_paid',
+      subtotal: 1000,
+      taxAmount: 180,
+      totalAmount: 1180,
+      amountPaid: 1180,
+      amountOutstanding: 1180,
+      lines: [],
+    });
+
+    expect(api.status).toBe('fully_paid');
+    expect(api.amountPaid).toBe('1180.00');
+    expect(api.amountOutstanding).toBe('0.00');
+    expect(api.balance).toBe('0.00');
+  });
+
   test('persists pricing snapshots on invoice creation and update', async () => {
     const pricingSnapshot = {
       version: 1,

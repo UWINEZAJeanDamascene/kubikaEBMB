@@ -19,10 +19,145 @@ function dateOrUndefined(value) {
 
 function safeAuditMetadata(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  // IDs are internal join keys, not audit detail for the back-office screen.
-  const allowed = new Set(['action', 'amount', 'status', 'reasonCode']);
+  // Preserve operational context while excluding tokens, credentials, PII,
+  // and internal identifiers. The audit writer also sanitizes recursively.
+  const allowed = new Set([
+    'action', 'amount', 'status', 'reasonCode', 'reason', 'operation', 'flow', 'scope',
+    'outcome', 'method', 'paymentMethod', 'registerName', 'receiptNumber', 'referenceNo',
+    'invoiceNumber', 'failureCode', 'attemptCountInWindow', 'payloadMatched', 'resultCount',
+  ]);
   return Object.fromEntries(Object.entries(value)
     .filter(([key, item]) => allowed.has(key) && ['string', 'number', 'boolean'].includes(typeof item)));
+}
+
+async function auditFiltersFromQuery(companyId, query = {}) {
+  const from = dateOrUndefined(query.from);
+  const to = dateOrUndefined(query.to);
+  if (to && /^\d{4}-\d{2}-\d{2}$/.test(String(query.to))) to.setUTCHours(23, 59, 59, 999);
+  if (from === null || to === null || (from && to && from > to)) return { error: 'Enter a valid audit date range.' };
+  const outcome = String(query.outcome || '').trim().toUpperCase();
+  if (outcome && !['COMMITTED', 'DENIED', 'FAILED', 'OBSERVED'].includes(outcome)) return { error: 'Choose a valid audit outcome.' };
+  const bounded = (key, max) => String(query[key] || '').trim().slice(0, max);
+  const where = {};
+  const event = bounded('event', 64);
+  if (event) where.event = event;
+  const actionId = bounded('actionId', 24);
+  if (actionId) where.actionId = actionId;
+  if (outcome) where.outcome = outcome;
+  if (bounded('correlationId', 128)) where.correlationId = bounded('correlationId', 128);
+  if (bounded('entityType', 64)) where.entityType = bounded('entityType', 64).toUpperCase();
+  if (bounded('entityId', 128)) where.entityId = bounded('entityId', 128);
+  if (from || to) where.createdAt = { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) };
+
+  const registerQuery = bounded('registerId', 120);
+  if (registerQuery) {
+    const registers = await prisma.posRegister.findMany({
+      where: { companyId, OR: [
+        { id: registerQuery },
+        { code: { contains: registerQuery, mode: 'insensitive' } },
+        { name: { contains: registerQuery, mode: 'insensitive' } },
+      ] }, select: { id: true }, take: 100,
+    });
+    where.registerId = { in: registers.map((row) => row.id) };
+  }
+  const actorQuery = bounded('userId', 120);
+  if (actorQuery) {
+    const users = await prisma.user.findMany({
+      where: { companyId, OR: [
+        { id: actorQuery },
+        { name: { contains: actorQuery, mode: 'insensitive' } },
+        { email: { contains: actorQuery, mode: 'insensitive' } },
+      ] }, select: { id: true }, take: 100,
+    });
+    where.userId = { in: users.map((row) => row.id) };
+  }
+  const deviceId = bounded('deviceId', 160);
+  if (deviceId) {
+    const devices = await prisma.posDevice.findMany({
+      where: { companyId, deviceId: { contains: deviceId, mode: 'insensitive' } },
+      select: { registerId: true }, take: 100,
+    });
+    const deviceRegisters = [...new Set(devices.map((row) => row.registerId))];
+    const registerIds = Array.isArray(where.registerId?.in)
+      ? where.registerId.in.filter((id) => deviceRegisters.includes(id))
+      : deviceRegisters;
+    where.registerId = { in: registerIds };
+  }
+  return { where };
+}
+
+function auditSeverity(row) {
+  const event = String(row.event || '').toUpperCase();
+  const outcome = String(row.outcome || '').toUpperCase();
+  if (event === 'POS_AUDIT_INTEGRITY_VERIFIED' && row.metadata?.valid === false) return 'critical';
+  if (['PIN_LOCKOUT', 'POS_ACTION_FAILED', 'POS_SYNC_CONFLICT', 'POS_IDEMPOTENCY_RESOLVED'].includes(event)
+    || outcome === 'FAILED') return 'high';
+  if (['PIN_LOGIN_FAILED', 'POS_ACTION_DENIED', 'POS_DUPLICATE_REQUEST_ATTEMPT', 'APPROVAL_DENIED'].includes(event)
+    || outcome === 'DENIED') return 'medium';
+  if (outcome === 'OBSERVED') return 'low';
+  return 'info';
+}
+
+const auditSelect = {
+  id: true, registerId: true, userId: true, event: true, actionId: true,
+  correlationId: true, outcome: true, entityType: true, entityId: true,
+  metadata: true, createdAt: true,
+};
+
+async function addAuditDisplayNames(companyId, rows) {
+  const registerIds = [...new Set(rows.map((row) => row.registerId).filter(Boolean))];
+  const userIds = [...new Set(rows.map((row) => row.userId).filter(Boolean))];
+  const [registers, users] = await Promise.all([
+    registerIds.length
+      ? prisma.posRegister.findMany({
+        where: { companyId, id: { in: registerIds } },
+        select: { id: true, name: true, code: true },
+      })
+      : [],
+    userIds.length
+      ? prisma.user.findMany({
+        where: { companyId, id: { in: userIds } },
+        select: { id: true, name: true },
+      })
+      : [],
+  ]);
+  const registersById = new Map(registers.map((register) => [register.id, register]));
+  const usersById = new Map(users.map((user) => [user.id, user]));
+  return rows.map((row) => ({
+    ...row,
+    register: row.registerId ? registersById.get(row.registerId) || null : null,
+    user: row.userId ? usersById.get(row.userId) || null : null,
+  }));
+}
+
+function safeAuditRow(row) {
+  return {
+    id: row.id, registerId: row.registerId, userId: row.userId,
+    event: row.event, actionId: row.actionId, correlationId: row.correlationId,
+    outcome: row.outcome, entityType: row.entityType, entityId: row.entityId,
+    severity: auditSeverity(row), metadata: safeAuditMetadata(row.metadata), createdAt: row.createdAt,
+    register: row.register, user: row.user,
+  };
+}
+
+function csvCell(value) {
+  let text = value == null ? '' : typeof value === 'string' ? value : String(value);
+  if (/^[=+@-]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function auditCsv(rows) {
+  const columns = ['time_utc', 'event', 'severity', 'outcome', 'register', 'user', 'action_id', 'correlation_id', 'entity_type', 'entity_reference', 'details'];
+  const lines = [columns.map(csvCell).join(',')];
+  for (const row of rows) {
+    lines.push([
+      row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt,
+      row.event, auditSeverity(row), row.outcome, row.register?.name || row.register?.code || '',
+      row.user?.name || '', row.actionId || '', row.correlationId || '', row.entityType || '', row.entityId || '',
+      JSON.stringify(safeAuditMetadata(row.metadata) || {}),
+    ].map(csvCell).join(','));
+  }
+  return `\uFEFF${lines.join('\r\n')}`;
 }
 
 function isZeroOrNull(value) {
@@ -389,27 +524,63 @@ exports.deleteEmptyClosedShift = async (req, res, next) => {
 exports.audit = async (req, res, next) => {
   try {
     const companyId = companyIdFrom(req);
-    const take = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
     if (!companyId) return res.status(400).json({ success: false, code: 'COMPANY_REQUIRED', message: 'Select a company first.' });
+    const filters = await auditFiltersFromQuery(companyId, req.query);
+    if (filters.error) return res.status(400).json({ success: false, code: 'INVALID_AUDIT_FILTERS', message: filters.error });
+    const requestedTake = Number.parseInt(req.query.limit, 10) || 50;
+    const take = Math.min(filters.where.correlationId ? 1000 : 5000, Math.max(1, requestedTake));
     const data = await prisma.posAuditLog.findMany({
-      where: {
-        companyId,
-        ...(req.query.event ? { event: String(req.query.event).slice(0, 64) } : {}),
-        ...(req.query.registerId ? { registerId: String(req.query.registerId) } : {}),
-      },
+      where: { companyId, ...filters.where },
       orderBy: { createdAt: 'desc' },
       take,
-      select: {
-        id: true, companyId: true, registerId: true, userId: true, event: true,
-        metadata: true, createdAt: true,
-        register: { select: { name: true, code: true } },
-        user: { select: { id: true, name: true } },
-      },
+      select: auditSelect,
     });
-    return res.json({
-      success: true,
-      data: data.map((row) => ({ ...row, metadata: safeAuditMetadata(row.metadata) })),
+    const severity = String(req.query.severity || '').trim().toLowerCase();
+    if (severity && !['critical', 'high', 'medium', 'low', 'info'].includes(severity)) {
+      return res.status(400).json({ success: false, code: 'INVALID_AUDIT_FILTERS', message: 'Choose a valid audit severity.' });
+    }
+    const resultLimit = Math.min(200, Math.max(1, requestedTake));
+    const filteredData = (severity ? data.filter((row) => auditSeverity(row) === severity) : data).slice(0, resultLimit);
+    const enrichedData = await addAuditDisplayNames(companyId, filteredData);
+    await writePosAuditLog({
+      companyId, userId: req.user?.id || req.user?._id || null,
+      event: 'POS_AUDIT_READ', ip: requestIp(req),
+      metadata: { resultCount: filteredData.length, filterCount: Object.keys(filters.where).length + (severity ? 1 : 0) },
     });
+    return res.json({ success: true, data: enrichedData.map(safeAuditRow) });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.exportAuditCsv = async (req, res, next) => {
+  try {
+    const companyId = companyIdFrom(req);
+    if (!companyId) return res.status(400).json({ success: false, code: 'COMPANY_REQUIRED', message: 'Select a company first.' });
+    const filters = await auditFiltersFromQuery(companyId, req.query);
+    if (filters.error) return res.status(400).json({ success: false, code: 'INVALID_AUDIT_FILTERS', message: filters.error });
+    const severity = String(req.query.severity || '').trim().toLowerCase();
+    if (severity && !['critical', 'high', 'medium', 'low', 'info'].includes(severity)) {
+      return res.status(400).json({ success: false, code: 'INVALID_AUDIT_FILTERS', message: 'Choose a valid audit severity.' });
+    }
+    let rows = await prisma.posAuditLog.findMany({
+      where: { companyId, ...filters.where }, orderBy: { createdAt: 'desc' }, take: 10000, select: auditSelect,
+    });
+    if (severity) rows = rows.filter((row) => auditSeverity(row) === severity);
+    const enrichedRows = await addAuditDisplayNames(companyId, rows);
+    await writePosAuditLog({
+      companyId, userId: req.user?.id || req.user?._id || null,
+      event: 'POS_AUDIT_EXPORTED', ip: requestIp(req),
+      metadata: { resultCount: rows.length, filterCount: Object.keys(filters.where).length, format: 'CSV' },
+    });
+    const date = new Date().toISOString().slice(0, 10);
+    res.set({
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="pos-audit-${date}.csv"`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    return res.send(auditCsv(enrichedRows));
   } catch (error) {
     return next(error);
   }

@@ -98,12 +98,13 @@ describe('customer master service', () => {
     const survivorId = 'eeeeeeeeeeeeeeeeeeeeeeee';
     const survivor = { id: survivorId, companyId: companyA, name: 'New Name', code: 'CUS-NEW', isWalkIn: false, isActive: true, mergedIntoClientId: null };
     const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
       $queryRawUnsafe: jest.fn().mockResolvedValue([]),
       client: {
         findFirst: jest.fn(async ({ where }) => where.id === source.id ? source : survivor),
         update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
-      posAuditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-id' }) },
+      posAuditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-id' }), findFirst: jest.fn().mockResolvedValue(null) },
     };
     const db = transactionalDb(tx);
     const merged = await service.mergeCustomers({
@@ -159,6 +160,7 @@ describe('customer master service', () => {
     jest.spyOn(JournalService, 'getMappedAccountCode').mockResolvedValue('2860');
     const journalSpy = jest.spyOn(JournalService, 'createEntriesAtomic').mockResolvedValue([{ _id: 'journal-entry' }]);
     const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
       $queryRawUnsafe: jest.fn(async (sql) => String(sql).includes('SUM(points)') ? [{ balance: 0 }] : []),
       client: {
         findFirst: jest.fn().mockResolvedValue({ id: customerA, mergedIntoClientId: null }),
@@ -168,7 +170,7 @@ describe('customer master service', () => {
         findFirst: jest.fn().mockResolvedValue(null),
         create: jest.fn(async ({ data }) => ({ ...data, id: 'adjustment-entry' })),
       },
-      posAuditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-entry' }) },
+      posAuditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-entry' }), findFirst: jest.fn().mockResolvedValue(null) },
     };
     const result = await service.appendLoyaltyEntry({
       companyId: companyA, customerId: customerA, userId, entryType: 'ADJUST', points: 10,

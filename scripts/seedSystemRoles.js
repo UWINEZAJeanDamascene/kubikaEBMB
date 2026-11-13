@@ -9,7 +9,7 @@ const { prisma, connectPrisma, disconnectPrisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 
 const CASHIER_POS_ROLE_PERMISSIONS = [
-  { resource: 'pos.till', actions: ['sell', 'cash_move', 'close_shift', 'discount', 'receive_account_payment', 'open_shift'] },
+  { resource: 'pos.till', actions: ['sell', 'cash_move', 'close_shift', 'discount', 'receive_account_payment', 'open_shift', 'reprint'] },
   { resource: 'products', actions: ['read'] },
   { resource: 'clients', actions: ['read', 'create'] },
 ];
@@ -20,7 +20,10 @@ const SUPERVISOR_POS_ROLE_PERMISSIONS = [
 ];
 const STORE_MANAGER_POS_ROLE_PERMISSIONS = [
   ...SUPERVISOR_POS_ROLE_PERMISSIONS,
-  { resource: 'pos.admin', actions: ['view', 'reports', 'cashiers', 'registers', 'printers', 'settings', 'shifts', 'approvals', 'audit'] },
+  { resource: 'pos.admin', actions: ['view', 'reports', 'cashiers', 'registers', 'printers', 'settings', 'shifts', 'approvals', 'audit', 'security'] },
+  { resource: 'pos.admin.audit', actions: ['read', 'export', 'verify'] },
+  { resource: 'pos.admin.security', actions: ['read', 'update'] },
+  { resource: 'pos.admin.security.sessions', actions: ['read', 'revoke'] },
   { resource: 'tills', actions: ['read', 'create'] },
   // Registers are assigned to the shop's active branch/warehouse records.
   { resource: 'warehouses', actions: ['read'] },
@@ -37,7 +40,7 @@ const OWNER_POS_ROLE_PERMISSIONS = [
 const systemRoles = [
   {
     name: 'cashier',
-    description: 'POS cashier access: sell, manage drawer movements, discounts within limits, and close own shift',
+    description: 'POS cashier access: sell, manage drawer movements, discount within limits, reprint signed receipts with a reason, and close own shift',
     is_system_role: true,
     permissions: CASHIER_POS_ROLE_PERMISSIONS,
   },
@@ -73,6 +76,9 @@ const systemRoles = [
     is_system_role: true,
     permissions: [
       { resource: '*', actions: ['read', 'create', 'update', 'delete', 'approve', 'post', 'confirm', 'admin'] },
+      { resource: 'pos.admin.audit', actions: ['read', 'export', 'verify'] },
+      { resource: 'pos.admin.security', actions: ['read', 'update'] },
+      { resource: 'pos.admin.security.sessions', actions: ['read', 'revoke'] },
       { resource: 'payroll', actions: ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'] },
     ]
   },

@@ -66,6 +66,7 @@ function createRequest({
     },
     headers: { 'idempotency-key': key },
     params: { shiftId: SHIFT_ID },
+    ip: '192.0.2.52',
     posAuthContext: {
       session: { companyId: COMPANY_ID, registerId: REGISTER_ID, userId: USER_ID },
     },
@@ -74,6 +75,7 @@ function createRequest({
 
 function createTransaction() {
   return {
+    $queryRaw: jest.fn().mockResolvedValue([]),
     $queryRawUnsafe: jest.fn().mockResolvedValue([{ id: SHIFT_ID }]),
     posCashMovement: {
       findFirst: jest.fn(),
@@ -98,7 +100,7 @@ function createTransaction() {
       findFirst: jest.fn(),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
-    posAuditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-id' }) },
+    posAuditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-id' }), findFirst: jest.fn().mockResolvedValue(null) },
   };
 }
 
@@ -170,6 +172,9 @@ describe('POS cash movement endpoint', () => {
         approvedById: null,
       }),
     });
+    expect(tx.posCashMovement.findFirst).toHaveBeenCalledWith({
+      where: { companyId: COMPANY_ID, idempotencyKey: IDEMPOTENCY_KEY },
+    });
     expect(postCashMovement).toHaveBeenCalledWith(expect.objectContaining({
       tx,
       companyId: COMPANY_ID,
@@ -185,8 +190,61 @@ describe('POS cash movement endpoint', () => {
       data: expect.objectContaining({ expectedCash: 11000 }),
     }));
     expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ event: 'CASH_MOVEMENT_RECORDED' }),
+      data: expect.objectContaining({
+        companyId: COMPANY_ID,
+        registerId: REGISTER_ID,
+        userId: USER_ID,
+        event: 'CASH_MOVEMENT_RECORDED',
+        ip: '192.0.2.52',
+        metadata: expect.objectContaining({ movementId: movement.id, shiftId: SHIFT_ID, amount: 10000 }),
+      }),
     }));
+    expect(tx.posAuditLog.create).toHaveBeenCalledTimes(1);
+
+    tx.posCashMovement.findFirst.mockResolvedValue({
+      ...movement,
+      performedById: USER_ID,
+      type: 'cash_in',
+      amount: 10000,
+      reasonCode: 'BANK_FLOAT',
+      reference: null,
+      bankSlipReference: null,
+      note: null,
+      idempotencyKey: IDEMPOTENCY_KEY,
+    });
+    const replay = createResponse();
+    await create(createRequest(), replay, jest.fn());
+
+    expect(replay.statusCode).toBe(200);
+    expect(replay.body.replayed).toBe(true);
+    expect(tx.posCashMovement.create).toHaveBeenCalledTimes(1);
+    expect(postCashMovement).toHaveBeenCalledTimes(1);
+    expect(tx.tillSession.update).toHaveBeenCalledTimes(1);
+    expect(tx.posAuditLog.create).toHaveBeenCalledTimes(1);
+  });
+
+  test('fails closed when cash movement audit persistence fails', async () => {
+    const tx = createTransaction();
+    const movement = { id: 'movement-id', companyId: COMPANY_ID, registerId: REGISTER_ID, shiftId: SHIFT_ID };
+    tx.posCashMovement.findFirst.mockResolvedValue(null);
+    tx.posCashMovement.create.mockResolvedValue(movement);
+    const auditError = new Error('audit insert unavailable');
+    tx.posAuditLog.create.mockRejectedValue(auditError);
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const next = jest.fn();
+    const res = createResponse();
+
+    await create(createRequest(), res, next);
+
+    expect(tx.posAuditLog.create).toHaveBeenCalledTimes(1);
+    expect(tx.posAuditLog.create.mock.calls[0][0].data).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: USER_ID,
+      event: 'CASH_MOVEMENT_RECORDED',
+    });
+    expect(next).toHaveBeenCalledWith(auditError);
+    expect(res.body).toBeNull();
   });
 
   test('returns failed posting status instead of reporting an exhausted retry as pending', async () => {

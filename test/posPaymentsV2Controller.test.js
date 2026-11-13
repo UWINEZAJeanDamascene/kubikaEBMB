@@ -56,6 +56,7 @@ const posPaymentService = require('../services/posPaymentService');
 const { createDirectSale } = require('../controllers/salesLegacyController');
 const posManualMobileMoneyService = require('../services/posManualMobileMoneyService');
 const { hasPosPermission } = require('../middleware/posAuthMiddleware');
+const { writePosAuditLog } = require('../services/posAuditService');
 const controller = require('../controllers/posPaymentsV2Controller');
 
 const COMPANY_ID = '507f1f77bcf86cd799439011';
@@ -311,6 +312,14 @@ describe('POS Payments V2 controller', () => {
   });
 
   test('records a resend attempt for a pending manual verification payment', async () => {
+    const attempt = {
+      attemptNo: 2,
+      providerStatus: 'MANUAL_PENDING',
+      requestedAt: new Date(),
+      expiresAt: new Date(Date.now() + 120000),
+    };
+    const tx = { posPaymentAttempt: { create: jest.fn().mockResolvedValue(attempt) } };
+    runInTransaction.mockImplementation((operation) => operation(tx));
     dbClient.mockReturnValue({
       posPayment: {
         findFirst: jest.fn().mockResolvedValue({
@@ -324,14 +333,6 @@ describe('POS Payments V2 controller', () => {
           attempts: [{ attemptNo: 1 }],
         }),
       },
-      posPaymentAttempt: {
-        create: jest.fn().mockResolvedValue({
-          attemptNo: 2,
-          providerStatus: 'MANUAL_PENDING',
-          requestedAt: new Date(),
-          expiresAt: new Date(Date.now() + 120000),
-        }),
-      },
     });
     const req = request({ params: { paymentId: 'momo-1' } });
     const res = response();
@@ -343,9 +344,15 @@ describe('POS Payments V2 controller', () => {
       attemptNo: 2,
       status: 'MANUAL_PENDING',
     });
+    expect(writePosAuditLog).toHaveBeenCalledTimes(1);
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'PAYMENT_MANUAL_MOBILE_MONEY_RESEND_REQUESTED',
+    }), tx);
   });
 
   test('cancels a pending manual payment and writes the cancellation audit', async () => {
+    const tx = { posPayment: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } };
+    runInTransaction.mockImplementation((operation) => operation(tx));
     dbClient.mockReturnValue({
       posPayment: {
         findFirst: jest.fn().mockResolvedValue({
@@ -357,10 +364,6 @@ describe('POS Payments V2 controller', () => {
           status: 'PENDING_VERIFICATION',
           amount: 600,
         }),
-        update: jest.fn().mockResolvedValue({
-          id: 'momo-1',
-          status: 'CANCELLED',
-        }),
       },
     });
     const req = request({ params: { paymentId: 'momo-1' } });
@@ -370,6 +373,10 @@ describe('POS Payments V2 controller', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body.data).toMatchObject({ id: 'momo-1', status: 'CANCELLED' });
+    expect(writePosAuditLog).toHaveBeenCalledTimes(1);
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'PAYMENT_CANCELLED',
+    }), tx);
   });
 
   test('records manual mobile money against the active shift without invoking a provider', async () => {
@@ -505,10 +512,10 @@ describe('POS Payments V2 controller', () => {
     expect(db.posPayment.create).not.toHaveBeenCalled();
   });
 
-  test('rejects split payment methods reserved for pending-confirmation support', async () => {
+  test('rejects manual mobile-money allocations in a split payment', async () => {
     const { db } = setupDatabase();
     const req = request({
-      body: { payments: [{ method: 'CASH', amount: 500 }, { method: 'BANK_TRANSFER', amount: 500 }] },
+      body: { payments: [{ method: 'CASH', amount: 500 }, { method: 'MTN_MOMO', amount: 500 }] },
     });
     const res = response();
 
@@ -1301,7 +1308,13 @@ describe('POS Payments V2 controller', () => {
   });
 
   test('reuses the persisted checkout snapshot and all successful cash tender when completing', async () => {
-    const { db, payment } = setupDatabase(pendingInvoice({ totalAmount: 500 }));
+    const { db, payment } = setupDatabase(pendingInvoice({
+      totalAmount: 500,
+      posCheckoutPayload: {
+        warehouseId: '507f1f77bcf86cd799439018',
+        items: [{ productId: '507f1f77bcf86cd799439019', quantity: 1 }],
+      },
+    }));
     db.posPayment.findMany.mockResolvedValue([{ ...payment, amount: 500, tendered: 600 }]);
     const req = request({ headers: { 'idempotency-key': 'complete-key-01' } });
     const res = response();
@@ -1309,9 +1322,11 @@ describe('POS Payments V2 controller', () => {
     await controller.completeSale(req, res, jest.fn());
 
     expect(createDirectSale).toHaveBeenCalledWith(req, res, expect.any(Function));
+    expect(req.body.displayTotal).toBe(500);
     expect(req.posV2Completion).toEqual({
       invoiceId: SALE_ID,
       completionKey: 'complete-key-01',
+      offlineOperationId: null,
       voucherReservations: false,
       manualMobileMoneyPaymentIds: [],
     });
@@ -1322,6 +1337,26 @@ describe('POS Payments V2 controller', () => {
       deviceId: 'device-1',
       payments: [{ paymentMethod: 'cash', amount: 600, reference: '' }],
     });
+  });
+
+  test('surfaces an offline flow-change exception instead of rerouting a V2 sale', async () => {
+    setupDatabase(pendingInvoice({
+      posCheckoutPayload: {
+        offlineSnapshotCapability: 'signed-capability',
+        offlinePaymentFlow: 'PAYMENTS_V2',
+        warehouseId: '507f1f77bcf86cd799439018',
+        items: [{ productId: '507f1f77bcf86cd799439019', quantity: 1 }],
+      },
+    }));
+    posPaymentService.resolvePaymentFlow.mockReturnValueOnce('LEGACY');
+    const req = request({ headers: { 'idempotency-key': 'complete-key-01' } });
+    const res = response();
+
+    await controller.completeSale(req, res, jest.fn());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('POS_OFFLINE_PAYMENT_FLOW_CHANGED');
+    expect(createDirectSale).not.toHaveBeenCalled();
   });
 
   test('completes a cash-and-credit sale while passing only collected cash to sale accounting', async () => {

@@ -37,6 +37,8 @@
     "test:phase0-step8": "jest --runInBand test/phase0TransactionsSequences.test.js",
     "test:atomicity": "jest --runInBand test/transactionAtomicity.test.js",
     "test:pos-e2e": "jest --runInBand --forceExit test/posCheckoutPathRetired.test.js test/posE2eCheckout.test.js test/posE2eTillApprovals.test.js test/salesLegacyPosSerials.test.js",
+    "pos:check-route-security": "node scripts/check-pos-route-security.js",
+    "pos:route-security-report": "node scripts/check-pos-route-security.js --markdown",
     "test:pos-gift-card-concurrency": "node -e \"if (!process.env.POS_TEST_DATABASE_URL && process.env.POS_TEST_ALLOW_LOCAL_DATABASE !== 'true') { console.error('Set POS_TEST_DATABASE_URL or explicitly enable the local database with POS_TEST_ALLOW_LOCAL_DATABASE=true'); process.exit(1); }\" && jest --runInBand test/posGiftCardConcurrency.integration.test.js",
     "test:pos-sale-completion-integration": "node -e \"if (!process.env.POS_TEST_DATABASE_URL && process.env.POS_TEST_ALLOW_LOCAL_DATABASE !== 'true') { console.error('Set POS_TEST_DATABASE_URL or explicitly enable the local database with POS_TEST_ALLOW_LOCAL_DATABASE=true'); process.exit(1); }\" && jest --runInBand test/posSaleCompletionPostgres.integration.test.js",
     "test:agg-parity": "jest --runInBand test/journalAggregationParity.test.js test/prismaAggregateFilters.test.js",

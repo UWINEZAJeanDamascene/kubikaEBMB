@@ -34,6 +34,14 @@ jest.mock('../models/BankAccount', () => ({ BankAccount: { findOne: jest.fn() } 
 jest.mock('../services/transactionService', () => ({ runInTransaction: jest.fn() }));
 jest.mock('../services/journalService', () => ({ reverse: jest.fn(), createEntry: jest.fn(), createDebitLine: jest.fn(), createCreditLine: jest.fn() }));
 jest.mock('../services/cacheService', () => ({ bumpCompanyFinancialCaches: jest.fn() }));
+// This flow test exercises one-use approval/refund behavior. Audit persistence
+// and fail-closed transaction behavior have dedicated POS audit integration
+// tests; keep the mocked transaction fixture independent of PostgreSQL's
+// advisory-lock/hash-chain implementation.
+jest.mock('../services/posAuditService', () => ({
+  writePosAuditLog: jest.fn().mockResolvedValue({ id: 'audit-id' }),
+  requestIp: jest.fn(() => null),
+}));
 jest.mock('../controllers/posManagerApprovalController', () => {
   const actual = jest.requireActual('../controllers/posManagerApprovalController');
   return {
@@ -260,7 +268,9 @@ describe('POS E2E — manager approval consume', () => {
     const db = {
       $queryRawUnsafe: jest.fn()
         .mockResolvedValueOnce([{ id: IDS.approval }])
-        .mockResolvedValueOnce([]),
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([])
+        .mockResolvedValue([]),
     };
     dbClient.mockReturnValue(db);
 
@@ -486,6 +496,25 @@ describe('POS E2E — void and refund gates', () => {
       body: { amount: 100, paymentMethod: 'cash', reference: 'till-1', idempotencyKey: 'refund-replay-0001' },
     }), res, (error) => { throw error; });
     expect(res.body).toMatchObject({ success: true, replayed: true, data: fresh });
+    expect(runInTransaction).not.toHaveBeenCalled();
+    expect(JournalService.createEntry).not.toHaveBeenCalled();
+  });
+
+  test('POS credit-note payout rejects reusing a key for a different amount', async () => {
+    CreditNote.findOne.mockResolvedValue({
+      _id: IDS.creditNote, status: 'partially_refunded', posOrigin: true, totalAmount: 1180,
+      amountRefunded: 100, amountAvailableAsCredit: 1180, amountAppliedToAR: 0,
+      amountRefundedFromCredit: 100, amountRefundedFromAR: 0,
+      payments: [{ idempotencyKey: 'refund-reuse-0001', amount: 100, paymentMethod: 'cash', reference: 'till-1' }],
+    });
+    const res = mockRes();
+    await recordRefund(makeReq({
+      params: { id: IDS.creditNote },
+      body: { amount: 200, paymentMethod: 'cash', reference: 'till-1', idempotencyKey: 'refund-reuse-0001' },
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('POS_REFUND_IDEMPOTENCY_CONFLICT');
     expect(runInTransaction).not.toHaveBeenCalled();
     expect(JournalService.createEntry).not.toHaveBeenCalled();
   });

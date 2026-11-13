@@ -61,6 +61,7 @@ function createRequest({
     },
     headers: { 'idempotency-key': key },
     params: { shiftId: SHIFT_ID },
+    ip: '192.0.2.50',
     posAuthContext: {
       session: { companyId: COMPANY_ID, registerId: REGISTER_ID, userId: USER_ID },
     },
@@ -97,6 +98,7 @@ function openShift() {
 
 function createTransaction({ shift = openShift(), heldCount = 0 } = {}) {
   return {
+    $queryRaw: jest.fn().mockResolvedValue([]),
     invoice: {
       count: jest.fn().mockResolvedValue(0),
       findMany: jest.fn().mockResolvedValue([]),
@@ -306,8 +308,16 @@ describe('POS shift close and Z report', () => {
       }),
     }));
     expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ event: 'SHIFT_CLOSED' }),
+      data: expect.objectContaining({
+        companyId: COMPANY_ID,
+        registerId: REGISTER_ID,
+        userId: USER_ID,
+        event: 'SHIFT_CLOSED',
+        ip: '192.0.2.50',
+        metadata: expect.objectContaining({ shiftId: SHIFT_ID, zNumber: 13 }),
+      }),
     }));
+    expect(tx.posAuditLog.create).toHaveBeenCalledTimes(1);
     expect(postShiftVariance).toHaveBeenCalledWith(expect.objectContaining({
       tx,
       companyId: COMPANY_ID,
@@ -315,6 +325,28 @@ describe('POS shift close and Z report', () => {
       variance: 0,
       reportNumber: 13,
     }));
+  });
+
+  test('fails closed when writing the shift-close audit event fails', async () => {
+    const tx = createTransaction();
+    tx.posZReport.findFirst.mockResolvedValue({ zNumber: 12 });
+    const auditError = new Error('audit insert unavailable');
+    tx.posAuditLog.create.mockRejectedValue(auditError);
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const next = jest.fn();
+    const res = createResponse();
+
+    await close(createRequest(), res, next);
+
+    expect(tx.posAuditLog.create).toHaveBeenCalledTimes(1);
+    expect(tx.posAuditLog.create.mock.calls[0][0].data).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: USER_ID,
+      event: 'SHIFT_CLOSED',
+    });
+    expect(next).toHaveBeenCalledWith(auditError);
+    expect(res.body).toBeNull();
   });
 
   test('links a non-zero cash variance posting to the shift and Z-report snapshot', async () => {

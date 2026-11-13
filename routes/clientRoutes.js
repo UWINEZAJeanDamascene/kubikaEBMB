@@ -26,6 +26,7 @@ const logAction = require('../middleware/logAction');
 const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
+const { idempotentHandler } = require('../services/posIdempotencyService');
 
 const cacheClients = cacheMiddleware({ type: 'client', ttl: 300 });
 const invalidateClients = cacheInvalidationMiddleware({ type: 'client' });
@@ -59,7 +60,7 @@ router.get('/export/pdf', requirePermission('clients', 'read'), exportClientsToP
 
 router.route('/:id')
   .get(requirePermission('clients', 'read'), cacheClients, getClient)
-  .put(requirePermission('clients', 'update'), requireEbmUpdateWhenBranchSubmissionRequested, invalidateClients, logAction('client'), updateClient)
+  .put(requirePermission('clients', 'update'), requireEbmUpdateWhenBranchSubmissionRequested, invalidateClients, logAction('client'), idempotentHandler(updateClient, { namespace: 'client-account' }))
   .delete(requirePermission('clients', 'delete'), invalidateClients, logAction('client'), deleteClient);
 
 // Toggle status

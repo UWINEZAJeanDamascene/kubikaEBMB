@@ -33,6 +33,7 @@ const FIELD_MAP = {
   qtyOnHand: { target: 'qtyOnHand' },
   reservedQuantity: { target: 'reservedQuantity' },
   unitCost: { target: 'unitCost' },
+  expiryDate: { target: 'expiryDate' },
   isQuarantined: { target: 'isQuarantined' },
   createdAt: { target: 'createdAt' },
   updatedAt: { target: 'updatedAt' },

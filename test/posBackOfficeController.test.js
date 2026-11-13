@@ -2,16 +2,19 @@
 
 jest.mock('../lib/prisma', () => ({ prisma: {
   $transaction: jest.fn(),
+  $queryRawUnsafe: jest.fn().mockResolvedValue([]),
   invoice: { aggregate: jest.fn() },
   posShift: { count: jest.fn(), findMany: jest.fn(), findFirst: jest.fn(), delete: jest.fn() },
-  posRegister: { count: jest.fn() },
+  posRegister: { count: jest.fn(), findMany: jest.fn() },
+  posDevice: { findMany: jest.fn() },
+  user: { findMany: jest.fn() },
   posApprovalRequest: { count: jest.fn() },
   posAuditLog: { findMany: jest.fn() },
   tillSession: { findFirst: jest.fn(), delete: jest.fn() },
 } }));
 
 jest.mock('../services/posAuditService', () => ({
-  requestIp: jest.fn(() => '127.0.0.1'),
+  requestIp: jest.fn((req) => req?.ip || null),
   writePosAuditLog: jest.fn(),
 }));
 
@@ -20,11 +23,21 @@ const { writePosAuditLog } = require('../services/posAuditService');
 const controller = require('../controllers/posBackOfficeController');
 
 function response() {
-  return { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
+  return {
+    statusCode: 200,
+    headers: {},
+    status(code) { this.statusCode = code; return this; },
+    json(body) { this.body = body; return this; },
+    set(headers) { this.headers = { ...this.headers, ...headers }; return this; },
+    send(body) { this.body = body; return this; },
+  };
 }
 
 describe('POS back-office reads', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.$queryRawUnsafe.mockResolvedValue([]);
+  });
 
   test('overview is tenant-scoped and reports live operational counts', async () => {
     prisma.invoice.aggregate.mockResolvedValue({ _count: { _all: 7 }, _sum: { totalAmount: 125000 } });
@@ -50,8 +63,11 @@ describe('POS back-office reads', () => {
   test('shift and audit listings always filter by the signed-in company', async () => {
     prisma.posShift.findMany.mockResolvedValue([]);
     prisma.posAuditLog.findMany.mockResolvedValue([{
-      id: 'audit-1', companyId: 'company-b', event: 'POS_ACTION', metadata: { action: 'REFUND', amount: 25, token: 'secret', phone: '+250000000' },
+      id: 'audit-1', companyId: 'company-b', registerId: 'register-b', userId: 'user-b',
+      event: 'POS_ACTION', metadata: { action: 'REFUND', amount: 25, token: 'secret', phone: '+250000000' },
     }]);
+    prisma.posRegister.findMany.mockResolvedValue([{ id: 'register-b', name: 'Main register', code: 'REG-1' }]);
+    prisma.user.findMany.mockResolvedValue([{ id: 'user-b', name: 'POS Manager' }]);
     const req = { user: { company: { _id: 'company-b' } }, query: { status: 'open', event: 'POS_SHIFT_OPENED' } };
     await controller.shifts(req, response(), (error) => { throw error; });
     const auditResponse = response();
@@ -59,6 +75,18 @@ describe('POS back-office reads', () => {
     expect(prisma.posShift.findMany.mock.calls[0][0].where).toMatchObject({ companyId: 'company-b', status: 'open' });
     expect(prisma.posAuditLog.findMany.mock.calls[0][0].where).toMatchObject({ companyId: 'company-b', event: 'POS_SHIFT_OPENED' });
     expect(auditResponse.body.data[0].metadata).toEqual({ action: 'REFUND', amount: 25 });
+    expect(auditResponse.body.data[0]).toMatchObject({
+      register: { name: 'Main register', code: 'REG-1' },
+      user: { id: 'user-b', name: 'POS Manager' },
+    });
+    expect(prisma.posRegister.findMany).toHaveBeenCalledWith({
+      where: { companyId: 'company-b', id: { in: ['register-b'] } },
+      select: { id: true, name: true, code: true },
+    });
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { companyId: 'company-b', id: { in: ['user-b'] } },
+      select: { id: true, name: true },
+    });
   });
 
   test('rejects invalid dates and requires company context', async () => {
@@ -69,6 +97,53 @@ describe('POS back-office reads', () => {
     await controller.audit({ user: {}, query: {} }, missingCompany, (error) => { throw error; });
     expect(missingCompany.statusCode).toBe(400);
   });
+
+  test('filters the audit table by actor, register, device, severity, outcome, and time', async () => {
+    prisma.posRegister.findMany.mockResolvedValue([{ id: 'register-a' }]);
+    prisma.user.findMany.mockResolvedValue([{ id: 'user-a' }]);
+    prisma.posDevice.findMany.mockResolvedValue([{ registerId: 'register-a' }]);
+    prisma.posAuditLog.findMany.mockResolvedValue([{
+      id: 'audit-denied', registerId: 'register-a', userId: 'user-a', event: 'POS_ACTION_DENIED',
+      outcome: 'DENIED', metadata: { action: 'refund', reasonCode: 'APPROVAL_REQUIRED' }, createdAt: new Date(),
+    }]);
+    prisma.posRegister.findMany.mockResolvedValueOnce([{ id: 'register-a' }]).mockResolvedValueOnce([{ id: 'register-a', name: 'Front till', code: 'REG-A' }]);
+    prisma.user.findMany.mockResolvedValueOnce([{ id: 'user-a' }]).mockResolvedValueOnce([{ id: 'user-a', name: 'Aline' }]);
+    const res = response();
+    await controller.audit({
+      user: { companyId: 'company-a' },
+      query: { registerId: 'Front', userId: 'Aline', deviceId: 'device-a', actionId: 'action-123', severity: 'medium', outcome: 'DENIED', from: '2026-11-01', to: '2026-11-12', limit: '20' },
+    }, res, (error) => { throw error; });
+
+    expect(prisma.posDevice.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { companyId: 'company-a', deviceId: { contains: 'device-a', mode: 'insensitive' } } }));
+    expect(prisma.posAuditLog.findMany.mock.calls[0][0].where).toMatchObject({
+      companyId: 'company-a', registerId: { in: ['register-a'] }, userId: { in: ['user-a'] }, actionId: 'action-123', outcome: 'DENIED',
+      createdAt: { gte: expect.any(Date), lte: expect.any(Date) },
+    });
+    expect(res.body.data[0]).toMatchObject({ severity: 'medium', event: 'POS_ACTION_DENIED' });
+  });
+
+  test('exports only allowlisted metadata and neutralizes CSV formulas', async () => {
+    prisma.posAuditLog.findMany.mockResolvedValue([{
+      id: 'audit-export', companyId: 'company-a', registerId: 'register-a', userId: 'user-a',
+      event: 'POS_ACTION', actionId: 'action-a', correlationId: 'corr-a', outcome: 'COMMITTED',
+      entityType: 'INVOICE', entityId: '=HYPERLINK("https://bad")',
+      metadata: { action: 'REFUND', amount: 12, token: 'must-not-export', customerEmail: 'private@example.test' },
+      createdAt: new Date('2026-11-12T09:00:00.000Z'),
+    }]);
+    prisma.posRegister.findMany.mockResolvedValue([{ id: 'register-a', name: 'Front register', code: 'REG-A' }]);
+    prisma.user.findMany.mockResolvedValue([{ id: 'user-a', name: 'Cashier' }]);
+    const res = response();
+
+    await controller.exportAuditCsv({ user: { companyId: 'company-a' }, query: { actionId: 'action-a' } }, res, (error) => { throw error; });
+
+    expect(prisma.posAuditLog.findMany.mock.calls.at(-1)[0].where).toMatchObject({ companyId: 'company-a', actionId: 'action-a' });
+    expect(res.headers['Content-Type']).toContain('text/csv');
+    expect(res.body).toContain("'=HYPERLINK");
+    expect(res.body).toContain('REFUND');
+    expect(res.body).not.toContain('must-not-export');
+    expect(res.body).not.toContain('private@example.test');
+  });
+
 });
 
 describe('deleteEmptyClosedShift', () => {
@@ -175,6 +250,7 @@ describe('deleteEmptyClosedShift', () => {
     await controller.deleteEmptyClosedShift({
       user: { id: 'manager-a', companyId: 'company-a' },
       params: { shiftId },
+      ip: '192.0.2.54',
     }, res, (error) => { throw error; });
 
     expect(res.body).toEqual({ success: true, data: { deletedShiftId: shiftId, deletedTillSessionId: 'till-session-a' } });
@@ -190,9 +266,32 @@ describe('deleteEmptyClosedShift', () => {
     expect(tx.posShift.delete).toHaveBeenCalledWith({ where: { id: shiftId } });
     expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
       companyId: 'company-a',
+      registerId: 'register-id',
       userId: 'manager-a',
       event: 'SHIFT_DELETED',
+      ip: '192.0.2.54',
     }), tx);
+    expect(writePosAuditLog).toHaveBeenCalledTimes(1);
+  });
+
+  test('fails closed when SHIFT_DELETED audit persistence fails', async () => {
+    tx.posShift.findFirst.mockResolvedValue(emptyShift);
+    tx.tillSession.findFirst.mockResolvedValue(null);
+    const auditError = new Error('audit insert unavailable');
+    writePosAuditLog.mockRejectedValueOnce(auditError);
+    const next = jest.fn();
+    const res = response();
+
+    await controller.deleteEmptyClosedShift({
+      user: { id: 'manager-a', companyId: 'company-a' },
+      params: { shiftId },
+      ip: '192.0.2.54',
+    }, res, next);
+
+    expect(writePosAuditLog).toHaveBeenCalledTimes(1);
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({ event: 'SHIFT_DELETED' }), tx);
+    expect(next).toHaveBeenCalledWith(auditError);
+    expect(res.body).toBeUndefined();
   });
 
   test('rejects a shift with financial activity without deleting records', async () => {

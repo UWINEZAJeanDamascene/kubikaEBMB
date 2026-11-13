@@ -31,6 +31,9 @@ function hashPosSalePayload(payload) {
 }
 
 function pendingCheckoutPayload(body) {
+  const clientInfo = body.clientInfo && typeof body.clientInfo === 'object' && !Array.isArray(body.clientInfo)
+    ? body.clientInfo
+    : null;
   return {
     items: body.items.map((item) => ({
       productId: String(item.productId),
@@ -39,19 +42,37 @@ function pendingCheckoutPayload(body) {
       ...(item.catalogUnitPrice != null ? { catalogUnitPrice: item.catalogUnitPrice } : {}),
       ...(item.discountPct != null ? { discountPct: item.discountPct } : {}),
       ...(item.discountReason != null ? { discountReason: String(item.discountReason) } : {}),
+      ...(item.taxRate != null ? { taxRate: item.taxRate } : {}),
+      ...(item.taxCode != null ? { taxCode: String(item.taxCode) } : {}),
       ...(item.unit != null ? { unit: item.unit } : {}),
       ...(item.description != null ? { description: item.description } : {}),
       ...(Array.isArray(item.serialNumbers) ? { serialNumbers: item.serialNumbers } : {}),
     })),
     warehouseId: String(body.warehouseId),
+    ...(body.displayTotal != null ? { displayTotal: Number(body.displayTotal) } : {}),
     ...(body.notes != null ? { notes: String(body.notes) } : {}),
     ...(body.terms != null ? { terms: String(body.terms) } : {}),
     ...(body.dueDate != null ? { dueDate: body.dueDate } : {}),
+    ...(clientInfo ? {
+      clientInfo: {
+        ...(clientInfo.name != null ? { name: String(clientInfo.name) } : {}),
+        ...(clientInfo.contact && typeof clientInfo.contact === 'object' && !Array.isArray(clientInfo.contact)
+          ? { contact: clientInfo.contact } : {}),
+        ...(clientInfo.address && typeof clientInfo.address === 'object' && !Array.isArray(clientInfo.address)
+          ? { address: clientInfo.address } : {}),
+      },
+    } : {}),
     ...(body.promotionId ? { promotionId: String(body.promotionId) } : {}),
     ...(body.clientId ? { clientId: String(body.clientId) } : {}),
     ...(body.cartDiscountPct != null ? { cartDiscountPct: Number(body.cartDiscountPct) } : {}),
     ...(body.cartDiscountReason != null ? { cartDiscountReason: String(body.cartDiscountReason) } : {}),
     ...(body.proformaDocumentId ? { proformaDocumentId: String(body.proformaDocumentId) } : {}),
+    ...(body.paymentMethod ? { paymentMethod: String(body.paymentMethod) } : {}),
+    ...(body.offlineSnapshotCapability ? { offlineSnapshotCapability: String(body.offlineSnapshotCapability) } : {}),
+    ...(body.offlineSaleId ? { offlineSaleId: String(body.offlineSaleId) } : {}),
+    ...(body.offlineOperationId ? { offlineOperationId: String(body.offlineOperationId) } : {}),
+    ...(body.offlineCreatedAt ? { offlineCreatedAt: String(body.offlineCreatedAt) } : {}),
+    ...(body.offlinePaymentFlow ? { offlinePaymentFlow: String(body.offlinePaymentFlow) } : {}),
   };
 }
 

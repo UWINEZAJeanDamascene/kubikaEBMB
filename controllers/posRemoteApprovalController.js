@@ -153,7 +153,7 @@ exports.create = async (req, res, next) => {
         registerId: request.registerId,
         userId: context.session.userId,
         event: 'APPROVAL_REQUESTED',
-        metadata: { approvalRequestId: request.id, action },
+        metadata: { approvalRequestId: request.id, correlationId: request.id, action },
         ip: requestIp(req),
       }, tx);
       return request;
@@ -264,7 +264,7 @@ exports.decide = async (req, res, next) => {
           registerId: request.registerId,
           userId: managerId,
           event: 'APPROVAL_DENIED',
-          metadata: { approvalRequestId: request.id, action: request.action, reason: 'POS_APPROVAL_POLICY_DISABLED' },
+          metadata: { approvalRequestId: request.id, correlationId: request.id, action: request.action, reason: 'POS_APPROVAL_POLICY_DISABLED' },
           ip: requestIp(req),
         }, tx);
         return { error: [409, 'POS_APPROVAL_POLICY_DISABLED', 'This approval policy was disabled before a manager decided the request.'] };
@@ -292,7 +292,7 @@ exports.decide = async (req, res, next) => {
       await writePosAuditLog({
         companyId: tenantId, registerId: request.registerId, userId: managerId,
         event: decision === 'APPROVE' ? 'APPROVAL_GRANTED' : 'APPROVAL_DENIED',
-        metadata: { approvalRequestId: request.id, action: request.action, reason },
+        metadata: { approvalRequestId: request.id, correlationId: request.id, action: request.action, reason },
         ip: requestIp(req),
       }, tx);
       return { requestId: request.id, decision, managerApprovalId };

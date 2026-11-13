@@ -187,7 +187,10 @@ function invoiceToApi(row) {
   const totalDiscount = qtyNum(row.totalDiscount) > 0
     ? qtyNum(row.totalDiscount)
     : Math.max(lineDiscount, qtyNum(posPromotion?.discountAmount));
-  const outstanding = row.amountOutstanding != null
+  const isPaid = ['fully_paid', 'paid'].includes(String(row.status || '').toLowerCase());
+  const outstanding = isPaid
+    ? 0
+    : row.amountOutstanding != null
     ? Math.round(Math.max(0, qtyNum(row.amountOutstanding)) * 100) / 100
     : Math.round(Math.max(0, totalAmount - amountPaid) * 100) / 100;
   // POS amounts are persisted to cents. Older sales could retain a partial

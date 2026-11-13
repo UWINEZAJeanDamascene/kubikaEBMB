@@ -54,6 +54,8 @@ async function startWorker() {
   startSafely('tenant-backups', () => require('./services/backupScheduler').startScheduler());
   startSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').startMonitoringScheduler());
   startSafely('pos-print-maintenance', () => require('./services/posPrintMaintenanceService').startPrintMaintenance());
+  startSafely('pos-audit-checkpoints', () => require('./services/posAuditCheckpointScheduler').startPosAuditCheckpointScheduler());
+  startSafely('pos-idempotency-sweeper', () => require('./services/posIdempotencySweeper').start());
 
   // BullMQ job system. It was previously started only inside the web process's
   // disabled `if (false && ...)` block, so it has been running nowhere.
@@ -128,6 +130,8 @@ async function shutdown(signal) {
     stopSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').stopScheduler());
     stopSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').stopMonitoringScheduler());
     stopSafely('pos-print-maintenance', () => require('./services/posPrintMaintenanceService').stopPrintMaintenance());
+    stopSafely('pos-audit-checkpoints', () => require('./services/posAuditCheckpointScheduler').stopPosAuditCheckpointScheduler());
+    stopSafely('pos-idempotency-sweeper', () => require('./services/posIdempotencySweeper').stop());
     // closeWorkers() is async; awaiting it lets in-flight jobs finish rather
     // than being killed mid-write.
     try {

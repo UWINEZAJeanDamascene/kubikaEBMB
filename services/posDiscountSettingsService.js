@@ -144,6 +144,9 @@ function normalizeDiscountSettings(value) {
   const systemTillTypes = normalizeStringList(value.systemTillTypes, 'System till types', {
     maximumItems: 50, maximumLength: 40, required: true,
   }).map((type) => type.toLocaleLowerCase());
+  if (systemTillTypes.some((type) => !/^[a-z][a-z0-9_-]{0,39}$/.test(type))) {
+    throw new TypeError('System till types must use letters, numbers, hyphens, or underscores and start with a letter.');
+  }
   if (!systemTillTypes.includes('retail')) throw new TypeError('The retail system till type must remain available.');
   const tillTypeFeatures = normalizeTillTypeFeatures(value.tillTypeFeatures, systemTillTypes);
   const registerLabels = normalizeStringList(value.registerLabels, 'Register discount labels', {

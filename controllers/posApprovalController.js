@@ -64,6 +64,7 @@ exports.create = async (req, res, next) => {
       return invalidRequest(res, 401, 'POS_SESSION_INVALID', 'A valid POS session is required.');
     }
 
+    const correlationId = generateObjectId();
     const { approverUserId, pin } = req.body || {};
     const action = String(req.body?.action || '').trim().toUpperCase();
     const requestContext = req.body?.context ?? null;
@@ -77,7 +78,7 @@ exports.create = async (req, res, next) => {
         registerId: context.session.registerId,
         userId: context.session.userId,
         event: 'APPROVAL_DENIED',
-        metadata: { action, reason: 'POS_APPROVAL_INVALID_REQUEST' },
+        metadata: { correlationId, action, reason: 'POS_APPROVAL_INVALID_REQUEST' },
       });
       return invalidRequest(res, 400, 'POS_APPROVAL_INVALID_REQUEST', 'Provide a supported action, manager, PIN, and optional object context.');
     }
@@ -88,6 +89,13 @@ exports.create = async (req, res, next) => {
     const requesterId = String(context.session.userId);
     const companyId = String(context.session.companyId);
     const registerId = String(context.session.registerId);
+    await audit(prisma, req, {
+      companyId,
+      registerId,
+      userId: requesterId,
+      event: 'APPROVAL_REQUESTED',
+      metadata: { correlationId, action, context: requestContext },
+    });
     const policy = await getApprovalPolicy(prisma, companyId, action);
     if (!policy.enabled) {
       await audit(prisma, req, {
@@ -95,7 +103,7 @@ exports.create = async (req, res, next) => {
         registerId,
         userId: requesterId,
         event: 'APPROVAL_DENIED',
-        metadata: { action, reason: 'POS_APPROVAL_POLICY_DISABLED' },
+        metadata: { correlationId, action, reason: 'POS_APPROVAL_POLICY_DISABLED' },
       });
       return invalidRequest(res, 403, 'POS_APPROVAL_POLICY_DISABLED', 'This action is not currently enabled for manager approval.');
     }
@@ -124,7 +132,7 @@ exports.create = async (req, res, next) => {
         registerId,
         userId: requesterId,
         event: 'APPROVAL_DENIED',
-        metadata: { action, approverUserId, reason: 'POS_APPROVER_UNAVAILABLE' },
+        metadata: { correlationId, action, approverUserId, reason: 'POS_APPROVER_UNAVAILABLE' },
       });
       return invalidRequest(res, 401, 'POS_APPROVER_UNAVAILABLE', 'The selected approver is unavailable for this company.');
     }
@@ -134,7 +142,7 @@ exports.create = async (req, res, next) => {
         registerId,
         userId: requesterId,
         event: 'APPROVAL_DENIED',
-        metadata: { action, approverUserId: manager.id, reason: 'POS_SELF_APPROVAL_DENIED' },
+        metadata: { correlationId, action, approverUserId: manager.id, reason: 'POS_SELF_APPROVAL_DENIED' },
       });
       return invalidRequest(res, 403, 'POS_SELF_APPROVAL_DENIED', 'A cashier cannot approve their own action.');
     }
@@ -171,7 +179,7 @@ exports.create = async (req, res, next) => {
         registerId,
         userId: requesterId,
         event: 'APPROVAL_DENIED',
-        metadata: { action, approverUserId: manager.id, reason: 'POS_APPROVAL_PERMISSION_REQUIRED' },
+        metadata: { correlationId, action, approverUserId: manager.id, reason: 'POS_APPROVAL_PERMISSION_REQUIRED' },
       });
       return invalidRequest(res, 403, 'POS_APPROVAL_PERMISSION_REQUIRED', 'The selected user cannot approve POS actions.');
     }
@@ -193,6 +201,7 @@ exports.create = async (req, res, next) => {
         userId: manager.id,
         event: 'PIN_LOGIN_FAILED',
         metadata: {
+          correlationId,
           flow: 'approval',
           reason: verified.error.body.code,
           remainingAttempts: verified.error.body.remainingAttempts,
@@ -204,7 +213,7 @@ exports.create = async (req, res, next) => {
           registerId,
           userId: manager.id,
           event: 'PIN_LOCKOUT',
-          metadata: { flow: 'approval' },
+          metadata: { correlationId, flow: 'approval' },
         });
       }
       await audit(prisma, req, {
@@ -212,7 +221,7 @@ exports.create = async (req, res, next) => {
         registerId,
         userId: requesterId,
         event: 'APPROVAL_DENIED',
-        metadata: { action, approverUserId: manager.id, reason: verified.error.body.code },
+        metadata: { correlationId, action, approverUserId: manager.id, reason: verified.error.body.code },
       });
       return res.status(verified.error.status).json(verified.error.body);
     }
@@ -220,7 +229,7 @@ exports.create = async (req, res, next) => {
     const result = await prisma.$transaction(async (tx) => {
       const approval = await tx.posApproval.create({
         data: {
-          id: generateObjectId(),
+          id: correlationId,
           companyId,
           registerId,
           requestedBy: requesterId,
@@ -239,6 +248,7 @@ exports.create = async (req, res, next) => {
         userId: manager.id,
         event: 'APPROVAL_GRANTED',
         metadata: {
+          correlationId,
           approvalId: approval.id,
           action,
           requestedBy: requesterId,

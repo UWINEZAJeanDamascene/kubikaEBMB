@@ -206,7 +206,11 @@ exports.reserve = async (req, res, next) => {
       existingReservationTokens: req.body?.existingReservationTokens,
     });
     return res.json({ success: true, data });
-  } catch (error) { return sendError(error, res, next); }
+  } catch (error) {
+    // reserveVoucher has already written the specific, sampled voucher denial.
+    if (error?.code === 'POS_VOUCHER_INVALID') req.posDomainDenialAudited = true;
+    return sendError(error, res, next);
+  }
 };
 
 exports.release = async (req, res, next) => {

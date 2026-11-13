@@ -16,6 +16,8 @@ const fields = {
   notify_on_low_stock: 'notifyOnLowStock', notify_on_overdue_invoice: 'notifyOnOverdueInvoice',
   overdue_invoice_alert_days: 'overdueInvoiceAlertDays', pos_offline_enabled: 'posOfflineEnabled',
   pos_offline_max_hours: 'posOfflineMaxHours', pos_offline_queue_limit: 'posOfflineQueueLimit',
+  pos_offline_max_sales: 'posOfflineMaxSales', pos_offline_max_single_sale: 'posOfflineMaxSingleSale',
+  pos_offline_action_caps: 'posOfflineActionCaps', pos_offline_policy: 'posOfflinePolicy',
   pos_negative_stock_escalation_days: 'posNegativeStockEscalationDays', last_updated_by: 'lastUpdatedBy',
 };
 const FIELD_MAP = Object.fromEntries(Object.entries(fields).map(([source, target]) => [source, { target, isId: /Id$/.test(target) || target === 'companyId' }]));

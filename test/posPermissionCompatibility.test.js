@@ -80,6 +80,44 @@ describe('POS permission compatibility catalog', () => {
     expect(PermissionService.check(oldTillGrant, 'pos.till', 'void')).toBe(false);
   });
 
+  test('enforces separate audit read, export, integrity, and security update capabilities', async () => {
+    const readOnlyManager = {
+      name: 'manager',
+      permissions: [
+        { resource: 'pos.admin.audit', actions: ['read'] },
+        { resource: 'pos.admin.security', actions: ['read'] },
+      ],
+    };
+    const invoke = async (resource, action) => {
+      const req = { user: { role: readOnlyManager } };
+      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+      const next = jest.fn();
+      await requirePosPermissions({ resource, action })(req, res, next);
+      return { res, next };
+    };
+
+    expect((await invoke('pos.admin.audit', 'read')).next).toHaveBeenCalledWith();
+    expect((await invoke('pos.admin.security', 'read')).next).toHaveBeenCalledWith();
+    for (const [resource, action] of [
+      ['pos.admin.audit', 'export'],
+      ['pos.admin.audit', 'verify'],
+      ['pos.admin.security', 'update'],
+    ]) {
+      const result = await invoke(resource, action);
+      expect(result.res.status).toHaveBeenCalledWith(403);
+      expect(result.next).not.toHaveBeenCalled();
+    }
+  });
+
+  test('legacy audit workspace permission is read-only for fine-grained routes', async () => {
+    const req = { user: { role: { name: 'manager', permissions: [{ resource: 'pos.admin', actions: ['audit'] }] } } };
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    const next = jest.fn();
+    await requirePosPermissions({ resource: 'pos.admin.audit', action: 'export' })(req, res, next);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
   test('catalog names are normalized and every new permission has a declared migration entry', () => {
     expect(capabilityName(' POS.TILL ', ' SELL ')).toBe('pos.till.sell');
     expect(Object.keys(POS_PERMISSION_COMPATIBILITY)).toEqual(expect.arrayContaining([

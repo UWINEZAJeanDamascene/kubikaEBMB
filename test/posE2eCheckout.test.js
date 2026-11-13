@@ -13,7 +13,7 @@ jest.mock('../models/BankAccount', () => ({ BankAccount: { findOne: jest.fn(), i
 jest.mock('../models/TillSession', () => ({ findOne: jest.fn() }));
 jest.mock('../models/StockLevel', () => ({ find: jest.fn(), updateMany: jest.fn() }));
 jest.mock('../models/StockSerialNumber', () => ({ find: jest.fn(), updateMany: jest.fn() }));
-jest.mock('../models/StockBatch', () => ({ find: jest.fn() }));
+jest.mock('../models/StockBatch', () => ({ find: jest.fn(), findOne: jest.fn() }));
 jest.mock('../models/InventoryBatch', () => ({ find: jest.fn() }));
 jest.mock('../services/transactionService', () => ({ runInTransaction: jest.fn() }));
 jest.mock('../services/posRegisterService', () => ({
@@ -96,6 +96,8 @@ const Warehouse = require('../models/Warehouse');
 const { BankAccount } = require('../models/BankAccount');
 const TillSession = require('../models/TillSession');
 const StockLevel = require('../models/StockLevel');
+const StockBatch = require('../models/StockBatch');
+const InventoryBatch = require('../models/InventoryBatch');
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
@@ -156,6 +158,12 @@ function checkoutQueryMock(initialImplementation = async () => []) {
   const setImplementation = query.mockImplementation.bind(query);
   query.mockImplementation = (implementation) => setImplementation(async (sql, ...params) => {
     const result = await implementation(sql, ...params);
+    if (!result?.length && String(sql).includes('UPDATE pos_receipt_number_allocations')) {
+      return [{ id: 'receipt-allocation-1' }];
+    }
+    if (!result?.length && String(sql).includes('FROM pos_effective_prices')) {
+      return [{ priceListId: null, productId: IDS.product, price: 1000 }];
+    }
     if (!result?.length && String(sql).includes('FROM "pos_shifts"')) {
       return [{ id: '777777777777777777777778', openedById: IDS.cashier }];
     }
@@ -499,6 +507,106 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     );
   });
 
+  test('V2 offline cash creates a pending sale with the original operation metadata', async () => {
+    const { db } = stubHappyPathDeps();
+    process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
+    const paymentService = require('../services/posPaymentService');
+    paymentService.resolvePaymentFlow.mockReturnValueOnce('PAYMENTS_V2');
+    const issuedAt = Date.now() - 1000;
+    const expiresAt = issuedAt + 24 * 60 * 60 * 1000;
+    const snapshotId = '333333333333333333333333';
+    const snapshotData = {
+      products: {
+        [IDS.product]: {
+          name: 'Widget at snapshot',
+          sku: 'WID-SNAP',
+          unit: 'pcs',
+          price: 1000,
+          taxRate: 18,
+          taxCode: 'B',
+          isStockable: true,
+          trackingType: 'none',
+          averageCost: 400,
+          availableStock: 3,
+          serialNumbers: [],
+        },
+      },
+      promotions: [],
+      negativeStockAllowed: false,
+      escalationDays: 3,
+      paymentFlow: 'PAYMENTS_V2',
+    };
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      const statement = String(sql);
+      if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE')) {
+        return [{ queueLimit: 10000, usedValue: 0 }];
+      }
+      if (statement.includes('FROM pos_offline_snapshots WHERE id =')) {
+        return [{
+          id: snapshotId,
+          warehouseId: IDS.warehouse,
+          tillSessionId: IDS.till,
+          snapshotData,
+          queueLimit: 10000,
+          expiresAt: new Date(expiresAt),
+        }];
+      }
+      if (statement.includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      return [];
+    });
+    const operationId = 'offline-v2-operation-0001';
+    const body = checkoutBody({
+      paymentAmount: 0,
+      deviceId: IDS.deviceId,
+      items: [saleLine({ taxRate: 18, taxCode: 'B' })],
+      offlineSnapshotCapability: issueCapability({
+        id: snapshotId,
+        companyId: IDS.company,
+        userId: IDS.cashier,
+        deviceId: IDS.deviceId,
+        registerId: IDS.registerId,
+        warehouseId: IDS.warehouse,
+        tillSessionId: IDS.till,
+        paymentFlow: 'PAYMENTS_V2',
+        issuedAt,
+        expiresAt,
+      }),
+      offlineReceiptNumber: 'INV-2026-00001',
+      offlineSaleId: operationId,
+      offlineOperationId: operationId,
+      offlinePaymentFlow: 'PAYMENTS_V2',
+      offlineCreatedAt: new Date(issuedAt + 500).toISOString(),
+    });
+    const req = makeReq({
+      body,
+      headers: { 'Idempotency-Key': `${operationId}-v2-create` },
+    });
+    req.posPaymentFlow = 'PAYMENTS_V2';
+    const res = mockRes();
+
+    await createDirectSale(req, res, (error) => { throw error; });
+
+    expect(res.body).toMatchObject({ success: true });
+    expect(res.statusCode).toBe(201);
+    expect(res.body.paymentRequired).toBe(true);
+    expect(Invoice.create.mock.calls[0][0][0].posCheckoutPayload).toMatchObject({
+      paymentMethod: 'cash',
+      offlineSnapshotCapability: body.offlineSnapshotCapability,
+      offlineSaleId: operationId,
+      offlineOperationId: operationId,
+      offlinePaymentFlow: 'PAYMENTS_V2',
+    });
+    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE pos_offline_snapshots SET used_value'),
+      1180,
+      snapshotId,
+      IDS.company,
+    );
+    expect(StockLevel.updateMany).not.toHaveBeenCalled();
+    expect(JournalService.createEntriesAtomic).not.toHaveBeenCalled();
+  });
+
   test('V2 completion reuses the pending invoice and posts revenue plus COGS in one journal entry', async () => {
     const { invoice, db } = stubHappyPathDeps();
     const shiftId = '777777777777777777777778';
@@ -534,6 +642,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       serialNumbers: [],
     }]);
     db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
       if (String(sql).includes('pos_completion_key')) return [{ status: 'PENDING_PAYMENT', completionKey: null }];
       if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
       if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
@@ -635,6 +744,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
         return [{ credit_limit: '500', outstanding_balance: '100', code: 'ACCOUNT-1' }];
       }
       if (String(sql).includes('COALESCE(SUM(amount_outstanding)')) return [{ overdueAmount: '0' }];
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
       if (String(sql).includes('pos_completion_key')) return [{ status: 'PENDING_PAYMENT', completionKey: null }];
       if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
       if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
@@ -737,6 +847,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
         return [{ credit_limit: '300', outstanding_balance: '100', code: 'ACCOUNT-1' }];
       }
       if (String(sql).includes('COALESCE(SUM(amount_outstanding)')) return [{ overdueAmount: '0' }];
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
       if (String(sql).includes('pos_completion_key')) return [{ status: 'PENDING_PAYMENT', completionKey: null }];
       if (String(sql).includes('FROM "pos_shifts"')) return [{ id: '777777777777777777777778', openedById: IDS.cashier }];
       if (String(sql).includes('INSERT INTO pos_stored_value_accounts')) {
@@ -824,6 +935,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       serialNumbers: [],
     }]);
     db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
       if (String(sql).includes('FROM pos_stored_value_ledger l')) {
         return [{ id: 'redemption-ledger', accountId: 'gift-card-account', amount: '1180', reference: 'EF01' }];
       }
@@ -933,8 +1045,20 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       findMany: jest.fn().mockResolvedValue([posPayment]),
     };
     db.posShift = { findFirst: jest.fn().mockResolvedValue({ id: shiftId, companyId: IDS.company, registerId }) };
-    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+    const saleRequestReservations = [];
+    const saleRequestFinalizations = [];
+    let durableSaleRequest = null;
+    db.$queryRawUnsafe.mockImplementation(async (sql, ...args) => {
       const query = String(sql);
+      if (query.includes('SELECT request_key AS')) return durableSaleRequest ? [durableSaleRequest] : [];
+      if (query.includes('INSERT INTO pos_sale_requests')) {
+        saleRequestReservations.push(args);
+        if (durableSaleRequest) return [];
+        durableSaleRequest = {
+          requestKey: args[1], createdById: args[2], payloadHash: args[3], invoiceId: null, status: 'processing',
+        };
+        return [{ requestKey: args[1] }];
+      }
       if (query.includes('SELECT l.account_id AS "accountId"')) {
         return [{ accountId: 'gift-card-account', reference: 'EF01', codeSuffix: 'EF01', amount: '1180' }];
       }
@@ -948,10 +1072,18 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       }
       return [];
     });
-    db.$executeRawUnsafe.mockImplementation(async (sql, completionKey) => {
+    db.$executeRawUnsafe.mockImplementation(async (sql, ...args) => {
       if (String(sql).includes('UPDATE invoices SET pos_completion_key')) {
         completionState.status = 'fully_paid';
-        completionState.completionKey = completionKey;
+        completionState.completionKey = args[0];
+      }
+      if (String(sql).includes('UPDATE pos_sale_requests')) {
+        saleRequestFinalizations.push(args);
+        durableSaleRequest = {
+          ...durableSaleRequest,
+          invoiceId: args[2],
+          status: 'completed',
+        };
       }
       return 1;
     });
@@ -1068,6 +1200,10 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(retried.map((res) => res.body.data._id)).toEqual([IDS.invoice, IDS.invoice]);
     expect(retried[0].body.data).toBe(retried[1].body.data);
     expect(req.posV2Completion.completionKey).toBe(completionKey);
+    expect(saleRequestReservations).toHaveLength(1);
+    expect(saleRequestReservations[0][1]).toBe(completionKey);
+    expect(saleRequestFinalizations).toHaveLength(1);
+    expect(saleRequestFinalizations[0][1]).toBe(completionKey);
     expect(JournalService.createEntriesAtomic).toHaveBeenCalledTimes(1);
     expect(stockState).toEqual({
       warehouseQuantity: initialStock.warehouseQuantity - 1,
@@ -1219,7 +1355,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
   });
 
   test('legacy tills retain the current direct-sale checkout behavior', async () => {
-    stubHappyPathDeps();
+    const { db } = stubHappyPathDeps();
     posPaymentService.resolvePaymentFlow.mockReturnValue('LEGACY');
     const res = mockRes();
 
@@ -1231,6 +1367,16 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(res.statusCode).toBe(201);
     expect(Invoice.create).toHaveBeenCalledTimes(1);
     expect(posPaymentService.getPaymentSettings).toHaveBeenCalledWith(IDS.company);
+    const completionAudits = writePosAuditLog.mock.calls.filter(([entry]) => entry.event === 'POS_SALE_COMPLETED');
+    expect(completionAudits).toHaveLength(1);
+    expect(completionAudits[0][1]).toBe(db);
+    expect(completionAudits[0][0]).toEqual(expect.objectContaining({
+      companyId: IDS.company,
+      registerId: expect.any(String),
+      userId: IDS.cashier,
+      event: 'POS_SALE_COMPLETED',
+      metadata: expect.objectContaining({ invoiceId: expect.any(String), paymentFlow: 'LEGACY' }),
+    }));
   });
 
   test('rejects legacy direct-sale requests for V2 tills before creating a sale', async () => {
@@ -1287,14 +1433,20 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     const res = mockRes();
     const next = jest.fn();
 
-    await getCheckoutPaymentFlow(makeReq({
+    const req = makeReq({
       query: { registerId: 'REG-1', deviceId: 'device-1' },
       user: { id: IDS.cashier, company: { _id: otherCompanyId } },
-    }), res, next);
+    });
+    req.posAuthContext = {
+      company: { id: IDS.company },
+      session: { userId: IDS.cashier },
+      register: { id: '888888888888888888888888', code: 'REG-1' },
+    };
+    await getCheckoutPaymentFlow(req, res, next);
 
     expect(next).not.toHaveBeenCalled();
-    expect(posPaymentService.getPaymentSettings).toHaveBeenCalledWith(otherCompanyId);
-    expect(findClaimedRegister).toHaveBeenCalledWith(otherCompanyId, 'REG-1', 'device-1');
+    expect(posPaymentService.getPaymentSettings).toHaveBeenCalledWith(IDS.company);
+    expect(findClaimedRegister).not.toHaveBeenCalled();
     expect(res.body.data).toMatchObject({
       paymentFlow: 'PAYMENTS_V2',
       methods: ['CASH', 'MTN_MOMO', 'AIRTEL_MONEY'],
@@ -1322,9 +1474,18 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     paymentService.resolveEnabledMethods.mockReturnValue(['CASH', 'CREDIT']);
     const res = mockRes();
 
-    await getCheckoutPaymentFlow(makeReq({
+    const req = makeReq({
       query: { registerId: 'REG-1', deviceId: 'device-1' },
-    }), res, (error) => { throw error; });
+    });
+    req.posAuthContext = {
+      company: { id: IDS.company },
+      session: { userId: IDS.cashier },
+      register: {
+        id: '888888888888888888888888',
+        systemTillType: 'restaurant',
+      },
+    };
+    await getCheckoutPaymentFlow(req, res, (error) => { throw error; });
 
     expect(res.body.data.methods).toEqual(['CASH']);
     expect(res.body.data.features).toEqual({
@@ -1603,6 +1764,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(res.body.replayed).toBe(true);
     expect(res.body.data).toBe(priorInvoice);
     expect(runInTransaction).not.toHaveBeenCalled();
+    expect(writePosAuditLog.mock.calls.filter(([entry]) => entry.event === 'POS_SALE_COMPLETED')).toHaveLength(0);
   });
 
   test('concurrent requests with the same idempotency key reserve only one sale', async () => {
@@ -1711,10 +1873,14 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       promotions: [],
       negativeStockAllowed: false,
       escalationDays: 3,
+      paymentFlow: 'LEGACY',
     };
     db.$queryRawUnsafe.mockImplementation(async (sql) => {
       const statement = String(sql);
       if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('SELECT receipt_number AS "receiptNumber"')) {
+        return [{ receiptNumber: 'INV-2026-00002' }];
+      }
       if (statement.includes('FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE')) {
         return [{ queueLimit: 10000, usedValue: 0 }];
       }
@@ -1737,6 +1903,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows(0, 0)) });
     const offlineSaleId = 'offline-sale-00000001';
     const requestData = checkoutBody({
+      displayTotal: 1180,
       deviceId: IDS.deviceId,
       offlineSnapshotCapability: issueCapability({
         id: snapshotId,
@@ -1746,28 +1913,68 @@ describe('POS E2E — checkout (sales-legacy)', () => {
         registerId: IDS.registerId,
         warehouseId: IDS.warehouse,
         tillSessionId: IDS.till,
+        receiptNumbers: ['INV-2026-00002'],
         issuedAt,
         expiresAt,
       }),
+      offlineReceiptNumber: 'INV-2026-00002',
       offlineSaleId,
+      offlineOperationId: 'offline-operation-00000001',
+      offlinePaymentFlow: 'LEGACY',
       offlineCreatedAt: new Date(issuedAt + 500).toISOString(),
       items: [saleLine({
-        taxRate: 18,
-        taxCode: 'B',
+        taxRate: 0,
+        taxCode: 'A',
         unit: 'pcs',
         catalogUnitPrice: 1000,
         unitPrice: 1000,
       })],
     });
+    const changedFlowRes = mockRes();
+    await createDirectSale(makeReq({
+      body: { ...requestData, offlinePaymentFlow: 'PAYMENTS_V2' },
+      headers: { 'Idempotency-Key': 'offline-idempotency-key-0002' },
+    }), changedFlowRes, (error) => { throw error; });
+
+    expect(changedFlowRes.statusCode).toBe(409);
+    expect(changedFlowRes.body.code).toBe('POS_OFFLINE_PAYMENT_FLOW_CHANGED');
+
+    const changedTotalRes = mockRes();
+    await createDirectSale(makeReq({
+      body: { ...requestData, displayTotal: 1000 },
+      headers: { 'Idempotency-Key': 'offline-idempotency-key-0010' },
+    }), changedTotalRes, (error) => { throw error; });
+    expect(changedTotalRes.statusCode).toBe(409);
+    expect(changedTotalRes.body.code).toBe('POS_OFFLINE_TOTAL_SNAPSHOT_MISMATCH');
+
     const res = mockRes();
     await createDirectSale(makeReq({
-      body: requestData,
+      body: { ...requestData, offlineReceiptNumber: 'offline-operation-00000001' },
       headers: { 'Idempotency-Key': 'offline-idempotency-key-0001' },
     }), res, (error) => { throw error; });
 
     expect(res.statusCode).toBe(201);
     expect(res.body.offlineConflictCount).toBe(1);
+    expect(Invoice.create.mock.calls[0][0][0].referenceNo).toBe('INV-2026-00002');
+    expect(db.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('AND operation_id = $4'),
+      IDS.company,
+      IDS.deviceId,
+      '888888888888888888888888',
+      'offline-operation-00000001',
+    );
+    expect(db.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('AND receipt_number = $4 AND (operation_id IS NULL OR operation_id = $6)'),
+      IDS.company,
+      IDS.deviceId,
+      '888888888888888888888888',
+      'INV-2026-00002',
+      expect.any(Date),
+      'offline-operation-00000001',
+    );
     expect(Invoice.create.mock.calls[0][0][0].lines[0].unitPrice).toBe(1000);
+    expect(Invoice.create.mock.calls[0][0][0].lines[0].taxCode).toBe('B');
+    expect(Invoice.create.mock.calls[0][0][0].lines[0].taxRate).toBe(18);
     expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
       expect.stringContaining('INSERT INTO pos_offline_conflicts'),
       expect.any(String),
@@ -1783,6 +1990,286 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(inventoryService.consumeAvailable).toHaveBeenCalled();
     expect(StockMovement.insertMany).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ totalCost: 400 })]),
+      expect.objectContaining({ session: null }),
+    );
+  });
+
+  test('posts an offline batch sale against the exact signed FEFO allocation', async () => {
+    const { db } = stubHappyPathDeps();
+    process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
+    const issuedAt = Date.now() - 1000;
+    const expiresAt = issuedAt + 24 * 60 * 60 * 1000;
+    const snapshotId = '333333333333333333333333';
+    const batchId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const snapshotData = {
+      products: {
+        [IDS.product]: {
+          name: 'Widget at snapshot',
+          sku: 'WID-SNAP',
+          unit: 'pcs',
+          price: 1000,
+          taxRate: 18,
+          taxCode: 'B',
+          isStockable: true,
+          trackingType: 'batch',
+          averageCost: 400,
+          availableStock: 5,
+          batches: [{
+            id: batchId,
+            batchNo: 'LOT-A',
+            availableQuantity: 5,
+            expiryDate: '2027-01-01T00:00:00.000Z',
+            unitCost: 400,
+          }],
+          serialNumbers: [],
+        },
+      },
+      promotions: [],
+      negativeStockAllowed: false,
+      escalationDays: 3,
+      paymentFlow: 'LEGACY',
+    };
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      const statement = String(sql);
+      if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE')) {
+        return [{ queueLimit: 10000, usedValue: 0 }];
+      }
+      if (statement.includes('FROM pos_offline_snapshots WHERE id =')) {
+        return [{
+          id: snapshotId,
+          warehouseId: IDS.warehouse,
+          tillSessionId: IDS.till,
+          snapshotData,
+          queueLimit: 10000,
+          expiresAt: new Date(expiresAt),
+        }];
+      }
+      if (statement.includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      if (statement.includes('INSERT INTO stock_levels')) {
+        return [{ previousStock: 5, newStock: 4, reservedStock: 0 }];
+      }
+      return [];
+    });
+    Product.find.mockReturnValue(leanFind([catalogProduct({
+      sellingPrice: 1400,
+      trackingType: 'batch',
+      trackBatch: true,
+    })]));
+    StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows(5, 0)) });
+    const batch = {
+      _id: batchId,
+      batchNo: 'LOT-A',
+      qtyOnHand: 5,
+      reservedQuantity: 0,
+      unitCost: 400,
+      expiryDate: new Date('2027-01-01T00:00:00.000Z'),
+      isQuarantined: false,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    StockBatch.findOne.mockReturnValue({ session: jest.fn().mockResolvedValue(batch) });
+    InventoryBatch.find.mockReturnValue({
+      sort: jest.fn().mockReturnThis(),
+      session: jest.fn().mockResolvedValue([]),
+    });
+    const offlineSaleId = 'offline-sale-batch-0001';
+    const body = checkoutBody({
+      deviceId: IDS.deviceId,
+      offlineSnapshotCapability: issueCapability({
+        id: snapshotId,
+        companyId: IDS.company,
+        userId: IDS.cashier,
+        deviceId: IDS.deviceId,
+        registerId: IDS.registerId,
+        warehouseId: IDS.warehouse,
+        tillSessionId: IDS.till,
+        issuedAt,
+        expiresAt,
+      }),
+      offlineReceiptNumber: 'INV-2026-00003',
+      offlineSaleId,
+      offlineOperationId: 'offline-operation-batch-0001',
+      offlinePaymentFlow: 'LEGACY',
+      offlineCreatedAt: new Date(issuedAt + 500).toISOString(),
+      items: [saleLine({
+        taxRate: 18,
+        taxCode: 'B',
+        unit: 'pcs',
+        catalogUnitPrice: 1000,
+        unitPrice: 1000,
+        batchAllocations: [{ batchId, quantity: 1 }],
+      })],
+    });
+
+    const invalidAllocationRes = mockRes();
+    await createDirectSale(makeReq({
+      body: {
+        ...body,
+        items: [{
+          ...body.items[0],
+          batchAllocations: [{ batchId, quantity: 6 }],
+        }],
+      },
+      headers: { 'Idempotency-Key': 'offline-idempotency-key-0004' },
+    }), invalidAllocationRes, (error) => { throw error; });
+    expect(invalidAllocationRes.statusCode).toBe(403);
+    expect(invalidAllocationRes.body.code).toBe('POS_OFFLINE_BATCH_SNAPSHOT_STOCK_EXCEEDED');
+
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body,
+      headers: { 'Idempotency-Key': 'offline-idempotency-key-0003' },
+    }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.body.offlineConflictCount).toBe(0);
+    expect(StockBatch.findOne).toHaveBeenCalledWith({
+      _id: batchId,
+      company: IDS.company,
+      product: IDS.product,
+      warehouse: IDS.warehouse,
+    });
+    expect(batch.qtyOnHand).toBe(4);
+    expect(StockMovement.insertMany).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ batchNumber: 'LOT-A:1', totalCost: 400 })]),
+      expect.objectContaining({ session: null }),
+    );
+  });
+
+  test('reconstructs FEFO batches for a legacy offline snapshot and audits the allocation', async () => {
+    const { db } = stubHappyPathDeps();
+    process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
+    const issuedAt = Date.now() - 1000;
+    const expiresAt = issuedAt + 24 * 60 * 60 * 1000;
+    const snapshotId = '333333333333333333333333';
+    const batchId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const expiryDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+    const snapshotData = {
+      products: {
+        [IDS.product]: {
+          name: 'Widget at snapshot',
+          sku: 'WID-SNAP',
+          unit: 'pcs',
+          price: 1000,
+          taxRate: 18,
+          taxCode: 'B',
+          isStockable: true,
+          trackingType: 'batch',
+          averageCost: 400,
+          availableStock: 5,
+          serialNumbers: [],
+        },
+      },
+      promotions: [],
+      negativeStockAllowed: false,
+      escalationDays: 3,
+      paymentFlow: 'LEGACY',
+    };
+    db.stockBatch.findMany = jest.fn().mockResolvedValue([{
+      id: batchId,
+      batchNo: 'LOT-LEGACY',
+      qtyOnHand: 5,
+      reservedQuantity: 0,
+      unitCost: 400,
+      expiryDate,
+      createdAt: new Date(issuedAt - 1000),
+    }]);
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      const statement = String(sql);
+      if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE')) {
+        return [{ queueLimit: 10000, usedValue: 0 }];
+      }
+      if (statement.includes('FROM pos_offline_snapshots WHERE id =')) {
+        return [{
+          id: snapshotId,
+          warehouseId: IDS.warehouse,
+          tillSessionId: IDS.till,
+          snapshotData,
+          queueLimit: 10000,
+          expiresAt: new Date(expiresAt),
+        }];
+      }
+      if (statement.includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      if (statement.includes('INSERT INTO stock_levels')) {
+        return [{ previousStock: 5, newStock: 4, reservedStock: 0 }];
+      }
+      return [];
+    });
+    Product.find.mockReturnValue(leanFind([catalogProduct({
+      sellingPrice: 1400,
+      trackingType: 'batch',
+      trackBatch: true,
+    })]));
+    StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows(5, 0)) });
+    const batch = {
+      _id: batchId,
+      batchNo: 'LOT-LEGACY',
+      qtyOnHand: 5,
+      reservedQuantity: 0,
+      unitCost: 400,
+      expiryDate,
+      isQuarantined: false,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    StockBatch.findOne.mockReturnValue({ session: jest.fn().mockResolvedValue(batch) });
+    InventoryBatch.find.mockReturnValue({
+      sort: jest.fn().mockReturnThis(),
+      session: jest.fn().mockResolvedValue([]),
+    });
+    const body = checkoutBody({
+      deviceId: IDS.deviceId,
+      offlineSnapshotCapability: issueCapability({
+        id: snapshotId,
+        companyId: IDS.company,
+        userId: IDS.cashier,
+        deviceId: IDS.deviceId,
+        registerId: IDS.registerId,
+        warehouseId: IDS.warehouse,
+        tillSessionId: IDS.till,
+        issuedAt,
+        expiresAt,
+      }),
+      offlineReceiptNumber: 'INV-2026-00004',
+      offlineSaleId: 'offline-sale-legacy-batch-0001',
+      offlineOperationId: 'offline-operation-legacy-batch-0001',
+      offlinePaymentFlow: 'LEGACY',
+      offlineCreatedAt: new Date(issuedAt + 500).toISOString(),
+      items: [saleLine({
+        taxRate: 18,
+        taxCode: 'B',
+        unit: 'pcs',
+        catalogUnitPrice: 1000,
+        unitPrice: 1000,
+      })],
+    });
+
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body,
+      headers: { 'Idempotency-Key': 'offline-idempotency-key-legacy-batch-0001' },
+    }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(201);
+    expect(db.stockBatch.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        companyId: IDS.company,
+        productId: IDS.product,
+        warehouseId: IDS.warehouse,
+      }),
+      take: 500,
+    }));
+    expect(StockBatch.findOne).toHaveBeenCalledWith({
+      _id: batchId,
+      company: IDS.company,
+      product: IDS.product,
+      warehouse: IDS.warehouse,
+    });
+    expect(StockMovement.insertMany).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({
+        batchNumber: 'LOT-LEGACY:1',
+        notes: expect.stringContaining('legacy offline batch allocation reconstructed at sync'),
+      })]),
       expect.objectContaining({ session: null }),
     );
   });

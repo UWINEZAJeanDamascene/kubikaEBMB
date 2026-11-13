@@ -2,7 +2,7 @@
 
 jest.mock('../middleware/auth', () => ({ protect: (req, res, next) => next() }));
 jest.mock('../middleware/rbacMiddleware', () => ({
-  requirePermissionOrRoles: () => (req, res, next) => next(),
+  requirePermissionOrRoles: jest.fn(() => (req, res, next) => next()),
 }));
 jest.mock('../controllers/tillController', () => {
   const handler = (req, res) => res.json({ reached: true });
@@ -24,6 +24,7 @@ jest.mock('../controllers/posRegisterController', () => new Proxy({}, { get: () 
 
 const express = require('express');
 const request = require('supertest');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const tillRoutes = require('../routes/tillRoutes');
 
 function appWithTillRoutes() {
@@ -56,6 +57,20 @@ describe('legacy till operational routes require a POS session', () => {
 
   test('register administration remains an ERP-authenticated management route', async () => {
     const response = await request(appWithTillRoutes()).get('/api/tills/registers').set(erpOnly);
+    expect(response.status).toBe(200);
+    expect(response.body.reached).toBe(true);
+  });
+
+  test('cashiers can resolve the register assigned to this device', async () => {
+    expect(requirePermissionOrRoles).toHaveBeenCalledWith(
+      'tills',
+      'read',
+      ['admin', 'accountant', 'manager', 'sales', 'viewer', 'cashier'],
+    );
+    const response = await request(appWithTillRoutes())
+      .get('/api/tills/registers/device/77777777-7777-4777-8777-777777777777')
+      .set(erpOnly);
+
     expect(response.status).toBe(200);
     expect(response.body.reached).toBe(true);
   });

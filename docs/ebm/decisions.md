@@ -54,6 +54,8 @@ The following are business-approved implementation defaults, **not RRA-confirmed
 
 Published sources did not resolve these operational questions. Obtain written RRA guidance before changing the corresponding defaults to CONFIRMED:
 
+The offline-fiscal safe default is to block offline sales requiring EBM on both the client and server. The settings UI shows a disabled provisional-receipt option, but it cannot be enabled until RRA/accountant guidance confirms the document's status and permitted use. This is a PROVISIONAL business policy dated 2026-11-11, not an RRA-confirmed rule. VSDC submission and receipt numbering are unchanged.
+
 1. Which exact VSDC v1.0.5 response codes guarantee that no transaction was recorded? In particular, do 891–893 guarantee non-delivery, and what does 894 mean for transaction outcome?
 2. What is the officially supported VSDC issuance flow for copy, training and proforma documents when `/saveSales` specifies `salesTyCd=N`? How should CIS §§10–11 requirements be met for them?
 3. Does an implementation using VSDC v1.0.5 also have to submit an electronic journal separately, as described in CIS? If so, which API/format and when?
@@ -64,6 +66,7 @@ Published sources did not resolve these operational questions. Obtain written RR
 8. Is the proposed 10-second signature wait acceptable? What is the complete required refund payload and process beyond the confirmed `N/R` code pair?
 9. Which CIS receipt layout elements (including copy/training/proforma labels, watermark and warning placement/size) must be implemented in each supported print format?
 10. What fiscal tender code and receipt reporting treatment does RRA require when a customer redeems POS loyalty points? Until confirmed, loyalty points remain a separate local tender and are disabled in V2 fiscal checkout; no tax or EBM mapping is inferred from the monetary loyalty wallet.
+11. What accounting and reconciliation treatment is required for unused offline receipt-number reservations at synchronization and shift close? The current POS control marks a number used in the sale transaction, retires unused numbers at shift close, and reports expired/retired reservations. It does not alter EBM/VSDC numbering.
 
 ## POS loyalty points and wallet separation
 

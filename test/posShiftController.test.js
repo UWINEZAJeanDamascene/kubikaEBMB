@@ -11,13 +11,13 @@ jest.mock('../lib/prisma', () => ({
   },
 }));
 jest.mock('../services/posAuditService', () => ({
-  requestIp: jest.fn(() => null),
+  requestIp: jest.fn((req) => req?.ip || null),
   writePosAuditLog: jest.fn().mockResolvedValue(undefined),
 }));
 
 const { prisma } = require('../lib/prisma');
 const { writePosAuditLog } = require('../services/posAuditService');
-const { current, history, open, xReport } = require('../controllers/posShiftController');
+const { current, history, open, remove, xReport } = require('../controllers/posShiftController');
 
 const COMPANY_ID = '507f1f77bcf86cd799439011';
 const REGISTER_ID = '507f1f77bcf86cd799439012';
@@ -43,6 +43,7 @@ function createRequest({ openingCount = { 5000: 2, other: 100 }, key = IDEMPOTEN
   return {
     body: { openingCount, ...(note === undefined ? {} : { note }) },
     headers: { 'idempotency-key': key },
+    ip: '192.0.2.49',
     posAuthContext: {
       session: { companyId: COMPANY_ID, registerId: REGISTER_ID, userId: USER_ID },
     },
@@ -55,10 +56,12 @@ function createTransaction() {
     posShift: {
       findFirst: jest.fn(),
       create: jest.fn(),
+      delete: jest.fn(),
     },
     tillSession: {
       findFirst: jest.fn().mockResolvedValue(null),
       create: jest.fn(async ({ data }) => data),
+      deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
     posAuditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-id' }) },
   };
@@ -136,7 +139,75 @@ describe('POS shift open endpoint', () => {
     expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
       event: 'SHIFT_OPENED',
       companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: USER_ID,
+      ip: '192.0.2.49',
     }), tx);
+    expect(writePosAuditLog).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not report shift opening as successful when its audit insert fails', async () => {
+    const tx = createTransaction();
+    tx.posShift.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    tx.posShift.create.mockImplementation(async ({ data }) => data);
+    prisma.$transaction.mockImplementation((callback) => callback(tx));
+    const auditError = new Error('audit insert unavailable');
+    writePosAuditLog.mockRejectedValueOnce(auditError);
+    const next = jest.fn();
+    const res = createResponse();
+
+    await open(createRequest(), res, next);
+
+    expect(writePosAuditLog).toHaveBeenCalledTimes(1);
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({ event: 'SHIFT_OPENED' }), tx);
+    expect(next).toHaveBeenCalledWith(auditError);
+    expect(res.statusCode).not.toBe(201);
+  });
+
+  test('audits shift deletion once inside the transaction and fails closed if audit persistence fails', async () => {
+    const shift = {
+      id: 'shift-to-delete', companyId: COMPANY_ID, registerId: REGISTER_ID,
+      shiftNumber: 3, status: 'open', openedById: USER_ID,
+      openedAt: new Date('2026-11-10T08:00:00.000Z'),
+      cashMovements: [], zReport: null, correctionReports: [], invoices: [], payments: [],
+      register: { code: 'POS-1', name: 'Front Register' },
+    };
+    const tx = createTransaction();
+    tx.posShift.findFirst.mockResolvedValue(shift);
+    prisma.$transaction.mockImplementation((callback) => callback(tx));
+    const req = {
+      params: { shiftId: shift.id },
+      ip: '192.0.2.53',
+      posAuthContext: { session: { companyId: COMPANY_ID, registerId: REGISTER_ID, userId: USER_ID } },
+    };
+    const res = createResponse();
+
+    await remove(req, res, (error) => { throw error; });
+
+    expect(res.body).toEqual({ success: true, data: { deletedShiftId: shift.id } });
+    expect(writePosAuditLog).toHaveBeenCalledTimes(1);
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: USER_ID,
+      event: 'SHIFT_DELETED',
+      ip: '192.0.2.53',
+      metadata: expect.objectContaining({ shiftId: shift.id }),
+    }), tx);
+
+    const auditError = new Error('audit insert unavailable');
+    writePosAuditLog.mockRejectedValueOnce(auditError);
+    const failClosedResponse = createResponse();
+    const next = jest.fn();
+    await remove(req, failClosedResponse, next);
+
+    expect(writePosAuditLog).toHaveBeenCalledTimes(2);
+    expect(writePosAuditLog.mock.calls[1][1]).toBe(tx);
+    expect(next).toHaveBeenCalledWith(auditError);
+    expect(failClosedResponse.body).toBeNull();
   });
 
   test('replays the original shift for the same key and payload', async () => {

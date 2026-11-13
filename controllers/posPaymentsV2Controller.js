@@ -891,27 +891,26 @@ exports.resendPayment = async (req, res, next) => {
     const settings = await posPaymentService.getPaymentSettings(companyId);
     const expiresAt = new Date(Date.now() + Number(settings.momoTimeoutSec || 120) * 1000);
     const nextAttempt = Number(payment.attempts?.[0]?.attemptNo || 0) + 1;
-    const attempt = await dbClient().posPaymentAttempt.create({
-      data: {
-        id: generateObjectId(),
+    const attempt = await runInTransaction(async (tx) => {
+      const createdAttempt = await tx.posPaymentAttempt.create({
+        data: {
+          id: generateObjectId(),
+          companyId,
+          paymentId: payment.id,
+          attemptNo: nextAttempt,
+          providerStatus: 'MANUAL_PENDING',
+          expiresAt,
+        },
+      });
+      await writePosAuditLog({
         companyId,
-        paymentId: payment.id,
-        attemptNo: nextAttempt,
-        providerStatus: 'MANUAL_PENDING',
-        expiresAt,
-      },
-    });
-    await writePosAuditLog({
-      companyId,
-      userId: String(user.id),
-      registerId: String(register.id),
-      shiftId: payment.shiftId,
-      saleId: payment.saleId,
-      action: 'RESEND_MANUAL_MOBILE_MONEY_PAYMENT',
-      entityType: 'pos_payment',
-      entityId: payment.id,
-      metadata: { attemptNo: nextAttempt, provider: payment.method },
-      ip: requestIp(req),
+        userId: String(user.id),
+        registerId: String(register.id),
+        event: 'PAYMENT_MANUAL_MOBILE_MONEY_RESEND_REQUESTED',
+        metadata: { paymentId: payment.id, saleId: payment.saleId, attemptNo: nextAttempt, provider: payment.method },
+        ip: requestIp(req),
+      }, tx);
+      return createdAttempt;
     });
     return res.status(201).json({
       success: true,
@@ -943,23 +942,26 @@ exports.cancelPayment = async (req, res, next) => {
     if (!['PENDING', 'PENDING_VERIFICATION'].includes(payment.status)) {
       return invalid(res, 409, 'POS_PAYMENT_CANCEL_INVALID', 'Only a pending payment can be cancelled.');
     }
-    const cancelled = await dbClient().posPayment.update({
-      where: { id: payment.id },
-      data: { status: 'CANCELLED', completedAt: new Date() },
+    const cancelled = await runInTransaction(async (tx) => {
+      const changed = await tx.posPayment.updateMany({
+        where: { id: payment.id, companyId, registerId: String(register.id), status: { in: ['PENDING', 'PENDING_VERIFICATION'] } },
+        data: { status: 'CANCELLED', completedAt: new Date() },
+      });
+      if (changed.count !== 1) {
+        return { error: { status: 409, code: 'POS_PAYMENT_CANCEL_INVALID', message: 'This payment has already changed and can no longer be cancelled.' } };
+      }
+      await writePosAuditLog({
+        companyId,
+        userId: String(user.id),
+        registerId: String(register.id),
+        event: 'PAYMENT_CANCELLED',
+        metadata: { paymentId: payment.id, saleId: payment.saleId, method: payment.method, amount: Number(payment.amount) },
+        ip: requestIp(req),
+      }, tx);
+      return { payment: { id: payment.id, status: 'CANCELLED' } };
     });
-    await writePosAuditLog({
-      companyId,
-      userId: String(user.id),
-      registerId: String(register.id),
-      shiftId: payment.shiftId,
-      saleId: payment.saleId,
-      action: 'CANCEL_POS_PAYMENT',
-      entityType: 'pos_payment',
-      entityId: payment.id,
-      metadata: { method: payment.method, amount: Number(payment.amount) },
-      ip: requestIp(req),
-    });
-    return res.json({ success: true, data: { id: cancelled.id, status: cancelled.status } });
+    if (cancelled.error) return invalid(res, cancelled.error.status, cancelled.error.code, cancelled.error.message);
+    return res.json({ success: true, data: cancelled.payment });
   } catch (error) {
     return next(error);
   }
@@ -1394,7 +1396,27 @@ exports.completeSale = async (req, res, next) => {
     return invalid(res, 400, 'POS_IDEMPOTENCY_KEY_INVALID', 'Provide an Idempotency-Key between 8 and 100 supported characters.');
   }
   try {
-    await assertPaymentsV2(companyId, String(register.id));
+    try {
+      await assertPaymentsV2(companyId, String(register.id));
+    } catch (error) {
+      if (error?.code === 'POS_PAYMENT_FLOW_DISABLED') {
+        const pending = await dbClient().invoice.findFirst({
+          where: { id: saleId, companyId, posOrigin: true },
+          select: { posCheckoutPayload: true },
+        });
+        const savedCheckout = pending?.posCheckoutPayload;
+        if (savedCheckout?.offlineSnapshotCapability
+          && savedCheckout.offlinePaymentFlow === 'PAYMENTS_V2') {
+          return invalid(
+            res,
+            409,
+            'POS_OFFLINE_PAYMENT_FLOW_CHANGED',
+            'The POS payment flow changed after this sale was queued. The sale was not rerouted; review or retry it only after restoring its original payment flow.',
+          );
+        }
+      }
+      throw error;
+    }
     const invoice = await dbClient().invoice.findFirst({
       where: { id: saleId, companyId, posOrigin: true },
       select: {
@@ -1502,6 +1524,7 @@ exports.completeSale = async (req, res, next) => {
     bindPosUser(req, auth);
     req.body = {
       ...invoice.posCheckoutPayload,
+      displayTotal: invoice.posCheckoutPayload.displayTotal ?? total,
       clientId: invoice.clientId,
       registerId: register.code,
       deviceId: register.claimedDeviceId,
@@ -1559,6 +1582,7 @@ exports.completeSale = async (req, res, next) => {
     req.posV2Completion = {
       invoiceId: saleId,
       completionKey: key,
+      offlineOperationId: String(invoice.posCheckoutPayload?.offlineOperationId || '').trim() || null,
       manualMobileMoneyPaymentIds: payments
         .filter((payment) => ['MTN_MOMO', 'AIRTEL_MONEY'].includes(payment.method))
         .map((payment) => String(payment.id)),
@@ -2572,11 +2596,14 @@ exports.providerWebhook = async (req, res, next) => {
     : providerParam === 'AIRTEL' ? 'AIRTEL_MONEY'
       : providerParam;
   const companyId = String(req.params.companyId || '').trim();
-  const payload = req.body && typeof req.body === 'object' ? req.body : {};
+  const payload = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : null;
 
   try {
-    if (!['MTN_MOMO', 'AIRTEL_MONEY'].includes(provider) || !companyId) {
+    if (!['MTN_MOMO', 'AIRTEL_MONEY'].includes(provider) || !/^[a-f\d]{24}$/i.test(companyId)) {
       return invalid(res, 404, 'POS_PROVIDER_WEBHOOK_NOT_FOUND', 'Provider webhook was not found.');
+    }
+    if (!payload || Buffer.byteLength(JSON.stringify(payload), 'utf8') > 64 * 1024) {
+      return invalid(res, 400, 'POS_PROVIDER_WEBHOOK_PAYLOAD_INVALID', 'Webhook payload must be a JSON object no larger than 64 KB.');
     }
     const secretName = provider === 'MTN_MOMO'
       ? 'POS_MOMO_WEBHOOK_SECRET'
@@ -2591,37 +2618,60 @@ exports.providerWebhook = async (req, res, next) => {
       || req.get?.('X-Signature')
       || '',
     ).trim();
+    const timestamp = String(
+      req.get?.('X-Kubika-Webhook-Timestamp')
+      || req.get?.('X-Webhook-Timestamp')
+      || '',
+    ).trim();
     const signatureOk = posProviderEventService.verifyProviderWebhookSignature({
       provider,
       payload,
       signature,
       secret,
+      timestamp,
     });
-
-    let externalRef;
-    let providerTxId;
-    let amount;
-    if (provider === 'MTN_MOMO') {
-      externalRef = payload.externalId || payload.referenceId || req.get?.('X-Reference-Id') || '';
-      providerTxId = payload.financialTransactionId || payload.transactionId || '';
-      amount = Number(payload.amount);
-    } else {
-      externalRef = payload.transaction?.reference || payload.externalId || '';
-      providerTxId = payload.transaction?.id || payload.transactionId || '';
-      amount = Number(payload.transaction?.amount);
+    if (!signatureOk) {
+      return invalid(res, 401, 'POS_PROVIDER_WEBHOOK_SIGNATURE_INVALID', 'Webhook signature is invalid or its timestamp is outside the allowed five-minute window.');
     }
-    const normalizedAmount = Number.isSafeInteger(amount) ? amount : null;
-    const eventKey = String(providerTxId || externalRef || createHash('sha256')
-      .update(JSON.stringify(payload))
-      .digest('hex')).slice(0, 160);
+
+    let externalRefValue;
+    let providerTxIdValue;
+    let amountValue;
+    if (provider === 'MTN_MOMO') {
+      externalRefValue = payload.externalId || payload.referenceId || req.get?.('X-Reference-Id') || '';
+      providerTxIdValue = payload.financialTransactionId || payload.transactionId || '';
+      amountValue = payload.amount;
+    } else {
+      externalRefValue = payload.transaction?.reference || payload.externalId || '';
+      providerTxIdValue = payload.transaction?.id || payload.transactionId || '';
+      amountValue = payload.transaction?.amount;
+    }
+    const normalizeProviderReference = (value) => (
+      typeof value === 'string' || (typeof value === 'number' && Number.isSafeInteger(value))
+        ? String(value).trim()
+        : ''
+    );
+    const externalRef = normalizeProviderReference(externalRefValue);
+    const providerTxId = normalizeProviderReference(providerTxIdValue);
+    const amountIsInteger = (typeof amountValue === 'number' && Number.isSafeInteger(amountValue))
+      || (typeof amountValue === 'string' && /^\d+$/.test(amountValue.trim()));
+    const amount = amountIsInteger ? Number(amountValue) : Number.NaN;
+    if (!externalRef || externalRef.length > 160 || providerTxId.length > 160
+      || !Number.isSafeInteger(amount) || amount <= 0) {
+      return invalid(res, 400, 'POS_PROVIDER_WEBHOOK_PAYLOAD_INVALID', 'Webhook must include a payment reference and a positive whole-number amount; provider references may not exceed 160 characters.');
+    }
+    // Provider transaction/reference identity is the durable replay key. Do
+    // not synthesize an event ID from the payload: missing IDs must fail
+    // closed, and the database unique key serializes concurrent replays.
+    const eventKey = providerTxId || externalRef;
     const result = await posProviderEventService.recordProviderSuccess({
       companyId,
       provider,
       eventKey,
       externalRef: String(externalRef || ''),
       providerTxId: String(providerTxId || '').slice(0, 160),
-      amount: normalizedAmount,
-      signatureOk,
+      amount,
+      signatureOk: true,
     });
     return res.status(202).json({
       success: true,

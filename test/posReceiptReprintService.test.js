@@ -64,4 +64,25 @@ describe('POS signed receipt reprint audit', () => {
     expect(replay.replayed).toBe(true);
     expect(writePosAuditLog).toHaveBeenCalledTimes(1);
   });
+
+  test('rejects an unsigned fiscal submission before creating a copy or audit entry', async () => {
+    tx.ebmSubmissionQueue.findFirst.mockResolvedValue({
+      ...submission,
+      ebmStatus: 'pending',
+      signedAt: null,
+      fiscalResponse: null,
+    });
+
+    await expect(createReceiptCopy({
+      companyId: 'company-a', invoiceId: 'invoice-a', registerId: 'register-a', actorUserId: 'cashier-a',
+      idempotencyKey: 'receipt-copy-0002', reason: 'Customer needs a copy',
+    })).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'POS_EBM_REPRINT_UNSIGNED',
+      message: 'Only a signed fiscal receipt can be reprinted as a copy.',
+    });
+
+    expect(tx.posEbmReceiptReprint.create).not.toHaveBeenCalled();
+    expect(writePosAuditLog).not.toHaveBeenCalled();
+  });
 });

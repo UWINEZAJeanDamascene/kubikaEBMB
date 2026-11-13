@@ -12,6 +12,13 @@ jest.mock('../lib/prisma', () => ({
     posSession: {
       updateMany: jest.fn(),
     },
+    posDevice: {
+      findFirst: jest.fn(),
+      findMany: jest.fn(),
+      upsert: jest.fn(),
+      update: jest.fn(),
+      updateMany: jest.fn(),
+    },
     posRegisterAccess: {
       findMany: jest.fn(),
       deleteMany: jest.fn(),
@@ -30,6 +37,7 @@ jest.mock('../lib/prisma', () => ({
 }));
 
 const { prisma } = require('../lib/prisma');
+const { generateKeyPairSync } = require('crypto');
 const {
   activateRegister,
   deleteRegister,
@@ -41,6 +49,15 @@ const {
   revokeDevice,
   listRegisters,
 } = require('../controllers/posRegisterController');
+const enrollmentKeys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+const enrollmentPublicKey = enrollmentKeys.publicKey
+  .export({ type: 'spki', format: 'der' })
+  .toString('base64');
+const enrollmentPayload = {
+  deviceId: '77777777-7777-4777-8777-777777777777',
+  publicKey: enrollmentPublicKey,
+  appVersion: '0.0.1',
+};
 
 function createResponse() {
   return {
@@ -92,14 +109,23 @@ describe('POS register activation', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation((callback) => callback({
-      posRegister: { update: prisma.posRegister.update },
+      posRegister: {
+        update: prisma.posRegister.update,
+        updateMany: prisma.posRegister.updateMany,
+      },
       posSession: { updateMany: prisma.posSession.updateMany },
+      posDevice: {
+        findFirst: prisma.posDevice.findFirst,
+        upsert: prisma.posDevice.upsert,
+        updateMany: prisma.posDevice.updateMany,
+      },
       posRegisterAccess: {
         deleteMany: prisma.posRegisterAccess.deleteMany,
         createMany: prisma.posRegisterAccess.createMany,
         updateMany: prisma.posRegisterAccess.updateMany,
       },
-      posAuditLog: { create: prisma.posAuditLog.create },
+      $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
+      posAuditLog: { create: prisma.posAuditLog.create, findFirst: jest.fn().mockResolvedValue(null) },
     }));
     prisma.posRegister.findFirst.mockResolvedValue(register);
     prisma.posRegister.update.mockImplementation(async ({ data }) => ({ ...register, ...data }));
@@ -107,9 +133,15 @@ describe('POS register activation', () => {
   });
 
   test('issues a one-time device token and stores only its SHA-256 hash', async () => {
-    const req = { user: { company: { _id: companyId } }, params: { registerId } };
+    const req = {
+      user: { company: { _id: companyId } },
+      params: { registerId },
+      body: enrollmentPayload,
+    };
     const res = createResponse();
 
+    prisma.posDevice.findFirst.mockResolvedValue(null);
+    prisma.posDevice.upsert.mockImplementation(async ({ create, update }) => ({ ...create, ...update }));
     await activateRegister(req, res, (error) => { throw error; });
 
     const { deviceToken } = res.body;
@@ -124,6 +156,16 @@ describe('POS register activation', () => {
       data: expect.objectContaining({
         deviceTokenHash: expect.any(String),
         lastSeenAt: expect.any(Date),
+      }),
+    }));
+    expect(prisma.posDevice.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: { companyId_deviceId: { companyId, deviceId: enrollmentPayload.deviceId } },
+      create: expect.objectContaining({
+        companyId,
+        registerId,
+        deviceId: enrollmentPayload.deviceId,
+        publicKey: enrollmentPublicKey,
+        status: 'active',
       }),
     }));
     const storedHash = prisma.posRegister.update.mock.calls[0][0].data.deviceTokenHash;
@@ -141,13 +183,36 @@ describe('POS register activation', () => {
 
   test('does not activate a register from another company or an inactive register', async () => {
     prisma.posRegister.findFirst.mockResolvedValue(null);
-    const req = { user: { company: { _id: companyId } }, params: { registerId } };
+    const req = {
+      user: { company: { _id: companyId } },
+      params: { registerId },
+      body: enrollmentPayload,
+    };
     const res = createResponse();
 
     await activateRegister(req, res, (error) => { throw error; });
 
     expect(res.statusCode).toBe(404);
     expect(res.body).not.toHaveProperty('deviceToken');
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['public key', { publicKey: 'not-a-public-key' }, 400, 'POS_DEVICE_PUBLIC_KEY_INVALID'],
+    ['app version', { appVersion: '0.0.2' }, 409, 'POS_SYNC_VERSION_UNSUPPORTED'],
+  ])('rejects an invalid enrollment %s before changing the register', async (_name, override, status, code) => {
+    const req = {
+      user: { company: { _id: companyId } },
+      params: { registerId },
+      body: { ...enrollmentPayload, ...override },
+    };
+    const res = createResponse();
+
+    await activateRegister(req, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(status);
+    expect(res.body.code).toBe(code);
+    expect(prisma.posRegister.findFirst).not.toHaveBeenCalled();
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 });
@@ -205,7 +270,8 @@ describe('POS register cashier access management', () => {
         updateMany: prisma.posRegisterAccess.updateMany,
       },
       posSession: { updateMany: prisma.posSession.updateMany },
-      posAuditLog: { create: prisma.posAuditLog.create },
+      $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
+      posAuditLog: { create: prisma.posAuditLog.create, findFirst: jest.fn().mockResolvedValue(null) },
     }));
     prisma.posRegisterAccess.deleteMany.mockResolvedValue({ count: 1 });
     prisma.posRegisterAccess.createMany.mockResolvedValue({ count: 1 });
@@ -359,11 +425,13 @@ describe('POS register deletion with retained history', () => {
     prisma.$transaction.mockImplementation((callback) => callback({
       posRegister: { update: prisma.posRegister.update },
       posSession: { updateMany: prisma.posSession.updateMany },
+      posDevice: { updateMany: prisma.posDevice.updateMany },
       posRegisterAccess: {
         deleteMany: prisma.posRegisterAccess.deleteMany,
         createMany: prisma.posRegisterAccess.createMany,
       },
-      posAuditLog: { create: prisma.posAuditLog.create },
+      $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
+      posAuditLog: { create: prisma.posAuditLog.create, findFirst: jest.fn().mockResolvedValue(null) },
     }));
     prisma.posRegister.findFirst.mockResolvedValue(register);
     prisma.tillSession.findFirst.mockResolvedValue(null);
@@ -402,6 +470,34 @@ describe('POS register deletion with retained history', () => {
     expect(res.body.code).toBe('POS_REGISTER_SHIFT_OPEN');
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
+
+  test('revokes and requests a safe wipe when deleting a register with an enrolled device', async () => {
+    prisma.posRegister.findFirst.mockResolvedValue({
+      ...register,
+      claimedDeviceId: enrollmentPayload.deviceId,
+    });
+    const req = {
+      user: { id: 'manager-1', company: { _id: companyId } },
+      params: { registerId },
+    };
+    const res = createResponse();
+
+    await deleteRegister(req, res, (error) => { throw error; });
+
+    expect(prisma.posDevice.updateMany).toHaveBeenCalledWith({
+      where: {
+        companyId,
+        registerId,
+        deviceId: enrollmentPayload.deviceId,
+        status: { not: 'revoked' },
+      },
+      data: {
+        status: 'revoked',
+        wipeRequestedAt: expect.any(Date),
+        wipeAcknowledgedAt: null,
+      },
+    });
+  });
 });
 
 describe('POS register one-time pairing codes', () => {
@@ -433,15 +529,31 @@ describe('POS register one-time pairing codes', () => {
     prisma.posSession.updateMany.mockResolvedValue({ count: 1 });
     prisma.posAuditLog.create.mockResolvedValue({});
     prisma.$transaction.mockImplementation((callback) => callback({
-      posRegister: { update: prisma.posRegister.update },
+      posRegister: {
+        update: prisma.posRegister.update,
+        updateMany: prisma.posRegister.updateMany,
+      },
       posSession: { updateMany: prisma.posSession.updateMany },
-      posAuditLog: { create: prisma.posAuditLog.create },
+      posDevice: {
+        findFirst: prisma.posDevice.findFirst,
+        upsert: prisma.posDevice.upsert,
+      },
+      $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
+      posAuditLog: { create: prisma.posAuditLog.create, findFirst: jest.fn().mockResolvedValue(null) },
     }));
   });
 
   function request(code = claimCode, company = companyId) {
-    return { user: { company: { _id: company } }, body: { deviceId, claimCode: code } };
+    return {
+      user: { company: { _id: company } },
+      body: { ...enrollmentPayload, deviceId, claimCode: code },
+    };
   }
+
+  beforeEach(() => {
+    prisma.posDevice.findFirst.mockResolvedValue(null);
+    prisma.posDevice.upsert.mockImplementation(async ({ create, update }) => ({ ...create, ...update }));
+  });
 
   test('claims a code once, returns a device token once, and stores only its hash', async () => {
     const res = createResponse();

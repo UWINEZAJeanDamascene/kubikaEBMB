@@ -29,6 +29,7 @@ const {
 } = require("../utils/creditNoteAccounting");
 const { resolveOriginalUnitCost } = require("../utils/creditNoteCost");
 const { generateObjectId, toIdString } = require("../utils/objectId");
+const { writePosAuditLog, requestIp } = require('../services/posAuditService');
 
 const EBMSalesService = require("../services/ebmSalesService");
 const { emitDataChanged } = require("../lib/realtimeEvents");
@@ -450,7 +451,35 @@ exports.createCreditNote = async (req, res, next) => {
     payload.taxAmount = lineArray.reduce((sum, line) => sum + line.lineTax, 0);
     payload.totalAmount = lineArray.reduce((sum, line) => sum + line.lineTotal, 0);
 
-    const note = await CreditNote.create(payload);
+    const isPosRefundDraft = req.body.posOrigin === true;
+    let note;
+    if (isPosRefundDraft) {
+      // Draft creation is not a posted refund, but it is the first step in the
+      // POS refund workflow. Keep its audit event atomic with the draft so a
+      // committed draft can never be missing its origin/action record.
+      const { runInTransaction } = require('../services/transactionService');
+      note = await runInTransaction(async (tx) => {
+        const created = await CreditNote.create(payload);
+        await writePosAuditLog({
+          companyId: String(companyId),
+          registerId: req.posAuthContext?.register?.id || req.posAuthContext?.session?.registerId || null,
+          userId: String(req.user.id),
+          event: 'POS_REFUND_DRAFT_CREATED',
+          metadata: {
+            creditNoteId: created.id || created._id,
+            invoiceId: invoice.id || invoice._id,
+            referenceNo: created.referenceNo || null,
+            amount: Number(created.totalAmount ?? payload.totalAmount),
+            lineCount: lineArray.length,
+            reason: String(payload.reason || '').slice(0, 500),
+          },
+          ip: requestIp(req),
+        }, tx);
+        return created;
+      });
+    } else {
+      note = await CreditNote.create(payload);
+    }
 
     // If model pre-save didn't compute totals for some reason, ensure totals persist
     try {
@@ -1259,6 +1288,26 @@ exports.recordRefund = async (req, res, next) => {
           notes: 'Credit note refund to customer',
           journalEntryId: journalEntry._id,
         });
+      }
+      if (note.posOrigin) {
+        await writePosAuditLog({
+          companyId,
+          registerId: refundTill?.registerId || note.registerId || null,
+          userId: req.user.id || req.user._id,
+          event: 'POS_REFUND_PAYOUT_RECORDED',
+          metadata: {
+            creditNoteId: String(note._id),
+            invoiceId: String(note.invoice?._id || note.invoice || ''),
+            refundId,
+            amount: refundAmount,
+            method: normalizedMethod,
+            arAmount: refundFromAR,
+            customerCreditAmount: refundFromCustomerCredit,
+            shiftId: activePosShift ? String(activePosShift) : null,
+            approvalId: req.body.posManagerApprovalId || null,
+          },
+          ip: requestIp(req),
+        }, dbClient());
       }
       return { replayed: false };
     });
@@ -2246,6 +2295,30 @@ exports.confirmCreditNote = async (req, res, next) => {
           dbClient(), preparedV2Refund, { userId: req.user.id || req.user._id },
         );
         v2RefundOutboxId = String(queued.id);
+      }
+      if (creditNote.posOrigin) {
+        const refundAmount = Number(creditNote.totalAmount || creditNote.grandTotal || creditNote.total || 0);
+        await writePosAuditLog({
+          companyId,
+          registerId: invoice.registerId || null,
+          userId: req.user.id || req.user._id,
+          event: 'POS_REFUND_COMPLETED',
+          metadata: {
+            creditNoteId: String(creditNote._id),
+            creditNoteNumber: String(creditNote.creditNoteNumber || creditNote.referenceNo || ''),
+            invoiceId: String(invoice._id),
+            invoiceNumber: String(invoice.invoiceNumber || invoice.referenceNo || ''),
+            amount: refundAmount,
+            reason: String(creditNote.reason || creditNote.description || req.body.reason || ''),
+            itemCount: lineArray.length,
+            returnedQuantity: lineArray.reduce((sum, line) => sum + Number(line.quantity || 0), 0),
+            returnDispositions: [...new Set(lineArray.map((line) => String(line.returnDisposition || 'restock')))],
+            shiftId: invoice.shiftId || null,
+            fiscalSubmissionId: v2RefundOutboxId,
+            approvedBy: req.body.posManagerApprovalId ? 'manager_approval_consumed' : null,
+          },
+          ip: requestIp(req),
+        }, dbClient());
       }
       console.log("DEBUG: Credit note saved successfully");
     });

@@ -1,10 +1,12 @@
 jest.mock('../lib/prisma', () => ({
   prisma: {
     posRegister: { findFirst: jest.fn() },
+    posDevice: { findFirst: jest.fn() },
     posUserCredential: { findUnique: jest.fn() },
     posRegisterAccess: { update: jest.fn(), findFirst: jest.fn() },
     posSession: {
       findFirst: jest.fn(),
+      update: jest.fn(async ({ where, data }) => ({ id: where.id, ...data })),
       updateMany: jest.fn(),
     },
     user: { findFirst: jest.fn() },
@@ -23,6 +25,12 @@ jest.mock('../services/posPinService', () => {
   const actual = jest.requireActual('../services/posPinService');
   return { ...actual, verifyPin: jest.fn(actual.verifyPin) };
 });
+jest.mock('../services/posSyncOperationContract', () => ({
+  verifyOperationSignature: jest.fn(),
+}));
+jest.mock('../services/posOfflineCapabilityService', () => ({
+  verifyCapability: jest.fn(),
+}));
 
 const { createHash } = require('crypto');
 const jwt = require('jsonwebtoken');
@@ -35,8 +43,12 @@ const {
   switchCashier,
   logout,
   me,
+  reportOfflinePinAttempts,
+  refreshSessionToken,
 } = require('../controllers/posAuthController');
 const { hashPin, verifyPin } = require('../services/posPinService');
+const { verifyOperationSignature } = require('../services/posSyncOperationContract');
+const { verifyCapability } = require('../services/posOfflineCapabilityService');
 const env = require('../src/config/environment');
 
 const COMPANY_ID = '507f1f77bcf86cd799439011';
@@ -64,6 +76,7 @@ function createResponse() {
 
 function request({ body = {}, sessionToken, headers = {} } = {}) {
   return {
+    ip: '192.0.2.44',
     body,
     headers: {
       ...(sessionToken ? { authorization: `Bearer ${sessionToken}` } : {}),
@@ -81,6 +94,7 @@ function createTx() {
   };
   return {
     access,
+    $queryRaw: jest.fn(async () => []),
     $queryRawUnsafe: jest.fn(async () => [{ ...access }]),
     posUserCredential: {
       findUnique: jest.fn(async () => ({ pinHash: global.pinHashForPosTests, mustChange: false })),
@@ -92,13 +106,23 @@ function createTx() {
       findUnique: jest.fn(async () => ({ posSingleRegisterSession: true, posRolePermissions: {} })),
     },
     posSession: {
+      findFirst: jest.fn(),
       updateMany: jest.fn(async () => ({ count: 1 })),
+      update: jest.fn(async ({ where, data }) => ({ id: where.id, ...data })),
       create: jest.fn(async ({ data }) => data),
     },
     posAuditLog: {
       create: jest.fn(async ({ data }) => data),
+      findFirst: jest.fn(async () => null),
     },
+    $executeRawUnsafe: jest.fn(async () => 1),
   };
+}
+
+function auditRows(client, event) {
+  return client.posAuditLog.create.mock.calls
+    .map(([argument]) => argument.data)
+    .filter((row) => row.event === event);
 }
 
 describe('POS authentication endpoints', () => {
@@ -129,6 +153,7 @@ describe('POS authentication endpoints', () => {
       branchId: null,
       isActive: true,
       deviceTokenHash: DEVICE_TOKEN_HASH,
+      claimedDeviceId: 'device-1',
     };
     cashier = {
       id: CASHIER_ID,
@@ -151,6 +176,7 @@ describe('POS authentication endpoints', () => {
     };
 
     prisma.posRegister.findFirst.mockResolvedValue(register);
+    prisma.posDevice.findFirst.mockResolvedValue({ deviceId: 'device-1', status: 'active', publicKey: 'test-key' });
     prisma.user.findFirst.mockImplementation(async ({ where }) => (
       where.id === SECOND_CASHIER_ID
         ? { ...cashier, id: SECOND_CASHIER_ID, name: 'Cashier Two' }
@@ -161,6 +187,7 @@ describe('POS authentication endpoints', () => {
       where.id === session.id && where.status.in.includes(session.status) ? session : null
     ));
     const updateSession = async ({ where, data }) => {
+      if (where.registerId?.not) return { count: 0 };
       if (where.id && where.id !== session.id) return { count: 0 };
       if (typeof where.status === 'string' && where.status !== session.status) return { count: 0 };
       if (where.status?.in && !where.status.in.includes(session.status)) return { count: 0 };
@@ -174,9 +201,18 @@ describe('POS authentication endpoints', () => {
     prisma.posRegisterAccess.findFirst.mockResolvedValue(null);
     prisma.systemSettings.findUnique.mockResolvedValue({ posRolePermissions: {} });
     resolveUserRoles.mockResolvedValue([]);
+    verifyOperationSignature.mockReturnValue(true);
+    verifyCapability.mockReturnValue({
+      companyId: COMPANY_ID,
+      deviceId: 'device-1',
+      registerId: REGISTER_ID,
+      userId: CASHIER_ID,
+      issuedAt: Date.now() - 60_000,
+      expiresAt: Date.now() + 60_000,
+    });
   });
 
-  test('PIN login creates a 12-hour POS session and returns no PIN/hash data', async () => {
+  test('PIN login creates a short-lived POS access token with a rotating refresh credential', async () => {
     const res = createResponse();
     await pinLogin(request({ body: { registerId: REGISTER_ID, userId: CASHIER_ID, pin: PIN } }), res, (error) => { throw error; });
 
@@ -191,16 +227,56 @@ describe('POS authentication endpoints', () => {
       sid: res.body.data.session.id,
     });
 
-    expect(token.exp - token.iat).toBe(12 * 60 * 60);
+    expect(token.exp - token.iat).toBe(15 * 60);
+    expect(res.body.data.refreshToken).toBeTruthy();
+    expect(res.body.data.refreshExpiresAt).toBeTruthy();
     expect(JSON.stringify(res.body)).not.toContain(PIN);
     expect(JSON.stringify(res.body)).not.toContain(global.pinHashForPosTests);
     expect(tx.posRegisterAccess.update).toHaveBeenCalledWith({
       where: { id: tx.access.id },
-      data: { failedPinAttempts: 0, pinLockedUntil: null },
+      data: { failedPinAttempts: 0, pinLockedUntil: null, pinLockoutCount: 0 },
     });
     expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'PIN_LOGIN_SUCCESS', userId: CASHIER_ID }),
     }));
+    expect(auditRows(tx, 'PIN_LOGIN_SUCCESS')).toHaveLength(1);
+    expect(auditRows(tx, 'PIN_LOGIN_SUCCESS')[0]).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: CASHIER_ID,
+      ip: '192.0.2.44',
+      metadata: expect.objectContaining({ sessionId: res.body.data.session.id, deviceId: 'device-1' }),
+    });
+    expect(auditRows(tx, 'PIN_LOGIN_SUCCESS')[0].metadata).not.toHaveProperty('deviceToken');
+    expect(auditRows(tx, 'PIN_LOGIN_SUCCESS')[0].metadata).not.toHaveProperty('token');
+  });
+
+  test('rotates refresh tokens once and rejects reuse of the previous token', async () => {
+    const { createPosSessionTokens } = require('../services/posSessionTokenService');
+    const initial = createPosSessionTokens(session);
+    session.refreshTokenHash = initial.refreshTokenHash;
+    session.refreshExpiresAt = initial.refreshExpiresAt;
+    tx.posSession.findFirst.mockImplementation(async ({ where }) => (
+      where.id === session.id && where.companyId === COMPANY_ID && where.registerId === REGISTER_ID
+        ? session
+        : null
+    ));
+    const req = request({ body: { registerId: REGISTER_ID, refreshToken: initial.refreshToken } });
+    req.posRegister = register;
+
+    const firstResponse = createResponse();
+    await refreshSessionToken(req, firstResponse, (error) => { throw error; });
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(firstResponse.body.data.refreshToken).not.toBe(initial.refreshToken);
+    expect(session.refreshTokenHash).not.toBe(initial.refreshTokenHash);
+    expect(auditRows(tx, 'SESSION_TOKEN_REFRESHED')).toHaveLength(1);
+
+    const replayResponse = createResponse();
+    await refreshSessionToken(req, replayResponse, (error) => { throw error; });
+    expect(replayResponse.statusCode).toBe(401);
+    expect(replayResponse.body.code).toBe('POS_REFRESH_TOKEN_INVALID');
+    expect(auditRows(tx, 'SESSION_TOKEN_REFRESHED')).toHaveLength(1);
   });
 
   test('compares the PIN after the access-row transaction has closed', async () => {
@@ -235,9 +311,40 @@ describe('POS authentication endpoints', () => {
     expect(tx.access.failedPinAttempts).toBe(1);
     expect(tx.posSession.create).not.toHaveBeenCalled();
     expect(JSON.stringify(res.body)).not.toContain('4826');
-    expect(prisma.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+    expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'PIN_LOGIN_FAILED', userId: CASHIER_ID }),
     }));
+    expect(auditRows(tx, 'PIN_LOGIN_FAILED')).toHaveLength(1);
+    expect(auditRows(tx, 'PIN_LOGIN_FAILED')[0]).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: CASHIER_ID,
+      ip: '192.0.2.44',
+      metadata: expect.objectContaining({ flow: 'pin_login', deviceId: 'device-1' }),
+    });
+    expect(auditRows(tx, 'PIN_LOGIN_SUCCESS')).toHaveLength(0);
+  });
+
+  test('audits a cashier-unavailable denial once with trusted register and device context', async () => {
+    prisma.user.findFirst.mockResolvedValue(null);
+    const res = createResponse();
+
+    await pinLogin(request({ body: { registerId: REGISTER_ID, userId: CASHIER_ID, pin: PIN } }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(401);
+    expect(auditRows(tx, 'PIN_LOGIN_FAILED')).toHaveLength(1);
+    expect(auditRows(tx, 'PIN_LOGIN_FAILED')[0]).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: null,
+      ip: '192.0.2.44',
+      metadata: expect.objectContaining({
+        flow: 'pin_login',
+        reason: 'POS_CASHIER_UNAVAILABLE',
+        deviceId: 'device-1',
+      }),
+    });
+    expect(tx.posSession.create).not.toHaveBeenCalled();
   });
 
   test('locks after five failures and refuses attempts during the lock period', async () => {
@@ -247,9 +354,18 @@ describe('POS authentication endpoints', () => {
     expect(failed.statusCode).toBe(423);
     expect(failed.body.code).toBe('POS_PIN_LOCKED');
     expect(tx.access.failedPinAttempts).toBe(5);
-    expect(prisma.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+    expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'PIN_LOCKOUT', userId: CASHIER_ID }),
     }));
+    expect(auditRows(tx, 'PIN_LOGIN_FAILED')).toHaveLength(1);
+    expect(auditRows(tx, 'PIN_LOCKOUT')).toHaveLength(1);
+    expect(auditRows(tx, 'PIN_LOCKOUT')[0]).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: CASHIER_ID,
+      ip: '192.0.2.44',
+      metadata: expect.objectContaining({ flow: 'pin_login', deviceId: 'device-1' }),
+    });
 
     tx.posUserCredential.findUnique.mockClear();
     const locked = createResponse();
@@ -265,6 +381,8 @@ describe('POS authentication endpoints', () => {
     expect(res.statusCode).toBe(401);
     expect(res.body.code).toBe('POS_DEVICE_INVALID');
     expect(prisma.$transaction).not.toHaveBeenCalled();
+    // No tenant audit row is attributed from a device token that failed validation.
+    expect(tx.posAuditLog.create).not.toHaveBeenCalled();
   });
 
   async function createSessionToken() {
@@ -290,6 +408,32 @@ describe('POS authentication endpoints', () => {
     expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'SESSION_UNLOCKED' }),
     }));
+    expect(auditRows(tx, 'SESSION_LOCKED')).toHaveLength(1);
+    expect(auditRows(tx, 'SESSION_UNLOCKED')).toHaveLength(1);
+    expect(auditRows(tx, 'SESSION_LOCKED')[0]).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: CASHIER_ID,
+      ip: '192.0.2.44',
+      metadata: expect.objectContaining({ sessionId: session.id, deviceId: 'device-1' }),
+    });
+  });
+
+  test('does not write a successful lock event when the session transition loses a race', async () => {
+    tx.posSession.updateMany.mockResolvedValueOnce({ count: 0 });
+    const req = request();
+    req.posAuthContext = {
+      session,
+      register,
+      user: cashier,
+      company,
+    };
+    const res = createResponse();
+
+    await lock(req, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(409);
+    expect(auditRows(tx, 'SESSION_LOCKED')).toHaveLength(0);
   });
 
   test('allows a configured POS approver to unlock with their own PIN', async () => {
@@ -334,9 +478,26 @@ describe('POS authentication endpoints', () => {
     expect(session.endReason).toBe('SWITCHED');
     expect(res.body.data.session.user.id).toBe(SECOND_CASHIER_ID);
     expect(res.body.data.sessionToken).toBeTruthy();
+    expect(res.body.data.refreshToken).toBeTruthy();
+    expect(res.body.data.refreshExpiresAt).toBeTruthy();
     expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'CASHIER_SWITCHED' }),
     }));
+    expect(auditRows(tx, 'SESSION_ENDED')).toHaveLength(1);
+    expect(auditRows(tx, 'CASHIER_SWITCHED')).toHaveLength(1);
+    expect(auditRows(tx, 'SESSION_ENDED')[0]).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: CASHIER_ID,
+      ip: '192.0.2.44',
+      metadata: expect.objectContaining({ sessionId: session.id, reason: 'SWITCHED', deviceId: 'device-1' }),
+    });
+    expect(auditRows(tx, 'CASHIER_SWITCHED')[0].metadata).toMatchObject({
+      fromUserId: CASHIER_ID,
+      toUserId: SECOND_CASHIER_ID,
+      sessionId: '507f1f77bcf86cd799439017',
+      deviceId: 'device-1',
+    });
   });
 
   test('logout ends the POS session while leaving till state untouched', async () => {
@@ -349,6 +510,21 @@ describe('POS authentication endpoints', () => {
     expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'SESSION_ENDED' }),
     }));
+    expect(auditRows(tx, 'SESSION_ENDED')).toHaveLength(1);
+    expect(auditRows(tx, 'SESSION_ENDED')[0]).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: CASHIER_ID,
+      ip: '192.0.2.44',
+      metadata: expect.objectContaining({ sessionId: session.id, reason: 'LOGOUT', deviceId: 'device-1' }),
+    });
+
+    const repeated = createResponse();
+    const repeatedRequest = request({ sessionToken: token });
+    repeatedRequest.posAuthContext = { session, register, user: cashier, company };
+    await logout(repeatedRequest, repeated, (error) => { throw error; });
+    expect(repeated.statusCode).toBe(409);
+    expect(auditRows(tx, 'SESSION_ENDED')).toHaveLength(1);
   });
 
   test('me returns custom-role POS permissions and sanitized identity', async () => {
@@ -398,12 +574,57 @@ describe('POS authentication endpoints', () => {
     await me(request({ sessionToken: await createSessionToken() }), res, (error) => { throw error; });
 
     expect(res.body.data.permissions).toEqual(expect.arrayContaining([
-      'pos.shift.open',
-      'pos.shift.close',
+      'pos.till.open_shift',
+      'pos.till.close_shift',
       'pos.report.history',
       'pos.report.z',
-      'pos.shift.settings',
+      'pos.admin.roles',
     ]));
+  });
+
+  test('reports signed offline PIN failures into server lockout state idempotently', async () => {
+    const reportId = 'c7d8f250-0ef0-43a7-b9b2-0fc154e986d1';
+    const failedAt = new Date().toISOString();
+    const req = request({
+      body: {
+        reports: [{
+          reportId,
+          companyId: COMPANY_ID,
+          deviceId: 'device-1',
+          registerId: REGISTER_ID,
+          userId: CASHIER_ID,
+          failedAt,
+          authCapability: 'signed-auth-capability',
+          signature: 'device-signature',
+        }],
+      },
+    });
+    req.posDevice = { companyId: COMPANY_ID, deviceId: 'device-1', publicKey: 'device-public-key' };
+    req.posRegister = { id: REGISTER_ID };
+    const res = createResponse();
+
+    await reportOfflinePinAttempts(req, res, (error) => { throw error; });
+
+    expect(res.body).toEqual({ success: true, data: { acceptedReportIds: [reportId] } });
+    expect(verifyOperationSignature).toHaveBeenCalledWith(
+      expect.objectContaining({ reportId, signature: 'device-signature' }),
+      'device-public-key',
+    );
+    expect(tx.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE pos_register_access'),
+      1,
+      null,
+      0,
+      COMPANY_ID,
+      REGISTER_ID,
+      CASHIER_ID,
+    );
+    expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        event: 'PIN_LOGIN_FAILED',
+        metadata: expect.objectContaining({ flow: 'offline_pin_sync', reportId }),
+      }),
+    }));
   });
 
   test('a locked or ended session cannot be used to call session endpoints', async () => {

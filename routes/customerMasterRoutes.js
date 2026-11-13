@@ -5,6 +5,7 @@ const router = express.Router();
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
 const controller = require('../controllers/customerMasterController');
+const { idempotentHandler } = require('../services/posIdempotencyService');
 
 router.use(protect);
 
@@ -14,7 +15,11 @@ router.get('/', requirePermission('clients', 'read'), controller.search);
 router.post('/quick-add', requirePermission('clients', 'create'), controller.quickAdd);
 router.post('/', requirePermission('clients', 'create'), controller.create);
 router.get('/:id/ledgers', requirePermission('clients', 'read'), controller.ledgers);
-router.post('/:id/loyalty-adjustments', requirePermission('clients', 'update'), controller.adjustLoyalty);
+router.post(
+  '/:id/loyalty-adjustments',
+  requirePermission('clients', 'update'),
+  idempotentHandler(controller.adjustLoyalty, { namespace: 'customer-ledger' }),
+);
 router.post('/:id/marketing-message', requirePermission('clients', 'update'), controller.sendMarketingMessage);
 router.get('/:id', requirePermission('clients', 'read'), controller.get);
 router.put('/:id', requirePermission('clients', 'update'), controller.update);

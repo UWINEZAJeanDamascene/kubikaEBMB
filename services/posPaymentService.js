@@ -170,11 +170,10 @@ function normalizeWriteOffApprovalThresholds(value) {
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw paymentError('POS_PAYMENT_SETTINGS_INVALID', 'writeOffApprovalThresholdByTillType must be an object.');
   }
-  const allowedTypes = new Set(DEFAULT_SYSTEM_TILL_TYPES);
   const entries = Object.entries(value);
-  const unknownType = entries.find(([type]) => !allowedTypes.has(String(type).trim().toLowerCase()));
-  if (unknownType) {
-    throw paymentError('POS_PAYMENT_SETTINGS_INVALID', `Unsupported system till type for write-off approval: ${unknownType[0]}.`);
+  const invalidType = entries.find(([type]) => !/^[a-z][a-z0-9_-]{0,39}$/i.test(String(type).trim()));
+  if (invalidType) {
+    throw paymentError('POS_PAYMENT_SETTINGS_INVALID', `Invalid system till type for write-off approval: ${invalidType[0]}.`);
   }
   return Object.fromEntries(entries.map(([type, threshold]) => {
     if (!Number.isSafeInteger(threshold) || threshold < 0) {
@@ -620,7 +619,11 @@ async function savePaymentSettings({ companyId, settings, userId, registerId, ip
     const previousSettings = normalizeSettings(beforeRow);
     const activeRegisters = registers.filter((register) => register.isActive);
     const accountingScopes = [
-      ...DEFAULT_SYSTEM_TILL_TYPES.map((tillType) => ({ tillType })),
+      ...[...new Set([
+        ...DEFAULT_SYSTEM_TILL_TYPES,
+        ...Object.keys(normalized.methodRegistry.tillTypeOverrides),
+        ...activeRegisters.map((register) => String(register.systemTillType || 'retail').toLowerCase()),
+      ])].map((tillType) => ({ tillType })),
       ...activeRegisters.map((register) => ({
         registerId: String(register.id),
         tillType: String(register.systemTillType || 'retail'),

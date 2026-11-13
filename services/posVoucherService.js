@@ -6,7 +6,7 @@ const { dbClient } = require('../lib/prisma');
 const { runInTransaction } = require('./transactionService');
 const { generateObjectId } = require('../utils/objectId');
 const { calculatePosPricing } = require('./posPricingAllocationService');
-const { writePosAuditLog } = require('./posAuditService');
+const { writePosAuditLog, writePosDenialAudit } = require('./posAuditService');
 
 const CODE_PATTERN = /^[A-Z0-9-]{8,50}$/;
 const VOUCHER_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -144,7 +144,8 @@ async function writeAudit(companyId, userId, event, metadata = {}, client) {
     event,
     metadata,
   };
-  await (client ? writePosAuditLog(entry, client) : writePosAuditLog(entry));
+  const writer = event === 'VOUCHER_INVALID_ATTEMPT' ? writePosDenialAudit : writePosAuditLog;
+  await (client ? writer(entry, client) : writer(entry));
 }
 
 async function getVoucher(companyId, voucherId, client = dbClient()) {
@@ -210,12 +211,10 @@ async function createVouchers(companyId, userId, input, count = 1) {
     for (const record of records) {
       created.push(await tx.posVoucher.create({ data: record.data }));
     }
+    await writeAudit(companyId, userId, bulk ? 'VOUCHER_BULK_GENERATED' : 'VOUCHER_CREATED', {
+      count, batchId, voucherIds: created.map((row) => row.id),
+    }, tx);
     return created;
-  });
-  await writeAudit(companyId, userId, bulk ? 'VOUCHER_BULK_GENERATED' : 'VOUCHER_CREATED', {
-    count,
-    batchId,
-    voucherIds: rows.map((row) => row.id),
   });
   return rows.map((row, index) => ({ voucher: voucherApi(row), code: records[index].code }));
 }
@@ -486,11 +485,20 @@ async function updateVoucherSettings(companyId, userId, input) {
     || !Number.isSafeInteger(settings.lockoutMinutes) || settings.lockoutMinutes < 1 || settings.lockoutMinutes > 60) {
     throw Object.assign(new Error('Voucher limits must be valid whole numbers within the allowed ranges.'), { code: 'POS_VOUCHER_SETTINGS_INVALID' });
   }
-  await dbClient().systemSettings.update({
-    where: { companyId: String(companyId) },
-    data: { posVoucherSettings: settings },
+  await dbClient().$transaction(async (tx) => {
+    const before = await tx.systemSettings.findUnique({
+      where: { companyId: String(companyId) },
+      select: { posVoucherSettings: true },
+    });
+    await tx.systemSettings.update({
+      where: { companyId: String(companyId) },
+      data: { posVoucherSettings: settings },
+    });
+    await writeAudit(companyId, userId, 'VOUCHER_SETTINGS_UPDATED', {
+      before: before?.posVoucherSettings || null,
+      after: settings,
+    }, tx);
   });
-  await writeAudit(companyId, userId, 'VOUCHER_SETTINGS_UPDATED', settings);
   return settings;
 }
 
@@ -697,17 +705,17 @@ async function reserveVoucher(companyId, cashierId, { code, cartInput, productsB
         },
       });
     }
+    await tx.posVoucherCodeAttempt.updateMany({
+      where: { companyId: String(companyId), cashierId: String(cashierId) },
+      data: { attemptCount: 0, lockedUntil: null, windowStartedAt: now },
+    });
+    await writeAudit(companyId, cashierId, 'VOUCHER_RESERVED', {
+      voucherId: voucher.id,
+      redemptionId: created.id,
+      discountRwf: currentDiscount,
+      expiresAt: created.expiresAt,
+    }, tx);
     return created;
-  });
-  await dbClient().posVoucherCodeAttempt.updateMany({
-    where: { companyId: String(companyId), cashierId: String(cashierId) },
-    data: { attemptCount: 0, lockedUntil: null, windowStartedAt: now },
-  });
-  await writeAudit(companyId, cashierId, 'VOUCHER_RESERVED', {
-    voucherId: voucher.id,
-    redemptionId: redemption.id,
-    discountRwf,
-    expiresAt: redemption.expiresAt,
   });
   return {
     reservationToken: token,
@@ -724,18 +732,20 @@ async function reserveVoucher(companyId, cashierId, { code, cartInput, productsB
 async function releaseReservation(companyId, cashierId, input) {
   const tokens = (Array.isArray(input) ? input : [input]).map((token) => String(token || '').trim()).filter(Boolean);
   if (!tokens.length) throw Object.assign(new Error('Provide at least one voucher reservation token.'), { code: 'POS_VOUCHER_RESERVATION_NOT_FOUND' });
-  const rows = await dbClient().posVoucherRedemption.updateMany({
-    where: {
-      companyId: String(companyId),
-      cashierId: String(cashierId),
-      reservationTokenHash: { in: tokens.map(hash) },
-      status: 'RESERVED',
-      invoiceId: null,
-    },
-    data: { status: 'RELEASED' },
+  await runInTransaction(async (tx) => {
+    const rows = await tx.posVoucherRedemption.updateMany({
+      where: {
+        companyId: String(companyId),
+        cashierId: String(cashierId),
+        reservationTokenHash: { in: tokens.map(hash) },
+        status: 'RESERVED',
+        invoiceId: null,
+      },
+      data: { status: 'RELEASED' },
+    });
+    if (rows.count !== tokens.length) throw Object.assign(new Error('One or more active voucher reservations were not found.'), { code: 'POS_VOUCHER_RESERVATION_NOT_FOUND' });
+    await writeAudit(companyId, cashierId, 'VOUCHER_RESERVATION_RELEASED', { count: rows.count }, tx);
   });
-  if (rows.count !== tokens.length) throw Object.assign(new Error('One or more active voucher reservations were not found.'), { code: 'POS_VOUCHER_RESERVATION_NOT_FOUND' });
-  await writeAudit(companyId, cashierId, 'VOUCHER_RESERVATION_RELEASED', { count: rows.count });
   return true;
 }
 
@@ -904,13 +914,13 @@ async function restoreRedemption(companyId, userId, redemptionId, reason) {
         restoreReason: note,
       },
     });
+    await writeAudit(companyId, userId, 'VOUCHER_RESTORED', {
+      voucherId: row.voucherId,
+      redemptionId: restored.id,
+      invoiceId: row.invoiceId,
+      reason: note,
+    }, tx);
     return { row: restored, voucherId: row.voucherId };
-  });
-  await writeAudit(companyId, userId, 'VOUCHER_RESTORED', {
-    voucherId: result.voucherId,
-    redemptionId: result.row.id,
-    invoiceId: result.row.invoiceId,
-    reason: note,
   });
   return result.row;
 }

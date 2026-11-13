@@ -1,11 +1,15 @@
-jest.mock('../models/StockBatch', () => ({ find: jest.fn() }));
+jest.mock('../models/StockBatch', () => ({ find: jest.fn(), findOne: jest.fn() }));
 jest.mock('../models/InventoryBatch', () => ({ find: jest.fn() }));
 jest.mock('../models/StockSerialNumber', () => ({ find: jest.fn() }));
 
 const StockBatch = require('../models/StockBatch');
 const InventoryBatch = require('../models/InventoryBatch');
 const StockSerialNumber = require('../models/StockSerialNumber');
-const { consumeTrackedBatches, findAvailableSerialsOutsideQuarantine } = require('../services/posTrackedStockService');
+const {
+  consumeTrackedBatches,
+  consumeOfflineTrackedBatches,
+  findAvailableSerialsOutsideQuarantine,
+} = require('../services/posTrackedStockService');
 
 function query(rows) {
   const q = {
@@ -56,6 +60,69 @@ describe('shared POS tracked-stock service', () => {
     StockBatch.find.mockReturnValue(query([batch]));
     await expect(consumeTrackedBatches('co', 'p', 'w', 2, {})).rejects.toMatchObject({ code: 'INSUFFICIENT_STOCK' });
     expect(batch.save).not.toHaveBeenCalled();
+  });
+
+  test('honors snapshot batch IDs and records shortages using signed batch costs', async () => {
+    const savedBatch = {
+      _id: 'aaaaaaaaaaaaaaaaaaaaaaaa',
+      batchNo: 'LOT-A',
+      qtyOnHand: 2,
+      reservedQuantity: 1,
+      unitCost: 999,
+      expiryDate: new Date('2027-01-01T00:00:00.000Z'),
+      isQuarantined: false,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    StockBatch.findOne.mockImplementation(({ _id }) => ({
+      session: jest.fn().mockResolvedValue(_id === savedBatch._id ? savedBatch : null),
+    }));
+    InventoryBatch.find.mockImplementation((filter) => query(
+      filter.batchNumber === 'LOT-A' ? [] : [],
+    ));
+
+    const result = await consumeOfflineTrackedBatches(
+      'company-1',
+      'product-1',
+      'warehouse-1',
+      [
+        { batchId: savedBatch._id, quantity: 3 },
+        { batchId: 'bbbbbbbbbbbbbbbbbbbbbbbb', quantity: 1 },
+      ],
+      [
+        { id: savedBatch._id, batchNo: 'LOT-A', availableQuantity: 3, expiryDate: null, unitCost: 7 },
+        { id: 'bbbbbbbbbbbbbbbbbbbbbbbb', batchNo: 'LOT-B', availableQuantity: 2, expiryDate: null, unitCost: 4 },
+      ],
+      new Date('2026-06-03T08:00:00.000Z'),
+      null,
+    );
+
+    expect(savedBatch.qtyOnHand).toBe(1);
+    expect(savedBatch.save).toHaveBeenCalledWith({ session: null });
+    expect(result).toMatchObject({
+      quantity: 4,
+      totalCost: 25,
+      shortfall: 3,
+      unavailableBatches: [
+        {
+          batchId: savedBatch._id,
+          batchNo: 'LOT-A',
+          quantity: 3,
+          consumedQuantity: 1,
+          reason: 'batch_quantity_changed',
+        },
+        {
+          batchId: 'bbbbbbbbbbbbbbbbbbbbbbbb',
+          batchNo: 'LOT-B',
+          quantity: 1,
+          consumedQuantity: 0,
+          reason: 'batch_missing',
+        },
+      ],
+    });
+    expect(InventoryBatch.find).toHaveBeenCalledWith(expect.objectContaining({
+      batchNumber: 'LOT-A',
+      availableQuantity: { $gt: 0 },
+    }));
   });
 
   test('filters requested serials attached to active quarantined batches', async () => {

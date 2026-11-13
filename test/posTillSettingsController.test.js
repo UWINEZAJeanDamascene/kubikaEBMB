@@ -4,6 +4,8 @@ jest.mock('../lib/prisma', () => ({
     $transaction: jest.fn((callback) => callback(require('../lib/prisma').prisma)),
     $queryRaw: jest.fn(),
     $executeRaw: jest.fn(),
+    $executeRawUnsafe: jest.fn().mockResolvedValue(1),
+    posRegister: { findMany: jest.fn() },
   },
 }));
 jest.mock('../services/posAuditService', () => ({
@@ -37,6 +39,34 @@ const completeSettings = {
   receipt: { paperWidth: 58, showCashier: true, showCustomer: false, showSku: true, showBarcode: false, headerNote: 'Shop note', footerNote: 'Welcome back' },
   loyalty: { pointValueRwf: 1, walletCreditEnabled: true, walletCreditEarnRatePercent: 1 },
   giftCardLimits: { maxPerCard: 100000, dailyLimitPerCashier: 300000, terms: '', tillTypeOverrides: {} },
+  offlineActionCaps: {
+    companyDefaults: {
+      mobile_money: { maxPerTransaction: 20000, maxTotalPerPeriod: 50000, maxCountPerPeriod: 4 },
+      card: { maxPerTransaction: 0, maxTotalPerPeriod: 0, maxCountPerPeriod: 0 },
+      paid_in: { maxPerTransaction: 0, maxTotalPerPeriod: 0, maxCountPerPeriod: 0 },
+      paid_out: { maxPerTransaction: 0, maxTotalPerPeriod: 0, maxCountPerPeriod: 0 },
+    },
+    tillTypeOverrides: {},
+    registerOverrides: {},
+  },
+  offlinePolicy: {
+    companyDefaults: {
+      enabled: false, maxHours: 12, maxSales: 200,
+      maxTotalValueRwf: 1000000, maxSingleSaleRwf: 1000000,
+      actions: {
+        cash_sales: true, manual_mobile_money: true, manual_card: true,
+        cash_paid_in: true, cash_paid_out: true, receipt_printing: true, local_x_report: true,
+        cached_customer_search: false, customer_quick_add: false, gift_card_issue: false,
+        gift_card_redemption: false, voucher_redemption: false, credit_sales: false,
+        credit_account_payments: false, store_credit: false, loyalty_wallet: false,
+        loyalty_points: false, bank_transfer: false, cheque: false, refunds: false, voids: false,
+        manager_approvals: false, price_overrides: false, discounts_above_limit: false,
+        ebm_required_sales: false, shift_open: false, shift_close: false,
+      },
+    },
+    tillTypeOverrides: {},
+    registerOverrides: {},
+  },
 };
 
 describe('POS till administration settings', () => {
@@ -62,6 +92,13 @@ describe('POS till administration settings', () => {
     }));
     expect(res.body.data.receipt).toEqual(expect.objectContaining({ paperWidth: 80, showCashier: true }));
     expect(res.body.data.denominations).toEqual([5000, 1000]);
+    expect(res.body.data.offlineActionCaps.companyDefaults.card)
+      .toEqual({ maxPerTransaction: 0, maxTotalPerPeriod: 0, maxCountPerPeriod: 0 });
+    expect(res.body.data.offlinePolicy.companyDefaults).toMatchObject({
+      enabled: false, maxHours: 12, maxSales: 200,
+      maxTotalValueRwf: 1000000, maxSingleSaleRwf: 1000000,
+      actions: expect.objectContaining({ cash_sales: true, refunds: false, shift_close: false }),
+    });
   });
 
   test('saves validated values under the active company and writes an audit event', async () => {
@@ -77,12 +114,20 @@ describe('POS till administration settings', () => {
       posCashOutApprovalLimit: 50000,
       posDrawerWarnAmount: 250000,
       posHeldSalesOnClose: 'BLOCK',
+      posOfflineActionCaps: completeSettings.offlineActionCaps,
     });
     prisma.$executeRaw.mockResolvedValue(1);
     const res = response();
+    const submittedSettings = {
+      ...completeSettings,
+      offlinePolicy: {
+        ...completeSettings.offlinePolicy,
+        companyDefaults: { ...completeSettings.offlinePolicy.companyDefaults, enabled: true, maxHours: 10 },
+      },
+    };
     await controller.updateSettings({
       user: { id: 'manager-id', companyId: 'company-a' },
-      body: completeSettings,
+      body: submittedSettings,
       query: {},
     }, res, (error) => { throw error; });
 
@@ -93,6 +138,23 @@ describe('POS till administration settings', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.data.receipt.paperWidth).toBe(58);
     expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({ companyId: 'company-a', event: 'TILL_SETTINGS_UPDATED' }), expect.anything());
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: 'company-a',
+      userId: 'manager-id',
+      event: 'POS_OFFLINE_ACTION_CAPS_UPDATED',
+      metadata: expect.objectContaining({
+        before: expect.any(Object),
+        after: expect.objectContaining({ companyDefaults: completeSettings.offlineActionCaps.companyDefaults }),
+      }),
+    }), expect.anything());
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: 'company-a',
+      userId: 'manager-id',
+      event: 'POS_OFFLINE_POLICY_UPDATED',
+      metadata: expect.objectContaining({
+        after: expect.objectContaining({ companyDefaults: expect.objectContaining({ enabled: true, maxHours: 10, maxSales: 200 }) }),
+      }),
+    }), expect.anything());
   });
 
   test('rejects invalid denomination order and invalid idle lock without saving', async () => {
@@ -110,6 +172,30 @@ describe('POS till administration settings', () => {
       body: { ...completeSettings, idleLockMinutes: 0 },
     }, idleRes, (error) => { throw error; });
     expect(idleRes.statusCode).toBe(400);
+    expect(prisma.systemSettings.update).not.toHaveBeenCalled();
+  });
+
+  test('rejects a register override that does not belong to the active company', async () => {
+    prisma.systemSettings.upsert.mockResolvedValue({});
+    prisma.systemSettings.findUnique.mockResolvedValue({});
+    prisma.posRegister.findMany.mockResolvedValue([]);
+    const res = response();
+    await controller.updateSettings({
+      user: { id: 'manager-id', companyId: 'company-a' },
+      body: {
+        ...completeSettings,
+        offlineActionCaps: {
+          ...completeSettings.offlineActionCaps,
+          registerOverrides: {
+            ['a'.repeat(24)]: { card: { maxPerTransaction: 10, maxTotalPerPeriod: 20, maxCountPerPeriod: 2 } },
+          },
+        },
+      },
+      query: {},
+    }, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.code).toBe('POS_TILL_SETTINGS_INVALID');
     expect(prisma.systemSettings.update).not.toHaveBeenCalled();
   });
 });

@@ -2,11 +2,13 @@ jest.mock('../lib/prisma', () => ({
   prisma: {
     posSession: { findFirst: jest.fn(), updateMany: jest.fn() },
     posRegister: { findFirst: jest.fn() },
+    posDevice: { findFirst: jest.fn() },
     user: { findFirst: jest.fn() },
     company: { findUnique: jest.fn() },
     systemSettings: { findUnique: jest.fn() },
     posApproval: { findFirst: jest.fn(), updateMany: jest.fn() },
-    posAuditLog: { create: jest.fn() },
+    posAuditLog: { create: jest.fn(), findFirst: jest.fn() },
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(),
   },
 }));
@@ -92,7 +94,16 @@ describe('POS session authorization middleware', () => {
       id: REGISTER_ID,
       companyId: COMPANY_ID,
       isActive: true,
+      code: 'till-1',
+      claimedDeviceId: 'device-1',
       deviceTokenHash: createHash('sha256').update(DEVICE_TOKEN).digest('hex'),
+    };
+    const device = {
+      id: 'device-1',
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      publicKey: 'device-public-key',
+      status: 'active',
     };
     user = {
       id: USER_ID,
@@ -115,12 +126,19 @@ describe('POS session authorization middleware', () => {
     verifyPosSessionToken.mockReturnValue(context);
     prisma.posSession.findFirst.mockResolvedValue(session);
     prisma.posSession.updateMany.mockResolvedValue({ count: 1 });
+    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.posAuditLog.findFirst.mockResolvedValue(null);
     prisma.$transaction.mockImplementation((callback) => callback({
       posSession: { updateMany: prisma.posSession.updateMany },
       posApproval: { updateMany: prisma.posApproval.updateMany },
-      posAuditLog: { create: prisma.posAuditLog.create },
+      $queryRaw: prisma.$queryRaw,
+      posAuditLog: {
+        create: prisma.posAuditLog.create,
+        findFirst: prisma.posAuditLog.findFirst,
+      },
     }));
     prisma.posRegister.findFirst.mockResolvedValue(register);
+    prisma.posDevice.findFirst.mockResolvedValue(device);
     prisma.user.findFirst.mockResolvedValue(user);
     prisma.company.findUnique.mockResolvedValue(company);
     prisma.systemSettings.findUnique.mockResolvedValue(settings);
@@ -151,7 +169,7 @@ describe('POS session authorization middleware', () => {
       'pos.receipt.share', 'pos.giftcard.issue', 'pos.giftcard.redeem',
     ]));
     expect(cashier).not.toEqual(expect.arrayContaining([
-      'pos.till.refund', 'pos.till.void', 'pos.till.no_sale', 'pos.till.reprint',
+      'pos.till.refund', 'pos.till.void', 'pos.till.no_sale',
       'pos.till.credit_sell', 'pos.admin.view', 'pos.admin.registers', 'pos.admin.settings',
       'pos.payment.reconcile',
     ]));
@@ -248,7 +266,7 @@ describe('POS session authorization middleware', () => {
     await requirePermission('pos.sell')(req, res, next);
 
     expect(next).toHaveBeenCalledWith();
-    expect(req.posPermissions).toEqual(['pos.sell', 'pos.receipt.share', 'pos.giftcard.redeem']);
+    expect(req.posPermissions).toEqual(['pos.sell', 'pos.receipt.share', 'pos.giftcard.redeem', 'pos.till.reprint']);
 
     const denied = response();
     await requirePermission('pos.refund')(req, denied, jest.fn());
@@ -326,14 +344,13 @@ describe('POS session authorization middleware', () => {
     ]));
   });
 
-  test('only POS roles with the dedicated permission can reprint receipts', async () => {
+  test('cashiers may request receipt copies while elevated roles retain reprint access', async () => {
     const req = request({ posAuthContext: { user, company, settings: { posRolePermissions: {} } } });
-    const denied = response();
-    const deniedNext = jest.fn();
+    const cashierAllowed = response();
+    const cashierNext = jest.fn();
     resolveUserRoles.mockResolvedValue([{ name: 'cashier' }]);
-    await requirePermission('pos.receipt.reprint')(req, denied, deniedNext);
-    expect(denied.statusCode).toBe(403);
-    expect(deniedNext).not.toHaveBeenCalled();
+    await requirePermission('pos.receipt.reprint')(req, cashierAllowed, cashierNext);
+    expect(cashierNext).toHaveBeenCalledWith();
 
     const allowed = response();
     const allowedNext = jest.fn();

@@ -285,7 +285,7 @@ exports.consumeApproval = async ({ approvalId, companyId, cashierId, action, sub
   }
   const db = dbClient();
   const rows = await db.$queryRawUnsafe(
-    'UPDATE pos_manager_approvals SET used_at = CURRENT_TIMESTAMP WHERE id = $1 AND company_id = $2 AND cashier_id = $3 AND action = $4 AND payload_hash = $5 AND (($6::char(24) IS NULL AND subject_id IS NULL) OR subject_id = $6) AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP AND manager_id <> cashier_id RETURNING id',
+    'UPDATE pos_manager_approvals SET used_at = CURRENT_TIMESTAMP WHERE id = $1 AND company_id = $2 AND cashier_id = $3 AND action = $4 AND payload_hash = $5 AND (($6::char(24) IS NULL AND subject_id IS NULL) OR subject_id = $6) AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP AND manager_id <> cashier_id RETURNING id, manager_id AS "managerId"',
     String(approvalId), String(companyId), String(cashierId), action, hashPayload(payload), subjectId ? String(subjectId) : null,
   );
   if (!rows.length) {
@@ -294,6 +294,31 @@ exports.consumeApproval = async ({ approvalId, companyId, cashierId, action, sub
     error.code = 'POS_MANAGER_APPROVAL_INVALID';
     throw error;
   }
+  const usedApproval = rows[0];
+  const linkedRequests = await db.$queryRawUnsafe(
+    'SELECT id AS "correlationId", register_id AS "registerId" FROM pos_approval_requests WHERE company_id = $1 AND manager_approval_id = $2 LIMIT 1',
+    String(companyId), String(usedApproval.id),
+  );
+  const correlationId = String(linkedRequests[0]?.correlationId || usedApproval.id);
+  // This transaction-local context lets every subsequent audit written by the
+  // same sale/refund transaction inherit the approval correlation id.
+  await db.$queryRawUnsafe(
+    "SELECT set_config('app.pos_approval_correlation_id', $1, true)",
+    correlationId,
+  );
+  await writePosAuditLog({
+    companyId: String(companyId),
+    registerId: linkedRequests[0]?.registerId || null,
+    userId: String(cashierId),
+    event: 'APPROVAL_USED',
+    metadata: {
+      approvalId: String(usedApproval.id),
+      correlationId,
+      action: String(action),
+      requestedBy: String(cashierId),
+      approvedBy: String(usedApproval.managerId),
+    },
+  }, db);
   return rows[0].id;
 };
 

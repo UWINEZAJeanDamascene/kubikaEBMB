@@ -2,6 +2,8 @@
 
 const { randomBytes, randomUUID } = require('crypto');
 const { hashStoredValueCode } = require('../services/posStoredValueCodeService');
+const { issueCapability } = require('../services/posOfflineCapabilityService');
+const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
 
 jest.mock('../config/redis', () => ({
   redisClient: { keys: jest.fn().mockResolvedValue([]) },
@@ -54,6 +56,18 @@ jest.mock('../services/smsService', () => ({
 jest.mock('../services/notificationDeliveryService', () => ({
   sendInvoiceDelivery: jest.fn().mockResolvedValue(undefined),
   sendLargeOrderAlert: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock('../services/inventoryService', () => ({
+  ...jest.requireActual('../services/inventoryService'),
+  // Offline stock cost-layer allocation is backed by the legacy inventory
+  // adapter. Keep this integration test focused on PostgreSQL sale posting.
+  consumeAvailable: jest.fn(async (_companyId, _productId, quantity) => ({
+    allocations: [],
+    consumed: Number(quantity),
+    shortfall: 0,
+    totalCost: 10 * Number(quantity),
+  })),
 }));
 
 const allowLocalDatabase = process.env.POS_TEST_ALLOW_LOCAL_DATABASE === 'true';
@@ -110,7 +124,7 @@ function response() {
   };
 }
 
-function requestFor(fixture, { payment = false, key, alternateTill = false }) {
+function requestFor(fixture, { payment = false, paymentMethod = 'GIFT_CARD', amount = 80, key, alternateTill = false }) {
   const headers = { 'idempotency-key': key };
   const registerId = alternateTill ? fixture.otherRegisterId : fixture.registerId;
   const registerCode = alternateTill ? fixture.otherRegisterCode : fixture.registerCode;
@@ -119,7 +133,9 @@ function requestFor(fixture, { payment = false, key, alternateTill = false }) {
   return {
     params: { saleId: fixture.saleId },
     body: payment
-      ? { payments: [{ method: 'GIFT_CARD', amount: 80, giftCardCode: fixture.rawCode }] }
+      ? paymentMethod === 'CASH'
+        ? { payments: [{ method: 'CASH', amount, tendered: amount }] }
+        : { payments: [{ method: 'GIFT_CARD', amount, giftCardCode: fixture.rawCode }] }
       : {},
     headers,
     get(name) {
@@ -170,6 +186,22 @@ async function recordGiftCardPayment(fixture) {
   return res;
 }
 
+async function recordOfflineCashPayment(fixture, amount = 80) {
+  const res = response();
+  await controller.recordCashPayment(
+    requestFor(fixture, {
+      payment: true,
+      paymentMethod: 'CASH',
+      amount,
+      key: `offline-completion-payment-${fixture.companyId}`,
+    }),
+    res,
+    (error) => { if (error) throw error; },
+  );
+  if (res.statusCode !== 201) throw new Error(`Offline cash setup failed: ${JSON.stringify(res.body)}`);
+  return res;
+}
+
 async function createFixture() {
   const fixture = {
     companyId: objectId(),
@@ -199,8 +231,10 @@ async function createFixture() {
     finalizationFunctionName: '',
     finalizationTableName: '',
   };
-  fixture.registerCode = `POS-COMPLETE-${fixture.companyId}`;
-  fixture.otherRegisterCode = `POS-COMPLETE-OTHER-${fixture.companyId}`;
+  // The offline snapshot's register binding is stored in CHAR(24), matching
+  // the register identifiers used by its signed capability.
+  fixture.registerCode = fixture.registerId;
+  fixture.otherRegisterCode = fixture.otherRegisterId;
 
   const cleanup = async () => {
     const cleanupSteps = [];
@@ -235,6 +269,9 @@ async function createFixture() {
       ));
     }
     cleanupSteps.push(
+      () => prisma.$executeRawUnsafe('DELETE FROM pos_sale_requests WHERE company_id = $1', fixture.companyId),
+      () => prisma.$executeRawUnsafe('DELETE FROM pos_receipt_number_allocations WHERE company_id = $1', fixture.companyId),
+      () => prisma.$executeRawUnsafe('DELETE FROM pos_offline_snapshots WHERE company_id = $1', fixture.companyId),
       () => prisma.posAuditLog.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.posPaymentRefund.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.posStoredValueLedger.deleteMany({ where: { companyId: fixture.companyId } }),
@@ -250,6 +287,7 @@ async function createFixture() {
       () => prisma.stockMovement.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.inventoryLayer.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.stockLevel.deleteMany({ where: { companyId: fixture.companyId } }),
+      () => prisma.posEffectivePrice.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.invoice.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.posStoredValueAccount.deleteMany({ where: { companyId: fixture.companyId } }),
       () => prisma.tillSession.deleteMany({ where: { companyId: fixture.companyId } }),
@@ -617,6 +655,228 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
     jest.restoreAllMocks();
   });
 
+  integrationTest('commits one V2 sale, payment, receipt, and journal across concurrent retries and a lost acknowledgment', async () => {
+    const fixture = await createFixture();
+    const operationId = `offline-operation-${fixture.companyId}`;
+    try {
+      const issuedAt = Date.now() - 10_000;
+      const expiresAt = issuedAt + 60 * 60 * 1000;
+      const saleCreatedAt = new Date(issuedAt + 5_000);
+      const snapshotId = objectId();
+      const receiptNumber = `INV-2026-${String(Number.parseInt(fixture.companyId.slice(-6), 16) % 999999 + 1).padStart(6, '0')}`;
+      const effectivePriceRow = await prisma.posEffectivePrice.findFirst({
+        where: { companyId: fixture.companyId, productId: fixture.productId, priceListId: null },
+        select: { id: true },
+      });
+      if (effectivePriceRow) {
+        await prisma.posEffectivePrice.update({
+          where: { id: effectivePriceRow.id },
+          data: { price: 80, effectiveFrom: new Date(issuedAt - 60_000), effectiveTo: null },
+        });
+      } else {
+        await prisma.posEffectivePrice.create({
+          data: {
+            id: objectId(),
+            companyId: fixture.companyId,
+            productId: fixture.productId,
+            price: 80,
+            effectiveFrom: new Date(issuedAt - 60_000),
+          },
+        });
+      }
+      const pricing = await getWarehousePriceListPrices(
+        fixture.companyId,
+        fixture.warehouseId,
+        [fixture.productId],
+        saleCreatedAt,
+        null,
+        true,
+      );
+      const offlineUnitPrice = effectivePrice(fixture.productId, 80, pricing.priceByProduct);
+      const snapshotData = {
+        paymentFlow: 'PAYMENTS_V2',
+        receiptNumbers: [receiptNumber],
+        products: {
+          [fixture.productId]: {
+            name: 'POS completion integration product',
+            sku: `POS-COMPLETE-${fixture.companyId}`,
+            unit: 'pcs',
+            standardPrice: offlineUnitPrice,
+            price: offlineUnitPrice,
+            taxRate: 0,
+            taxCode: 'A',
+            isStockable: true,
+            trackingType: 'none',
+            averageCost: 10,
+            availableStock: 5,
+            batches: [],
+            serialNumbers: [],
+            incomingTransfers: [],
+            outgoingTransfers: [],
+          },
+        },
+        promotions: [],
+        negativeStockAllowed: false,
+        escalationDays: 3,
+      };
+      const capability = issueCapability({
+        id: snapshotId,
+        companyId: fixture.companyId,
+        userId: fixture.cashierId,
+        deviceId: fixture.deviceId,
+        registerId: fixture.registerCode,
+        warehouseId: fixture.warehouseId,
+        tillSessionId: fixture.tillSessionId,
+        paymentFlow: 'PAYMENTS_V2',
+        receiptNumbers: [receiptNumber],
+        issuedAt,
+        expiresAt,
+      });
+      await prisma.$executeRawUnsafe(
+        'INSERT INTO pos_offline_snapshots (id, company_id, user_id, device_id, register_id, warehouse_id, till_session_id, snapshot_data, queue_limit, issued_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::numeric, $10::timestamptz, $11::timestamptz)',
+        snapshotId,
+        fixture.companyId,
+        fixture.cashierId,
+        fixture.deviceId,
+        fixture.registerCode,
+        fixture.warehouseId,
+        fixture.tillSessionId,
+        JSON.stringify(snapshotData),
+        1000,
+        new Date(issuedAt),
+        new Date(expiresAt),
+      );
+      await prisma.$executeRawUnsafe(
+        'INSERT INTO pos_receipt_number_allocations (id, company_id, device_id, register_id, block_id, block_index, receipt_number, expires_at) VALUES ($1, $2, $3, $4, $5, 0, $6, $7::timestamptz)',
+        objectId(),
+        fixture.companyId,
+        fixture.deviceId,
+        fixture.registerId,
+        snapshotId,
+        receiptNumber,
+        new Date(expiresAt),
+      );
+      await prisma.invoice.update({
+        where: { id: fixture.saleId },
+        data: {
+          referenceNo: receiptNumber,
+          posCheckoutPayload: {
+            warehouseId: fixture.warehouseId,
+            offlineOperationId: operationId,
+            offlineSaleId: operationId,
+            offlineCreatedAt: saleCreatedAt.toISOString(),
+            offlineSnapshotCapability: capability,
+            offlineReceiptNumber: receiptNumber,
+            offlinePaymentFlow: 'PAYMENTS_V2',
+            items: [{
+              productId: fixture.productId,
+              quantity: 1,
+              unitPrice: offlineUnitPrice,
+              catalogUnitPrice: offlineUnitPrice,
+              discountPct: 0,
+              serialNumbers: [],
+            }],
+          },
+        },
+      });
+      await recordOfflineCashPayment(fixture, offlineUnitPrice);
+
+      // Keep the first completion transaction open during journal insertion
+      // so the second request races the same idempotency key before commit.
+      fixture.functionName = `pos_exactly_once_pause_${fixture.companyId}`;
+      fixture.triggerName = `pos_exactly_once_pause_${fixture.companyId}`;
+      await prisma.$executeRawUnsafe(
+        `CREATE FUNCTION "${fixture.functionName}"() RETURNS trigger AS $body$ BEGIN IF NEW.company_id = '${fixture.companyId}' THEN PERFORM pg_sleep(0.5); END IF; RETURN NEW; END; $body$ LANGUAGE plpgsql`,
+      );
+      await prisma.$executeRawUnsafe(
+        `CREATE TRIGGER "${fixture.triggerName}" BEFORE INSERT ON journal_entries FOR EACH ROW EXECUTE FUNCTION "${fixture.functionName}"()`,
+      );
+
+      // The server commits and sends success, but the client loses that
+      // acknowledgment. The overlapping retry must replay the same result.
+      const droppedAck = response();
+      let responseWrites = 0;
+      droppedAck.json = (body) => {
+        responseWrites += 1;
+        droppedAck.body = body;
+        return droppedAck;
+      };
+      const concurrentRetry = response();
+      await Promise.all([
+        controller.completeSale(
+          requestFor(fixture, { key: operationId }),
+          droppedAck,
+          (error) => { if (error) throw error; },
+        ),
+        controller.completeSale(
+          requestFor(fixture, { key: operationId }),
+          concurrentRetry,
+          (error) => { if (error) throw error; },
+        ),
+      ]);
+      expect(droppedAck.body).toMatchObject({ success: true, data: { _id: fixture.saleId } });
+      expect(responseWrites).toBe(1);
+
+      const secondConcurrentRetry = response();
+      await controller.completeSale(
+        requestFor(fixture, { key: operationId }),
+        secondConcurrentRetry,
+        (error) => { if (error) throw error; },
+      );
+      for (const res of [concurrentRetry, secondConcurrentRetry]) {
+        if (![200, 201].includes(res.statusCode)) {
+          throw new Error(`Offline V2 completion failed: ${JSON.stringify(res.body)}`);
+        }
+        expect(res.body.success).toBe(true);
+        expect(String(res.body.data?.id || res.body.data?._id)).toBe(fixture.saleId);
+      }
+      // The discarded acknowledgment was written once; each retry replays it.
+      expect(responseWrites).toBe(1);
+
+      const [invoices, requestRows, payments, journals, fiscalReceipts, movements] = await Promise.all([
+        prisma.invoice.findMany({ where: { companyId: fixture.companyId, id: fixture.saleId } }),
+        prisma.$queryRawUnsafe(
+          'SELECT request_key AS "requestKey", invoice_id AS "invoiceId", status FROM pos_sale_requests WHERE company_id = $1 AND request_key = $2',
+          fixture.companyId,
+          operationId,
+        ),
+        prisma.posPayment.findMany({ where: { companyId: fixture.companyId, saleId: fixture.saleId, status: 'SUCCESS' } }),
+        prisma.journalEntry.findMany({ where: { companyId: fixture.companyId, sourceType: 'invoice', sourceId: fixture.saleId } }),
+        prisma.ebmSubmissionQueue.findMany({ where: { companyId: fixture.companyId, documentType: 'pos', documentId: fixture.saleId } }),
+        prisma.stockMovement.findMany({ where: { companyId: fixture.companyId, productId: fixture.productId } }),
+      ]);
+
+      expect(invoices).toHaveLength(1);
+      expect(invoices[0]).toMatchObject({
+        referenceNo: receiptNumber,
+        posCompletionKey: operationId,
+        status: 'fully_paid',
+      });
+      expect(invoices.filter((invoice) => invoice.referenceNo === receiptNumber)).toHaveLength(1);
+      expect(requestRows).toEqual([{
+        requestKey: operationId,
+        invoiceId: fixture.saleId,
+        status: 'completed',
+      }]);
+      expect(payments).toHaveLength(1);
+      expect(invoices[0].payments).toHaveLength(1);
+      expect(journals).toHaveLength(1);
+      expect(fiscalReceipts).toHaveLength(1);
+      const receiptAllocations = await prisma.$queryRawUnsafe(
+        'SELECT receipt_number AS "receiptNumber", operation_id AS "operationId" FROM pos_receipt_number_allocations WHERE company_id = $1 AND device_id = $2 AND register_id = $3 AND operation_id = $4',
+        fixture.companyId,
+        fixture.deviceId,
+        fixture.registerId,
+        operationId,
+      );
+      expect(receiptAllocations).toEqual([{ receiptNumber, operationId }]);
+      expect(movements).toHaveLength(1);
+      expect(Number(movements[0].quantity)).toBe(1);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   integrationTest('defers a failed posting, then retries once before replaying concurrent completions', async () => {
     const EBMSalesService = require('../services/ebmSalesService');
     const JournalService = require('../services/journalService');
@@ -657,6 +917,16 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
       expect(pendingInvoice.status).toBe('fully_paid');
       expect(pendingInvoice.posPostingStatus).toBe('pending');
       expect(pendingInvoice.posCompletionKey).toBe(`completion-retry-${fixture.companyId}`);
+      const transactionalRequest = await prisma.$queryRawUnsafe(
+        'SELECT request_key AS "requestKey", invoice_id AS "invoiceId", status FROM pos_sale_requests WHERE company_id = $1 AND request_key = $2',
+        fixture.companyId,
+        `completion-retry-${fixture.companyId}`,
+      );
+      expect(transactionalRequest).toEqual([{
+        requestKey: `completion-retry-${fixture.companyId}`,
+        invoiceId: fixture.saleId,
+        status: 'completed',
+      }]);
       expect(deferredJournals).toHaveLength(0);
       expect(Number(deferredStock.qtyOnHand)).toBe(4);
       expect(Number(deferredProduct.currentStock)).toBe(4);
@@ -690,6 +960,16 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
       expect(successfulResponses.every((res) => res.body.success)).toBe(true);
       expect(successfulResponses.filter((res) => res.body.replayed === true)).toHaveLength(2);
       expect(successfulResponses.map((res) => res.body.data.id)).toEqual([fixture.saleId, fixture.saleId]);
+      const replayedTransactionalRequests = await prisma.$queryRawUnsafe(
+        'SELECT request_key AS "requestKey", invoice_id AS "invoiceId", status FROM pos_sale_requests WHERE company_id = $1 AND request_key = $2',
+        fixture.companyId,
+        completionKey,
+      );
+      expect(replayedTransactionalRequests).toEqual([{
+        requestKey: completionKey,
+        invoiceId: fixture.saleId,
+        status: 'completed',
+      }]);
       const [completedInvoice, journals, stock, product, layer, movements] = await Promise.all([
         prisma.invoice.findUnique({ where: { id: fixture.saleId } }),
         prisma.journalEntry.findMany({
@@ -743,7 +1023,7 @@ describe('POS sale completion posting (PostgreSQL integration)', () => {
       });
       expect(durableSubmission).toMatchObject({
         ebmStatus: 'failed',
-        registerId: fixture.registerId,
+        registerId: fixture.registerCode,
         shiftId: fixture.shiftId,
         cashierId: fixture.cashierId,
         salesTyCd: 'N',

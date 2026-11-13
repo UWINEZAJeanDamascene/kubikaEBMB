@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { posApiRateLimit } = require('../middleware/posRouteRateLimits');
 const { protect } = require('../middleware/auth');
 const { requireAssignedPermissions: requirePermission } = require('../middleware/posAuthorization');
 const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
@@ -7,7 +8,11 @@ const { requirePosSession, requirePermission: requirePosPermission } = require('
 const { authorizeCreditNoteRead } = require('../middleware/creditNoteReadAuthorization');
 const CreditNote = require('../models/CreditNote');
 const controller = require('../controllers/creditNoteController');
+const { idempotentHandler } = require('../services/posIdempotencyService');
+const { posAuditOutcome } = require('../middleware/posAuditOutcome');
+const idemCreditNote = (handler) => idempotentHandler(handler, { namespace: 'credit-note' });
 
+router.use(posApiRateLimit);
 router.use(protect);
 
 // Module 8 API Endpoints:
@@ -44,18 +49,25 @@ function authorizeCreditNoteDraft(req, res, next) {
   // A POS-origin draft does not post a refund, change stock, or reverse the
   // journal. It may be prepared from a signed-in till; confirmation below
   // still requires the one-use manager approval consumed by the controller.
-  if (req.body?.posOrigin === true) return requireSamePosCashier(req, res, next);
+  if (req.body?.posOrigin === true) {
+    req.posFinancialOperation = true;
+    return requireSamePosCashier(req, res, next);
+  }
   return requirePermission('credit_notes', 'create')(req, res, next);
+}
+
+function auditPosCreditNoteOutcome(req, res, next) {
+  return req.posFinancialOperation ? posAuditOutcome(req, res, next) : next();
 }
 
 router.route('/')
   .get(authorizeCreditNoteRead, controller.getCreditNotes)
-  .post(authorizeCreditNoteDraft, controller.createCreditNote);
+  .post(authorizeCreditNoteDraft, auditPosCreditNoteOutcome, idemCreditNote(controller.createCreditNote));
 
 router.route('/:id')
   .get(authorizeCreditNoteRead, controller.getCreditNote)
-  .put(requirePermission('credit_notes', 'update'), controller.updateCreditNote)
-  .delete(requirePermission('credit_notes', 'delete'), controller.deleteCreditNote);
+  .put(requirePermission('credit_notes', 'update'), idemCreditNote(controller.updateCreditNote))
+  .delete(requirePermission('credit_notes', 'delete'), idemCreditNote(controller.deleteCreditNote));
 
 router.get('/:id/pdf', authorizeCreditNoteRead, controller.generateCreditNotePDF);
 
@@ -64,7 +76,10 @@ async function authorizeCreditNoteConfirmation(req, res, next) {
   try {
     const note = await CreditNote.findOne({ _id: req.params.id, company: req.user.company._id }).select('posOrigin').lean();
     if (!note) return next();
-    if (note.posOrigin) return requireSamePosCashier(req, res, next);
+    if (note.posOrigin) {
+      req.posFinancialOperation = true;
+      return requireSamePosCashier(req, res, next);
+    }
     const action = 'approve';
     const roles = await resolveUserRoles(req.user);
     if (!roles.some((role) => PermissionService.check(role, 'credit_notes', action))) {
@@ -75,12 +90,12 @@ async function authorizeCreditNoteConfirmation(req, res, next) {
     return next(error);
   }
 }
-router.post('/:id/confirm', authorizeCreditNoteConfirmation, controller.confirmCreditNote);
-router.post('/:id/submit-ebm', requirePermission('credit_notes', 'approve'), controller.submitCreditNoteEbm);
+router.post('/:id/confirm', authorizeCreditNoteConfirmation, auditPosCreditNoteOutcome, idemCreditNote(controller.confirmCreditNote));
+router.post('/:id/submit-ebm', requirePermission('credit_notes', 'approve'), idemCreditNote(controller.submitCreditNoteEbm));
 
 // Legacy endpoints (backwards compatibility)
-router.put('/:id/approve', requirePermission('credit_notes', 'approve'), controller.confirmCreditNote);
-router.post('/:id/apply', requirePermission('credit_notes', 'approve'), controller.applyCreditNote); // Apply to another invoice
-router.post('/:id/refund', authorizeCreditNoteConfirmation, controller.recordRefund);
+router.put('/:id/approve', requirePermission('credit_notes', 'approve'), idemCreditNote(controller.confirmCreditNote));
+router.post('/:id/apply', requirePermission('credit_notes', 'approve'), idemCreditNote(controller.applyCreditNote)); // Apply to another invoice
+router.post('/:id/refund', authorizeCreditNoteConfirmation, auditPosCreditNoteOutcome, idemCreditNote(controller.recordRefund));
 
 module.exports = router;

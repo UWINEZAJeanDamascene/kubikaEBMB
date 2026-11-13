@@ -52,6 +52,17 @@ describe('POS PIN service', () => {
     expect(state.failedAttempts).toBe(PIN_FAILURE_LIMIT);
     expect(state.isLocked).toBe(true);
     expect(state.lockedUntil.getTime() - now.getTime()).toBe(PIN_LOCKOUT_DURATION_MS);
+    expect(state.lockoutCount).toBe(1);
+  });
+
+  test('doubles the duration of each consecutive lockout up to one hour', () => {
+    const now = new Date('2026-10-29T13:00:00.000Z');
+    const first = getPinFailureState(4, null, now, { failureLimit: 5, lockoutDurationMs: 60_000, lockoutCount: 0 });
+    const second = getPinFailureState(4, null, now, { failureLimit: 5, lockoutDurationMs: 60_000, lockoutCount: first.lockoutCount });
+    const capped = getPinFailureState(4, null, now, { failureLimit: 5, lockoutDurationMs: 3_600_000, lockoutCount: 3 });
+    expect(first.lockedUntil.getTime() - now.getTime()).toBe(60_000);
+    expect(second.lockedUntil.getTime() - now.getTime()).toBe(120_000);
+    expect(capped.lockedUntil.getTime() - now.getTime()).toBe(3_600_000);
   });
 
   test('keeps an active lockout and resets attempts after it expires', () => {
@@ -62,11 +73,14 @@ describe('POS PIN service', () => {
       failedAttempts: PIN_FAILURE_LIMIT,
       lockedUntil,
       isLocked: true,
+      lockoutCount: 0,
     });
     expect(getPinFailureState(PIN_FAILURE_LIMIT, lockedUntil, lockedUntil)).toEqual({
       failedAttempts: 1,
       lockedUntil: null,
       isLocked: false,
+      lockoutCount: 0,
+      lockoutDurationMs: 0,
     });
   });
 
@@ -75,6 +89,7 @@ describe('POS PIN service', () => {
       failedAttempts: 0,
       lockedUntil: null,
       isLocked: false,
+      lockoutCount: 0,
     });
   });
 });

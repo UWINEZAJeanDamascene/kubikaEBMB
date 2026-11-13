@@ -287,6 +287,15 @@ exports.remove = async (req, res, next) => {
         },
       });
 
+      await writePosAuditLog({
+        companyId,
+        registerId,
+        userId,
+        event: 'SHIFT_DELETED',
+        metadata: { shiftId: shift.id, shiftNumber: shift.shiftNumber, registerName: shift.register.name },
+        ip: requestIp(req),
+      }, tx);
+
       return { code: null, shift };
     });
 
@@ -299,15 +308,6 @@ exports.remove = async (req, res, next) => {
       const [message, status] = messages[result.code];
       return invalidRequest(res, status, result.code, message);
     }
-
-    await writePosAuditLog({
-      companyId,
-      registerId,
-      userId,
-      event: 'SHIFT_DELETED',
-      metadata: { shiftId: result.shift.id, shiftNumber: result.shift.shiftNumber, registerName: result.shift.register.name },
-      ip: requestIp(req),
-    });
 
     return res.json({ success: true, data: { deletedShiftId: result.shift.id } });
   } catch (error) {

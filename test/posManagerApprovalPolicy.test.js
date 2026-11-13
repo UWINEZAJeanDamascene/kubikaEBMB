@@ -17,9 +17,9 @@ jest.mock('../services/posAuditService', () => ({
 }));
 
 const bcrypt = require('bcryptjs');
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const { writePosAuditLog } = require('../services/posAuditService');
-const { createApproval } = require('../controllers/posManagerApprovalController');
+const { createApproval, consumeApproval } = require('../controllers/posManagerApprovalController');
 
 function response() {
   return {
@@ -110,5 +110,33 @@ describe('POS manager approval policy integration', () => {
     expect(res.body.code).toBe('POS_APPROVAL_POLICY_DISABLED');
     expect(prisma.user.findFirst).not.toHaveBeenCalled();
     expect(prisma.posManagerApproval.create).not.toHaveBeenCalled();
+  });
+
+  test('consumes remote manager approval and audits with the request correlation id in the same transaction client', async () => {
+    const db = { $queryRawUnsafe: jest.fn() };
+    db.$queryRawUnsafe
+      .mockResolvedValueOnce([{ id: 'approval-1', managerId: 'manager-1' }])
+      .mockResolvedValueOnce([{ correlationId: 'request-1', registerId: 'register-1' }])
+      .mockResolvedValueOnce([]);
+    dbClient.mockReturnValue(db);
+
+    await expect(consumeApproval({
+      approvalId: 'approval-1',
+      companyId: 'company-1',
+      cashierId: 'cashier-1',
+      action: 'refund',
+      subjectId: 'invoice-1',
+      payload: { amount: 100, reason: 'damaged item' },
+    })).resolves.toBe('approval-1');
+
+    expect(db.$queryRawUnsafe).toHaveBeenNthCalledWith(2, expect.stringContaining('manager_approval_id = $2 LIMIT 1'), 'company-1', 'approval-1');
+    expect(db.$queryRawUnsafe).toHaveBeenNthCalledWith(3, expect.stringContaining("set_config('app.pos_approval_correlation_id'"), 'request-1');
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: 'company-1', registerId: 'register-1', userId: 'cashier-1', event: 'APPROVAL_USED',
+      metadata: expect.objectContaining({
+        approvalId: 'approval-1', correlationId: 'request-1', action: 'refund',
+        requestedBy: 'cashier-1', approvedBy: 'manager-1',
+      }),
+    }), db);
   });
 });

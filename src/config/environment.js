@@ -134,11 +134,13 @@ function buildConfig() {
       env: nodeEnv,
       port: number(process.env.PORT, 3000),
       frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
-      allowedOrigins: array(process.env.ALLOWED_ORIGINS, ['http://localhost:3000', 'http://localhost:5173']),
-      corsOrigins: array(
-        process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS,
-        [],
-      ),
+      allowedOrigins: array(
+        process.env.ALLOWED_ORIGINS,
+        nodeEnv === 'production' ? [] : ['http://localhost:3000', 'http://localhost:5173'],
+      ).filter((origin) => nodeEnv !== 'production' || !/^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(origin)),
+      corsOrigins: array(process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS,
+        nodeEnv === 'production' ? [] : ['http://localhost:3000', 'http://localhost:5173'])
+        .filter((origin) => nodeEnv !== 'production' || !/^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(origin)),
     },
     
     // =====================

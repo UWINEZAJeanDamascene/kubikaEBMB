@@ -6,6 +6,7 @@ jest.mock('../services/posAuditService', () => ({
   writePosAuditLog: jest.fn().mockResolvedValue(undefined),
 }));
 
+const { dbClient } = require('../lib/prisma');
 const { runInTransaction } = require('../services/transactionService');
 const { writePosAuditLog } = require('../services/posAuditService');
 const {
@@ -106,26 +107,55 @@ describe('POS provider success events', () => {
     expect(tx.posPayment.update).not.toHaveBeenCalled();
   });
 
+  test('turns a concurrent unique-key loser into the saved replay result', async () => {
+    const existing = { id: 'winning-event', matchedPaymentId: PAYMENT_ID };
+    tx.posProviderEvent.create.mockRejectedValue(Object.assign(new Error('unique event key'), { code: 'P2002' }));
+    dbClient.mockReturnValue({
+      posProviderEvent: { findFirst: jest.fn().mockResolvedValue(existing) },
+    });
+
+    const result = await recordProviderSuccess({
+      companyId: COMPANY_ID,
+      provider: 'MTN_MOMO',
+      eventKey: 'concurrent-event',
+      externalRef: 'external-reference',
+      providerTxId: 'provider-transaction',
+      amount: 500,
+      signatureOk: true,
+    });
+
+    expect(result).toEqual({ event: existing, replayed: true, unmatched: false });
+    expect(tx.posPayment.update).not.toHaveBeenCalled();
+    expect(writePosAuditLog).not.toHaveBeenCalled();
+  });
+
   test('verifies a webhook HMAC and rejects bad signatures', () => {
     const payload = { externalId: 'ref-1', amount: 500 };
     const crypto = require('crypto');
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const canonical = JSON.stringify(Object.keys(payload).sort().reduce((ordered, key) => {
+      ordered[key] = payload[key];
+      return ordered;
+    }, {}));
     const signature = crypto.createHmac('sha256', 'test-secret')
-      .update(JSON.stringify(Object.keys(payload).sort().reduce((ordered, key) => {
-        ordered[key] = payload[key];
-        return ordered;
-      }, {})))
+      .update(`${timestamp}.${canonical}`)
       .digest('hex');
     expect(verifyProviderWebhookSignature({
       provider: 'MTN_MOMO',
       payload,
       signature: `sha256=${signature}`,
       secret: 'test-secret',
+      timestamp,
     })).toBe(true);
     expect(verifyProviderWebhookSignature({
       provider: 'MTN_MOMO',
       payload,
       signature: '0'.repeat(64),
       secret: 'test-secret',
+      timestamp,
+    })).toBe(false);
+    expect(verifyProviderWebhookSignature({
+      provider: 'MTN_MOMO', payload, signature, secret: 'test-secret', timestamp: '946684800',
     })).toBe(false);
   });
 });

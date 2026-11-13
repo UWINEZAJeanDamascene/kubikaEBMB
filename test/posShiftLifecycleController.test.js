@@ -51,7 +51,7 @@ function createRequest({ body = {}, key = 'lifecycle-key-0001' } = {}) {
     posAuthContext: {
       session: { companyId: COMPANY_ID, registerId: REGISTER_ID, userId: USER_ID },
     },
-    ip: '127.0.0.1',
+    ip: '192.0.2.51',
   };
 }
 
@@ -77,6 +77,7 @@ function makeTransaction({ shift, priorCorrection = null, newerShift = null } = 
   };
 
   return {
+    $queryRaw: jest.fn(async () => []),
     $queryRawUnsafe: jest.fn(async (query) => {
       if (String(query).includes('pos_registers')) return [{ id: REGISTER_ID }];
       if (String(query).includes('pos_shifts')) return [{ id: SHIFT_ID }];
@@ -187,6 +188,36 @@ describe('POS shift reopen and cashier handover', () => {
       where: { id: 'till-id' },
       data: expect.objectContaining({ status: 'open', expectedCash: 13700 }),
     }));
+    const reopenAudit = tx.posAuditLog.create.mock.calls.filter(([entry]) => entry.data.event === 'SHIFT_REOPENED');
+    expect(reopenAudit).toHaveLength(1);
+    expect(reopenAudit[0][0].data).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: USER_ID,
+      ip: '192.0.2.51',
+      metadata: expect.objectContaining({ shiftId: SHIFT_ID, reason: 'Correct the original counted cash entry.' }),
+    });
+  });
+
+  test('fails closed when shift reopen audit persistence fails', async () => {
+    const tx = makeTransaction();
+    const auditError = new Error('audit insert unavailable');
+    tx.posAuditLog.create.mockImplementation(async ({ data }) => {
+      if (data.event === 'SHIFT_REOPENED') throw auditError;
+      return { id: 'audit-id' };
+    });
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const next = jest.fn();
+    const res = createResponse();
+
+    await reopen(createRequest({
+      body: { reason: 'Correct the original counted cash entry.', approvalToken: APPROVAL_TOKEN },
+    }), res, next);
+
+    const reopenAudit = tx.posAuditLog.create.mock.calls.filter(([entry]) => entry.data.event === 'SHIFT_REOPENED');
+    expect(reopenAudit).toHaveLength(1);
+    expect(next).toHaveBeenCalledWith(auditError);
+    expect(res.body).toBeNull();
   });
 
   test('does not reopen a shift when a newer shift exists', async () => {
@@ -269,8 +300,23 @@ describe('POS shift reopen and cashier handover', () => {
       shift: expect.objectContaining({ id: SHIFT_ID }),
       variance: 0,
     }));
-    expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ event: 'SHIFT_HANDED_OVER' }),
-    }));
+    const closeAudit = tx.posAuditLog.create.mock.calls.filter(([entry]) => entry.data.event === 'SHIFT_CLOSED');
+    const handoverAudit = tx.posAuditLog.create.mock.calls.filter(([entry]) => entry.data.event === 'SHIFT_HANDED_OVER');
+    expect(closeAudit).toHaveLength(1);
+    expect(closeAudit[0][0].data).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: USER_ID,
+      ip: '192.0.2.51',
+      metadata: expect.objectContaining({ shiftId: SHIFT_ID, zReportId: expect.any(String) }),
+    });
+    expect(handoverAudit).toHaveLength(1);
+    expect(handoverAudit[0][0].data).toMatchObject({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      userId: USER_ID,
+      ip: '192.0.2.51',
+      metadata: expect.objectContaining({ shiftId: SHIFT_ID, newShiftId: expect.any(String), toUserId: NEXT_USER_ID }),
+    });
   });
 });

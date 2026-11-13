@@ -4,6 +4,11 @@ const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const { normalizePosShiftSettings } = require('../services/posShiftService');
 const { normalizePosGiftCardSettings } = require('../services/posGiftCardSettingsService');
+const {
+  defaultOfflineActionCaps,
+  normalizeOfflineActionCaps,
+} = require('../services/posOfflineActionCapsService');
+const { normalizeOfflinePolicy } = require('../services/posOfflinePolicyService');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const {
   DEFAULT_RECEIPT_SETTINGS, normalizeReceiptSettings, resolveReceiptSettings,
@@ -14,6 +19,7 @@ const SETTING_FIELDS = [
   'cashAccountability', 'denominations', 'defaultFloat', 'varianceTolerance',
   'varianceApprovalLimit', 'cashOutApprovalLimit', 'drawerWarnAmount',
   'heldSalesOnClose', 'idleLockMinutes', 'receipt', 'loyalty', 'giftCardLimits',
+  'offlineActionCaps', 'offlinePolicy',
 ];
 // These fields describe the GET response and are not writable settings. Ignore
 // them for clients that submit the response object they received from GET.
@@ -59,6 +65,8 @@ function normalizedSettings(row, branchId = null) {
   return {
     ...shift,
     giftCardLimits: normalizePosGiftCardSettings(row?.posGiftCardSettings),
+    offlineActionCaps: normalizeOfflineActionCaps(row?.posOfflineActionCaps || defaultOfflineActionCaps()),
+    offlinePolicy: normalizeOfflinePolicy(row?.posOfflinePolicy, row || {}),
     giftCardTillTypes: Array.isArray(row?.posDiscountSettings?.systemTillTypes)
       ? row.posDiscountSettings.systemTillTypes.map((type) => String(type).toLowerCase())
       : ['retail'],
@@ -106,6 +114,13 @@ exports.getSettings = async (req, res, next) => {
         posLoyaltySettings: true,
         posGiftCardSettings: true,
         posDiscountSettings: true,
+        posOfflineActionCaps: true,
+        posOfflinePolicy: true,
+        posOfflineEnabled: true,
+        posOfflineMaxHours: true,
+        posOfflineQueueLimit: true,
+        posOfflineMaxSales: true,
+        posOfflineMaxSingleSale: true,
       },
     });
     return res.json({
@@ -144,6 +159,8 @@ exports.updateSettings = async (req, res, next) => {
     let shift;
     let receipt;
     let giftCardLimits;
+    let offlineActionCaps;
+    let offlinePolicy;
     try {
       shift = normalizePosShiftSettings({
         cashAccountability: body.cashAccountability,
@@ -158,6 +175,14 @@ exports.updateSettings = async (req, res, next) => {
       receipt = normalizeReceiptSettings(body.receipt);
       body.loyalty = normalizeLoyaltySettings(body.loyalty);
       giftCardLimits = normalizePosGiftCardSettings(body.giftCardLimits);
+      offlineActionCaps = normalizeOfflineActionCaps(body.offlineActionCaps);
+      offlinePolicy = normalizeOfflinePolicy(body.offlinePolicy, {
+        posOfflineEnabled: body.offlinePolicy?.companyDefaults?.enabled,
+        posOfflineMaxHours: body.offlinePolicy?.companyDefaults?.maxHours,
+        posOfflineQueueLimit: body.offlinePolicy?.companyDefaults?.maxTotalValueRwf,
+        posOfflineMaxSales: body.offlinePolicy?.companyDefaults?.maxSales,
+        posOfflineMaxSingleSale: body.offlinePolicy?.companyDefaults?.maxSingleSaleRwf,
+      });
     } catch (error) {
       if (error instanceof TypeError || error instanceof RangeError) return sendInvalid(res, error.message);
       throw error;
@@ -172,8 +197,31 @@ exports.updateSettings = async (req, res, next) => {
       });
       const current = await tx.systemSettings.findUnique({
         where: { companyId },
-        select: { posReceiptSettings: true, posLoyaltySettings: true, posGiftCardSettings: true },
+        select: {
+          posReceiptSettings: true,
+          posLoyaltySettings: true,
+          posGiftCardSettings: true,
+          posOfflineActionCaps: true,
+          posOfflinePolicy: true,
+          posOfflineEnabled: true,
+          posOfflineMaxHours: true,
+          posOfflineQueueLimit: true,
+          posOfflineMaxSales: true,
+          posOfflineMaxSingleSale: true,
+        },
       });
+      const registerOverrideIds = Object.keys(offlineActionCaps.registerOverrides);
+      const policyRegisterIds = Object.keys(offlinePolicy.registerOverrides);
+      const allRegisterOverrideIds = [...new Set([...registerOverrideIds, ...policyRegisterIds])];
+      if (allRegisterOverrideIds.length) {
+        const ownedRegisters = await tx.posRegister.findMany({
+          where: { companyId, id: { in: allRegisterOverrideIds } },
+          select: { id: true },
+        });
+        if (ownedRegisters.length !== allRegisterOverrideIds.length) {
+          throw Object.assign(new TypeError('Every register offline policy override must belong to this company.'), { code: 'POS_OFFLINE_CAP_REGISTER_SCOPE_INVALID' });
+        }
+      }
       const storedReceiptSettings = saveReceiptSettings(current?.posReceiptSettings, receipt, branchId);
       const saved = await tx.systemSettings.update({
         where: { companyId },
@@ -190,6 +238,18 @@ exports.updateSettings = async (req, res, next) => {
           posReceiptSettings: storedReceiptSettings,
           posLoyaltySettings: body.loyalty,
           posGiftCardSettings: giftCardLimits,
+          posOfflineActionCaps: offlineActionCaps,
+          posOfflinePolicy: {
+            companyActions: offlinePolicy.companyDefaults.actions,
+            provisionalFiscalReceiptsAllowed: offlinePolicy.provisionalFiscalReceiptsAllowed,
+            tillTypeOverrides: offlinePolicy.tillTypeOverrides,
+            registerOverrides: offlinePolicy.registerOverrides,
+          },
+          posOfflineEnabled: offlinePolicy.companyDefaults.enabled,
+          posOfflineMaxHours: offlinePolicy.companyDefaults.maxHours,
+          posOfflineQueueLimit: offlinePolicy.companyDefaults.maxTotalValueRwf,
+          posOfflineMaxSales: offlinePolicy.companyDefaults.maxSales,
+          posOfflineMaxSingleSale: offlinePolicy.companyDefaults.maxSingleSaleRwf,
           lastUpdatedBy: userId || null,
         },
         select: {
@@ -206,6 +266,13 @@ exports.updateSettings = async (req, res, next) => {
           posLoyaltySettings: true,
           posGiftCardSettings: true,
           posDiscountSettings: true,
+          posOfflineActionCaps: true,
+          posOfflinePolicy: true,
+          posOfflineEnabled: true,
+          posOfflineMaxHours: true,
+          posOfflineQueueLimit: true,
+          posOfflineMaxSales: true,
+          posOfflineMaxSingleSale: true,
         },
       });
       await writePosAuditLog({
@@ -228,6 +295,49 @@ exports.updateSettings = async (req, res, next) => {
           metadata: { before: normalizeLoyaltySettings(current?.posLoyaltySettings), after: body.loyalty },
           ip: requestIp(req),
         }, tx);
+      }
+      const offlineCapsChanged = JSON.stringify(normalizeOfflineActionCaps(current?.posOfflineActionCaps))
+        !== JSON.stringify(offlineActionCaps);
+      if (offlineCapsChanged) {
+        await writePosAuditLog({
+          companyId,
+          userId: userId || null,
+          event: 'POS_OFFLINE_ACTION_CAPS_UPDATED',
+          metadata: {
+            before: normalizeOfflineActionCaps(current?.posOfflineActionCaps),
+            after: offlineActionCaps,
+          },
+          ip: requestIp(req),
+        }, tx);
+        await tx.$executeRawUnsafe(
+          `INSERT INTO pos_sync_changes (company_id, entity_type, entity_id, warehouse_id, deleted)
+           VALUES ($1, 'settings', 'system_settings', NULL, FALSE)`,
+          companyId,
+        );
+      }
+      const beforeOfflinePolicy = normalizeOfflinePolicy(current?.posOfflinePolicy, current || {});
+      const afterOfflinePolicy = normalizeOfflinePolicy({
+        companyActions: offlinePolicy.companyDefaults.actions,
+        provisionalFiscalReceiptsAllowed: offlinePolicy.provisionalFiscalReceiptsAllowed,
+        tillTypeOverrides: offlinePolicy.tillTypeOverrides,
+        registerOverrides: offlinePolicy.registerOverrides,
+      }, {
+        posOfflineEnabled: offlinePolicy.companyDefaults.enabled,
+        posOfflineMaxHours: offlinePolicy.companyDefaults.maxHours,
+        posOfflineQueueLimit: offlinePolicy.companyDefaults.maxTotalValueRwf,
+        posOfflineMaxSales: offlinePolicy.companyDefaults.maxSales,
+        posOfflineMaxSingleSale: offlinePolicy.companyDefaults.maxSingleSaleRwf,
+      });
+      if (JSON.stringify(beforeOfflinePolicy) !== JSON.stringify(afterOfflinePolicy)) {
+        await writePosAuditLog({
+          companyId, userId: userId || null, event: 'POS_OFFLINE_POLICY_UPDATED',
+          metadata: { before: beforeOfflinePolicy, after: afterOfflinePolicy },
+          ip: requestIp(req),
+        }, tx);
+        await tx.$executeRawUnsafe(
+          `INSERT INTO pos_sync_changes (company_id, entity_type, entity_id, warehouse_id, deleted)
+           VALUES ($1, 'settings', 'system_settings', NULL, FALSE)`, companyId,
+        );
       }
       return { ...saved, posReceiptSettings: storedReceiptSettings };
     });

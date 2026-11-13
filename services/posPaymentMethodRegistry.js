@@ -1,7 +1,5 @@
 'use strict';
 
-const { DEFAULT_SYSTEM_TILL_TYPES } = require('./posDiscountSettingsService');
-
 const PAYMENT_METHOD_REGISTRY = Object.freeze([
   {
     id: 'CASH',
@@ -323,8 +321,8 @@ function normalizeMethodRegistry(value, legacyEnabledMethods = [], legacyRegiste
   };
   const tillTypeOverrides = normalizeOverrides(source.tillTypeOverrides, 'methodRegistry.tillTypeOverrides');
   for (const tillType of Object.keys(tillTypeOverrides)) {
-    if (!DEFAULT_SYSTEM_TILL_TYPES.includes(tillType.toLowerCase())) {
-      throw registryError(`Unsupported system till type for payment settings: ${tillType}.`);
+    if (!/^[a-z][a-z0-9_-]{0,39}$/i.test(tillType)) {
+      throw registryError(`Invalid system till type for payment settings: ${tillType}.`);
     }
   }
   const registerOverrides = normalizeOverrides(source.registerOverrides, 'methodRegistry.registerOverrides');

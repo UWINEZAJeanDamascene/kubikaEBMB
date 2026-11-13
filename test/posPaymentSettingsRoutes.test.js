@@ -39,6 +39,12 @@ jest.mock('../middleware/posAuthMiddleware', () => ({
   },
 }));
 
+// This suite checks route authorization and settings responses; idempotency
+// middleware behavior is covered directly by posIdempotencyService tests.
+jest.mock('../services/posIdempotencyService', () => ({
+  idempotentHandler: (handler) => handler,
+}));
+
 jest.mock('../services/posPaymentService', () => ({
   getPaymentSettings: jest.fn(),
   listPaymentRegisters: jest.fn(),
@@ -193,6 +199,7 @@ describe('POS payment settings routes', () => {
     const response = await request(app)
       .put('/api/pos/payment-settings')
       .set('x-pos-permissions', 'pos.payment.settings')
+      .set('Idempotency-Key', 'payment-settings-invalid-provider')
       .send({ enabledMethods: ['CASH', 'MTN_MOMO'] });
 
     expect(response.status).toBe(400);
@@ -270,6 +277,7 @@ describe('POS payment settings routes', () => {
     const response = await request(app)
       .put('/api/pos/payment-settings')
       .set('x-pos-permissions', 'pos.payment.settings')
+      .set('Idempotency-Key', 'payment-settings-secret-response')
       .send({ enabledMethods: ['CASH'] });
 
     expect(response.status).toBe(200);
@@ -300,6 +308,7 @@ describe('POS payment settings routes', () => {
       .set('x-session-company', 'company-a')
       .set('x-company-id', 'company-b')
       .set('x-pos-permissions', 'pos.payment.settings')
+      .set('Idempotency-Key', 'payment-settings-company-scope')
       .send({ enabledMethods: ['CASH'] });
 
     expect(response.status).toBe(200);

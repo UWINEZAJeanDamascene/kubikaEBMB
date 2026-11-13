@@ -22,8 +22,12 @@ function response() {
   return {
     statusCode: 200,
     body: null,
+    headers: {},
     status(code) { this.statusCode = code; return this; },
+    set(name, value) { this.headers[name.toLowerCase()] = value; return this; },
+    type(value) { this.headers['content-type'] = value; return this; },
     json(body) { this.body = body; return this; },
+    send(body) { this.body = body; return this; },
   };
 }
 
@@ -98,5 +102,22 @@ describe('public POS receipt sharing controller', () => {
     expect(res.body).toMatchObject({ success: false, code: 'POS_RECEIPT_EMAIL_FAILED' });
     expect(receiptService.revokePublicReceiptLink).toHaveBeenCalledWith(expect.objectContaining({ linkId: 'link-a' }));
     expect(receiptService.auditShare).not.toHaveBeenCalled();
+  });
+
+  test.each(['publicDocument', 'publicPdf'])('%s returns one generic not-found response for unavailable tokens', async (method) => {
+    receiptService.publicReceiptDocument.mockRejectedValue(receiptService.PUBLIC_RECEIPT_NOT_FOUND);
+    const res = response();
+
+    await controller[method]({ params: { token: 'invalid-or-unavailable' } }, res);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toBe('Not found');
+    expect(res.headers).toMatchObject({
+      'content-type': 'text/plain',
+      'cache-control': 'no-store, private',
+      'x-robots-tag': 'noindex, nofollow',
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff',
+    });
   });
 });

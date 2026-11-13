@@ -4,6 +4,27 @@ const StockBatch = require('../models/StockBatch');
 const InventoryBatch = require('../models/InventoryBatch');
 const StockSerialNumber = require('../models/StockSerialNumber');
 
+async function consumeLegacyBatchQuantity(companyId, productId, warehouseId, batchNo, quantity, session) {
+  let remaining = quantity;
+  const legacyBatches = await InventoryBatch.find({
+    company: companyId,
+    product: productId,
+    warehouse: warehouseId,
+    batchNumber: batchNo,
+    availableQuantity: { $gt: 0 },
+  }).sort({ receivedDate: 1 }).session(session);
+  for (const legacy of legacyBatches) {
+    if (remaining <= 0) break;
+    const taken = Math.min(remaining, Number(legacy.availableQuantity || 0));
+    legacy.availableQuantity = Number(legacy.availableQuantity) - taken;
+    legacy.quantity = Math.max(0, Number(legacy.quantity || 0) - taken);
+    legacy.totalCost = Number(legacy.quantity) * Number(legacy.unitCost || 0);
+    legacy.updateStatus?.();
+    await legacy.save({ session });
+    remaining -= taken;
+  }
+}
+
 async function consumeTrackedBatches(companyId, productId, warehouseId, quantity, session) {
   const batches = await StockBatch.find({ company: companyId, product: productId, warehouse: warehouseId, qtyOnHand: { $gt: 0 }, isQuarantined: false })
     .sort({ expiryDate: 1, createdAt: 1 }).session(session);
@@ -28,22 +49,102 @@ async function consumeTrackedBatches(companyId, productId, warehouseId, quantity
     allocations.push({ batchNo: batch.batchNo, quantity: taken, unitCost });
     totalCost += taken * unitCost;
 
-    let batchRemaining = taken;
-    const legacyBatches = await InventoryBatch.find({ company: companyId, product: productId, warehouse: warehouseId, batchNumber: batch.batchNo, availableQuantity: { $gt: 0 } })
-      .sort({ receivedDate: 1 }).session(session);
-    for (const legacy of legacyBatches) {
-      if (batchRemaining <= 0) break;
-      const legacyTake = Math.min(batchRemaining, Number(legacy.availableQuantity || 0));
-      legacy.availableQuantity = Number(legacy.availableQuantity) - legacyTake;
-      legacy.quantity = Math.max(0, Number(legacy.quantity || 0) - legacyTake);
-      legacy.totalCost = Number(legacy.quantity) * Number(legacy.unitCost || 0);
-      legacy.updateStatus?.();
-      await legacy.save({ session });
-      batchRemaining -= legacyTake;
-    }
+    await consumeLegacyBatchQuantity(companyId, productId, warehouseId, batch.batchNo, taken, session);
     remaining -= taken;
   }
   return { allocations, totalCost, quantity };
+}
+
+async function consumeOfflineTrackedBatches(
+  companyId,
+  productId,
+  warehouseId,
+  requestedAllocations,
+  snapshotBatches,
+  saleCreatedAt,
+  session,
+) {
+  const snapshotById = new Map((snapshotBatches || []).map((batch) => [String(batch.id), batch]));
+  const allocations = [];
+  const unavailableBatches = [];
+  let totalCost = 0;
+  let shortfall = 0;
+
+  for (const request of requestedAllocations) {
+    const batchId = String(request.batchId);
+    const snapshotBatch = snapshotById.get(batchId);
+    if (!snapshotBatch) {
+      throw Object.assign(new Error('Offline batch allocation was not present in the signed snapshot.'), {
+        code: 'POS_OFFLINE_BATCH_ALLOCATION_INVALID',
+      });
+    }
+    const requested = Number(request.quantity);
+    const unitCost = Number(snapshotBatch.unitCost) || 0;
+    const batch = await StockBatch.findOne({
+      _id: batchId,
+      company: companyId,
+      product: productId,
+      warehouse: warehouseId,
+    }).session(session);
+
+    let consumedQuantity = 0;
+    let reason = '';
+    if (!batch) {
+      reason = 'batch_missing';
+    } else if (batch.isQuarantined) {
+      reason = 'batch_quarantined';
+    } else if (batch.batchNo !== snapshotBatch.batchNo) {
+      reason = 'batch_identity_changed';
+    } else if (batch.expiryDate && new Date(batch.expiryDate).getTime() < saleCreatedAt.getTime()) {
+      reason = 'batch_expired_at_sale';
+    } else {
+      const onHand = Number(batch.qtyOnHand) || 0;
+      const reserved = Number(batch.reservedQuantity) || 0;
+      consumedQuantity = Math.min(requested, Math.max(0, onHand - reserved));
+      if (consumedQuantity < requested) reason = 'batch_quantity_changed';
+      if (consumedQuantity > 0) {
+        batch.qtyOnHand = Math.max(0, onHand - consumedQuantity);
+        await batch.save({ session });
+        await consumeLegacyBatchQuantity(
+          companyId,
+          productId,
+          warehouseId,
+          snapshotBatch.batchNo,
+          consumedQuantity,
+          session,
+        );
+      }
+    }
+
+    const missingQuantity = requested - consumedQuantity;
+    if (missingQuantity > 0) {
+      shortfall += missingQuantity;
+      unavailableBatches.push({
+        batchId,
+        batchNo: String(snapshotBatch.batchNo || ''),
+        quantity: requested,
+        consumedQuantity,
+        reason: reason || 'batch_quantity_changed',
+      });
+    }
+    totalCost += requested * unitCost;
+    allocations.push({
+      batchId,
+      batchNo: String(snapshotBatch.batchNo || ''),
+      quantity: requested,
+      unitCost,
+      consumedQuantity,
+      shortfall: missingQuantity,
+    });
+  }
+
+  return {
+    allocations,
+    totalCost,
+    quantity: requestedAllocations.reduce((sum, allocation) => sum + Number(allocation.quantity), 0),
+    shortfall,
+    unavailableBatches,
+  };
 }
 
 async function findAvailableSerialsOutsideQuarantine({ companyId, productId, warehouseId, serialNumbers }) {
@@ -69,4 +170,8 @@ async function findAvailableSerialsOutsideQuarantine({ companyId, productId, war
   });
 }
 
-module.exports = { consumeTrackedBatches, findAvailableSerialsOutsideQuarantine };
+module.exports = {
+  consumeTrackedBatches,
+  consumeOfflineTrackedBatches,
+  findAvailableSerialsOutsideQuarantine,
+};

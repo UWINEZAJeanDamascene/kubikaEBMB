@@ -2,7 +2,7 @@ jest.mock('../lib/prisma', () => ({
   prisma: {
     user: { findFirst: jest.fn() },
     posApprovalPolicy: { findUnique: jest.fn().mockResolvedValue(null) },
-    posAuditLog: { create: jest.fn() },
+    posAuditLog: { create: jest.fn(), findFirst: jest.fn().mockResolvedValue(null) },
     $transaction: jest.fn(),
   },
 }));
@@ -69,8 +69,9 @@ describe('POS approval endpoint', () => {
     jest.clearAllMocks();
     prisma.posApprovalPolicy.findUnique.mockResolvedValue(null);
     tx = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
       posApproval: { create: jest.fn(async ({ data }) => ({ id: data.id })) },
-      posAuditLog: { create: jest.fn(async ({ data }) => data) },
+      posAuditLog: { create: jest.fn(async ({ data }) => data), findFirst: jest.fn().mockResolvedValue(null) },
     };
     prisma.user.findFirst.mockImplementation(async ({ where }) => ({
       id: where.id,
@@ -104,6 +105,12 @@ describe('POS approval endpoint', () => {
     expect(approvalData.tokenHash).toBe(createHash('sha256').update(res.body.data.approvalToken).digest('hex'));
     expect(JSON.stringify(approvalData)).not.toContain(res.body.data.approvalToken);
     expect(JSON.stringify(res.body)).not.toContain(PIN);
+    const requestAudit = tx.posAuditLog.create.mock.calls.find(([entry]) => entry.data.event === 'APPROVAL_REQUESTED');
+    const grantedAudit = tx.posAuditLog.create.mock.calls.find(([entry]) => entry.data.event === 'APPROVAL_GRANTED');
+    expect(requestAudit).toBeTruthy();
+    expect(grantedAudit).toBeTruthy();
+    expect(requestAudit[0].data.metadata.correlationId).toBe(approvalData.id);
+    expect(grantedAudit[0].data.metadata).toMatchObject({ correlationId: approvalData.id, approvalId: approvalData.id });
     expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'APPROVAL_GRANTED', userId: MANAGER_ID }),
     }));
@@ -125,7 +132,10 @@ describe('POS approval endpoint', () => {
     await create(request(), forbidden, jest.fn());
     expect(forbidden.statusCode).toBe(403);
     expect(forbidden.body.code).toBe('POS_APPROVAL_PERMISSION_REQUIRED');
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(tx.posApproval.create).not.toHaveBeenCalled();
+    expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ event: 'APPROVAL_DENIED' }),
+    }));
 
     hasPosPermission.mockResolvedValue(true);
     const self = response();
@@ -189,7 +199,10 @@ describe('POS approval endpoint', () => {
       { manager: ['pos.approve'] },
       'pos.credit.over_limit',
     );
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(tx.posApproval.create).not.toHaveBeenCalled();
+    expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ event: 'APPROVAL_DENIED' }),
+    }));
   });
 
   test('does not issue an approval when the manager PIN is rejected', async () => {
@@ -212,7 +225,7 @@ describe('POS approval endpoint', () => {
     expect(res.body.code).toBe('POS_PIN_INVALID');
     expect(res.body.remainingAttempts).toBe(4);
     expect(tx.posApproval.create).not.toHaveBeenCalled();
-    expect(prisma.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+    expect(tx.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'APPROVAL_DENIED' }),
     }));
   });

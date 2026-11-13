@@ -19,6 +19,10 @@ jest.mock('../services/posStoredValueCodeService', () => ({
   hashStoredValueCode: jest.fn((code) => `hash:${code}`),
   generateStoredValueCode: jest.fn(() => 'GIFTCARD1234'),
 }));
+jest.mock('../services/posAuditService', () => ({
+  writePosAuditLog: jest.fn(async () => undefined),
+  requestIp: jest.fn(() => '127.0.0.1'),
+}));
 
 const { dbClient } = require('../lib/prisma');
 const { runInTransaction } = require('../services/transactionService');
@@ -28,6 +32,7 @@ const { BankAccount } = require('../models/BankAccount');
 const TillSession = require('../models/TillSession');
 const CurrencyService = require('../services/CurrencyService');
 const { findClaimedRegister } = require('../services/posRegisterService');
+const { writePosAuditLog } = require('../services/posAuditService');
 const controller = require('../controllers/posStoredValueController');
 
 function response() {
@@ -111,6 +116,12 @@ describe('POS stored value issuance', () => {
       expect(findClaimedRegister).not.toHaveBeenCalled();
       expect(TillSession.findOne).not.toHaveBeenCalled();
       expect(dbClient().$queryRawUnsafe).not.toHaveBeenCalled();
+      expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'POS_STORED_VALUE_ISSUED',
+        companyId: 'company-id',
+        userId: 'manager-id',
+        metadata: expect.objectContaining({ kind: 'gift_card', fundingMethod: paymentMethod }),
+      }), {});
     },
   );
 });

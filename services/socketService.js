@@ -12,7 +12,9 @@ const init = (server, options = {}) => {
   
   // For socket.io, when credentials: true, we cannot use '*'
   // Must use explicit origins array or a function
-  const corsOrigins = CORS_ORIGINS && CORS_ORIGINS.length > 0 ? CORS_ORIGINS : ['http://localhost:3000', 'http://localhost:5173'];
+  const corsOrigins = CORS_ORIGINS && CORS_ORIGINS.length > 0
+    ? CORS_ORIGINS
+    : config.env.isProduction ? [] : ['http://localhost:3000', 'http://localhost:5173'];
   
   io = new Server(server, {
     cors: {

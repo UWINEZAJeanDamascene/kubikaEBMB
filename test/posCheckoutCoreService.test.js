@@ -35,14 +35,30 @@ describe('POS checkout core service', () => {
 
   test('builds the same pending checkout snapshot and verifies saved calculated lines', () => {
     const body = {
-      items: [{ productId: 'product-1', quantity: 2, unitPrice: 100, discountPct: 5, discountReason: 'Damaged', serialNumbers: ['S1'] }],
+      items: [{ productId: 'product-1', quantity: 2, unitPrice: 100, discountPct: 5, discountReason: 'Damaged', taxRate: 18, taxCode: 'B', serialNumbers: ['S1'] }],
+      displayTotal: 224.2,
       warehouseId: 'warehouse-1', notes: 'counter sale', promotionId: 'promo-1',
+      clientInfo: { name: 'Walk-in Customer', contact: { phone: '0781234567' } },
       cartDiscountPct: 0, cartDiscountReason: '',
+      paymentMethod: 'cash',
+      offlineSnapshotCapability: 'signed-capability',
+      offlineSaleId: 'offline-sale-00000001',
+      offlineOperationId: 'offline-op-00000001',
+      offlineCreatedAt: '2026-11-07T08:00:00.000Z',
+      offlinePaymentFlow: 'PAYMENTS_V2',
     };
     expect(pendingCheckoutPayload(body)).toEqual({
-      items: [{ productId: 'product-1', quantity: 2, unitPrice: 100, discountPct: 5, discountReason: 'Damaged', serialNumbers: ['S1'] }],
+      items: [{ productId: 'product-1', quantity: 2, unitPrice: 100, discountPct: 5, discountReason: 'Damaged', taxRate: 18, taxCode: 'B', serialNumbers: ['S1'] }],
+      displayTotal: 224.2,
       warehouseId: 'warehouse-1', notes: 'counter sale', promotionId: 'promo-1',
+      clientInfo: { name: 'Walk-in Customer', contact: { phone: '0781234567' } },
       cartDiscountPct: 0, cartDiscountReason: '',
+      paymentMethod: 'cash',
+      offlineSnapshotCapability: 'signed-capability',
+      offlineSaleId: 'offline-sale-00000001',
+      offlineOperationId: 'offline-op-00000001',
+      offlineCreatedAt: '2026-11-07T08:00:00.000Z',
+      offlinePaymentFlow: 'PAYMENTS_V2',
     });
     expect(lineValuesMatch({
       productId: 'product-1', qty: 2, unitPrice: 100, discountPct: 5, taxRate: 18,
