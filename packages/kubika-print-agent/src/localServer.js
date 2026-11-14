@@ -88,7 +88,9 @@ function createLocalServer({
   });
   app.use(express.json({ limit: '10mb' }));
   app.use((req, res, next) => {
-    if (req.path === '/v1/pair') return next();
+    const publicSetupRead = req.method === 'GET'
+      && ['/', '/setup', '/v1/setup', '/status', '/v1/status'].includes(req.path);
+    if (req.path === '/v1/pair' || publicSetupRead) return next();
     const token = getRequestToken(req);
     const stored = credentialStore?.load?.();
     const hasInstalledToken = Boolean(stored?.accessToken && token === stored.accessToken);
@@ -110,7 +112,7 @@ function createLocalServer({
         paired: Boolean(credentialStore.load()),
         printers: discoverPrinters(),
         service: 'kubika-print-agent',
-        version: '0.1.2',
+        version: '0.1.3',
       },
     });
   });
@@ -228,7 +230,7 @@ function createLocalServer({
         paired,
         printers: discoverPrinters(),
         service: 'kubika-print-agent',
-        version: '0.1.2',
+        version: '0.1.3',
       },
     });
   });

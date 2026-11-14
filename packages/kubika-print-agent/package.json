@@ -1,6 +1,6 @@
 {
   "name": "@kubika/print-agent",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Kubika Windows Print Agent MVP",
   "main": "src/main.js",

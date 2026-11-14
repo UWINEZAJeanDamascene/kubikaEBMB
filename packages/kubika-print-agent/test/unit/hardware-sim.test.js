@@ -146,15 +146,46 @@ test('local API rejects untrusted origins, missing tokens, and repeated requests
     const forbiddenOrigin = await fetch(url, { headers: { Origin: 'https://attacker.example' } });
     assert.equal(forbiddenOrigin.status, 403);
 
-    const missingToken = await fetch(url);
+    const missingToken = await fetch(`http://127.0.0.1:${address.port}/v1/printers/refresh`, { method: 'POST' });
     assert.equal(missingToken.status, 401);
 
-    const first = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-    const second = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-    const limited = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const first = await fetch(url);
+    const second = await fetch(url);
+    const limited = await fetch(url);
     assert.equal(first.status, 200);
     assert.equal(second.status, 200);
     assert.equal(limited.status, 429);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('local setup page and status are available before pairing; printer mutations still require a token', async () => {
+  const app = createLocalServer({
+    ledger: {},
+    credentialStore: { load: () => null },
+    discoverPrinters: () => [{ name: 'Receipt Printer', transport: 'windows-spooler' }],
+    savePrinters: () => {},
+    transmitDirect: async () => ({}),
+    onPair: async () => ({}),
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise((resolve) => server.once('listening', resolve));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const page = await fetch(baseUrl);
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /Pair agent/);
+
+    const status = await fetch(`${baseUrl}/v1/status`);
+    const body = await status.json();
+    assert.equal(status.status, 200);
+    assert.equal(body.data.paired, false);
+    assert.equal(body.data.printers[0].name, 'Receipt Printer');
+
+    const mutation = await fetch(`${baseUrl}/v1/printers/refresh`, { method: 'POST' });
+    assert.equal(mutation.status, 401);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
