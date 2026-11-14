@@ -283,6 +283,7 @@ exports.uncertain = async (req, res, next) => {
 function printAgentReleasePaths(fileName) {
   const candidates = [
     process.env.KUBIKA_PRINT_AGENT_RELEASE_DIR,
+    path.join(__dirname, '..', 'packages', 'kubika-print-agent', 'release'),
     path.resolve(__dirname, '..', '..', 'packages', 'kubika-print-agent', 'release'),
     path.join(__dirname, '..', 'downloads', 'print-agent'),
   ].filter(Boolean);

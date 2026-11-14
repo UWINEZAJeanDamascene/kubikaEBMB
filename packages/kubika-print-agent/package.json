@@ -1,0 +1,22 @@
+{
+  "name": "@kubika/print-agent",
+  "version": "0.1.2",
+  "private": true,
+  "description": "Kubika Windows Print Agent MVP",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "dev": "node src/main.js",
+    "test": "node --test test/**/*.test.js",
+    "simulator:tcp9100": "node tools/tcp9100-simulator.js",
+    "build:installer": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File installer/build.ps1"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "express": "^5.1.0",
+    "pdfkit": "^0.17.2"
+  }
+}

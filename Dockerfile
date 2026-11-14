@@ -65,6 +65,7 @@ COPY --from=builder /app/lib ./lib
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/ai-engine ./ai-engine
 COPY --from=builder /app/fixtures ./fixtures
+COPY --from=builder /app/downloads/print-agent ./downloads/print-agent
 
 # Change ownership
 RUN chown -R nodejs:nodejs /app

@@ -1,0 +1,26 @@
+<service>
+  <id>KubikaPrintAgent</id>
+  <name>Kubika Print Agent</name>
+  <description>Local print bridge for Kubika POS devices</description>
+  <workingdirectory>%BASE%</workingdirectory>
+  <executable>%BASE%\runtime\node.exe</executable>
+  <arguments>"%BASE%\src\main.js"</arguments>
+  <stoptimeout>15 sec</stoptimeout>
+  <startmode>Automatic</startmode>
+  <serviceaccount>
+    <domain>.</domain>
+    <user>LocalSystem</user>
+    <password></password>
+  </serviceaccount>
+  <log mode="roll-by-size">
+    <path>%ProgramData%\Kubika\PrintAgent\logs</path>
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>10</keepFiles>
+  </log>
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <env name="KUBIKA_PRINT_AGENT_DATA_DIR" value="%ProgramData%\Kubika\PrintAgent"/>
+  <env name="KUBIKA_BACKEND_URL" value="https://kubikapos.up.railway.app"/>
+  <env name="NODE_ENV" value="production"/>
+</service>

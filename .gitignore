@@ -1,6 +1,9 @@
 
 # Dependencies
 node_modules/
+packages/kubika-print-agent/node_modules/
+packages/kubika-print-agent/staging/
+packages/kubika-print-agent/release/
 .pnp/
 .pnp.js
 
