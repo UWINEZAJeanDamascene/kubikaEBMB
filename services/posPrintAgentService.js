@@ -66,6 +66,14 @@ async function pairAgent({ pairingCode, deviceId, name, platform, version }) {
         deviceId: resolvedDeviceId,
       },
     });
+    if (existingAgent && String(existingAgent.registerId || '') !== String(resolvedRegisterId)) {
+      throw Object.assign(new Error('This device is already paired to a different register and cannot be silently rebound.'), {
+        code: 'PRINT_PAIRING_REGISTER_MISMATCH',
+        companyId,
+        registerId: existingAgent.registerId,
+        deviceId: resolvedDeviceId,
+      });
+    }
     const agentData = {
         id: generateObjectId(),
         companyId,
@@ -157,6 +165,113 @@ async function refreshAgentToken(refreshToken) {
   return { agent: updated, accessToken, refreshToken: newRefreshToken };
 }
 
+async function rebindAgent({ companyId, agentId, registerId }) {
+  return prisma.$transaction(async (tx) => {
+    const register = await tx.posRegister.findFirst({
+      where: { id: registerId, companyId, isActive: true },
+      select: { id: true },
+    });
+    if (!register) return { code: 'POS_REGISTER_NOT_FOUND' };
+
+    const agent = await tx.posPrintAgent.findFirst({
+      where: { id: agentId, companyId },
+    });
+    if (!agent) return { code: 'PRINT_AGENT_NOT_FOUND' };
+
+    const now = new Date();
+    const updated = await tx.posPrintAgent.update({
+      where: { id: agent.id },
+      data: {
+        registerId: register.id,
+        status: 'active',
+        revokedAt: null,
+        accessTokenHash: hash(secureRandom(48)),
+        refreshTokenHash: hash(secureRandom(48)),
+        accessExpiresAt: new Date(now.getTime() + ACCESS_TTL_MS),
+        lastSeenAt: now,
+      },
+    });
+    return { agent: updated, previousRegisterId: agent.registerId };
+  });
+}
+
+async function issueDrawerAuthorization({
+  companyId,
+  registerId,
+  actionType,
+  actionId,
+  shiftId,
+  requesterId,
+  approvalId,
+  reason,
+  ttlSeconds = 15,
+}) {
+  const allowedActions = ['cash-sale', 'no-sale', 'paid-in', 'paid-out', 'shift-open', 'shift-close', 'test'];
+  if (
+    !allowedActions.includes(actionType)
+    || !actionId
+    || !requesterId
+    || !reason
+    || (actionType === 'no-sale' && !approvalId)
+  ) {
+    return { code: 'PRINT_DRAWER_AUTHORIZATION_INVALID' };
+  }
+  const register = await prisma.posRegister.findFirst({
+    where: { id: registerId, companyId, isActive: true },
+    select: { id: true },
+  });
+  if (!register) return { code: 'POS_REGISTER_NOT_FOUND' };
+
+  const token = secureRandom(32);
+  const now = new Date();
+  const safeTtlSeconds = Math.max(1, Math.min(30, Number(ttlSeconds) || 15));
+  const authorization = await prisma.posPrintDrawerAuthorization.create({
+    data: {
+      id: generateObjectId(),
+      companyId,
+      registerId,
+      tokenHash: hash(token),
+      actionType,
+      actionId: String(actionId).slice(0, 160),
+      shiftId: shiftId || null,
+      requesterId,
+      approvalId: approvalId || null,
+      reason: String(reason).trim().slice(0, 500),
+      expiresAt: new Date(now.getTime() + safeTtlSeconds * 1000),
+    },
+  });
+  return { authorization, token };
+}
+
+async function consumeDrawerAuthorization({ token, agent }) {
+  if (!token || !agent?.companyId || !agent?.registerId) return { code: 'PRINT_DRAWER_AUTHORIZATION_INVALID' };
+  return prisma.$transaction(async (tx) => {
+    const authorization = await tx.posPrintDrawerAuthorization.findFirst({
+      where: { tokenHash: hash(token), companyId: agent.companyId },
+    });
+    if (!authorization) return { code: 'PRINT_DRAWER_AUTHORIZATION_INVALID' };
+    if (String(authorization.registerId) !== String(agent.registerId)) {
+      return { code: 'PRINT_DRAWER_AUTHORIZATION_REGISTER_MISMATCH', authorization };
+    }
+    const now = new Date();
+    if (authorization.expiresAt <= now) return { code: 'PRINT_DRAWER_AUTHORIZATION_EXPIRED', authorization };
+    if (authorization.usedAt) return { code: 'PRINT_DRAWER_AUTHORIZATION_REUSED', authorization };
+
+    const consumed = await tx.posPrintDrawerAuthorization.updateMany({
+      where: {
+        id: authorization.id,
+        companyId: agent.companyId,
+        registerId: agent.registerId,
+        usedAt: null,
+        expiresAt: { gt: now },
+      },
+      data: { usedAt: now, outcome: 'authorized' },
+    });
+    if (consumed.count !== 1) return { code: 'PRINT_DRAWER_AUTHORIZATION_REUSED', authorization };
+    return { authorization: { ...authorization, usedAt: now, outcome: 'authorized' } };
+  });
+}
+
 module.exports = {
   ACCESS_TTL_MS,
   REFRESH_TTL_MS,
@@ -165,4 +280,7 @@ module.exports = {
   pairAgent,
   authenticateAgent,
   refreshAgentToken,
+  rebindAgent,
+  issueDrawerAuthorization,
+  consumeDrawerAuthorization,
 };

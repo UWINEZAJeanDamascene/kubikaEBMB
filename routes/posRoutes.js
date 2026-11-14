@@ -134,7 +134,7 @@ router.get('/registers/:registerId/cashier-access', protect, canManagePosRegiste
 router.put('/registers/:registerId/cashier-access', protect, canManagePosRegisters, idem(posRegisterController.updateCashierAccess));
 router.get('/registers/:registerId/cashiers', requireDevice(), posRegisterController.listCashiers);
 router.post('/auth/pin-login', posCredentialRateLimit, posAuthController.pinLogin);
-router.post('/auth/refresh', posCredentialRateLimit, requireDevice(), posAuthController.refreshSessionToken);
+router.post('/auth/refresh', posCredentialRateLimit, requireDevice(), idem(posAuthController.refreshSessionToken));
 router.post('/auth/offline-attempts', posCredentialRateLimit, requireDevice(), posAuthController.reportOfflinePinAttempts);
 router.post('/approvals', requirePosSession(), idem(posApprovalController.create));
 router.get('/approval-managers', requirePosSession(), posRemoteApprovalController.eligibleManagers);

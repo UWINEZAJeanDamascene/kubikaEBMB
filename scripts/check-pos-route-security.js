@@ -39,6 +39,10 @@ const SPECIAL_AUTH = new Map([
   ['POST /api/pos/print-agent/agent/jobs/:jobId/lease', 'Print-agent bearer credential and job lease state are validated.'],
   ['POST /api/pos/print-agent/agent/jobs/:jobId/acknowledge', 'Print-agent bearer credential and job ownership/state are validated.'],
   ['POST /api/pos/print-agent/agent/jobs/:jobId/fail', 'Print-agent bearer credential and job ownership/state are validated.'],
+  ['POST /api/pos/print-agent/agent/jobs/:jobId/uncertain', 'Print-agent bearer credential and job ownership/state are validated.'],
+  ['POST /api/pos/print-agent/agent/drawer-authorizations/consume', 'Print-agent bearer credential, register binding, expiry, and single-use authorization are validated.'],
+  ['POST /api/pos/print-agent/drawer-authorizations', 'Active cashier session, payment permission, register binding, and one-time drawer capability are validated.'],
+  ['POST /api/pos/print-agent/drawer-authorizations/consume', 'Active cashier session, register binding, expiry, and single-use capability are validated.'],
   ['GET /api/public/pos/receipts/:token', 'Hashed, expiring public receipt capability token is checked by the receipt controller.'],
   ['GET /api/public/pos/receipts/:token/pdf', 'Hashed, expiring public receipt capability token is checked by the receipt controller.'],
   ['GET /api/pos/print-agent/admin/release', 'ERP session is required; release metadata is non-mutating.'],
@@ -54,6 +58,7 @@ const SESSION_ACTION_AUTH = new Map([
   ['GET /api/pos/approval-managers', 'Only eligible company managers are returned.'],
   ['GET /api/pos/approval-requests/:requestId', 'Controller limits visibility to requester or assigned manager.'],
   ['POST /api/pos/users/:id/pin', 'Controller restricts change to active cashier or approved reset flow.'],
+  ['POST /api/pos/auth/refresh', 'Controller validates the paired-device session and active refresh token before rotating it.'],
   ['POST /api/pos/auth/lock', 'Only active session may lock itself.'],
   ['POST /api/pos/auth/unlock', 'Only a locked session may unlock through PIN verification.'],
   ['POST /api/pos/auth/switch', 'Controller validates cashier assignment and PIN.'],
@@ -75,6 +80,10 @@ const NATIVE_IDEMPOTENCY = new Map([
   ['POST /api/pos/print-agent/agent/jobs/:jobId/lease', 'Print job ID and lease state are the native job boundary.'],
   ['POST /api/pos/print-agent/agent/jobs/:jobId/acknowledge', 'Print job ID and state transition are the native job boundary.'],
   ['POST /api/pos/print-agent/agent/jobs/:jobId/fail', 'Print job ID and state transition are the native job boundary.'],
+  ['POST /api/pos/print-agent/agent/jobs/:jobId/uncertain', 'Print job ID, active lease token, and one-way uncertain state are the native job boundary.'],
+  ['POST /api/pos/print-agent/agent/drawer-authorizations/consume', 'Drawer authorization row is atomically consumed once per register.'],
+  ['POST /api/pos/print-agent/drawer-authorizations', 'Action identity and shared idempotency prevent duplicate authorization issuance on replay.'],
+  ['POST /api/pos/print-agent/drawer-authorizations/consume', 'Drawer authorization row is atomically consumed once per cashier session.'],
 ]);
 
 function matchingParen(source, open) {

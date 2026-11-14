@@ -10,11 +10,16 @@ async function expireAndCleanup() {
   });
   await prisma.posPrintJob.updateMany({
     where: { status: { in: ['leased', 'transmitting'] }, leasedUntil: { lt: now } },
-    data: { status: 'queued', leaseTokenHash: null, leasedUntil: null, availableAt: now },
+    data: {
+      status: 'uncertain',
+      lastError: 'The agent lease expired before the print outcome was acknowledged.',
+      leaseTokenHash: null,
+      leasedUntil: null,
+    },
   });
   const purgeBefore = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   await prisma.posPrintJob.deleteMany({
-    where: { status: { in: ['transmitted', 'confirmed', 'failed', 'expired'] }, updatedAt: { lt: purgeBefore } },
+    where: { status: { in: ['transmitted', 'confirmed', 'failed', 'expired', 'uncertain'] }, updatedAt: { lt: purgeBefore } },
   });
 }
 

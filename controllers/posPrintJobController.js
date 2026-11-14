@@ -8,6 +8,16 @@ const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const hash = (value) => createHash('sha256').update(String(value)).digest('hex');
 const companyIdFor = (req) => String(req.user.company?._id || req.user.companyId || '');
 
+function redactCustomerFields(value) {
+  if (Array.isArray(value)) return value.map((item) => redactCustomerFields(item));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value)
+      .filter(([key]) => !/(customer|client|buyer|contact|phone|tin|taxpayer|address|email)/i.test(key))
+      .map(([key, nested]) => [key, redactCustomerFields(nested)]));
+  }
+  return value;
+}
+
 function ttlFor(jobType) {
   if (jobType === 'drawer-open') return 15;
   if (jobType === 'receipt' || jobType === 'refund-receipt' || jobType === 'test-print') return 120;
@@ -25,7 +35,15 @@ exports.createJob = async (req, res, next) => {
     if (!/^[a-f\d]{24}$/i.test(registerId) || !allowedTypes.includes(jobType) || !idempotencyKey || !payload) {
       return res.status(400).json({ success: false, code: 'PRINT_JOB_INVALID', message: 'Invalid print job request.' });
     }
-    const payloadText = JSON.stringify(payload);
+    if (jobType === 'drawer-open') {
+      return res.status(403).json({
+        success: false,
+        code: 'PRINT_DRAWER_AUTHORIZATION_REQUIRED',
+        message: 'Drawer kicks require a short-lived, single-use authorization and cannot be queued as ordinary print jobs.',
+      });
+    }
+    const redactedPayload = redactCustomerFields(payload);
+    const payloadText = JSON.stringify(redactedPayload);
     if (Buffer.byteLength(payloadText, 'utf8') > 256 * 1024) {
       return res.status(413).json({ success: false, code: 'PRINT_PAYLOAD_TOO_LARGE', message: 'Print payload exceeds 256 KB.' });
     }
@@ -45,7 +63,7 @@ exports.createJob = async (req, res, next) => {
     const job = await prisma.posPrintJob.create({
       data: {
         id: generateObjectId(), companyId, registerId, jobType, idempotencyKey,
-        payloadJson: payload, payloadHash: hash(payloadText),
+        payloadJson: redactedPayload, payloadHash: hash(payloadText),
         copyRequired: ['receipt', 'refund-receipt'].includes(jobType),
         expiresAt, createdById: String(req.user.id || req.user._id || '') || null,
       },
@@ -74,7 +92,7 @@ exports.listJobs = async (req, res, next) => {
       where.registerId = registerId;
     }
     const jobs = await prisma.posPrintJob.findMany({ where, orderBy: { createdAt: 'desc' }, take: 100 });
-    return res.json({ success: true, data: jobs });
+    return res.json({ success: true, data: jobs.map((job) => ({ ...job, payloadJson: undefined })) });
   } catch (error) { next(error); }
 };
 
@@ -119,12 +137,17 @@ exports.poll = async (req, res, next) => {
     await prisma.posPrintAgent.updateMany({ where: { id: agent.id, companyId: agent.companyId }, data: { lastSeenAt: now } });
     await prisma.posPrintJob.updateMany({
       where: { agentId: agent.id, status: { in: ['leased', 'transmitting'] }, leasedUntil: { lt: now } },
-      data: { status: 'queued', leaseTokenHash: null, leasedUntil: null, availableAt: now },
+      data: {
+        status: 'uncertain',
+        lastError: 'The agent lease expired before the print outcome was acknowledged.',
+        leaseTokenHash: null,
+        leasedUntil: null,
+      },
     });
     const jobs = await prisma.posPrintJob.findMany({
       where: {
         companyId: agent.companyId, registerId: agent.registerId || undefined, expiresAt: { gt: now },
-        status: 'queued', availableAt: { lte: now },
+        status: 'queued', jobType: { not: 'drawer-open' }, availableAt: { lte: now },
         OR: [{ agentId: null }, { agentId: agent.id }],
       },
       orderBy: [{ availableAt: 'asc' }, { createdAt: 'asc' }],
@@ -215,6 +238,43 @@ exports.fail = async (req, res, next) => {
     await writePosAuditLog({
       companyId: agent.companyId, registerId: agent.registerId,
       event: 'PRINT_JOB_FAILED', metadata: { jobId: job.id, agentId: agent.id, terminal, error: errorMessage }, ip: requestIp(req),
+    });
+    return res.json({ success: true, data: { id: updated.id, status: updated.status } });
+  } catch (error) { next(error); }
+};
+
+exports.uncertain = async (req, res, next) => {
+  try {
+    const agent = req.printAgent;
+    const jobId = String(req.params.jobId || '');
+    const leaseToken = String(req.body.leaseToken || '');
+    if (!leaseToken) return res.status(400).json({ success: false, code: 'PRINT_JOB_LEASE_INVALID', message: 'A valid lease token is required.' });
+    const errorMessage = String(req.body.error || 'Print outcome is unknown').trim().slice(0, 500);
+    const job = await prisma.posPrintJob.findFirst({
+      where: {
+        id: jobId,
+        companyId: agent.companyId,
+        agentId: agent.id,
+        status: { in: ['leased', 'transmitting'] },
+        leaseTokenHash: hash(leaseToken),
+      },
+    });
+    if (!job) return res.status(409).json({ success: false, code: 'PRINT_JOB_LEASE_INVALID', message: 'Job lease is invalid or expired.' });
+    const updated = await prisma.posPrintJob.update({
+      where: { id: job.id },
+      data: {
+        status: 'uncertain',
+        lastError: errorMessage,
+        leaseTokenHash: null,
+        leasedUntil: null,
+      },
+    });
+    await writePosAuditLog({
+      companyId: agent.companyId,
+      registerId: agent.registerId,
+      event: 'PRINT_JOB_UNCERTAIN',
+      metadata: { jobId: job.id, agentId: agent.id, error: errorMessage },
+      ip: requestIp(req),
     });
     return res.json({ success: true, data: { id: updated.id, status: updated.status } });
   } catch (error) { next(error); }

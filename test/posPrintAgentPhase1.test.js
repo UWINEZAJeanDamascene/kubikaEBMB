@@ -12,6 +12,12 @@ const mockPrisma = {
     update: jest.fn(),
     updateMany: jest.fn(),
   },
+  posRegister: {
+    findFirst: jest.fn(),
+  },
+  posPrintDrawerAuthorization: {
+    create: jest.fn(),
+  },
   posPrintJob: {
     findFirst: jest.fn(),
     updateMany: jest.fn(),
@@ -22,7 +28,14 @@ const mockPrisma = {
 jest.mock('../lib/prisma', () => ({ prisma: mockPrisma }));
 jest.mock('../utils/objectId', () => ({ generateObjectId: () => 'abcdefghijklmnopqrstuvwxyz123456' }));
 
-const { pairAgent, authenticateAgent, hash } = require('../services/posPrintAgentService');
+const {
+  pairAgent,
+  authenticateAgent,
+  hash,
+  rebindAgent,
+  issueDrawerAuthorization,
+  consumeDrawerAuthorization,
+} = require('../services/posPrintAgentService');
 
 describe('POS print agent Phase 1 foundation', () => {
   beforeEach(() => jest.clearAllMocks());
@@ -95,12 +108,12 @@ describe('POS print agent Phase 1 foundation', () => {
     });
   });
 
-  test('reactivates an existing device record even when it is revoked or assigned to another register', async () => {
+  test('reuses the same register for a revoked device but refuses a different-register rebind', async () => {
     const pairing = { id: 'c'.repeat(24), name: 'Counter 1', companyId: 'a'.repeat(24), registerId: 'e'.repeat(24) };
-    const existingAgent = {
+    const sameRegisterAgent = {
       id: 'd'.repeat(24),
       companyId: pairing.companyId,
-      registerId: 'b'.repeat(24),
+      registerId: pairing.registerId,
       deviceId: 'device-1',
       status: 'revoked',
       revokedAt: new Date(),
@@ -111,8 +124,8 @@ describe('POS print agent Phase 1 foundation', () => {
         update: jest.fn().mockResolvedValue({ id: pairing.id }),
       },
       posPrintAgent: {
-        findFirst: jest.fn().mockResolvedValue(existingAgent),
-        update: jest.fn(async ({ data }) => ({ ...existingAgent, ...data })),
+        findFirst: jest.fn().mockResolvedValue(sameRegisterAgent),
+        update: jest.fn(async ({ data }) => ({ ...sameRegisterAgent, ...data })),
       },
     };
     mockPrisma.$transaction.mockImplementation(async (callback) => callback(tx));
@@ -124,16 +137,40 @@ describe('POS print agent Phase 1 foundation', () => {
     });
 
     expect(result.agent).toMatchObject({
-      id: existingAgent.id,
+      id: sameRegisterAgent.id,
       registerId: pairing.registerId,
       status: 'active',
       revokedAt: null,
     });
     expect(tx.posPrintAgent.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: existingAgent.id },
+      where: { id: sameRegisterAgent.id },
       data: expect.objectContaining({ registerId: pairing.registerId, status: 'active', revokedAt: null }),
     }));
     expect(tx.posPrintAgent.create).toBeUndefined();
+
+    const mismatchTx = {
+      posPrintPairingCode: {
+        findFirst: jest.fn().mockResolvedValue(pairing),
+        update: jest.fn().mockResolvedValue({ id: pairing.id }),
+      },
+      posPrintAgent: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'mismatch-id',
+          companyId: pairing.companyId,
+          registerId: 'z'.repeat(24),
+          deviceId: 'device-1',
+          status: 'active',
+        }),
+        update: jest.fn(),
+      },
+    };
+    mockPrisma.$transaction.mockImplementationOnce(async (callback) => callback(mismatchTx));
+
+    await expect(pairAgent({
+      pairingCode: 'KUBIKA-12345678',
+      deviceId: 'device-1',
+      platform: 'windows',
+    })).rejects.toMatchObject({ code: 'PRINT_PAIRING_REGISTER_MISMATCH' });
   });
 
   test('retries a concurrent device insert conflict and updates the winning agent', async () => {
@@ -196,5 +233,142 @@ describe('POS print agent Phase 1 foundation', () => {
         accessExpiresAt: { gt: expect.any(Date) },
       }),
     });
+  });
+
+  test('admin rebind is tenant-scoped and rotates both agent credentials', async () => {
+    const companyId = 'a'.repeat(24);
+    const agent = {
+      id: 'd'.repeat(24),
+      companyId,
+      registerId: 'b'.repeat(24),
+      accessTokenHash: 'old-access-hash',
+      refreshTokenHash: 'old-refresh-hash',
+      status: 'revoked',
+    };
+    const tx = {
+      posRegister: { findFirst: jest.fn().mockResolvedValue({ id: 'e'.repeat(24) }) },
+      posPrintAgent: {
+        findFirst: jest.fn().mockResolvedValue(agent),
+        update: jest.fn(async ({ data }) => ({ ...agent, ...data })),
+      },
+    };
+    mockPrisma.$transaction.mockImplementation(async (callback) => callback(tx));
+
+    const result = await rebindAgent({
+      companyId,
+      agentId: agent.id,
+      registerId: 'e'.repeat(24),
+    });
+
+    expect(result.previousRegisterId).toBe(agent.registerId);
+    expect(result.agent).toMatchObject({ registerId: 'e'.repeat(24), status: 'active' });
+    expect(tx.posRegister.findFirst).toHaveBeenCalledWith({
+      where: { id: 'e'.repeat(24), companyId, isActive: true },
+      select: { id: true },
+    });
+    expect(tx.posPrintAgent.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: agent.id },
+      data: expect.objectContaining({
+        registerId: 'e'.repeat(24),
+        status: 'active',
+        revokedAt: null,
+        accessExpiresAt: expect.any(Date),
+      }),
+    }));
+    const updateData = tx.posPrintAgent.update.mock.calls[0][0].data;
+    expect(updateData.accessTokenHash).not.toBe(agent.accessTokenHash);
+    expect(updateData.refreshTokenHash).not.toBe(agent.refreshTokenHash);
+  });
+
+  test('drawer authorization is short-lived, register-bound, and consumed once', async () => {
+    const companyId = 'a'.repeat(24);
+    const registerId = 'b'.repeat(24);
+    mockPrisma.posRegister.findFirst.mockResolvedValue({ id: registerId });
+    mockPrisma.posPrintDrawerAuthorization.create.mockImplementation(async ({ data }) => data);
+
+    const issued = await issueDrawerAuthorization({
+      companyId,
+      registerId,
+      actionType: 'no-sale',
+      actionId: 'till-session-1',
+      shiftId: 'c'.repeat(24),
+      requesterId: 'd'.repeat(24),
+      approvalId: 'e'.repeat(24),
+      reason: 'Manager-approved no-sale',
+      ttlSeconds: 100,
+    });
+
+    expect(issued.token).toEqual(expect.any(String));
+    expect(issued.authorization.tokenHash).toBe(hash(issued.token));
+    expect(issued.authorization.expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 30000);
+    expect(issued.authorization.approvalId).toBe('e'.repeat(24));
+
+    const authorization = {
+      id: 'f'.repeat(24),
+      companyId,
+      registerId,
+      actionType: 'no-sale',
+      actionId: 'till-session-1',
+      shiftId: 'c'.repeat(24),
+      requesterId: 'd'.repeat(24),
+      approvalId: 'e'.repeat(24),
+      expiresAt: new Date(Date.now() + 10000),
+      usedAt: null,
+    };
+    const tx = {
+      posPrintDrawerAuthorization: {
+        findFirst: jest.fn().mockResolvedValue(authorization),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+    };
+    mockPrisma.$transaction.mockImplementation(async (callback) => callback(tx));
+    const result = await consumeDrawerAuthorization({
+      token: issued.token,
+      agent: { companyId, registerId, id: 'agent-1' },
+    });
+
+    expect(result.authorization.usedAt).toBeInstanceOf(Date);
+    expect(tx.posPrintDrawerAuthorization.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: authorization.id, usedAt: null }),
+      data: expect.objectContaining({ outcome: 'authorized', usedAt: expect.any(Date) }),
+    }));
+
+    tx.posPrintDrawerAuthorization.findFirst.mockResolvedValue({ ...authorization, usedAt: new Date() });
+    const reused = await consumeDrawerAuthorization({
+      token: issued.token,
+      agent: { companyId, registerId, id: 'agent-1' },
+    });
+    expect(reused.code).toBe('PRINT_DRAWER_AUTHORIZATION_REUSED');
+    expect(tx.posPrintDrawerAuthorization.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  test('drawer authorization refuses expired and different-register tokens', async () => {
+    const authorization = {
+      id: 'f'.repeat(24),
+      companyId: 'a'.repeat(24),
+      registerId: 'b'.repeat(24),
+      expiresAt: new Date(Date.now() - 1000),
+      usedAt: null,
+    };
+    const tx = {
+      posPrintDrawerAuthorization: {
+        findFirst: jest.fn().mockResolvedValue(authorization),
+        updateMany: jest.fn(),
+      },
+    };
+    mockPrisma.$transaction.mockImplementation(async (callback) => callback(tx));
+
+    const expired = await consumeDrawerAuthorization({
+      token: 'expired-token',
+      agent: { companyId: authorization.companyId, registerId: authorization.registerId },
+    });
+    expect(expired.code).toBe('PRINT_DRAWER_AUTHORIZATION_EXPIRED');
+
+    const wrongRegister = await consumeDrawerAuthorization({
+      token: 'wrong-register-token',
+      agent: { companyId: authorization.companyId, registerId: 'c'.repeat(24) },
+    });
+    expect(wrongRegister.code).toBe('PRINT_DRAWER_AUTHORIZATION_REGISTER_MISMATCH');
+    expect(tx.posPrintDrawerAuthorization.updateMany).not.toHaveBeenCalled();
   });
 });

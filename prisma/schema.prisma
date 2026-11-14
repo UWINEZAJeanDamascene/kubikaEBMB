@@ -1480,6 +1480,26 @@ model PosPrintAgent {
   @@map("pos_print_agents")
 }
 
+model PosPrintDrawerAuthorization {
+  id          String    @id @db.Char(24)
+  companyId   String    @map("company_id") @db.Char(24)
+  registerId  String    @map("register_id") @db.Char(24)
+  tokenHash   String    @unique @map("token_hash") @db.Char(64)
+  actionType  String    @map("action_type") @db.VarChar(40)
+  actionId    String    @map("action_id") @db.VarChar(160)
+  shiftId     String?   @map("shift_id") @db.Char(24)
+  requesterId String    @map("requester_id") @db.Char(24)
+  approvalId  String?   @map("approval_id") @db.Char(24)
+  reason      String    @db.VarChar(500)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt      DateTime? @map("used_at") @db.Timestamptz(3)
+  outcome     String?   @db.VarChar(30)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([companyId, registerId, expiresAt])
+  @@map("pos_print_drawer_authorizations")
+}
+
 model PosPrintPrinter {
   id            String        @id @db.Char(24)
   companyId     String        @map("company_id") @db.Char(24)
