@@ -1,6 +1,6 @@
 ﻿{
-    "version":  "0.1.3",
-    "releaseDateUtc":  "2026-11-14T09:11:26.6406174Z",
+    "version":  "0.1.4",
+    "releaseDateUtc":  "2026-11-14T11:45:18.4847949Z",
     "hardwareValidation":  {
                                "productionCertificate":  "not-provided",
                                "windowsSdk":  "available",
@@ -8,10 +8,10 @@
                                "physicalDrawers":  "pending",
                                "physicalPrinters":  "pending"
                            },
-    "sha256":  "7f614d3014fa88c6273d5a8ce4b833f0115bf758441fa70ddc9e515f9dfc8608",
-    "setup":  "KubikaPrintAgent-0.1.3-setup.exe",
+    "sha256":  "0d4ff7934bca8ab7d00b6831e47612044823e4f6881e855ea30fc5c8251b96ce",
+    "setup":  "KubikaPrintAgent-0.1.4-setup.exe",
     "signed":  false,
-    "package":  "KubikaPrintAgent-0.1.3-portable.zip",
-    "setupSha256":  "2fe265bea25017e40eef2670bcd243b8a4dfa69972dfe1f88793ccad63a40d6b",
+    "package":  "KubikaPrintAgent-0.1.4-portable.zip",
+    "setupSha256":  "5ec5fb5ae6f560dfb0ca9fe6498178c9e8262cee5b08a91e79b26c79f284f232",
     "winswSha256":  "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
 }

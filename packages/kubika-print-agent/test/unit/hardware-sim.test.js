@@ -97,6 +97,77 @@ test('local printer selection persists the chosen discovered Windows printer as 
   }
 });
 
+test('paired browser sessions authorize only origin-bound local printer operations', async () => {
+  const token = 'installed-agent-token';
+  let savedPrinters = [];
+  const app = createLocalServer({
+    ledger: {},
+    credentialStore: { load: () => ({ accessToken: token }) },
+    discoverPrinters: () => [{ name: 'Receipt Printer', transport: 'windows-spooler', isDefault: false }],
+    savePrinters: (printers) => { savedPrinters = printers; },
+    transmitDirect: async () => ({}),
+    onPair: async () => ({ agentId: 'agent-test', accessToken: token }),
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise((resolve) => server.once('listening', resolve));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const origin = 'https://kubika-ebmf.vercel.app';
+
+  try {
+    const originlessSession = await fetch(`${baseUrl}/v1/browser-session`, { method: 'POST' });
+    assert.equal(originlessSession.status, 403);
+
+    const pairResponse = await fetch(`${baseUrl}/v1/pair`, {
+      method: 'POST',
+      headers: { Origin: origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairingCode: 'test-code' }),
+    });
+    const pairBody = await pairResponse.json();
+    assert.equal(pairResponse.status, 200);
+    assert.equal(Object.prototype.hasOwnProperty.call(pairBody.data, 'accessToken'), false);
+
+    const missingToken = await fetch(`${baseUrl}/v1/printers/refresh`, { method: 'POST' });
+    assert.equal(missingToken.status, 401);
+
+    const bootstrap = await fetch(`${baseUrl}/v1/browser-session`, {
+      method: 'POST',
+      headers: { Origin: origin },
+    });
+    const session = await bootstrap.json();
+    assert.equal(bootstrap.status, 200);
+    assert.equal(session.success, true);
+    assert.ok(Date.parse(session.data.expiresAt) > Date.now());
+    assert.notEqual(session.data.token, token);
+
+    const refresh = await fetch(`${baseUrl}/v1/printers/refresh`, {
+      method: 'POST',
+      headers: { Origin: origin, Authorization: `Bearer ${session.data.token}` },
+    });
+    assert.equal(refresh.status, 200);
+
+    const selection = await fetch(`${baseUrl}/v1/printers/select`, {
+      method: 'POST',
+      headers: { Origin: origin, Authorization: `Bearer ${session.data.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Receipt Printer' }),
+    });
+    assert.equal(selection.status, 200);
+    assert.equal(savedPrinters[0].isDefault, true);
+
+    const wrongOrigin = await fetch(`${baseUrl}/v1/printers/refresh`, {
+      method: 'POST',
+      headers: { Origin: 'https://attacker.example', Authorization: `Bearer ${session.data.token}` },
+    });
+    assert.equal(wrongOrigin.status, 403);
+
+    const outOfScope = await fetch(`${baseUrl}/v1/logs`, {
+      headers: { Origin: origin, Authorization: `Bearer ${session.data.token}` },
+    });
+    assert.equal(outOfScope.status, 401);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test('local printer selection rejects a printer not discovered by the agent', async () => {
   const token = 'installed-agent-token';
   const app = createLocalServer({
@@ -186,6 +257,12 @@ test('local setup page and status are available before pairing; printer mutation
 
     const mutation = await fetch(`${baseUrl}/v1/printers/refresh`, { method: 'POST' });
     assert.equal(mutation.status, 401);
+
+    const browserSession = await fetch(`${baseUrl}/v1/browser-session`, {
+      method: 'POST',
+      headers: { Origin: 'https://kubika-ebmf.vercel.app' },
+    });
+    assert.equal(browserSession.status, 401);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

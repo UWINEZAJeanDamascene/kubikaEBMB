@@ -53,7 +53,7 @@ async function pair(body) {
       deviceId: body.deviceId || require('crypto').randomUUID(),
       name: body.name || 'Kubika Print Agent',
       platform: 'windows',
-      version: '0.1.3',
+      version: '0.1.4',
     }),
   });
   credentials.save({

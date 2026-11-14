@@ -1,6 +1,16 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { randomBytes } = require('crypto');
+
+const BROWSER_SESSION_TTL_MS = 15 * 60 * 1000;
+const BROWSER_SESSION_ROUTES = new Set([
+  'POST /v1/jobs',
+  'POST /v1/printers',
+  'POST /v1/printers/refresh',
+  'POST /v1/printers/select',
+  'POST /v1/unpair',
+]);
 
 const DEFAULT_ALLOWED_ORIGINS = new Set([
   'http://localhost',
@@ -70,6 +80,7 @@ function createLocalServer({
 }) {
   const app = express();
   const rateLimit = createRateLimiter(rateLimitOptions?.limit, rateLimitOptions?.windowMs);
+  const browserSessions = new Map();
   app.disable('x-powered-by');
   app.use((req, res, next) => {
     const origin = req.headers.origin;
@@ -90,15 +101,24 @@ function createLocalServer({
   app.use((req, res, next) => {
     const publicSetupRead = req.method === 'GET'
       && ['/', '/setup', '/v1/setup', '/status', '/v1/status'].includes(req.path);
-    if (req.path === '/v1/pair' || publicSetupRead) return next();
+    if (req.path === '/v1/pair' || req.path === '/v1/browser-session' || publicSetupRead) return next();
     const token = getRequestToken(req);
     const stored = credentialStore?.load?.();
     const hasInstalledToken = Boolean(stored?.accessToken && token === stored.accessToken);
+    const browserSession = token && browserSessions.get(token);
+    const hasBrowserSession = Boolean(
+      stored?.accessToken
+      && browserSession
+      && browserSession.expiresAt > Date.now()
+      && browserSession.origin === req.headers.origin
+      && BROWSER_SESSION_ROUTES.has(`${req.method} ${req.path}`),
+    );
+    if (browserSession && !hasBrowserSession) browserSessions.delete(token);
     const hasDrawerCapability = req.method === 'POST'
       && req.path === '/v1/jobs'
       && req.body?.jobType === 'drawer-open'
       && Boolean(String(req.body?.drawerAuthorizationToken || '').trim());
-    if (!hasInstalledToken && !hasDrawerCapability) {
+    if (!hasInstalledToken && !hasBrowserSession && !hasDrawerCapability) {
       return res.status(401).json({ success: false, code: 'PRINT_AGENT_UNAUTHORIZED', message: 'This local agent requires the installed pairing token.' });
     }
     return next();
@@ -112,7 +132,7 @@ function createLocalServer({
         paired: Boolean(credentialStore.load()),
         printers: discoverPrinters(),
         service: 'kubika-print-agent',
-        version: '0.1.3',
+        version: '0.1.4',
       },
     });
   });
@@ -140,7 +160,6 @@ function createLocalServer({
         data: {
           paired: true,
           agentId: result.agentId,
-          accessToken: result.accessToken || credentialStore.load()?.accessToken || null,
           printers: result.printers || [],
         },
       });
@@ -230,7 +249,7 @@ function createLocalServer({
         paired,
         printers: discoverPrinters(),
         service: 'kubika-print-agent',
-        version: '0.1.3',
+        version: '0.1.4',
       },
     });
   });
@@ -243,6 +262,36 @@ function createLocalServer({
       try { return fs.readFileSync(path.join(logDir, name), 'utf8').split(/\r?\n/).slice(-100); } catch { return []; }
     });
     res.json({ success: true, data: { lines } });
+  });
+
+  app.post('/v1/browser-session', (req, res) => {
+    const origin = String(req.headers.origin || '');
+    if (!origin || !isAllowedOrigin(origin)) {
+      return res.status(403).json({
+        success: false,
+        code: 'PRINT_AGENT_ORIGIN_FORBIDDEN',
+        message: 'A browser session requires an allowed application origin.',
+      });
+    }
+    if (!credentialStore.load()?.accessToken) {
+      return res.status(401).json({
+        success: false,
+        code: 'PRINT_AGENT_UNAUTHORIZED',
+        message: 'Pair this Print Agent before authorizing browser controls.',
+      });
+    }
+
+    const now = Date.now();
+    for (const [sessionToken, session] of browserSessions) {
+      if (session.expiresAt <= now) browserSessions.delete(sessionToken);
+    }
+    const token = randomBytes(32).toString('base64url');
+    const expiresAt = now + BROWSER_SESSION_TTL_MS;
+    browserSessions.set(token, { origin, expiresAt });
+    res.json({
+      success: true,
+      data: { token, expiresAt: new Date(expiresAt).toISOString() },
+    });
   });
 
   app.get('/', (_req, res) => {

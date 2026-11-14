@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
-$version = '0.1.3'
+$version = '0.1.4'
 $staging = Join-Path $root 'staging'
 $release = Join-Path $root 'release'
 $runtimeDir = Join-Path $staging 'runtime'
