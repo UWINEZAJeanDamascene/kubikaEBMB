@@ -51,6 +51,7 @@ const posShiftLifecycleController = require('../controllers/posShiftLifecycleCon
 const posPaymentSettingsRoutes = require('./posPaymentSettingsRoutes');
 const posPaymentSettingsController = require('../controllers/posPaymentSettingsController');
 const posTillSettingsController = require('../controllers/posTillSettingsController');
+const posScannerSettingsController = require('../controllers/posScannerSettingsController');
 const posDiscountSettingsController = require('../controllers/posDiscountSettingsController');
 const posAccountingProfileController = require('../controllers/posAccountingProfileController');
 const posBackOfficeController = require('../controllers/posBackOfficeController');
@@ -72,6 +73,10 @@ router.use('/print-agent', posPrintAgentRoutes);
 
 router.use('/payment-settings', posPaymentSettingsRoutes);
 const canManagePosSettings = requirePermissionOrRoles('pos.admin', 'settings', ['admin', 'manager', 'store_manager', 'owner']);
+router.get('/scanner-settings', requirePosSession(), requirePermission('pos.till.sell'), posScannerSettingsController.getCurrent);
+router.get('/admin/scanner-settings', protect, canManagePosSettings, posScannerSettingsController.getAdmin);
+router.put('/admin/scanner-settings', protect, canManagePosSettings, idem(posScannerSettingsController.updateAdmin));
+router.put('/admin/scanner-settings/open-price-product', protect, canManagePosSettings, idem(posScannerSettingsController.updateOpenPriceProduct));
 router.get('/register-settings/payment-methods', protect, canManagePosSettings, posPaymentSettingsController.getAdminSettings);
 router.put('/register-settings/payment-methods', protect, canManagePosSettings, idem(posPaymentSettingsController.updateAdminSettings));
 router.get('/register-settings', protect, canManagePosSettings, posTillSettingsController.getSettings);
@@ -179,8 +184,17 @@ router.get('/admin/audit/export.csv', canExportPosAudit, posBackOfficeController
 router.get('/admin/audit', canReadPosAudit, posBackOfficeController.audit);
 const canReadPosSecurity = requirePosPermissions({ resource: 'pos.admin.security', action: 'read' });
 const canUpdatePosSecurity = requirePosPermissions({ resource: 'pos.admin.security', action: 'update' });
-const canReadPosSecuritySessions = requirePosPermissions({ resource: 'pos.admin.security.sessions', action: 'read' });
-const canRevokePosSecuritySessions = requirePosPermissions({ resource: 'pos.admin.security.sessions', action: 'revoke' });
+const POS_SECURITY_ADMIN_ROLES = ['admin', 'manager', 'store_manager', 'owner', 'platform_admin', 'super_admin'];
+const canReadPosSecuritySessions = requirePermissionOrRoles(
+  'pos.admin.security.sessions',
+  'read',
+  POS_SECURITY_ADMIN_ROLES,
+);
+const canRevokePosSecuritySessions = requirePermissionOrRoles(
+  'pos.admin.security.sessions',
+  'revoke',
+  POS_SECURITY_ADMIN_ROLES,
+);
 router.get('/admin/security/settings', canReadPosSecurity, posSecurityController.getSettings);
 router.put('/admin/security/settings', canUpdatePosSecurity, idem(posSecurityController.updateSettings));
 router.get('/admin/security/sessions', canReadPosSecuritySessions, posSecurityController.activeSessions);

@@ -332,6 +332,103 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(res.body.code).toBe('POS_MANAGER_APPROVAL_REQUIRED');
   });
 
+  test('denies open-price checkout without the dedicated POS permission', async () => {
+    const openPriceProductId = IDS.product;
+    const { db } = stubHappyPathDeps();
+    Product.find.mockReturnValue(leanFind([catalogProduct({ isStockable: false })]));
+    StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue([]) });
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: discountTestSettings,
+      posScannerSettings: { openPriceProductId },
+    });
+    const req = makeReq({
+      body: checkoutBody({
+        items: [saleLine({ openPrice: true, description: 'Emergency service', unitPrice: 1500 })],
+        paymentAmount: 1770,
+      }),
+    });
+    req.posAuthContext = {
+      user: { id: IDS.cashier, role: { id: 'cashier-role', name: 'cashier', permissions: [] } },
+      session: { companyId: IDS.company, registerId: '888888888888888888888888' },
+      settings: { posRolePermissions: {} },
+    };
+
+    const res = mockRes();
+    await createDirectSale(req, res, jest.fn());
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body.code).toBe('POS_PERMISSION_DENIED');
+    expect(Invoice.create).not.toHaveBeenCalled();
+  });
+
+  test('posts an authorized open-price line with the configured product tax and no stock movement', async () => {
+    const { db } = stubHappyPathDeps();
+    Product.find.mockReturnValue(leanFind([catalogProduct({ isStockable: false })]));
+    StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue([]) });
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: discountTestSettings,
+      posScannerSettings: { openPriceProductId: IDS.product },
+    });
+    const req = makeReq({
+      body: checkoutBody({
+        items: [saleLine({
+          openPrice: true,
+          description: 'Emergency service',
+          unitPrice: 1500,
+        })],
+        paymentAmount: 1770,
+      }),
+    });
+    req.posAuthContext = {
+      user: { id: IDS.cashier, role: { id: 'supervisor-role', name: 'supervisor', permissions: [] } },
+      session: { companyId: IDS.company, registerId: '888888888888888888888888' },
+      settings: { posRolePermissions: {} },
+    };
+
+    const res = mockRes();
+    await createDirectSale(req, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(201);
+    expect(Invoice.create.mock.calls[0][0][0].lines[0]).toMatchObject({
+      description: 'Emergency service',
+      unitPrice: 1500,
+      taxRate: 18,
+      taxCode: 'B',
+    });
+    expect(StockMovement.insertMany).not.toHaveBeenCalled();
+    expect(inventoryService.consume).not.toHaveBeenCalled();
+  });
+
+  test('rejects cart discounts on open-price items', async () => {
+    const { db } = stubHappyPathDeps();
+    Product.find.mockReturnValue(leanFind([catalogProduct({ isStockable: false })]));
+    StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue([]) });
+    db.systemSettings.findUnique.mockResolvedValue({
+      posDiscountSettings: discountTestSettings,
+      posScannerSettings: { openPriceProductId: IDS.product },
+    });
+    const req = makeReq({
+      body: checkoutBody({
+        items: [saleLine({ openPrice: true, description: 'Emergency service', unitPrice: 1500 })],
+        cartDiscountPct: 10,
+        cartDiscountReason: 'Test discount',
+        paymentAmount: 1593,
+      }),
+    });
+    req.posAuthContext = {
+      user: { id: IDS.cashier, role: { id: 'supervisor-role', name: 'supervisor', permissions: [] } },
+      session: { companyId: IDS.company, registerId: '888888888888888888888888' },
+      settings: { posRolePermissions: {} },
+    };
+
+    const res = mockRes();
+    await createDirectSale(req, res, jest.fn());
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.code).toBe('POS_OPEN_PRICE_DISCOUNT_UNSUPPORTED');
+    expect(Invoice.create).not.toHaveBeenCalled();
+  });
+
   test('cash checkout posts stock, journals, and till cash activity', async () => {
     const { invoice, db } = stubHappyPathDeps();
     const scopedProfile = {
@@ -535,10 +632,14 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       negativeStockAllowed: false,
       escalationDays: 3,
       paymentFlow: 'PAYMENTS_V2',
+      offlinePolicy: { requiresFiscalSubmission: false },
     };
     db.$queryRawUnsafe.mockImplementation(async (sql) => {
       const statement = String(sql);
       if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('FROM companies c LEFT JOIN system_settings s')) {
+        return [{ ebmEnabled: false, offlinePolicy: { provisionalFiscalReceiptsAllowed: false } }];
+      }
       if (statement.includes('FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE')) {
         return [{ queueLimit: 10000, usedValue: 0 }];
       }
@@ -1874,10 +1975,14 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       negativeStockAllowed: false,
       escalationDays: 3,
       paymentFlow: 'LEGACY',
+      offlinePolicy: { requiresFiscalSubmission: false },
     };
     db.$queryRawUnsafe.mockImplementation(async (sql) => {
       const statement = String(sql);
       if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('FROM companies c LEFT JOIN system_settings s')) {
+        return [{ ebmEnabled: false, offlinePolicy: { provisionalFiscalReceiptsAllowed: false } }];
+      }
       if (statement.includes('SELECT receipt_number AS "receiptNumber"')) {
         return [{ receiptNumber: 'INV-2026-00002' }];
       }
@@ -2028,10 +2133,14 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       negativeStockAllowed: false,
       escalationDays: 3,
       paymentFlow: 'LEGACY',
+      offlinePolicy: { requiresFiscalSubmission: false },
     };
     db.$queryRawUnsafe.mockImplementation(async (sql) => {
       const statement = String(sql);
       if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('FROM companies c LEFT JOIN system_settings s')) {
+        return [{ ebmEnabled: false, offlinePolicy: { provisionalFiscalReceiptsAllowed: false } }];
+      }
       if (statement.includes('FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE')) {
         return [{ queueLimit: 10000, usedValue: 0 }];
       }
@@ -2164,6 +2273,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       negativeStockAllowed: false,
       escalationDays: 3,
       paymentFlow: 'LEGACY',
+      offlinePolicy: { requiresFiscalSubmission: false },
     };
     db.stockBatch.findMany = jest.fn().mockResolvedValue([{
       id: batchId,
@@ -2177,6 +2287,9 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     db.$queryRawUnsafe.mockImplementation(async (sql) => {
       const statement = String(sql);
       if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('FROM companies c LEFT JOIN system_settings s')) {
+        return [{ ebmEnabled: false, offlinePolicy: { provisionalFiscalReceiptsAllowed: false } }];
+      }
       if (statement.includes('FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE')) {
         return [{ queueLimit: 10000, usedValue: 0 }];
       }

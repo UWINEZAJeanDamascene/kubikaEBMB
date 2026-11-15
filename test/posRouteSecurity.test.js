@@ -43,6 +43,18 @@ describe('POS route security inventory', () => {
     }
   });
 
+  test('same-device credential recovery is authenticated, permission-gated, and idempotent', () => {
+    for (const key of [
+      'POST /api/tills/registers/device-recovery/challenge',
+      'POST /api/tills/registers/device-recovery/complete',
+    ]) {
+      const route = routes.find((entry) => entry.key === key);
+      expect(route?.authentication).toBe('ERP_SESSION');
+      expect(route?.authorization).toBe('ROUTE_PERMISSION');
+      expect(route?.idempotency).toBe('SHARED_IDEMPOTENCY');
+    }
+  });
+
   test('every declared mutation has shared idempotency or an explicitly documented native boundary', () => {
     const mutationsWithoutReplayBoundary = routes.filter((route) => (
       ['POST', 'PUT', 'PATCH', 'DELETE'].includes(route.method)

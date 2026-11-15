@@ -7,6 +7,8 @@ const {
   clientToApi,
   supplierToApi,
   productToApi,
+  productTranslateCreate,
+  productTranslateUpdate,
   chartOfAccountToApi,
   taxRateToApi,
   currencyToApi,
@@ -101,6 +103,7 @@ describe('Phase 2 master data mappers', () => {
       companyId: 'c1',
       name: 'Widget',
       sku: 'WID-001',
+      alternateBarcodes: ['ALT-001'],
       categoryId: 'cat1',
       currentStock: { toString: () => '25.5000' },
       reservedQuantity: { toString: () => '5.0000' },
@@ -126,6 +129,19 @@ describe('Phase 2 master data mappers', () => {
     expect(api.taxRate).toBe('0.180000');
     expect(api.isLowStock).toBe(false);
     expect(api.availableStock).toBe(20.5);
+    expect(api.alternateBarcodes).toEqual(['ALT-001']);
+  });
+
+  test('product alternate barcodes are normalized for create and update', async () => {
+    const created = await productTranslateCreate({
+      companyId: '507f1f77bcf86cd799439021',
+      name: 'Widget',
+      sku: 'wid-001',
+      category: '507f1f77bcf86cd799439022',
+      alternateBarcodes: [' alt-001 ', 'ALT-001', 'alt-002'],
+    });
+    expect(created.alternateBarcodes).toEqual(['ALT-001', 'ALT-002']);
+    expect(productTranslateUpdate({ alternateBarcodes: [' alt-003 ', 'alt-003'] }).alternateBarcodes).toEqual(['ALT-003']);
   });
 
   test('chartOfAccountToApi uses snake_case legacy fields', () => {

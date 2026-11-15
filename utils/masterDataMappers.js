@@ -6,6 +6,19 @@ const { generateObjectId, toIdString } = require('./objectId');
 const { decimalToNumber, decimalToString, idRef, mapTimestamps } = require('./decimalHelpers');
 const { sanitizeProductHistory } = require('./productHistoryHelpers');
 
+function normalizeAlternateBarcodes(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new TypeError('Alternate barcodes must be provided as a list.');
+  const barcodes = [...new Set(value.map((barcode) => {
+    if (typeof barcode !== 'string') throw new TypeError('Each alternate barcode must be text.');
+    return barcode.trim().toUpperCase();
+  }).filter(Boolean))];
+  if (barcodes.length > 64 || barcodes.some((barcode) => barcode.length > 128)) {
+    throw new RangeError('A product can have up to 64 alternate barcodes, each at most 128 characters.');
+  }
+  return barcodes;
+}
+
 function mergeUpdatePayload(update = {}) {
   const direct = { ...update };
   if (direct.$set) {
@@ -427,6 +440,7 @@ function productToApi(row) {
     sku: row.sku,
     barcode: row.barcode ?? null,
     barcodeType: row.barcodeType ?? 'CODE128',
+    alternateBarcodes: Array.isArray(row.alternateBarcodes) ? row.alternateBarcodes : [],
     imageUrl: row.imageUrl ?? null,
     imageUrls: Array.isArray(row.imageUrls) ? row.imageUrls : [],
     description: row.description ?? null,
@@ -479,6 +493,7 @@ const PRODUCT_INPUT_MAP = {
   sku: 'sku',
   barcode: 'barcode',
   barcodeType: 'barcodeType',
+  alternateBarcodes: 'alternateBarcodes',
   imageUrl: 'imageUrl',
   imageUrls: 'imageUrls',
   description: 'description',
@@ -536,6 +551,7 @@ async function productTranslateCreate(data) {
     isActive: data.isActive !== false,
     isStockable: data.isStockable !== false,
     isArchived: Boolean(data.isArchived),
+    alternateBarcodes: normalizeAlternateBarcodes(data.alternateBarcodes),
     ebm: data.ebm || {},
     history: data.history || [],
     customFields: data.customFields || {},
@@ -543,7 +559,11 @@ async function productTranslateCreate(data) {
 }
 
 function productTranslateUpdate(update = {}) {
-  return productInputToPrisma(mergeUpdatePayload(update));
+  const data = productInputToPrisma(mergeUpdatePayload(update));
+  if (Object.prototype.hasOwnProperty.call(data, 'alternateBarcodes')) {
+    data.alternateBarcodes = normalizeAlternateBarcodes(data.alternateBarcodes);
+  }
+  return data;
 }
 
 function chartOfAccountToApi(row) {

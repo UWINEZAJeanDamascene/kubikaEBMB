@@ -19,7 +19,7 @@ async function expireAndCleanup() {
   });
   const purgeBefore = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   await prisma.posPrintJob.deleteMany({
-    where: { status: { in: ['transmitted', 'confirmed', 'failed', 'expired', 'uncertain'] }, updatedAt: { lt: purgeBefore } },
+    where: {     status: { in: ['transmitted', 'confirmed', 'failed', 'expired', 'uncertain', 'cancelled'] }, updatedAt: { lt: purgeBefore } },
   });
 }
 

@@ -2,6 +2,7 @@ const { createHash, randomBytes } = require('crypto');
 const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
+const { verifyOperationSignature } = require('../services/posSyncOperationContract');
 const {
   deviceKeyFingerprint,
   hashDeviceToken: hashEnrolledDeviceToken,
@@ -16,6 +17,7 @@ const normalizeDeviceId = (value) => {
   return /^[a-f0-9-]{36}$/.test(id) ? id : null;
 };
 const hashClaimCode = (code) => createHash('sha256').update(String(code)).digest('hex');
+const DEVICE_RECOVERY_TTL_MS = 2 * 60 * 1000;
 const publicRegister = (register) => ({
   _id: register.id,
   registerId: register.code,
@@ -676,6 +678,220 @@ exports.issueClaimCode = async (req, res, next) => {
     return res.json({ success: true, data: publicRegister(register), claimCode, claimCodeExpiresAt: expiresAt });
   } catch (error) {
     next(error);
+  }
+};
+
+exports.createDeviceRecoveryChallenge = async (req, res, next) => {
+  try {
+    const companyId = companyIdFor(req);
+    const deviceId = normalizeDeviceId(req.body?.deviceId);
+    if (!deviceId) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_DEVICE_RECOVERY_REQUEST_INVALID',
+        message: 'A valid paired POS device is required.',
+      });
+    }
+
+    const register = await prisma.posRegister.findFirst({
+      where: { companyId, isActive: true, claimedDeviceId: deviceId },
+    });
+    if (!register?.deviceTokenHash) {
+      return res.status(404).json({
+        success: false,
+        code: 'POS_DEVICE_RECOVERY_UNAVAILABLE',
+        message: 'This browser is not the currently paired device for an active register.',
+      });
+    }
+    const device = await prisma.posDevice.findFirst({
+      where: {
+        companyId,
+        registerId: register.id,
+        deviceId,
+        status: 'active',
+      },
+    });
+    if (!device?.publicKey || device.deviceTokenHash !== register.deviceTokenHash) {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_DEVICE_RECOVERY_KEY_UNAVAILABLE',
+        message: 'This paired device cannot prove its identity. Hand over the active shift before replacing it.',
+      });
+    }
+
+    const challenge = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + DEVICE_RECOVERY_TTL_MS);
+    const stored = await prisma.posDevice.updateMany({
+      where: {
+        id: device.id,
+        companyId,
+        registerId: register.id,
+        deviceId,
+        status: 'active',
+        deviceTokenHash: device.deviceTokenHash,
+        publicKey: device.publicKey,
+      },
+      data: {
+        recoveryChallengeHash: hashClaimCode(challenge),
+        recoveryChallengeExpiresAt: expiresAt,
+      },
+    });
+    if (stored.count !== 1) {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_DEVICE_RECOVERY_RETRY',
+        message: 'The paired device changed. Refresh and try again.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        protocol: 'KUBIKA_POS_DEVICE_RECOVERY_V1',
+        companyId,
+        registerId: register.id,
+        deviceId,
+        challenge,
+        expiresAt: expiresAt.toISOString(),
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.recoverDeviceCredential = async (req, res, next) => {
+  try {
+    const companyId = companyIdFor(req);
+    const deviceId = normalizeDeviceId(req.body?.deviceId);
+    const challenge = String(req.body?.challenge || '');
+    const expiresAt = String(req.body?.expiresAt || '');
+    const signature = String(req.body?.signature || '');
+    if (!deviceId || !/^[A-Za-z0-9_-]{43}$/.test(challenge)
+      || !/^[A-Za-z0-9_-]{86}$/.test(signature)) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_DEVICE_RECOVERY_REQUEST_INVALID',
+        message: 'The signed device recovery request is invalid.',
+      });
+    }
+
+    const register = await prisma.posRegister.findFirst({
+      where: { companyId, isActive: true, claimedDeviceId: deviceId },
+    });
+    const device = register && await prisma.posDevice.findFirst({
+      where: {
+        companyId,
+        registerId: register.id,
+        deviceId,
+        status: 'active',
+      },
+    });
+    const challengeExpiresAt = device?.recoveryChallengeExpiresAt;
+    if (!register?.deviceTokenHash || !device?.publicKey
+      || device.deviceTokenHash !== register.deviceTokenHash
+      || device.recoveryChallengeHash !== hashClaimCode(challenge)
+      || !challengeExpiresAt
+      || challengeExpiresAt.getTime() <= Date.now()
+      || new Date(expiresAt).getTime() !== challengeExpiresAt.getTime()) {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_DEVICE_RECOVERY_CHALLENGE_EXPIRED',
+        message: 'The recovery challenge expired or is no longer valid. Start recovery again.',
+      });
+    }
+
+    const signedPayload = {
+      protocol: 'KUBIKA_POS_DEVICE_RECOVERY_V1',
+      companyId,
+      registerId: register.id,
+      deviceId,
+      challenge,
+      expiresAt: challengeExpiresAt.toISOString(),
+    };
+    if (!verifyOperationSignature({ ...signedPayload, signature }, device.publicKey)) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_DEVICE_RECOVERY_SIGNATURE_INVALID',
+        message: 'This browser could not prove it is the paired POS device.',
+      });
+    }
+
+    const deviceToken = newDeviceToken();
+    const tokenHash = hashEnrolledDeviceToken(deviceToken);
+    const now = new Date();
+    try {
+      const recovered = await prisma.$transaction(async (tx) => {
+        const registerChanged = await tx.posRegister.updateMany({
+          where: {
+            id: register.id,
+            companyId,
+            isActive: true,
+            claimedDeviceId: deviceId,
+            deviceTokenHash: device.deviceTokenHash,
+          },
+          data: { deviceTokenHash: tokenHash },
+        });
+        if (registerChanged.count !== 1) throw new Error('POS_DEVICE_RECOVERY_STATE_CHANGED');
+
+        const deviceChanged = await tx.posDevice.updateMany({
+          where: {
+            id: device.id,
+            companyId,
+            registerId: register.id,
+            deviceId,
+            status: 'active',
+            deviceTokenHash: device.deviceTokenHash,
+            publicKey: device.publicKey,
+            recoveryChallengeHash: hashClaimCode(challenge),
+            recoveryChallengeExpiresAt: { gt: now },
+          },
+          data: {
+            deviceTokenHash: tokenHash,
+            recoveryChallengeHash: null,
+            recoveryChallengeExpiresAt: null,
+          },
+        });
+        if (deviceChanged.count !== 1) throw new Error('POS_DEVICE_RECOVERY_STATE_CHANGED');
+
+        await writePosAuditLog({
+          companyId,
+          registerId: register.id,
+          userId: req.user.id || req.user._id,
+          event: 'REGISTER_DEVICE_CREDENTIAL_RECOVERED',
+          metadata: { deviceId, registerCode: register.code },
+          ip: requestIp(req),
+        }, tx);
+        return true;
+      });
+      if (!recovered) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_DEVICE_RECOVERY_RETRY',
+          message: 'The paired device changed. Start recovery again.',
+        });
+      }
+    } catch (error) {
+      if (error?.message === 'POS_DEVICE_RECOVERY_STATE_CHANGED') {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_DEVICE_RECOVERY_RETRY',
+          message: 'The paired device changed. Start recovery again.',
+        });
+      }
+      throw error;
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        deviceToken,
+        deviceId,
+        register: publicRegister(register),
+      },
+    });
+  } catch (error) {
+    return next(error);
   }
 };
 

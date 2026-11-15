@@ -327,6 +327,7 @@ model SystemSettings {
   posCashOutApprovalLimit            Int      @default(50000) @map("pos_cash_out_approval_limit")
   posDrawerWarnAmount                Int?     @map("pos_drawer_warn_amount")
   posReceiptSettings                 Json     @default("{\"paperWidth\":80,\"columns\":42,\"showCashier\":true,\"showCustomer\":true,\"showSku\":false,\"showBarcode\":false,\"headerNote\":\"\",\"footerNote\":\"Thank you for shopping with us.\",\"returnPolicy\":\"\",\"logoUrl\":\"\",\"autoPrintOnSale\":false,\"digitalReceiptsEnabled\":true,\"digitalReceiptExpiryDays\":30}") @map("pos_receipt_settings")
+  posScannerSettings                 Json     @default("{\"companyDefaults\":{\"terminator\":\"Enter\",\"speedThresholdMs\":50,\"minimumLength\":3,\"maximumLength\":128,\"duplicateWindowMs\":800,\"duplicateBehavior\":\"add_quantity\",\"prefixToStrip\":\"\",\"suffixToStrip\":\"\",\"feedbackSound\":false,\"enabledSymbologies\":[\"EAN13\",\"EAN8\",\"UPCA\",\"CODE128\",\"CODE39\",\"ITF14\",\"QR\"]},\"tillTypeOverrides\":{},\"registerOverrides\":{}}") @map("pos_scanner_settings") @db.JsonB
   posLoyaltySettings                 Json     @default("{\"pointValueRwf\":1}") @map("pos_loyalty_settings")
   // Security monitoring preferences only. Authentication lockout rules remain
   // enforced by the POS auth service and cannot be weakened from this UI.
@@ -1417,6 +1418,8 @@ model PosDevice {
   storageQuotaBytes  BigInt?     @map("storage_quota_bytes")
   storagePersistent  Boolean?    @map("storage_persistent")
   storageCheckedAt   DateTime?   @map("storage_checked_at") @db.Timestamptz(3)
+  recoveryChallengeHash      String?   @map("recovery_challenge_hash") @db.VarChar(64)
+  recoveryChallengeExpiresAt DateTime? @map("recovery_challenge_expires_at") @db.Timestamptz(3)
   lastSyncAt         DateTime?   @map("last_sync_at") @db.Timestamptz(3)
   wipeRequestedAt    DateTime?   @map("wipe_requested_at") @db.Timestamptz(3)
   wipeAcknowledgedAt DateTime?   @map("wipe_acknowledged_at") @db.Timestamptz(3)
@@ -1509,6 +1512,7 @@ model PosPrintPrinter {
   address       String        @db.VarChar(255)
   paperWidthMm  Int           @default(80) @map("paper_width_mm")
   columns       Int           @default(42)
+  codePage      Int           @default(16) @map("code_page")
   drawerEnabled Boolean       @default(false) @map("drawer_enabled")
   drawerPin     Int           @default(2) @map("drawer_pin")
   pulseOnMs     Int           @default(25) @map("pulse_on_ms")
@@ -1539,6 +1543,10 @@ model PosPrintJob {
   payloadJson         Json             @map("payload_json")
   payloadHash         String           @map("payload_hash") @db.Char(64)
   copyRequired        Boolean          @default(false) @map("copy_required")
+  sourceDocumentId    String?          @map("source_document_id") @db.VarChar(64)
+  copyNumber          Int              @default(0) @map("copy_number")
+  shiftId             String?          @map("shift_id") @db.Char(24)
+  localOnly           Boolean          @default(false) @map("local_only")
   attemptCount        Int              @default(0) @map("attempt_count")
   maxAttempts         Int              @default(8) @map("max_attempts")
   leaseTimeoutSeconds Int              @default(30) @map("lease_timeout_seconds")
@@ -1555,12 +1563,14 @@ model PosPrintJob {
   updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
   company             Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
   register            PosRegister      @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  shift               PosShift?        @relation(fields: [shiftId], references: [id], onDelete: SetNull)
   agent               PosPrintAgent?   @relation(fields: [agentId], references: [id], onDelete: SetNull)
   printer             PosPrintPrinter? @relation(fields: [printerId], references: [id], onDelete: SetNull)
   createdBy           User?            @relation("PosPrintJobCreator", fields: [createdById], references: [id], onDelete: SetNull)
 
   @@unique([companyId, idempotencyKey])
   @@index([companyId, registerId, status])
+  @@index([companyId, registerId, shiftId, status], map: "pos_print_jobs_shift_status_idx")
   @@index([agentId, status, availableAt])
   @@index([expiresAt], map: "pos_print_jobs_expiry_idx")
   @@map("pos_print_jobs")
@@ -1600,6 +1610,7 @@ model PosShift {
   cashMovements       PosCashMovement[]
   zReport             PosZReport?
   correctionReports   PosShiftCorrectionReport[]
+  printJobs           PosPrintJob[]
   invoices            Invoice[]
   payments            PosPayment[]
   ebmSubmissionQueues EbmSubmissionQueue[]       @relation("EbmSubmissionShift")
@@ -2661,6 +2672,7 @@ model Product {
   sku                   String
   barcode               String?
   barcodeType           BarcodeType            @default(CODE128) @map("barcode_type")
+  alternateBarcodes     String[]               @default([]) @map("alternate_barcodes")
   imageUrl              String?                @map("image_url")
   imageUrls             String[]               @default([]) @map("image_urls")
   description           String?
@@ -2744,6 +2756,7 @@ model Product {
   @@index([name(ops: raw("gin_trgm_ops"))], map: "products_name_trgm_idx", type: Gin)
   @@index([sku(ops: raw("gin_trgm_ops"))], map: "products_sku_trgm_idx", type: Gin)
   @@index([barcode(ops: raw("gin_trgm_ops"))], map: "products_barcode_trgm_idx", type: Gin)
+  @@index([alternateBarcodes], map: "products_alternate_barcodes_gin_idx", type: Gin)
   @@map("products")
 }
 

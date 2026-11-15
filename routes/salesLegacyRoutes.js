@@ -32,6 +32,7 @@ const posNonPostingDocumentController = require('../controllers/posNonPostingDoc
 const posPublicReceiptController = require('../controllers/posPublicReceiptController');
 const posDiscountApplicationController = require('../controllers/posDiscountApplicationController');
 const posVoucherController = require('../controllers/posVoucherController');
+const posScannerSettingsController = require('../controllers/posScannerSettingsController');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 
 const requirePosSessionAuth = requirePosSession();
@@ -180,6 +181,7 @@ router.get(
 );
 router.post('/discounts/apply', canCreateSale, requirePosSessionAuth, requirePosSessionPermission('pos.till.discount'), idem(posDiscountApplicationController.apply));
 router.post('/direct-sale', canCreateSale, requireOnlinePosSession, requireOnlinePosPaymentPermission, logAction('sales_legacy_direct_sale'), idem(createDirectSale));
+router.get('/scanner-offline-index', requirePosSessionAuth, requirePosSellPermission, posScannerSettingsController.getOfflineIndex);
 router.post(
   '/offline-snapshot',
   canCreateSale,

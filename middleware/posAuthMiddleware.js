@@ -23,6 +23,7 @@ const CASHIER_POS_PERMISSIONS = [
 ];
 const SUPERVISOR_POS_PERMISSIONS = [
   ...CASHIER_POS_PERMISSIONS,
+  'pos.till.open_price',
   'pos.till.refund',
   'pos.till.void',
   'pos.till.no_sale',

@@ -38,6 +38,7 @@ jest.mock('../lib/prisma', () => ({
 
 const { prisma } = require('../lib/prisma');
 const { generateKeyPairSync } = require('crypto');
+const { signOperationEnvelope } = require('../services/posSyncOperationContract');
 const {
   activateRegister,
   deleteRegister,
@@ -46,6 +47,8 @@ const {
   updateCashierAccess,
   claimRegister,
   issueClaimCode,
+  createDeviceRecoveryChallenge,
+  recoverDeviceCredential,
   revokeDevice,
   listRegisters,
 } = require('../controllers/posRegisterController');
@@ -58,6 +61,14 @@ const enrollmentPayload = {
   publicKey: enrollmentPublicKey,
   appVersion: '0.0.1',
 };
+const recoveryPayload = (challenge, expiresAt) => ({
+  protocol: 'KUBIKA_POS_DEVICE_RECOVERY_V1',
+  companyId: '507f1f77bcf86cd799439011',
+  registerId: '507f1f77bcf86cd799439012',
+  deviceId: enrollmentPayload.deviceId,
+  challenge,
+  expiresAt,
+});
 
 function createResponse() {
   return {
@@ -73,6 +84,175 @@ function createResponse() {
     },
   };
 }
+
+describe('same-device credential recovery', () => {
+  const companyId = '507f1f77bcf86cd799439011';
+  const registerId = '507f1f77bcf86cd799439012';
+  const register = {
+    id: registerId,
+    companyId,
+    code: 'POS-TEST',
+    name: 'Test Register',
+    isActive: true,
+    claimedDeviceId: enrollmentPayload.deviceId,
+    deviceTokenHash: 'old-token-hash',
+    claimExpiresAt: null,
+    createdAt: new Date('2026-10-29T13:00:00.000Z'),
+  };
+  const device = {
+    id: '507f1f77bcf86cd799439013',
+    companyId,
+    registerId,
+    deviceId: enrollmentPayload.deviceId,
+    publicKey: enrollmentPublicKey,
+    deviceTokenHash: 'old-token-hash',
+    status: 'active',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.posRegister.findFirst.mockResolvedValue(register);
+    prisma.posDevice.findFirst.mockResolvedValue(device);
+    prisma.posDevice.updateMany.mockResolvedValue({ count: 1 });
+    prisma.posRegister.updateMany.mockResolvedValue({ count: 1 });
+    prisma.$transaction.mockImplementation((callback) => callback({
+      posRegister: { updateMany: prisma.posRegister.updateMany },
+      posDevice: { updateMany: prisma.posDevice.updateMany },
+      $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
+      posAuditLog: {
+        create: prisma.posAuditLog.create,
+        findFirst: jest.fn().mockResolvedValue(null),
+      },
+    }));
+  });
+
+  test('creates a short-lived challenge only for the already-enrolled device', async () => {
+    const req = {
+      user: { id: 'manager-1', company: { _id: companyId } },
+      body: { deviceId: enrollmentPayload.deviceId },
+    };
+    const res = createResponse();
+
+    await createDeviceRecoveryChallenge(req, res, (error) => { throw error; });
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toMatchObject({
+      protocol: 'KUBIKA_POS_DEVICE_RECOVERY_V1',
+      companyId,
+      registerId,
+      deviceId: enrollmentPayload.deviceId,
+    });
+    expect(res.body.data.challenge).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(prisma.posDevice.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ deviceTokenHash: device.deviceTokenHash, status: 'active' }),
+      data: {
+        recoveryChallengeHash: expect.any(String),
+        recoveryChallengeExpiresAt: expect.any(Date),
+      },
+    }));
+    expect(prisma.tillSession.findFirst).not.toHaveBeenCalled();
+    expect(prisma.posSession.updateMany).not.toHaveBeenCalled();
+  });
+
+  test('rotates both token hashes after valid device proof and preserves the active shift/session', async () => {
+    const challenge = require('crypto').randomBytes(32).toString('base64url');
+    const expiry = new Date(Date.now() + 60_000);
+    const payload = recoveryPayload(challenge, expiry.toISOString());
+    const signature = signOperationEnvelope(payload, enrollmentKeys.privateKey);
+    prisma.posDevice.findFirst.mockResolvedValue({
+      ...device,
+      recoveryChallengeHash: require('crypto').createHash('sha256').update(challenge).digest('hex'),
+      recoveryChallengeExpiresAt: expiry,
+    });
+    const req = {
+      user: { id: 'manager-1', company: { _id: companyId } },
+      body: {
+        deviceId: enrollmentPayload.deviceId,
+        challenge,
+        expiresAt: expiry.toISOString(),
+        signature,
+      },
+      ip: '127.0.0.1',
+    };
+    const res = createResponse();
+
+    await recoverDeviceCredential(req, res, (error) => { throw error; });
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.deviceToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(res.body.data.register).toMatchObject({ _id: registerId, registerId: 'POS-TEST' });
+    const tokenHash = require('crypto').createHash('sha256').update(res.body.data.deviceToken).digest('hex');
+    expect(prisma.posRegister.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ claimedDeviceId: enrollmentPayload.deviceId, deviceTokenHash: 'old-token-hash' }),
+      data: { deviceTokenHash: tokenHash },
+    }));
+    expect(prisma.posDevice.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ recoveryChallengeHash: expect.any(String) }),
+      data: {
+        deviceTokenHash: tokenHash,
+        recoveryChallengeHash: null,
+        recoveryChallengeExpiresAt: null,
+      },
+    }));
+    expect(prisma.posSession.updateMany).not.toHaveBeenCalled();
+    expect(prisma.tillSession.findFirst).not.toHaveBeenCalled();
+    expect(prisma.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ event: 'REGISTER_DEVICE_CREDENTIAL_RECOVERED' }),
+    }));
+  });
+
+  test('rejects invalid proof without rotating the paired device credential', async () => {
+    const challenge = require('crypto').randomBytes(32).toString('base64url');
+    const expiry = new Date(Date.now() + 60_000);
+    prisma.posDevice.findFirst.mockResolvedValue({
+      ...device,
+      recoveryChallengeHash: require('crypto').createHash('sha256').update(challenge).digest('hex'),
+      recoveryChallengeExpiresAt: expiry,
+    });
+    const req = {
+      user: { id: 'manager-1', company: { _id: companyId } },
+      body: {
+        deviceId: enrollmentPayload.deviceId,
+        challenge,
+        expiresAt: expiry.toISOString(),
+        signature: 'A'.repeat(86),
+      },
+    };
+    const res = createResponse();
+
+    await recoverDeviceCredential(req, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body.code).toBe('POS_DEVICE_RECOVERY_SIGNATURE_INVALID');
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  test('rejects an expired challenge without changing device or register state', async () => {
+    const challenge = require('crypto').randomBytes(32).toString('base64url');
+    const expiry = new Date(Date.now() - 1_000);
+    prisma.posDevice.findFirst.mockResolvedValue({
+      ...device,
+      recoveryChallengeHash: require('crypto').createHash('sha256').update(challenge).digest('hex'),
+      recoveryChallengeExpiresAt: expiry,
+    });
+    const req = {
+      user: { id: 'manager-1', company: { _id: companyId } },
+      body: {
+        deviceId: enrollmentPayload.deviceId,
+        challenge,
+        expiresAt: expiry.toISOString(),
+        signature: 'A'.repeat(86),
+      },
+    };
+    const res = createResponse();
+
+    await recoverDeviceCredential(req, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('POS_DEVICE_RECOVERY_CHALLENGE_EXPIRED');
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+});
 
 describe('POS register listing', () => {
   test('lists only active registers so deleted registers are removed from settings', async () => {

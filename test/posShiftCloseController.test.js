@@ -96,7 +96,7 @@ function openShift() {
   };
 }
 
-function createTransaction({ shift = openShift(), heldCount = 0 } = {}) {
+function createTransaction({ shift = openShift(), heldCount = 0, unprintedReceiptCount = 0 } = {}) {
   return {
     $queryRaw: jest.fn().mockResolvedValue([]),
     invoice: {
@@ -154,6 +154,7 @@ function createTransaction({ shift = openShift(), heldCount = 0 } = {}) {
         .mockResolvedValueOnce(shift),
       update: jest.fn(async ({ data }) => ({ ...shift, ...data })),
     },
+    posPrintJob: { count: jest.fn().mockResolvedValue(unprintedReceiptCount) },
     posRegister: {
       findFirst: jest.fn().mockResolvedValue({ code: 'POS-1', name: 'POS register' }),
     },
@@ -257,6 +258,7 @@ describe('POS shift close and Z report', () => {
       difference: 0,
       closeIdempotencyKey: IDEMPOTENCY_KEY,
     });
+
     expect(res.body.data.zReport).toMatchObject({
       zNumber: 13,
       shiftId: SHIFT_ID,
@@ -325,6 +327,23 @@ describe('POS shift close and Z report', () => {
       variance: 0,
       reportNumber: 13,
     }));
+  });
+
+  test('includes a shift-close warning when unprinted fiscal receipts remain', async () => {
+    const tx = createTransaction({ unprintedReceiptCount: 2 });
+    tx.posZReport.findFirst.mockResolvedValue({ zNumber: 12 });
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const res = createResponse();
+
+    await close(createRequest(), res, (error) => { throw error; });
+
+    expect(tx.posPrintJob.count).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        shiftId: SHIFT_ID,
+        status: { in: ['queued', 'failed', 'transmitting', 'transmitted', 'uncertain'] },
+      }),
+    }));
+    expect(res.body.data.zReport.snapshot.unprintedReceipts).toEqual({ count: 2, warning: true });
   });
 
   test('fails closed when writing the shift-close audit event fails', async () => {

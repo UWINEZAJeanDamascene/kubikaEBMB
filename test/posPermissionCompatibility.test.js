@@ -1,5 +1,6 @@
 const { PermissionService } = require('../middleware/authorize');
 const { requirePosPermissions } = require('../middleware/posAuthorization');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const {
   POS_PERMISSION_COMPATIBILITY,
   capabilityName,
@@ -65,6 +66,35 @@ describe('POS permission compatibility catalog', () => {
     await requirePosPermissions({ resource: 'pos.till', action: 'void' })(req, res, deniedNext);
     expect(res.status).toHaveBeenCalledWith(403);
     expect(deniedNext).not.toHaveBeenCalled();
+  });
+
+  test('system administrator roles can use POS security actions while custom roles need explicit grants', async () => {
+    const invoke = async (role) => {
+      const req = { user: { role } };
+      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+      const next = jest.fn();
+      await requirePermissionOrRoles(
+        'pos.admin.security.sessions',
+        'read',
+        ['admin', 'manager', 'store_manager', 'owner', 'platform_admin', 'super_admin'],
+      )(req, res, next);
+      return { res, next };
+    };
+
+    const systemAdmin = await invoke({
+      name: 'admin',
+      is_system_role: true,
+      permissions: [],
+    });
+    expect(systemAdmin.next).toHaveBeenCalledWith();
+
+    const customAdmin = await invoke({
+      name: 'admin',
+      is_system_role: false,
+      permissions: [],
+    });
+    expect(customAdmin.res.status).toHaveBeenCalledWith(403);
+    expect(customAdmin.next).not.toHaveBeenCalled();
   });
 
   test('fails closed for capabilities without a legacy equivalent', () => {

@@ -171,7 +171,7 @@ describe('POS session authorization middleware', () => {
     expect(cashier).not.toEqual(expect.arrayContaining([
       'pos.till.refund', 'pos.till.void', 'pos.till.no_sale',
       'pos.till.credit_sell', 'pos.admin.view', 'pos.admin.registers', 'pos.admin.settings',
-      'pos.payment.reconcile',
+      'pos.payment.reconcile', 'pos.till.open_price',
     ]));
     const configuredCashier = await permissionsForUser(
       { role: 'cashier' },
@@ -185,7 +185,7 @@ describe('POS session authorization middleware', () => {
     const supervisor = await permissionsForUser({ role: 'supervisor' }, COMPANY_ID, {});
     expect(supervisor).toEqual(expect.arrayContaining([
       'pos.till.refund', 'pos.till.void', 'pos.till.no_sale', 'pos.till.reprint',
-      'pos.till.credit_sell', 'pos.admin.shifts', 'pos.admin.approvals',
+      'pos.till.credit_sell', 'pos.till.open_price', 'pos.admin.shifts', 'pos.admin.approvals',
     ]));
     expect(supervisor).not.toContain('pos.admin.registers');
 

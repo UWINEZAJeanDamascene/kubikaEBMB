@@ -204,6 +204,26 @@ describe('POS audit logging', () => {
     expect(prisma.posAuditLog.create).not.toHaveBeenCalled();
   });
 
+  test('accepts cashier receipt print lifecycle audit events', async () => {
+    prisma.posAuditLog.create.mockImplementation(async ({ data }) => data);
+
+    const events = ['PRINT_ATTEMPT_STARTED', 'PRINT_JOB_DEFERRED', 'PRINT_JOB_CANCELLED'];
+    for (const event of events) {
+      await writePosAuditLog({
+        companyId: 'company',
+        registerId: 'register',
+        event,
+        metadata: { jobId: 'print-job-1', shiftId: 'shift-1' },
+      });
+    }
+
+    expect(prisma.posAuditLog.create.mock.calls.map(([{ data }]) => data.event)).toEqual(events);
+    expect(prisma.posAuditLog.create.mock.calls[0][0].data).toEqual(expect.objectContaining({
+      outcome: 'COMMITTED',
+      metadata: { jobId: 'print-job-1', shiftId: 'shift-1' },
+    }));
+  });
+
   test('accepts and records remote device wipe requests', async () => {
     prisma.posAuditLog.create.mockResolvedValue({ id: 'audit-id' });
 

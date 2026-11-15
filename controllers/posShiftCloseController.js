@@ -392,6 +392,16 @@ exports.close = async (req, res, next) => {
         },
       });
       if (!shift) return { code: 'POS_SHIFT_NOT_OPEN' };
+      const unprintedReceiptCount = await tx.posPrintJob.count({
+        where: {
+          companyId,
+          registerId,
+          shiftId,
+          localOnly: true,
+          jobType: { in: ['receipt', 'refund-receipt'] },
+          status: { in: ['queued', 'failed', 'transmitting', 'transmitted', 'uncertain'] },
+        },
+      });
 
       await tx.$queryRawUnsafe(
         'SELECT id FROM invoices WHERE company_id = $1 AND shift_id = $2 AND pos_origin = true AND status = $3 FOR UPDATE',
@@ -739,6 +749,10 @@ exports.close = async (req, res, next) => {
         fiscalClosePolicy,
         fiscalApprovedById,
       });
+      snapshot.unprintedReceipts = {
+        count: unprintedReceiptCount,
+        warning: unprintedReceiptCount > 0,
+      };
       snapshot.offlineReceiptNumbers = {
         unusedAtClose: unusedOfflineReceiptNumbers,
         accounting: 'Unused reservations for this shift were retired and cannot be used by a later shift.',

@@ -8,7 +8,6 @@ router.use(posAuditOutcome);
 const idem = (handler) => idempotentHandler(handler, { namespace: 'tills' });
 const { protect } = require('../middleware/auth');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
-const { requirePosPermissions } = require('../middleware/posAuthorization');
 const { requirePosSession, requirePermission } = require('../middleware/posAuthMiddleware');
 const { openTill, closeTill, recordNoSale, managerCloseTill, getActiveTill, getTillShifts, deleteEmptyTillShift } = require('../controllers/tillController');
 const posCheckoutSupportController = require('../controllers/posCheckoutSupportController');
@@ -25,8 +24,17 @@ const canResolveAssignedRegister = requirePermissionOrRoles(
 // Register/device administration uses the POS capability consistently with
 // the back-office UI; built-in administrator roles retain compatibility.
 const canManageRegisters = requirePermissionOrRoles('pos.admin', 'registers', ['admin', 'manager', 'store_manager', 'owner']);
-const canReadSecurityDevices = requirePosPermissions({ resource: 'pos.admin.security.sessions', action: 'read' });
-const canManageSecurityDevices = requirePosPermissions({ resource: 'pos.admin.security.sessions', action: 'revoke' });
+const POS_DEVICE_ADMIN_ROLES = ['admin', 'manager', 'store_manager', 'owner', 'platform_admin', 'super_admin'];
+const canReadSecurityDevices = requirePermissionOrRoles(
+  'pos.admin.security.sessions',
+  'read',
+  POS_DEVICE_ADMIN_ROLES,
+);
+const canManageSecurityDevices = requirePermissionOrRoles(
+  'pos.admin.security.sessions',
+  'revoke',
+  POS_DEVICE_ADMIN_ROLES,
+);
 const canCloseTill = requirePermissionOrRoles('tills', 'close', ['admin', 'manager']);
 
 // These older controllers predate POS sessions and read req.user. Bind that
@@ -75,6 +83,8 @@ const posSessionRead = (permission, handler) => [
 router.get('/registers/device/:deviceId', protect, canResolveAssignedRegister, posRegisterController.getDeviceRegister);
 router.post('/registers/claim', protect, canManageRegisters, idem(posRegisterController.claimRegister));
 router.get('/registers', protect, canManageRegisters, posRegisterController.listRegisters);
+router.post('/registers/device-recovery/challenge', protect, canManageRegisters, idem(posRegisterController.createDeviceRecoveryChallenge));
+router.post('/registers/device-recovery/complete', protect, canManageRegisters, idem(posRegisterController.recoverDeviceCredential));
 router.get('/devices', protect, canReadSecurityDevices, posRegisterController.listDevices);
 router.patch('/devices/:deviceId/status', protect, canManageSecurityDevices, idem(posRegisterController.setDeviceStatus));
 router.post('/devices/:deviceId/wipe', protect, canManageSecurityDevices, idem(posRegisterController.requestDeviceWipe));

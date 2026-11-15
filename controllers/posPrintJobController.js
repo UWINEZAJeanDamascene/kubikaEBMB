@@ -19,9 +19,31 @@ function redactCustomerFields(value) {
 }
 
 function ttlFor(jobType) {
-  if (jobType === 'drawer-open') return 15;
-  if (jobType === 'receipt' || jobType === 'refund-receipt' || jobType === 'test-print') return 120;
-  return 30 * 60;
+  if (jobType === 'drawer-open') return 10;
+  if (['receipt', 'refund-receipt', 'gift-card-slip'].includes(jobType)) return 120;
+  if (jobType === 'test-print') return 30;
+  if (['x-report', 'z-report', 'cash-movement-slip', 'report-pdf'].includes(jobType)) return 10 * 60;
+  if (['invoice-pdf', 'statement-pdf'].includes(jobType)) return 24 * 60 * 60;
+  return 10 * 60;
+}
+
+function maxAttemptsFor(jobType) {
+  if (jobType === 'drawer-open') return 2;
+  if (['receipt', 'refund-receipt', 'gift-card-slip'].includes(jobType)) return 9;
+  if (jobType === 'test-print') return 3;
+  if (['x-report', 'z-report', 'cash-movement-slip', 'report-pdf'].includes(jobType)) return 8;
+  return 12;
+}
+
+function retryDelaySeconds(jobType, attemptCount) {
+  const schedule = ['receipt', 'refund-receipt', 'gift-card-slip'].includes(jobType)
+    ? [2, 5, 10, 15, 20, 20, 20, 20]
+    : jobType === 'test-print'
+      ? [2, 5]
+      : jobType === 'drawer-open'
+        ? [2]
+        : [5, 10, 20, 30, 60, 60, 60];
+  return schedule[Math.min(Math.max(attemptCount - 1, 0), schedule.length - 1)];
 }
 
 exports.createJob = async (req, res, next) => {
@@ -31,9 +53,33 @@ exports.createJob = async (req, res, next) => {
     const jobType = String(req.body.jobType || '');
     const idempotencyKey = String(req.body.idempotencyKey || '').trim();
     const payload = req.body.payload;
-    const allowedTypes = ['receipt', 'refund-receipt', 'drawer-open', 'invoice-pdf', 'report-pdf', 'test-print'];
+    const allowedTypes = [
+      'receipt', 'refund-receipt', 'gift-card-slip', 'x-report', 'z-report',
+      'cash-movement-slip', 'drawer-open', 'invoice-pdf', 'statement-pdf',
+      'report-pdf', 'test-print',
+    ];
     if (!/^[a-f\d]{24}$/i.test(registerId) || !allowedTypes.includes(jobType) || !idempotencyKey || !payload) {
       return res.status(400).json({ success: false, code: 'PRINT_JOB_INVALID', message: 'Invalid print job request.' });
+    }
+    let sourceDocumentId = null;
+    let copyNumber = 0;
+    if (jobType === 'receipt' || jobType === 'refund-receipt') {
+      const receipt = payload.receiptDocument || payload.receipt || (payload.version === 1 ? payload : null);
+      const keyParts = /^([a-f\d]{24}):(0|[1-9]\d*):(receipt|refund-receipt)$/i.exec(idempotencyKey);
+      copyNumber = Number(receipt?.flags?.copyNumber || 0);
+      const isCopy = Boolean(receipt?.flags?.isCopy);
+      if (!keyParts
+        || keyParts[3] !== jobType
+        || !Number.isSafeInteger(copyNumber)
+        || Number(keyParts[2]) !== copyNumber
+        || isCopy !== (copyNumber > 0)) {
+        return res.status(400).json({
+          success: false,
+          code: 'PRINT_JOB_COPY_KEY_MISMATCH',
+          message: 'Receipt document, copy number, and print-job key must match.',
+        });
+      }
+      sourceDocumentId = keyParts[1].toLowerCase();
     }
     if (jobType === 'drawer-open') {
       return res.status(403).json({
@@ -64,7 +110,10 @@ exports.createJob = async (req, res, next) => {
       data: {
         id: generateObjectId(), companyId, registerId, jobType, idempotencyKey,
         payloadJson: redactedPayload, payloadHash: hash(payloadText),
-        copyRequired: ['receipt', 'refund-receipt'].includes(jobType),
+        copyRequired: copyNumber > 0,
+        sourceDocumentId,
+        copyNumber,
+        maxAttempts: maxAttemptsFor(jobType),
         expiresAt, createdById: String(req.user.id || req.user._id || '') || null,
       },
     });
@@ -96,25 +145,259 @@ exports.listJobs = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+function cashierPrintContext(req) {
+  const context = req.posAuthContext;
+  return {
+    companyId: String(context?.company?.id || ''),
+    registerId: String(context?.register?.id || ''),
+    registerCode: String(context?.register?.code || ''),
+    userId: String(context?.user?.id || ''),
+  };
+}
+
+exports.beginCashierReceiptAttempt = async (req, res, next) => {
+  const { companyId, registerId, registerCode, userId } = cashierPrintContext(req);
+  const sourceDocumentId = String(req.body?.sourceDocumentId || '').toLowerCase();
+  const jobType = String(req.body?.jobType || '');
+  const copyNumber = Number(req.body?.copyNumber ?? 0);
+  if (!companyId || !registerId || !userId
+    || !/^[a-f\d]{24}$/.test(sourceDocumentId)
+    || !['receipt', 'refund-receipt'].includes(jobType)
+    || !Number.isSafeInteger(copyNumber) || copyNumber < 0) {
+    return res.status(400).json({ success: false, code: 'PRINT_JOB_INVALID', message: 'Receipt print context is invalid.' });
+  }
+
+  try {
+    const [invoice, shift] = await Promise.all([
+      prisma.invoice.findFirst({
+        where: {
+          id: sourceDocumentId,
+          companyId,
+          OR: [
+            { registerId },
+            ...(registerCode && registerCode !== registerId ? [{ registerId: registerCode }] : []),
+            { registerId: null },
+          ],
+        },
+        select: { id: true },
+      }),
+      prisma.posShift.findFirst({
+        where: { companyId, registerId, status: { in: ['open', 'reopened'] } },
+        orderBy: { openedAt: 'desc' },
+        select: { id: true },
+      }),
+    ]);
+    if (!invoice) return res.status(404).json({ success: false, code: 'POS_RECEIPT_NOT_FOUND', message: 'Receipt not found for this register.' });
+    if (!shift) return res.status(409).json({ success: false, code: 'POS_SHIFT_REQUIRED', message: 'Open a shift before printing a receipt.' });
+    if (copyNumber > 0) {
+      const receiptCopy = await prisma.posEbmReceiptReprint.findFirst({
+        where: { companyId, invoiceId: sourceDocumentId, registerId, copyNumber },
+        select: { id: true },
+      });
+      if (!receiptCopy) return res.status(409).json({ success: false, code: 'POS_RECEIPT_COPY_NOT_FOUND', message: 'The signed receipt copy must be prepared before it can be printed.' });
+    }
+
+    const idempotencyKey = `${sourceDocumentId}:${copyNumber}:${jobType}`;
+    const metadataHash = hash(JSON.stringify({ sourceDocumentId, copyNumber, jobType }));
+    let job = await prisma.posPrintJob.findFirst({ where: { companyId, idempotencyKey } });
+    if (job) {
+      if (job.payloadHash !== metadataHash || !job.localOnly || job.registerId !== registerId) {
+        return res.status(409).json({ success: false, code: 'PRINT_IDEMPOTENCY_CONFLICT', message: 'This print identity belongs to another print request.' });
+      }
+      if (!['queued', 'failed'].includes(job.status)) {
+        const code = job.status === 'uncertain' || job.status === 'transmitting'
+          ? 'PRINT_JOB_OUTCOME_UNCERTAIN'
+          : 'PRINT_DUPLICATE_REFUSED';
+        return res.status(409).json({ success: false, code, message: 'This receipt already has a print outcome. Resolve it before printing again.', data: { id: job.id, status: job.status } });
+      }
+      const updated = await prisma.posPrintJob.updateMany({
+        where: { id: job.id, companyId, status: job.status, localOnly: true },
+        data: {
+          status: 'transmitting',
+          shiftId: shift.id,
+          attemptCount: { increment: 1 },
+          lastError: null,
+        },
+      });
+      if (updated.count !== 1) return res.status(409).json({ success: false, code: 'PRINT_JOB_STATE_CHANGED', message: 'The receipt print state changed. Refresh before retrying.' });
+      job = await prisma.posPrintJob.findFirst({ where: { id: job.id, companyId } });
+    } else {
+      job = await prisma.posPrintJob.create({
+        data: {
+          id: generateObjectId(),
+          companyId,
+          registerId,
+          shiftId: shift.id,
+          jobType,
+          idempotencyKey,
+          payloadJson: {},
+          payloadHash: metadataHash,
+          copyRequired: copyNumber > 0,
+          sourceDocumentId,
+          copyNumber,
+          localOnly: true,
+          status: 'transmitting',
+          attemptCount: 1,
+          maxAttempts: maxAttemptsFor(jobType),
+          expiresAt: new Date(Date.now() + ttlFor(jobType) * 1000),
+          createdById: userId,
+        },
+      });
+    }
+    await writePosAuditLog({
+      companyId, registerId, userId,
+      event: 'PRINT_ATTEMPT_STARTED',
+      metadata: { jobId: job.id, shiftId: shift.id, sourceDocumentId, copyNumber, jobType },
+      ip: requestIp(req),
+    });
+    return res.status(201).json({ success: true, data: { id: job.id, status: job.status, shiftId: shift.id } });
+  } catch (error) {
+    if (error?.code === 'P2002') {
+      return res.status(409).json({ success: false, code: 'PRINT_JOB_STATE_CHANGED', message: 'This receipt print was started in another session. Refresh before retrying.' });
+    }
+    return next(error);
+  }
+};
+
+exports.listCashierReceiptAttempts = async (req, res, next) => {
+  try {
+    const { companyId, registerId } = cashierPrintContext(req);
+    if (!companyId || !registerId) return res.status(403).json({ success: false, code: 'POS_SESSION_REQUIRED', message: 'A valid POS session is required.' });
+    const jobs = await prisma.posPrintJob.findMany({
+      where: {
+        companyId,
+        registerId,
+        localOnly: true,
+        jobType: { in: ['receipt', 'refund-receipt'] },
+        status: { in: ['queued', 'failed', 'transmitting', 'transmitted', 'uncertain'] },
+      },
+      orderBy: [{ createdAt: 'asc' }],
+      take: 100,
+      select: {
+        id: true, sourceDocumentId: true, copyNumber: true, jobType: true,
+        status: true, shiftId: true, createdAt: true, lastError: true,
+        shift: { select: { shiftNumber: true } },
+      },
+    });
+    const invoiceIds = [...new Set(jobs.filter((job) => job.copyNumber > 0).map((job) => job.sourceDocumentId).filter(Boolean))];
+    const receiptCopies = invoiceIds.length
+      ? await prisma.posEbmReceiptReprint.findMany({
+        where: { companyId, invoiceId: { in: invoiceIds } },
+        select: { invoiceId: true, copyNumber: true, idempotencyKey: true },
+      })
+      : [];
+    const copyKeys = new Map(receiptCopies.map((copy) => [`${copy.invoiceId}:${copy.copyNumber}`, copy.idempotencyKey]));
+    return res.json({
+      success: true,
+      data: jobs.map((job) => ({
+        id: job.id,
+        sourceDocumentId: job.sourceDocumentId,
+        copyNumber: job.copyNumber,
+        jobType: job.jobType,
+        status: job.status,
+        shiftId: job.shiftId,
+        createdAt: job.createdAt,
+        lastError: job.lastError,
+        shift: job.shift,
+        copyKey: job.copyNumber > 0 ? copyKeys.get(`${job.sourceDocumentId}:${job.copyNumber}`) || null : null,
+      })),
+    });
+  } catch (error) { next(error); }
+};
+
+exports.recordCashierReceiptOutcome = async (req, res, next) => {
+  try {
+    const { companyId, registerId, userId } = cashierPrintContext(req);
+    const jobId = String(req.params.jobId || '');
+    const outcome = String(req.body?.outcome || '');
+    const reason = String(req.body?.reason || '').trim().slice(0, 500);
+    const transitions = {
+      transmitted: { from: ['transmitting'], to: 'transmitted', event: 'PRINT_JOB_TRANSMITTED' },
+      failed: { from: ['transmitting'], to: 'failed', event: 'PRINT_JOB_FAILED' },
+      uncertain: { from: ['transmitting'], to: 'uncertain', event: 'PRINT_JOB_UNCERTAIN' },
+      confirm: { from: ['transmitting', 'transmitted', 'uncertain'], to: 'confirmed', event: 'PRINT_JOB_CONFIRMED' },
+      defer: { from: ['transmitting', 'transmitted', 'uncertain', 'failed'], to: 'queued', event: 'PRINT_JOB_DEFERRED' },
+      cancel: { from: ['queued', 'failed'], to: 'cancelled', event: 'PRINT_JOB_CANCELLED' },
+    };
+    const transition = transitions[outcome];
+    if (!companyId || !registerId || !userId || !/^[a-f\d]{24}$/i.test(jobId) || !transition) {
+      return res.status(400).json({ success: false, code: 'PRINT_OUTCOME_INVALID', message: 'Receipt print outcome is invalid.' });
+    }
+    if (['failed', 'uncertain'].includes(outcome) && reason.length < 3) {
+      return res.status(400).json({ success: false, code: 'PRINT_OUTCOME_REASON_REQUIRED', message: 'Provide a short reason for this print outcome.' });
+    }
+    const job = await prisma.posPrintJob.findFirst({
+      where: { id: jobId, companyId, registerId, localOnly: true, jobType: { in: ['receipt', 'refund-receipt'] } },
+      select: { id: true, status: true, shiftId: true, sourceDocumentId: true, copyNumber: true, jobType: true },
+    });
+    if (!job) return res.status(404).json({ success: false, code: 'PRINT_JOB_NOT_FOUND', message: 'Receipt print attempt was not found.' });
+    if (!transition.from.includes(job.status)) {
+      return res.status(409).json({ success: false, code: 'PRINT_JOB_STATE_CHANGED', message: `Cannot record ${outcome} for a ${job.status} receipt print.` });
+    }
+    const now = new Date();
+    const targetStatus = outcome === 'defer' && ['transmitting', 'transmitted', 'uncertain'].includes(job.status)
+      ? 'uncertain'
+      : transition.to;
+    const data = {
+      status: targetStatus,
+      leaseTokenHash: null,
+      leasedUntil: null,
+      ...(outcome === 'transmitted' ? { transmittedAt: now, acknowledgedAt: now } : {}),
+      ...(outcome === 'confirm' ? { confirmedAt: now, acknowledgedAt: now } : {}),
+      ...(outcome === 'failed' || outcome === 'uncertain' || outcome === 'cancel' ? { lastError: reason || 'Cashier skipped this receipt.' } : {}),
+      ...(outcome === 'defer' ? { lastError: reason || 'Cashier selected print later.' } : {}),
+    };
+    const updated = await prisma.posPrintJob.updateMany({
+      where: { id: job.id, companyId, registerId, status: job.status, localOnly: true },
+      data,
+    });
+    if (updated.count !== 1) return res.status(409).json({ success: false, code: 'PRINT_JOB_STATE_CHANGED', message: 'The receipt print state changed. Refresh before retrying.' });
+    await writePosAuditLog({
+      companyId, registerId, userId,
+      event: transition.event,
+      metadata: {
+        jobId: job.id, shiftId: job.shiftId, sourceDocumentId: job.sourceDocumentId,
+        copyNumber: job.copyNumber, jobType: job.jobType, reason: reason || null,
+      },
+      ip: requestIp(req),
+    });
+    return res.json({ success: true, data: { id: job.id, status: targetStatus } });
+  } catch (error) { next(error); }
+};
+
 exports.configurePrinter = async (req, res, next) => {
   try {
     const companyId = companyIdFor(req);
-    const { agentId, name, transport, address, paperWidthMm, columns, drawerEnabled, drawerPin, pulseOnMs, pulseOffMs } = req.body;
+    const { agentId, name, transport, address, paperWidthMm, columns, codePage, drawerEnabled, drawerPin, pulseOnMs, pulseOffMs } = req.body;
     const agent = await prisma.posPrintAgent.findFirst({ where: { id: agentId, companyId, status: 'active', revokedAt: null } });
     if (!agent) return res.status(404).json({ success: false, code: 'PRINT_AGENT_NOT_FOUND', message: 'Print agent not found for this company.' });
     if (!name || !transport || !address) return res.status(400).json({ success: false, code: 'PRINT_PRINTER_INVALID', message: 'Printer name, transport, and address are required.' });
     const width = Number(paperWidthMm);
     const colCount = Number(columns);
-    if (![58, 80].includes(width) || !Number.isInteger(colCount) || colCount < 20 || colCount > 80) {
-      return res.status(400).json({ success: false, code: 'PRINT_PRINTER_INVALID', message: 'Paper width and column settings are invalid.' });
+    const selectedCodePage = Number(codePage ?? 16);
+    if (![58, 80].includes(width) || !Number.isInteger(colCount) || colCount < 20 || colCount > 80 || ![16, 19].includes(selectedCodePage)) {
+      return res.status(400).json({ success: false, code: 'PRINT_PRINTER_INVALID', message: 'Paper width, calibrated columns, or code page is invalid.' });
     }
     const printer = await prisma.$transaction(async (tx) => {
       await tx.posPrintPrinter.updateMany({ where: { agentId: agent.id, companyId, isDefault: true }, data: { isDefault: false } });
-      return tx.posPrintPrinter.create({
-        data: {
-          id: generateObjectId(), companyId, agentId: agent.id,
-          name: String(name).trim().slice(0, 160), transport: String(transport).trim(),
-          address: String(address).trim().slice(0, 255), paperWidthMm: width, columns: colCount,
+      const printerIdentity = {
+        agentId: agent.id,
+        name: String(name).trim().slice(0, 160),
+        transport: String(transport).trim(),
+        address: String(address).trim().slice(0, 255),
+      };
+      return tx.posPrintPrinter.upsert({
+        where: { agentId_name_transport_address: printerIdentity },
+        create: {
+          id: generateObjectId(), companyId, ...printerIdentity,
+          paperWidthMm: width, columns: colCount, codePage: selectedCodePage,
+          drawerEnabled: Boolean(drawerEnabled), drawerPin: drawerPin === 5 ? 5 : 2,
+          pulseOnMs: Math.max(1, Math.min(1000, Number(pulseOnMs || 25))),
+          pulseOffMs: Math.max(50, Math.min(5000, Number(pulseOffMs || 500))),
+          isDefault: true,
+        },
+        update: {
+          companyId, paperWidthMm: width, columns: colCount, codePage: selectedCodePage,
           drawerEnabled: Boolean(drawerEnabled), drawerPin: drawerPin === 5 ? 5 : 2,
           pulseOnMs: Math.max(1, Math.min(1000, Number(pulseOnMs || 25))),
           pulseOffMs: Math.max(50, Math.min(5000, Number(pulseOffMs || 500))),
@@ -147,7 +430,7 @@ exports.poll = async (req, res, next) => {
     const jobs = await prisma.posPrintJob.findMany({
       where: {
         companyId: agent.companyId, registerId: agent.registerId || undefined, expiresAt: { gt: now },
-        status: 'queued', jobType: { not: 'drawer-open' }, availableAt: { lte: now },
+        status: 'queued', localOnly: false, jobType: { not: 'drawer-open' }, availableAt: { lte: now },
         OR: [{ agentId: null }, { agentId: agent.id }],
       },
       orderBy: [{ availableAt: 'asc' }, { createdAt: 'asc' }],
@@ -223,14 +506,16 @@ exports.fail = async (req, res, next) => {
     });
     if (!job) return res.status(409).json({ success: false, code: 'PRINT_JOB_LEASE_INVALID', message: 'Job lease is invalid or expired.' });
     const now = new Date();
-    const retrySeconds = Math.min(10, 2 ** Math.min(job.attemptCount, 4));
-    const terminal = job.attemptCount >= job.maxAttempts;
+    const retrySeconds = retryDelaySeconds(job.jobType, job.attemptCount);
+    const retryAt = new Date(now.getTime() + retrySeconds * 1000);
+    const expired = job.expiresAt <= retryAt;
+    const terminal = job.attemptCount >= job.maxAttempts || expired;
     const updated = await prisma.posPrintJob.update({
       where: { id: job.id },
       data: {
-        status: terminal ? 'failed' : 'queued',
+        status: terminal ? (expired ? 'expired' : 'failed') : 'queued',
         lastError: errorMessage,
-        availableAt: terminal ? job.availableAt : new Date(now.getTime() + retrySeconds * 1000),
+        availableAt: terminal ? job.availableAt : retryAt,
         leaseTokenHash: null,
         leasedUntil: null,
       },

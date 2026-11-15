@@ -34,6 +34,7 @@ const FIELD_MAP = {
   sku: { target: 'sku', transform: (v) => ({ sku: typeof v === 'string' ? v.toUpperCase() : v }) },
   barcode: { target: 'barcode' },
   barcodeType: { target: 'barcodeType' },
+  alternateBarcodes: { target: 'alternateBarcodes' },
   imageUrl: { target: 'imageUrl' },
   imageUrls: { target: 'imageUrls' },
   description: { target: 'description' },

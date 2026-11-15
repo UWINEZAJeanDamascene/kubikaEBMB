@@ -3,7 +3,7 @@ const path = require('path');
 const config = require('./config');
 const { CredentialStore } = require('./credentialStore');
 const { PrintLedger } = require('./ledger');
-const { discoverWindowsPrinters } = require('./printerDiscovery');
+const { discoverWindowsPrinters, mergePrinterProfiles } = require('./printerDiscovery');
 const { createLocalServer } = require('./localServer');
 const { transmitJob, retryDelay, shouldSkipAutomaticRetry } = require('./jobProcessor');
 
@@ -22,7 +22,7 @@ function savePrinters(printers) {
   fs.writeFileSync(printerFile, JSON.stringify(printers, null, 2), { mode: 0o600 });
 }
 function refreshPrinters() {
-  const printers = discoverWindowsPrinters();
+  const printers = mergePrinterProfiles(discoverWindowsPrinters(), loadPrinters());
   savePrinters(printers);
   return printers;
 }
@@ -65,8 +65,7 @@ async function pair(body) {
     companyId: result.data.companyId || null,
     registerId: result.data.registerId || null,
   });
-  const discovered = discoverWindowsPrinters();
-  savePrinters(discovered);
+  const discovered = refreshPrinters();
   return { ...result.data, printers: discovered };
 }
 
@@ -131,7 +130,7 @@ async function leaseAndProcess(job, stored) {
       body: JSON.stringify({ leaseToken, outcome: 'transmitted' }),
     }, stored.accessToken);
   } catch (error) {
-    if (transmissionCompleted) ledger.markUncertain(job.id, error.message);
+    if (transmissionCompleted) ledger.markUncertain(leased.idempotencyKey || leased.idempotency_key || leased.id, error.message);
     await api(`/api/pos/print-agent/agent/jobs/${encodeURIComponent(job.id)}/uncertain`, {
       method: 'POST',
       body: JSON.stringify({ leaseToken, error: error.message }),
@@ -152,7 +151,8 @@ async function pollLoop() {
   try {
     const polled = await api('/api/pos/print-agent/agent/jobs/poll', { method: 'GET' }, stored.accessToken);
     for (const job of polled.data.jobs || []) {
-      const existing = ledger.get(job.id);
+      const ledgerJobId = job.idempotencyKey || job.idempotency_key || job.id;
+      const existing = ledger.get(ledgerJobId);
       if (shouldSkipAutomaticRetry(existing)) continue;
       try {
         await leaseAndProcess(job, stored);

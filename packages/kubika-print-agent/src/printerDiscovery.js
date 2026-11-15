@@ -26,4 +26,34 @@ function discoverWindowsPrinters() {
   }));
 }
 
-module.exports = { discoverWindowsPrinters };
+function mergePrinterProfiles(discovered, existing) {
+  const identity = (printer) => `${printer.transport}:${printer.address || printer.name}`;
+  const saved = Array.isArray(existing) ? existing : [];
+  const profiles = new Map(saved.map((printer) => [identity(printer), printer]));
+  const merged = discovered.map((printer) => {
+    const profile = profiles.get(identity(printer));
+    if (!profile) return { ...printer, isDefault: false };
+    return {
+      ...printer,
+      paperWidthMm: profile.paperWidthMm,
+      columns: profile.columns,
+      codePage: profile.codePage,
+      role: profile.role,
+      capabilities: profile.capabilities,
+      drawerEnabled: profile.drawerEnabled,
+      drawerPin: profile.drawerPin,
+      pulseOnMs: profile.pulseOnMs,
+      pulseOffMs: profile.pulseOffMs,
+      isDefault: Boolean(profile.isDefault),
+    };
+  });
+  if (!merged.some((printer) => printer.isDefault) && merged.length) {
+    const fallback = discovered.find((printer) => printer.isDefault) || merged[0];
+    const fallbackIdentity = identity(fallback);
+    const selected = merged.find((printer) => identity(printer) === fallbackIdentity);
+    if (selected) selected.isDefault = true;
+  }
+  return merged;
+}
+
+module.exports = { discoverWindowsPrinters, mergePrinterProfiles };

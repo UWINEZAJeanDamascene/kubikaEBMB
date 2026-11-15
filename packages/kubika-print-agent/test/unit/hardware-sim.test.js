@@ -6,17 +6,18 @@ const path = require('node:path');
 const net = require('node:net');
 const { createLocalServer } = require('../../src/localServer');
 
-const { renderThermal, drawerCommand } = require('../../src/escpos');
+const { drawerCommand } = require('../../src/escpos');
+const { renderThermalDocument } = require('../../../kubika-receipt-renderer/index.cjs');
 const { printTcp9100 } = require('../../src/transports');
 
 test('TCP 9100 simulator receives exact ESC/POS receipt bytes', async () => {
-  const bytes = renderThermal({
+  const bytes = renderThermalDocument({
     shopName: 'Kubika Test Shop',
     receiptNumber: 'R-1001',
     lines: [{ description: 'Coffee', quantity: 2, total: 5 }],
     total: 5,
     paperWidthMm: 58,
-  });
+  }, { columns: 32, jobType: 'receipt' });
   const capturePath = path.join(os.tmpdir(), `kubika-escpos-${process.pid}.bin`);
 
   const received = await new Promise((resolve, reject) => {
@@ -41,7 +42,7 @@ test('TCP 9100 simulator receives exact ESC/POS receipt bytes', async () => {
   });
 
   fs.writeFileSync(capturePath, received);
-  assert.deepEqual(received, bytes);
+  assert.deepEqual(received, Buffer.from(bytes));
   assert.equal(received.includes(Buffer.from('COPY / DUPLICATE')), false);
   assert.ok(received.length > 100);
   fs.unlinkSync(capturePath);
@@ -51,13 +52,13 @@ test('drawer pulse and 80 mm thermal rendering are emitted as ESC/POS bytes', ()
   const pulse = drawerCommand(5, 25, 500);
   assert.deepEqual([...pulse], [0x1b, 0x70, 0x01, 13, 250]);
 
-  const receipt = renderThermal({
+  const receipt = renderThermalDocument({
     shopName: 'Kubika',
     lines: [{ description: 'Item', quantity: 1, total: 100 }],
     total: 100,
     paperWidthMm: 80,
-  });
-  assert.ok(receipt.includes(Buffer.from('Kubika')));
+  }, { columns: 48, jobType: 'receipt' });
+  assert.ok(Buffer.from(receipt).includes(Buffer.from('Kubika')));
   assert.equal(receipt[0], 0x1b);
 });
 

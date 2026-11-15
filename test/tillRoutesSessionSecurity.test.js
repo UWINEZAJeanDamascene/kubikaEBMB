@@ -74,4 +74,18 @@ describe('legacy till operational routes require a POS session', () => {
     expect(response.status).toBe(200);
     expect(response.body.reached).toBe(true);
   });
+
+  test('POS device security routes retain the built-in admin role fallback', () => {
+    const adminRoles = ['admin', 'manager', 'store_manager', 'owner', 'platform_admin', 'super_admin'];
+    expect(requirePermissionOrRoles).toHaveBeenCalledWith(
+      'pos.admin.security.sessions',
+      'read',
+      adminRoles,
+    );
+    expect(requirePermissionOrRoles).toHaveBeenCalledWith(
+      'pos.admin.security.sessions',
+      'revoke',
+      adminRoles,
+    );
+  });
 });

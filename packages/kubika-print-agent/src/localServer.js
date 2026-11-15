@@ -207,8 +207,21 @@ function createLocalServer({
           message: 'Select a Windows printer discovered by this Print Agent.',
         });
       }
+      const paperWidthMm = Number(req.body?.paperWidthMm ?? selected.paperWidthMm ?? 80);
+      const columns = Number(req.body?.columns ?? selected.columns ?? (paperWidthMm === 58 ? 32 : 42));
+      const codePage = Number(req.body?.codePage ?? selected.codePage ?? 16);
+      if (![58, 80].includes(paperWidthMm) || !Number.isInteger(columns) || columns < 20 || columns > 80 || ![16, 19].includes(codePage)) {
+        return res.status(400).json({
+          success: false,
+          code: 'PRINT_PRINTER_SELECT_FAILED',
+          message: 'Choose a supported paper width, calibrated column count, and code page.',
+        });
+      }
       const updated = printers.map((printer) => ({
         ...printer,
+        ...(printer.transport === selected.transport && printer.name === selected.name
+          ? { paperWidthMm, columns, codePage }
+          : {}),
         isDefault: printer.transport === selected.transport && printer.name === selected.name,
       }));
       savePrinters(updated);
@@ -224,10 +237,19 @@ function createLocalServer({
       if (!/^[^:]+:\d+$/.test(address)) {
         return res.status(400).json({ success: false, message: 'Enter a printer address such as 127.0.0.1:9100.' });
       }
+      const paperWidthMm = Number(req.body.paperWidthMm ?? 80);
+      const columns = Number(req.body.columns ?? (paperWidthMm === 58 ? 32 : 42));
+      const codePage = Number(req.body.codePage ?? 16);
+      if (![58, 80].includes(paperWidthMm) || !Number.isInteger(columns) || columns < 20 || columns > 80 || ![16, 19].includes(codePage)) {
+        return res.status(400).json({ success: false, code: 'PRINT_PRINTER_SELECT_FAILED', message: 'Choose a supported paper width, calibrated column count, and code page.' });
+      }
       const printer = {
         name: String(req.body.name || 'Virtual TCP Printer').trim(),
         transport: 'tcp9100',
         address,
+        paperWidthMm,
+        columns,
+        codePage,
         isDefault: true,
         status: 'configured',
       };

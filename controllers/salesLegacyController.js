@@ -66,6 +66,8 @@ const {
   normalizeStoredDiscountSettings,
 } = require('../services/posDiscountSettingsService');
 const { buildDiscountApprovalContext } = require('../services/posDiscountApplicationService');
+const { hasPosPermission } = require('../middleware/posAuthMiddleware');
+const { normalizeScannerConfiguration } = require('../services/posScannerSettingsService');
 
 async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash }) {
   const replay = await replayPosSale({
@@ -465,7 +467,7 @@ exports.createDirectSale = async (req, res, next) => {
         _id: { $in: productIds },
         company: companyId,
       })
-        .select('name sku sellingPrice unit taxRate taxCode currentStock isStockable isNoDiscount category averageCost trackingType trackSerialNumbers trackBatch')
+        .select('name sku sellingPrice unit taxRate taxCode currentStock isActive isStockable isNoDiscount category averageCost trackingType trackSerialNumbers trackBatch')
         .lean();
       productsBatch.forEach((p) => productsMap.set(p._id.toString(), p));
     } catch (batchErr) {
@@ -488,7 +490,7 @@ exports.createDirectSale = async (req, res, next) => {
     const [discountSettingsRow, roleAssignments] = await Promise.all([
       dbClient().systemSettings.findUnique({
         where: { companyId: String(companyId) },
-        select: { posDiscountSettings: true },
+        select: { posDiscountSettings: true, posScannerSettings: true },
       }),
       posCashierId
         ? dbClient().userRole.findMany({
@@ -500,6 +502,52 @@ exports.createDirectSale = async (req, res, next) => {
     const discountSettings = normalizeStoredDiscountSettings(
       discountSettingsRow?.posDiscountSettings || DEFAULT_DISCOUNT_SETTINGS,
     );
+    const configuredOpenPriceProductId = normalizeScannerConfiguration(
+      discountSettingsRow?.posScannerSettings,
+    ).openPriceProductId;
+    const openPriceItems = items.filter((item) => item?.openPrice === true
+      || (configuredOpenPriceProductId && String(item?.productId) === configuredOpenPriceProductId));
+    if (openPriceItems.length) {
+      if (offlineContext) {
+        return res.status(403).json({
+          success: false,
+          code: 'POS_OPEN_PRICE_OFFLINE_UNSUPPORTED',
+          message: 'Open-price items require an online checkout.',
+        });
+      }
+      if (!configuredOpenPriceProductId || openPriceItems.some((item) => (
+        item.openPrice !== true || String(item.productId) !== configuredOpenPriceProductId
+      ))) {
+        return res.status(403).json({
+          success: false,
+          code: 'POS_OPEN_PRICE_PRODUCT_INVALID',
+          message: 'Open-price items must use the company-configured POS product.',
+        });
+      }
+      const configuredProduct = productsMap.get(configuredOpenPriceProductId);
+      if (!configuredProduct || configuredProduct.isActive === false || configuredProduct.isStockable !== false) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_OPEN_PRICE_PRODUCT_UNAVAILABLE',
+          message: 'The configured POS open-price product is no longer an active non-stock product.',
+        });
+      }
+      const allowed = await hasPosPermission(
+        req.posAuthContext?.user,
+        String(companyId),
+        req.posAuthContext?.settings?.posRolePermissions,
+        'pos.till.open_price',
+      );
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          code: 'POS_PERMISSION_DENIED',
+          message: 'Your POS role does not allow open-price items.',
+          requiredPermission: 'pos.till.open_price',
+        });
+      }
+    }
+    const hasOpenPriceItems = openPriceItems.length > 0;
     const tillFeatures = getTillTypeFeatures(discountSettings, claimedRegister.systemTillType);
     if (!tillFeatures.manualDiscounts && Number(rawCartDiscountPct) > 0) {
       return res.status(403).json({
@@ -612,6 +660,18 @@ exports.createDirectSale = async (req, res, next) => {
         message: 'Cart discount must be between 0 and 100 percent.',
       });
     }
+    if (hasOpenPriceItems && (
+      cartDiscountPct > 0
+      || promotionId
+      || (Array.isArray(voucherReservationTokens) && voucherReservationTokens.length > 0)
+      || req.posV2Completion?.voucherReservations
+    )) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_OPEN_PRICE_DISCOUNT_UNSUPPORTED',
+        message: 'Remove open-price items before applying cart discounts, promotions, or vouchers.',
+      });
+    }
     if (offlineContext && cartDiscountPct > 0) {
       return res.status(403).json({
         success: false,
@@ -694,7 +754,21 @@ exports.createDirectSale = async (req, res, next) => {
       }
       const requestedUnitPrice = item.unitPrice == null ? productPrice : Number(item.unitPrice);
       const requestedDiscountPct = item.discountPct == null ? 0 : Number(item.discountPct);
-      const isRestrictedProduct = isDiscountRestricted(product);
+      const isOpenPriceItem = item.openPrice === true;
+      const isRestrictedProduct = !isOpenPriceItem && isDiscountRestricted(product);
+      if (isOpenPriceItem) {
+        const description = String(item.description || '').normalize('NFKC').trim();
+        if (description.length < 1 || description.length > 120 || /[\u0000-\u001f\u007f-\u009f]/.test(description)
+          || !Number.isFinite(requestedUnitPrice) || requestedUnitPrice <= 0
+          || requestedUnitPrice > Number.MAX_SAFE_INTEGER
+          || requestedDiscountPct !== 0) {
+          return res.status(400).json({
+            success: false,
+            code: 'POS_OPEN_PRICE_LINE_INVALID',
+            message: 'Open-price lines require a description, a positive valid price, and no line discount.',
+          });
+        }
+      }
       const appliedCartDiscountPct = isRestrictedProduct ? 0 : cartDiscountPct;
       const discountPct = promotion
         ? Number(promotionDiscountPctByIndex.get(itemIndex) || 0)
@@ -752,14 +826,14 @@ exports.createDirectSale = async (req, res, next) => {
 
       const unitPrice = requestedUnitPrice;
       const hasPriceOverride = Math.abs(unitPrice - productPrice) > 0.000001;
-      if (!tillFeatures.manualDiscounts && (requestedDiscountPct > 0 || hasPriceOverride)) {
+      if (!tillFeatures.manualDiscounts && (requestedDiscountPct > 0 || (hasPriceOverride && !isOpenPriceItem))) {
         return res.status(403).json({
           success: false,
           code: 'POS_TILL_FEATURE_DISABLED',
           message: 'Manual discounts and price overrides are disabled for this till type.',
         });
       }
-      if (hasPriceOverride) requiresManagerApproval = true;
+      if (hasPriceOverride && !isOpenPriceItem) requiresManagerApproval = true;
       
       const isStockable = offlineContext ? snapshotProduct.isStockable !== false : product.isStockable !== false;
       const serialNumbers = Array.isArray(item.serialNumbers)
@@ -954,7 +1028,11 @@ exports.createDirectSale = async (req, res, next) => {
         product: product._id,
         productCode: offlineContext ? snapshotProduct.sku : (product.sku || ''),
         productName: offlineContext ? snapshotProduct.name : product.name,
-        description: offlineContext ? snapshotProduct.name : (item.description || product.name),
+        description: offlineContext
+          ? snapshotProduct.name
+          : item.openPrice === true
+            ? String(item.description).normalize('NFKC').trim()
+            : (item.description || product.name),
         qty: quantity,
         unit: offlineContext ? snapshotProduct.unit : (item.unit || product.unit || 'pcs'),
         unitPrice: unitPrice,
@@ -2913,6 +2991,15 @@ exports.getPosProducts = async (req, res, next) => {
     
     if (search && String(search).trim()) {
       const term = escapeRegex(String(search).trim());
+      const alternateBarcodeMatches = await dbClient().product.findMany({
+        where: {
+          companyId: String(companyId),
+          isActive: true,
+          alternateBarcodes: { has: String(search).trim().toUpperCase() },
+        },
+        select: { id: true },
+        take: 100,
+      });
       // Prefix predicates keep the B-tree/trigram indexes usable for the hot
       // POS lookup. Barcode and SKU also get exact-match clauses so scans and
       // scanner input resolve without a leading-wildcard substring query.
@@ -2923,6 +3010,9 @@ exports.getPosProducts = async (req, res, next) => {
         { sku: { $regex: `^${term}`, $options: 'i' } },
         { name: { $regex: `^${term}`, $options: 'i' } },
       ];
+      if (alternateBarcodeMatches.length) {
+        searchTerms.push({ _id: { $in: alternateBarcodeMatches.map((product) => product.id) } });
+      }
       if (isObjectIdString(search)) searchTerms.push({ _id: String(search).trim() });
       filters.push({ $or: searchTerms });
     }
@@ -2940,7 +3030,7 @@ exports.getPosProducts = async (req, res, next) => {
     // Keyset pagination uses the indexed sort key and a single look-ahead row.
     // It avoids a full matching-row count and work proportional to page depth.
     const fetchedProducts = await Product.find(query)
-      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode imageUrl imageUrls category isNoDiscount isStockable trackingType trackSerialNumbers trackBatch')
+      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode alternateBarcodes imageUrl imageUrls category isNoDiscount isStockable trackingType trackSerialNumbers trackBatch')
       .populate('category')
       .sort({ name: 1, _id: 1 })
       .limit(resultLimit + 1);
@@ -3008,6 +3098,7 @@ exports.getPosProducts = async (req, res, next) => {
         name: p.name,
         sku: p.sku,
         barcode: p.barcode,
+        alternateBarcodes: Array.isArray(p.alternateBarcodes) ? p.alternateBarcodes : [],
         imageUrl: p.imageUrl || null,
         imageUrls: Array.isArray(p.imageUrls) ? p.imageUrls : [],
         sellingPrice: effectivePrice(String(p._id), toNumber(p.sellingPrice), priceListPricing.priceByProduct),

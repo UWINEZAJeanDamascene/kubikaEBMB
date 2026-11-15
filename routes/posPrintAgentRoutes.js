@@ -24,6 +24,9 @@ router.post('/drawer-authorizations/consume', requirePosSession(), requirePermis
 router.post('/admin/printers', protect, canManage, idempotentHandler(printJobController.configurePrinter, { namespace: 'pos-print-admin' }));
 router.post('/admin/jobs', protect, canManage, idempotentHandler(printJobController.createJob, { namespace: 'pos-print-admin' }));
 router.get('/admin/jobs', protect, canManage, printJobController.listJobs);
+router.post('/cashier/receipt-attempts', requirePosSession(), requirePermission('pos.till.sell'), printJobController.beginCashierReceiptAttempt);
+router.get('/cashier/receipt-attempts', requirePosSession(), requirePermission('pos.till.sell'), printJobController.listCashierReceiptAttempts);
+router.post('/cashier/receipt-attempts/:jobId/outcome', requirePosSession(), requirePermission('pos.till.sell'), printJobController.recordCashierReceiptOutcome);
 router.get('/admin/release', protect, printJobController.getRelease);
 router.get('/admin/download', protect, printJobController.downloadSetup);
 
