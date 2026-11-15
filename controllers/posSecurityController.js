@@ -1,4 +1,5 @@
 const { prisma } = require('../lib/prisma');
+const { DEFAULT_MAX_READ_ROWS } = require('../lib/readContext');
 const { verifyPosAuditIntegrity } = require('../services/posAuditIntegrityService');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const { generateObjectId } = require('../utils/objectId');
@@ -12,7 +13,7 @@ const DEFAULTS = Object.freeze({
   idleLockMinutes: 5,
   singleRegisterSession: true,
 });
-const MAX_REPORT_ROWS = 5000;
+const MAX_REPORT_ROWS = DEFAULT_MAX_READ_ROWS;
 const SECURITY_EVENTS = ['PIN_LOGIN_FAILED', 'PIN_LOCKOUT', 'POS_ACTION_DENIED', 'POS_ACTION_FAILED', 'POS_DUPLICATE_REQUEST_ATTEMPT'];
 
 function companyIdFrom(req) {

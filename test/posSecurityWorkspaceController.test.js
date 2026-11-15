@@ -3,12 +3,17 @@
 jest.mock('../lib/prisma', () => ({ prisma: {
   systemSettings: { findUnique: jest.fn(), upsert: jest.fn() },
   posSession: { findMany: jest.fn(), findFirst: jest.fn(), updateMany: jest.fn() },
+  posAuditLog: { findMany: jest.fn() },
+  posApprovalRequest: { count: jest.fn() },
+  posSyncException: { count: jest.fn() },
+  posIdempotencyRecord: { count: jest.fn() },
   $transaction: jest.fn(),
 } }));
 jest.mock('../services/posAuditIntegrityService', () => ({ verifyPosAuditIntegrity: jest.fn() }));
 jest.mock('../services/posAuditService', () => ({ requestIp: jest.fn(() => '192.0.2.1'), writePosAuditLog: jest.fn() }));
 
 const { prisma } = require('../lib/prisma');
+const { DEFAULT_MAX_READ_ROWS } = require('../lib/readContext');
 const { writePosAuditLog } = require('../services/posAuditService');
 const controller = require('../controllers/posSecurityController');
 
@@ -20,11 +25,25 @@ describe('POS security workspace controller', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation((callback) => callback(prisma));
+    prisma.posAuditLog.findMany.mockResolvedValue([]);
+    prisma.posApprovalRequest.count.mockResolvedValue(0);
+    prisma.posSyncException.count.mockResolvedValue(0);
+    prisma.posIdempotencyRecord.count.mockResolvedValue(0);
     prisma.systemSettings.findUnique.mockResolvedValue({
       posSecuritySettings: { duplicateAttemptWindowMinutes: 20, duplicateAttemptThreshold: 7, riskReportLookbackDays: 45, pinFailureLimit: 6, pinLockoutMinutes: 8 },
       posIdleLockMinutes: 4,
       posSingleRegisterSession: false,
     });
+  });
+
+  test.each(['duplicateAttempts', 'riskReport'])('%s reads no more than the shared HTTP row limit', async (report) => {
+    const res = response();
+    await controller[report]({ user: { companyId: 'company-a' }, query: {} }, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.posAuditLog.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      take: DEFAULT_MAX_READ_ROWS,
+    }));
   });
 
   test('reads and persists the enforced PIN, idle-lock, and single-register policies', async () => {

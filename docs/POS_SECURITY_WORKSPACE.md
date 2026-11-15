@@ -16,7 +16,7 @@ Reads and exports append their own audit events. Integrity verification reports 
 
 ## Security workspace
 
-`/pos/admin/security` provides company-level PIN failure/lockout settings, idle-session lock timing, one-register-per-cashier policy, risk thresholds and lookback, duplicate-attempt/replay reports, active POS sessions, and audit-chain verification.
+`/pos/admin/security` provides company-level PIN failure/lockout settings, idle-session lock timing, one-register-per-cashier policy, risk thresholds and lookback, duplicate-attempt/replay reports, active POS sessions, and audit-chain verification. Security reports read at most the configured `QUERY_MAX_ROWS` audit events (500 by default); the risk report marks results that reach this cap as potentially truncated.
 
 PIN and session policy writes are enforced by the server. Changing PIN failure limits affects subsequent register PIN failures. Ending a session marks it ended in the database and records a `SESSION_ENDED` audit event in the same transaction; the till must authenticate again on its next request.
 
