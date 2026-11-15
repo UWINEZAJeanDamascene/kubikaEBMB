@@ -246,6 +246,26 @@ describe('POS audit logging', () => {
     });
   });
 
+  test('accepts and records POS open-price product setting changes', async () => {
+    prisma.posAuditLog.create.mockImplementation(async ({ data }) => data);
+
+    await writePosAuditLog({
+      companyId: 'company',
+      userId: 'manager',
+      event: 'POS_SCANNER_OPEN_PRICE_PRODUCT_UPDATED',
+      metadata: { productId: 'product' },
+    });
+
+    expect(prisma.posAuditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        companyId: 'company',
+        userId: 'manager',
+        event: 'POS_SCANNER_OPEN_PRICE_PRODUCT_UPDATED',
+        metadata: { productId: 'product' },
+      }),
+    });
+  });
+
   test('records an offline action usage idempotency conflict', async () => {
     prisma.posAuditLog.create.mockResolvedValue({ id: 'audit-id' });
 
