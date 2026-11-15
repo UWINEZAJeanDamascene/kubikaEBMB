@@ -58,6 +58,72 @@ const createTransporter = () => {
     };
   }
 
+  if (provider === 'resend') {
+    const request = async (path, method, body) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      let response;
+      try {
+        response = await fetch(`https://api.resend.com${path}`, {
+          method,
+          headers: {
+            Authorization: `Bearer ${emailConfig.resendApiKey}`,
+            ...(body ? { 'Content-Type': 'application/json' } : {}),
+          },
+          ...(body ? { body: JSON.stringify(body) } : {}),
+          signal: controller.signal,
+        });
+      } catch (error) {
+        const timedOut = error?.name === 'AbortError';
+        throw Object.assign(
+          new Error(timedOut ? 'Resend API request timed out.' : 'Could not connect to the Resend API.'),
+          { code: timedOut ? 'ETIMEDOUT' : 'ERESEND_CONNECTION' },
+        );
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw Object.assign(
+          new Error(`Resend API request failed with HTTP ${response.status}.`),
+          { code: response.status === 429 ? 'ERESEND_RATE_LIMIT' : 'ERESEND_API', status: response.status },
+        );
+      }
+      return result;
+    };
+
+    return {
+      verify: async () => {
+        await request('/domains', 'GET');
+        return true;
+      },
+      sendMail: async (mail) => {
+        const attachments = (mail.attachments || []).map((attachment) => ({
+          filename: attachment.filename,
+          content: Buffer.isBuffer(attachment.content)
+            ? attachment.content.toString('base64')
+            : attachment.content,
+          ...(attachment.contentType ? { content_type: attachment.contentType } : {}),
+        }));
+        const result = await request('/emails', 'POST', {
+          from: mail.from,
+          to: Array.isArray(mail.to) ? mail.to : String(mail.to || '').split(',').map((address) => address.trim()).filter(Boolean),
+          subject: mail.subject,
+          html: mail.html,
+          text: mail.text,
+          ...(attachments.length ? { attachments } : {}),
+        });
+        return {
+          accepted: Array.isArray(mail.to) ? mail.to : [mail.to],
+          rejected: [],
+          messageId: result.id,
+          response: 'Resend API accepted the email.',
+        };
+      },
+    };
+  }
+
   const poolDefaults = {
     pool: true,
     maxConnections: 5,
@@ -78,19 +144,6 @@ const createTransporter = () => {
       auth: {
         user: emailConfig.gmailUser,
         pass: emailConfig.gmailAppPassword
-      }
-    });
-  }
-
-  if (provider === 'resend') {
-    return nodemailer.createTransport({
-      ...poolDefaults,
-      host: 'smtp.resend.com',
-      port: 465,
-      secure: true,
-      auth: {
-        user: 'resend',
-        pass: emailConfig.resendApiKey
       }
     });
   }
@@ -123,7 +176,7 @@ const getTransporter = () => {
 };
 
 /**
- * Verify SMTP connection. Safe to call at server startup.
+ * Verify the configured email provider. Safe to call at server startup.
  * Returns true/false — never throws.
  */
 const testConnection = async () => {

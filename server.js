@@ -192,6 +192,9 @@ async function initializeServer() {
    require('./src/models/ImportJob');
 
   app = express();
+  // Railway terminates public HTTPS at one proxy hop. Trust only that hop so
+  // req.ip and express-rate-limit can safely use the forwarded client address.
+  require('./config/proxyTrust').configureProxyTrust(app, NODE_ENV);
 
   // Every request gets an explicit HTTP read context. Large reads must opt into
   // a worker/export context instead of escaping the policy through a query arg.
