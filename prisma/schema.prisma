@@ -326,6 +326,8 @@ model SystemSettings {
   posVarianceApprovalLimit           Int      @default(5000) @map("pos_variance_approval_limit")
   posCashOutApprovalLimit            Int      @default(50000) @map("pos_cash_out_approval_limit")
   posDrawerWarnAmount                Int?     @map("pos_drawer_warn_amount")
+  posDrawerSettings                  Json     @default("{\"companyDefaults\":{\"cashSale\":true,\"onlyWhenChangeDue\":false,\"paidIn\":false,\"paidOut\":false,\"shiftOpen\":false,\"shiftClose\":false,\"noSale\":true},\"tillTypeOverrides\":{},\"registerOverrides\":{}}") @map("pos_drawer_settings") @db.JsonB
+  posHardwareSettings                Json     @default("{\"tillTypeOverrides\":{},\"registerOverrides\":{}}") @map("pos_hardware_settings") @db.JsonB
   posReceiptSettings                 Json     @default("{\"paperWidth\":80,\"columns\":42,\"showCashier\":true,\"showCustomer\":true,\"showSku\":false,\"showBarcode\":false,\"headerNote\":\"\",\"footerNote\":\"Thank you for shopping with us.\",\"returnPolicy\":\"\",\"logoUrl\":\"\",\"autoPrintOnSale\":false,\"digitalReceiptsEnabled\":true,\"digitalReceiptExpiryDays\":30}") @map("pos_receipt_settings")
   posScannerSettings                 Json     @default("{\"companyDefaults\":{\"terminator\":\"Enter\",\"speedThresholdMs\":50,\"minimumLength\":3,\"maximumLength\":128,\"duplicateWindowMs\":800,\"duplicateBehavior\":\"add_quantity\",\"prefixToStrip\":\"\",\"suffixToStrip\":\"\",\"feedbackSound\":false,\"enabledSymbologies\":[\"EAN13\",\"EAN8\",\"UPCA\",\"CODE128\",\"CODE39\",\"ITF14\",\"QR\"]},\"tillTypeOverrides\":{},\"registerOverrides\":{}}") @map("pos_scanner_settings") @db.JsonB
   posLoyaltySettings                 Json     @default("{\"pointValueRwf\":1}") @map("pos_loyalty_settings")
@@ -1023,6 +1025,8 @@ model Company {
   posPrintAgents              PosPrintAgent[]
   posPrintPrinters            PosPrintPrinter[]
   posPrintJobs                PosPrintJob[]
+  posPrintDocuments           PosPrintDocument[]
+  posHardwareDevices          PosHardwareDevice[]
   posShifts                   PosShift[]
   posShiftCorrectionReports   PosShiftCorrectionReport[]
   posCashMovements            PosCashMovement[]
@@ -1395,6 +1399,8 @@ model PosRegister {
   printPairingCodes      PosPrintPairingCode[]
   printAgents            PosPrintAgent[]
   printJobs              PosPrintJob[]
+  printDocuments         PosPrintDocument[]
+  hardwareDevices        PosHardwareDevice[]
   approvalRequests       PosApprovalRequest[]
   devices                PosDevice[]
 
@@ -1497,6 +1503,7 @@ model PosPrintDrawerAuthorization {
   expiresAt   DateTime  @map("expires_at") @db.Timestamptz(3)
   usedAt      DateTime? @map("used_at") @db.Timestamptz(3)
   outcome     String?   @db.VarChar(30)
+  outcomeAt   DateTime? @map("outcome_at") @db.Timestamptz(3)
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
 
   @@index([companyId, registerId, expiresAt])
@@ -1513,6 +1520,11 @@ model PosPrintPrinter {
   paperWidthMm  Int           @default(80) @map("paper_width_mm")
   columns       Int           @default(42)
   codePage      Int           @default(16) @map("code_page")
+  role          String        @default("receipt") @db.VarChar(20)
+  paperSize     String        @default("thermal") @map("paper_size") @db.VarChar(16)
+  copies        Int           @default(1)
+  tray          String?       @db.VarChar(80)
+  duplex        Boolean       @default(false)
   drawerEnabled Boolean       @default(false) @map("drawer_enabled")
   drawerPin     Int           @default(2) @map("drawer_pin")
   pulseOnMs     Int           @default(25) @map("pulse_on_ms")
@@ -1525,6 +1537,7 @@ model PosPrintPrinter {
   company       Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
   agent         PosPrintAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
   jobs          PosPrintJob[]
+  hardwareDevice PosHardwareDevice?
 
   @@unique([agentId, name, transport, address])
   @@index([agentId, isDefault])
@@ -1544,6 +1557,8 @@ model PosPrintJob {
   payloadHash         String           @map("payload_hash") @db.Char(64)
   copyRequired        Boolean          @default(false) @map("copy_required")
   sourceDocumentId    String?          @map("source_document_id") @db.VarChar(64)
+  documentId          String?          @map("document_id") @db.Char(24)
+  documentVersion     Int?             @map("document_version")
   copyNumber          Int              @default(0) @map("copy_number")
   shiftId             String?          @map("shift_id") @db.Char(24)
   localOnly           Boolean          @default(false) @map("local_only")
@@ -1566,6 +1581,7 @@ model PosPrintJob {
   shift               PosShift?        @relation(fields: [shiftId], references: [id], onDelete: SetNull)
   agent               PosPrintAgent?   @relation(fields: [agentId], references: [id], onDelete: SetNull)
   printer             PosPrintPrinter? @relation(fields: [printerId], references: [id], onDelete: SetNull)
+  document            PosPrintDocument? @relation(fields: [documentId], references: [id], onDelete: SetNull)
   createdBy           User?            @relation("PosPrintJobCreator", fields: [createdById], references: [id], onDelete: SetNull)
 
   @@unique([companyId, idempotencyKey])
@@ -1574,6 +1590,50 @@ model PosPrintJob {
   @@index([agentId, status, availableAt])
   @@index([expiresAt], map: "pos_print_jobs_expiry_idx")
   @@map("pos_print_jobs")
+}
+
+model PosPrintDocument {
+  id               String       @id @db.Char(24)
+  companyId        String       @map("company_id") @db.Char(24)
+  registerId       String       @map("register_id") @db.Char(24)
+  documentType     String       @map("document_type") @db.VarChar(40)
+  sourceDocumentId String       @map("source_document_id") @db.VarChar(64)
+  version          Int          @default(1)
+  payloadJson      Json?        @map("payload_json")
+  pdfBytes         Bytes?       @map("pdf_bytes") @db.ByteA
+  payloadHash      String       @map("payload_hash") @db.Char(64)
+  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt        DateTime?    @map("expires_at") @db.Timestamptz(3)
+  company          Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register         PosRegister  @relation(fields: [registerId], references: [id], onDelete: Restrict)
+  jobs             PosPrintJob[]
+
+  @@unique([companyId, registerId, documentType, sourceDocumentId, version], map: "pos_print_documents_identity_key")
+  @@index([companyId, registerId, expiresAt])
+  @@map("pos_print_documents")
+}
+
+model PosHardwareDevice {
+  id          String          @id @db.Char(24)
+  companyId   String          @map("company_id") @db.Char(24)
+  registerId  String          @map("register_id") @db.Char(24)
+  printerId   String?         @unique @map("printer_id") @db.Char(24)
+  kind        String          @db.VarChar(24)
+  name        String          @db.VarChar(160)
+  connection  String          @db.VarChar(30)
+  address     String          @db.VarChar(255)
+  profileJson Json            @default("{}") @map("profile_json") @db.JsonB
+  status      String          @default("unknown") @db.VarChar(30)
+  lastSeenAt  DateTime?       @map("last_seen_at") @db.Timestamptz(3)
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company     Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  register    PosRegister     @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  printer     PosPrintPrinter? @relation(fields: [printerId], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, registerId, kind, connection, address], map: "pos_hardware_devices_identity_key")
+  @@index([companyId, registerId, kind, status])
+  @@map("pos_hardware_devices")
 }
 
 model PosShift {

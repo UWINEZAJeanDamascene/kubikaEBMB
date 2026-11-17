@@ -79,7 +79,12 @@ describe('record POS no-sale drawer openings', () => {
         }),
       ]) },
     }));
-    expect(res.body).toEqual({ success: true, data: updatedTill });
+    const savedActivity = tx.tillSession.update.mock.calls[0][0].data.cashActivity.find((activity) => activity.type === 'no_sale');
+    expect(savedActivity.id).toMatch(/^[a-f\d]{24}$/i);
+    expect(res.body).toEqual({
+      success: true,
+      data: { ...updatedTill, activityId: savedActivity.id },
+    });
   });
 
   test('does not consume approval if the till is no longer owned and open', async () => {

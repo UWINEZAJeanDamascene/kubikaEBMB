@@ -207,7 +207,7 @@ test('local API rejects untrusted origins, missing tokens, and repeated requests
     savePrinters: () => {},
     transmitDirect: async () => ({}),
     onPair: async () => ({}),
-    rateLimitOptions: { limit: 2, windowMs: 60000 },
+    rateLimitOptions: { limit: 3, windowMs: 60000 },
   });
   const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve) => server.once('listening', resolve));
@@ -229,6 +229,38 @@ test('local API rejects untrusted origins, missing tokens, and repeated requests
     assert.equal(limited.status, 429);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('local API rejects unconfigured localhost ports and private-network preflights', async () => {
+  const previousAllowedOrigins = process.env.KUBIKA_PRINT_AGENT_ALLOWED_ORIGINS;
+  process.env.KUBIKA_PRINT_AGENT_ALLOWED_ORIGINS = 'http://localhost:5173';
+  const app = createLocalServer({
+    ledger: {},
+    credentialStore: { load: () => ({ accessToken: 'installed-agent-token' }) },
+    discoverPrinters: () => [],
+    savePrinters: () => {},
+    transmitDirect: async () => ({}),
+    onPair: async () => ({}),
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise((resolve) => server.once('listening', resolve));
+  const url = `http://127.0.0.1:${server.address().port}/v1/status`;
+
+  try {
+    const configured = await fetch(url, { headers: { Origin: 'http://localhost:5173' } });
+    const unconfigured = await fetch(url, { headers: { Origin: 'http://localhost:3000' } });
+    const preflight = await fetch(url, {
+      method: 'OPTIONS',
+      headers: { Origin: 'http://localhost:3000', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Private-Network': 'true' },
+    });
+    assert.equal(configured.status, 200);
+    assert.equal(unconfigured.status, 403);
+    assert.equal(preflight.status, 403);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    if (previousAllowedOrigins === undefined) delete process.env.KUBIKA_PRINT_AGENT_ALLOWED_ORIGINS;
+    else process.env.KUBIKA_PRINT_AGENT_ALLOWED_ORIGINS = previousAllowedOrigins;
   }
 });
 
@@ -255,6 +287,7 @@ test('local setup page and status are available before pairing; printer mutation
     assert.equal(status.status, 200);
     assert.equal(body.data.paired, false);
     assert.equal(body.data.printers[0].name, 'Receipt Printer');
+    assert.equal(body.data.version, require('../../package.json').version);
 
     const mutation = await fetch(`${baseUrl}/v1/printers/refresh`, { method: 'POST' });
     assert.equal(mutation.status, 401);
@@ -272,6 +305,7 @@ test('local setup page and status are available before pairing; printer mutation
 test('local drawer kicks require a valid one-time server authorization', async () => {
   const token = 'installed-agent-token';
   const consumed = new Set();
+  const outcomes = [];
   let transmitted = 0;
   const app = createLocalServer({
     ledger: {},
@@ -285,8 +319,9 @@ test('local drawer kicks require a valid one-time server authorization', async (
       if (authorizationToken === 'expired') throw Object.assign(new Error('Authorization expired.'), { status: 410 });
       if (consumed.has(authorizationToken)) throw Object.assign(new Error('Authorization already used.'), { status: 409 });
       consumed.add(authorizationToken);
-      return { authorized: true };
+      return { authorizationId: 'drawer-authorization-1' };
     },
+    recordDrawerOutcome: async (authorizationId, outcome) => outcomes.push({ authorizationId, outcome }),
   });
   const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve) => server.once('listening', resolve));
@@ -303,6 +338,35 @@ test('local drawer kicks require a valid one-time server authorization', async (
     assert.equal((await send('one-time-token')).status, 200);
     assert.equal((await send('one-time-token')).status, 409);
     assert.equal(transmitted, 1);
+    assert.deepEqual(outcomes, [{ authorizationId: 'drawer-authorization-1', outcome: 'opened' }]);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('local drawer failures record a failed outcome after consuming authorization', async () => {
+  const outcomes = [];
+  const app = createLocalServer({
+    ledger: {},
+    credentialStore: { load: () => ({ accessToken: 'installed-agent-token' }) },
+    discoverPrinters: () => [],
+    savePrinters: () => {},
+    transmitDirect: async () => { throw new Error('Printer unavailable.'); },
+    onPair: async () => ({}),
+    authorizeDrawer: async () => ({ authorizationId: 'drawer-authorization-2' }),
+    recordDrawerOutcome: async (authorizationId, outcome) => outcomes.push({ authorizationId, outcome }),
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise((resolve) => server.once('listening', resolve));
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer installed-agent-token' },
+      body: JSON.stringify({ jobType: 'drawer-open', drawerAuthorizationToken: 'authorized-token' }),
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(outcomes, [{ authorizationId: 'drawer-authorization-2', outcome: 'failed' }]);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

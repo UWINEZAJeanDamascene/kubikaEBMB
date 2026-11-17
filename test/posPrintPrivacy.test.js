@@ -1,11 +1,13 @@
 const crypto = require('crypto');
 
 const mockPrisma = {
+  $executeRaw: jest.fn(),
   posPrintAgent: { updateMany: jest.fn() },
   posRegister: { findFirst: jest.fn() },
   posShift: { findFirst: jest.fn() },
   invoice: { findFirst: jest.fn() },
   posEbmReceiptReprint: { findFirst: jest.fn(), findMany: jest.fn() },
+  posPrintDocument: { findFirst: jest.fn(), create: jest.fn() },
   posPrintJob: {
     findFirst: jest.fn(),
     create: jest.fn(),
@@ -137,13 +139,18 @@ describe('POS print-job privacy and retention', () => {
     mockPrisma.posShift.findFirst.mockResolvedValue({ id: 'f'.repeat(24) });
     mockPrisma.posPrintJob.findFirst.mockResolvedValue(null);
     mockPrisma.posPrintJob.create.mockImplementation(async ({ data }) => ({ id: data.id, status: data.status }));
+    mockPrisma.posPrintDocument.findFirst.mockResolvedValue(null);
+    mockPrisma.posPrintDocument.create.mockImplementation(async ({ data }) => ({ id: '9'.repeat(24), ...data }));
     const req = {
       posAuthContext: {
         company: { id: 'a'.repeat(24) },
         register: { id: 'b'.repeat(24) },
         user: { id: 'd'.repeat(24) },
       },
-      body: { sourceDocumentId: 'e'.repeat(24), jobType: 'receipt', copyNumber: 0 },
+      body: {
+        sourceDocumentId: 'e'.repeat(24), jobType: 'receipt', copyNumber: 0,
+        receiptDocument: { version: 1, flags: { copyNumber: 0, isCopy: false, receiptType: 'SALE' }, customerName: 'Sensitive Customer' },
+      },
       ip: '127.0.0.1',
     };
     const res = response();
@@ -160,8 +167,11 @@ describe('POS print-job privacy and retention', () => {
       status: 'transmitting',
       localOnly: true,
       payloadJson: {},
+      documentId: expect.any(String),
     }));
     expect(JSON.stringify(created.payloadJson)).not.toMatch(/customer|email|phone|receiptLines/i);
+    expect(JSON.stringify(created.payloadJson)).not.toContain('Sensitive Customer');
+    expect(mockPrisma.posPrintDocument.create.mock.calls[0][0].data.payloadJson.receipt.customerName).toBe('Sensitive Customer');
     expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
       event: 'PRINT_ATTEMPT_STARTED',
       metadata: expect.objectContaining({ shiftId: 'f'.repeat(24), sourceDocumentId: 'e'.repeat(24) }),
@@ -173,13 +183,18 @@ describe('POS print-job privacy and retention', () => {
     mockPrisma.posShift.findFirst.mockResolvedValue({ id: 'f'.repeat(24) });
     mockPrisma.posPrintJob.findFirst.mockResolvedValue(null);
     mockPrisma.posPrintJob.create.mockImplementation(async ({ data }) => ({ id: data.id, status: data.status }));
+    mockPrisma.posPrintDocument.findFirst.mockResolvedValue(null);
+    mockPrisma.posPrintDocument.create.mockImplementation(async ({ data }) => ({ id: '9'.repeat(24), ...data }));
     const req = {
       posAuthContext: {
         company: { id: 'a'.repeat(24) },
         register: { id: 'b'.repeat(24), code: 'REGISTER-01' },
         user: { id: 'd'.repeat(24) },
       },
-      body: { sourceDocumentId: 'e'.repeat(24), jobType: 'receipt', copyNumber: 0 },
+      body: {
+        sourceDocumentId: 'e'.repeat(24), jobType: 'receipt', copyNumber: 0,
+        receiptDocument: { version: 1, flags: { copyNumber: 0, isCopy: false, receiptType: 'SALE' } },
+      },
       ip: '127.0.0.1',
     };
     const res = response();
@@ -216,7 +231,10 @@ describe('POS print-job privacy and retention', () => {
         register: { id: 'b'.repeat(24) },
         user: { id: 'd'.repeat(24) },
       },
-      body: { sourceDocumentId: 'e'.repeat(24), jobType: 'receipt', copyNumber: 0 },
+      body: {
+        sourceDocumentId: 'e'.repeat(24), jobType: 'receipt', copyNumber: 0,
+        receiptDocument: { version: 1, flags: { copyNumber: 0, isCopy: false, receiptType: 'SALE' } },
+      },
     };
     const res = response();
 
@@ -237,7 +255,10 @@ describe('POS print-job privacy and retention', () => {
         register: { id: 'b'.repeat(24) },
         user: { id: 'd'.repeat(24) },
       },
-      body: { sourceDocumentId: 'e'.repeat(24), jobType: 'receipt', copyNumber: 1 },
+      body: {
+        sourceDocumentId: 'e'.repeat(24), jobType: 'receipt', copyNumber: 1,
+        receiptDocument: { version: 1, flags: { copyNumber: 1, isCopy: true, receiptType: 'SALE' } },
+      },
     };
     const res = response();
 
@@ -417,6 +438,7 @@ describe('POS print-job privacy and retention', () => {
   test('purges terminal print jobs after the retention window', async () => {
     mockPrisma.posPrintJob.updateMany.mockResolvedValue({ count: 0 });
     mockPrisma.posPrintJob.deleteMany.mockResolvedValue({ count: 1 });
+    mockPrisma.$executeRaw.mockResolvedValue(1);
 
     await expireAndCleanup();
 
@@ -429,6 +451,13 @@ describe('POS print-job privacy and retention', () => {
     expect(purge.where.status.in).toEqual(['transmitted', 'confirmed', 'failed', 'expired', 'uncertain', 'cancelled']);
     expect(purge.where.updatedAt.lt).toBeInstanceOf(Date);
     expect(mockPrisma.posPrintJob.deleteMany).toHaveBeenCalledTimes(1);
+    const payloadPurgeSql = mockPrisma.$executeRaw.mock.calls[0][0].join(' ');
+    expect(payloadPurgeSql).toContain('SET payload_json =');
+    expect(payloadPurgeSql).toContain('updated_at <');
+    const payloadPurgeBefore = mockPrisma.$executeRaw.mock.calls[0][1];
+    expect(payloadPurgeBefore).toBeInstanceOf(Date);
+    expect(Math.abs((Date.now() - payloadPurgeBefore.getTime()) - 24 * 60 * 60 * 1000)).toBeLessThan(1000);
+    expect(Math.abs((Date.now() - purge.where.updatedAt.lt.getTime()) - 7 * 24 * 60 * 60 * 1000)).toBeLessThan(1000);
   });
 
   test('marks expired leases uncertain instead of requeueing potentially printed jobs', async () => {

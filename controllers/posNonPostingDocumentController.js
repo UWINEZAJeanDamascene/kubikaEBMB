@@ -58,7 +58,10 @@ exports.convertProforma = async (req, res, next) => {
       ...(req.body || {}),
       proformaDocumentId: document.id,
       items: Array.isArray(saved.items) ? saved.items.map((item) => ({
-        productId: item.productId, quantity: item.quantity, unitPrice: item.unitPrice,
+        productId: item.productId, quantity: item.salesQuantity ?? item.quantity,
+        unitPrice: item.saleUnitPrice ?? (Number(item.unitPrice) * Number(item.baseUnitsPerSale || 1)),
+        catalogUnitPrice: item.catalogSaleUnitPrice ?? undefined,
+        salesUnitCode: item.salesUnitCode || undefined,
         discountPct: item.discountPct, discountReason: item.discountReason, serialNumbers: item.serialNumbers || [],
       })) : [],
       warehouseId: req.body?.warehouseId || saved.warehouseId,

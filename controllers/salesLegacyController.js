@@ -36,6 +36,7 @@ const { shouldBlockOfflineFiscalSale } = require('../services/posOfflinePolicySe
 const { reserveOfflineActionUsage } = require('../services/posOfflineActionUsageService');
 const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
 const { getWarehouseTransferVisibility } = require('../services/posTransferVisibilityService');
+const { normalizeWholesaleConfig, resolveWholesaleLine } = require('../utils/posWholesalePricing');
 const notificationDeliveryService = require('../services/notificationDeliveryService');
 const posPaymentService = require('../services/posPaymentService');
 const {
@@ -467,11 +468,23 @@ exports.createDirectSale = async (req, res, next) => {
         _id: { $in: productIds },
         company: companyId,
       })
-        .select('name sku sellingPrice unit taxRate taxCode currentStock isActive isStockable isNoDiscount category averageCost trackingType trackSerialNumbers trackBatch')
+        .select('name sku sellingPrice unit taxRate taxCode currentStock isActive isStockable isNoDiscount category averageCost trackingType trackSerialNumbers trackBatch customFields')
         .lean();
       productsBatch.forEach((p) => productsMap.set(p._id.toString(), p));
     } catch (batchErr) {
       console.warn('[createDirectSale] Batch product load failed:', batchErr.message);
+    }
+    const wholesaleBaseQuantityByProduct = new Map();
+    for (const item of items) {
+      const product = productsMap.get(String(item.productId));
+      if (!product) continue;
+      const code = String(item.salesUnitCode || '').trim().toLowerCase();
+      const configuredUnit = code ? normalizeWholesaleConfig(product).units.find((unit) => unit.code === code) : null;
+      if (code && !configuredUnit) {
+        return res.status(409).json({ success: false, code: 'POS_WHOLESALE_UNIT_CHANGED', message: `${product.name} selling unit is no longer configured. Refresh the till and retry.` });
+      }
+      const multiplier = configuredUnit?.baseQuantity || 1;
+      wholesaleBaseQuantityByProduct.set(String(product._id), (wholesaleBaseQuantityByProduct.get(String(product._id)) || 0) + Number(item.quantity || 0) * multiplier);
     }
     const categoryIds = [...new Set([...productsMap.values()]
       .map((product) => String(product.category?._id || product.category || ''))
@@ -621,14 +634,18 @@ exports.createDirectSale = async (req, res, next) => {
         const product = productsMap.get(String(item.productId));
         const snapshotProduct = offlineContext?.snapshotData.products?.[String(item.productId)];
         const quantity = Number(item.quantity);
-        const price = offlineContext
+        const basePrice = offlineContext
           ? Number(snapshotProduct?.price)
           : product ? effectivePrice(String(product._id), product.sellingPrice, priceListPricing.priceByProduct) : NaN;
-        const requestedPrice = item.unitPrice == null ? price : Number(item.unitPrice);
-        if (!product || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price)
-          || Math.abs(requestedPrice - price) > 0.000001 || Number(item.discountPct || 0) !== 0) return null;
+        const wholesaleLine = offlineContext || !product
+          ? { salesUnitPrice: basePrice }
+          : resolveWholesaleLine({ product, quantity, salesUnitCode: item.salesUnitCode, basePrice, totalBaseQuantity: wholesaleBaseQuantityByProduct.get(String(product._id)) || quantity });
+        const expectedPrice = Number(wholesaleLine.salesUnitPrice);
+        const requestedPrice = item.unitPrice == null ? expectedPrice : Number(item.unitPrice);
+        if (!product || wholesaleLine.error || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(basePrice)
+          || Math.abs(requestedPrice - expectedPrice) > 0.000001 || Number(item.discountPct || 0) !== 0) return null;
         if (isDiscountRestricted(product)) return 0;
-        return quantity * price;
+        return quantity * expectedPrice;
       });
       if (bases.some((amount) => amount == null)) {
         return res.status(400).json({ success: false, code: 'POS_PROMOTION_MANUAL_DISCOUNT_CONFLICT', message: 'Promotions cannot be combined with manual discounts or overridden prices. Remove the manual adjustment and apply one promotion.' });
@@ -747,12 +764,27 @@ exports.createDirectSale = async (req, res, next) => {
       if (offlineContext && !snapshotProduct) {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_PRODUCT_NOT_IN_SNAPSHOT', message: 'A sale item was not included in the signed offline catalog snapshot.' });
       }
-      const quantity = Number(item.quantity);
+      const saleQuantity = Number(item.quantity);
       const productPrice = effectivePrice(String(product._id), product.sellingPrice, priceListPricing.priceByProduct);
+      const wholesaleLine = offlineContext
+        ? { multiplier: 1, baseQuantity: saleQuantity, unitPrice: productPrice, salesUnitPrice: productPrice, unitLabel: product.unit }
+        : resolveWholesaleLine({
+          product, quantity: saleQuantity, salesUnitCode: item.salesUnitCode, basePrice: productPrice,
+          totalBaseQuantity: wholesaleBaseQuantityByProduct.get(String(product._id)) || saleQuantity,
+        });
+      if (wholesaleLine.error || (offlineContext && item.salesUnitCode)) {
+        return res.status(offlineContext ? 403 : 409).json({
+          success: false,
+          code: offlineContext ? 'POS_OFFLINE_WHOLESALE_UNSUPPORTED' : 'POS_WHOLESALE_UNIT_CHANGED',
+          message: offlineContext ? 'Wholesale packs and quantity-break pricing require the till to be online.' : wholesaleLine.error,
+        });
+      }
+      const quantity = Number(wholesaleLine.baseQuantity);
+      const expectedSalesPrice = offlineContext ? productPrice : Number(wholesaleLine.salesUnitPrice);
       if (offlineContext && Math.abs(Number(snapshotProduct.price) - productPrice) > 0.000001) {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_PRICE_SNAPSHOT_MISMATCH', message: `${snapshotProduct.name} price no longer matches the signed offline catalog.` });
       }
-      const requestedUnitPrice = item.unitPrice == null ? productPrice : Number(item.unitPrice);
+      const requestedUnitPrice = item.unitPrice == null ? expectedSalesPrice : Number(item.unitPrice);
       const requestedDiscountPct = item.discountPct == null ? 0 : Number(item.discountPct);
       const isOpenPriceItem = item.openPrice === true;
       const isRestrictedProduct = !isOpenPriceItem && isDiscountRestricted(product);
@@ -778,13 +810,13 @@ exports.createDirectSale = async (req, res, next) => {
         : typeof item.discountReason === 'string' ? item.discountReason.trim() : '';
       if (offlineContext && (
         item.catalogUnitPrice == null
-        || Math.abs(Number(item.catalogUnitPrice) - productPrice) > 0.000001
-        || Math.abs(requestedUnitPrice - productPrice) > 0.000001
+        || Math.abs(Number(item.catalogUnitPrice) - expectedSalesPrice) > 0.000001
+        || Math.abs(requestedUnitPrice - expectedSalesPrice) > 0.000001
         || Number(item.discountPct || 0) !== 0
       )) {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_PRICE_SNAPSHOT_MISMATCH', message: `${snapshotProduct.name} price or discount does not match the signed offline catalog.` });
       }
-      if (!offlineContext && item.catalogUnitPrice != null && Math.abs(Number(item.catalogUnitPrice) - productPrice) > 0.000001) {
+      if (!offlineContext && item.catalogUnitPrice != null && Math.abs(Number(item.catalogUnitPrice) - expectedSalesPrice) > 0.000001) {
         return res.status(409).json({
           success: false,
           code: 'POS_PRICE_CHANGED',
@@ -807,7 +839,7 @@ exports.createDirectSale = async (req, res, next) => {
         });
       }
       if (isRestrictedProduct
-        && (requestedDiscountPct > 0 || requestedUnitPrice < productPrice - 0.000001 || discountPct > 0)) {
+        && (requestedDiscountPct > 0 || requestedUnitPrice < expectedSalesPrice - 0.000001 || discountPct > 0)) {
         return res.status(403).json({
           success: false,
           code: 'POS_ITEM_DISCOUNT_NOT_ALLOWED',
@@ -825,7 +857,7 @@ exports.createDirectSale = async (req, res, next) => {
       }
 
       const unitPrice = requestedUnitPrice;
-      const hasPriceOverride = Math.abs(unitPrice - productPrice) > 0.000001;
+      const hasPriceOverride = Math.abs(requestedUnitPrice - expectedSalesPrice) > 0.000001;
       if (!tillFeatures.manualDiscounts && (requestedDiscountPct > 0 || (hasPriceOverride && !isOpenPriceItem))) {
         return res.status(403).json({
           success: false,
@@ -1012,8 +1044,9 @@ exports.createDirectSale = async (req, res, next) => {
       }
       const taxCode = offlineContext ? snapshotProduct.taxCode : (product.taxCode || (taxRate > 0 ? 'B' : 'A'));
       if (offlineContext && Number(item.taxRate) !== taxRate) offlineTaxPayloadMismatch = true;
+      const baseUnitPrice = requestedUnitPrice / Number(wholesaleLine.multiplier || 1);
       const { subtotal, discountAmount, netAmount, taxAmount, lineTotal } = calculatePosLineAmounts({
-        quantity, unitPrice, discountPct, taxRate,
+        quantity, unitPrice: baseUnitPrice, discountPct, taxRate,
       });
       if (![subtotal, discountAmount, netAmount, taxAmount, lineTotal].every(Number.isFinite)
         || lineTotal > Number.MAX_SAFE_INTEGER) {
@@ -1032,10 +1065,12 @@ exports.createDirectSale = async (req, res, next) => {
           ? snapshotProduct.name
           : item.openPrice === true
             ? String(item.description).normalize('NFKC').trim()
-            : (item.description || product.name),
+            : Number(wholesaleLine.multiplier || 1) > 1
+              ? `${product.name} · ${saleQuantity} ${wholesaleLine.unitLabel} (${quantity} ${product.unit || 'unit'})`
+              : (item.description || product.name),
         qty: quantity,
-        unit: offlineContext ? snapshotProduct.unit : (item.unit || product.unit || 'pcs'),
-        unitPrice: unitPrice,
+        unit: offlineContext ? snapshotProduct.unit : (product.unit || 'pcs'),
+        unitPrice: baseUnitPrice,
         discountPct: discountPct,
         discountReason,
         discountCapPercent: promotion
@@ -3030,7 +3065,7 @@ exports.getPosProducts = async (req, res, next) => {
     // Keyset pagination uses the indexed sort key and a single look-ahead row.
     // It avoids a full matching-row count and work proportional to page depth.
     const fetchedProducts = await Product.find(query)
-      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode alternateBarcodes imageUrl imageUrls category isNoDiscount isStockable trackingType trackSerialNumbers trackBatch')
+      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode alternateBarcodes imageUrl imageUrls category isNoDiscount isStockable trackingType trackSerialNumbers trackBatch customFields')
       .populate('category')
       .sort({ name: 1, _id: 1 })
       .limit(resultLimit + 1);
@@ -3057,7 +3092,7 @@ exports.getPosProducts = async (req, res, next) => {
       : [];
     const categoryById = new Map(categoryRows.map((category) => [String(category.id).trim(), category]));
 
-    const [warehouseStockLevels, priceListPricing, transferVisibility, quarantinedRows] = await Promise.all([
+    const [warehouseStockLevels, priceListPricing, transferVisibility, quarantinedRows, availabilityWarehouses] = await Promise.all([
       warehouseId && products.length
       ? StockLevel.find({
           company_id: companyId,
@@ -3069,7 +3104,7 @@ exports.getPosProducts = async (req, res, next) => {
       getWarehouseTransferVisibility(companyId, warehouseId, products.map((product) => product._id)),
       products.length
         ? dbClient().stockBatch.groupBy({
-          by: ['productId'],
+          by: ['productId', 'warehouseId'],
           where: {
             companyId: String(companyId),
             productId: { in: products.map((product) => String(product._id)) },
@@ -3080,11 +3115,34 @@ exports.getPosProducts = async (req, res, next) => {
           _sum: { qtyOnHand: true },
         })
         : [],
+      dbClient().warehouse.findMany({
+        where: { companyId: String(companyId), isActive: true },
+        select: { id: true, name: true, code: true },
+        orderBy: { name: 'asc' },
+        take: 100,
+      }),
     ]);
+    const allWarehouseLevels = products.length && availabilityWarehouses.length
+      ? await StockLevel.find({
+          company_id: companyId,
+          warehouse_id: { $in: availabilityWarehouses.map((warehouse) => warehouse.id) },
+          product_id: { $in: products.map((product) => product._id) },
+        }).lean()
+      : [];
+    const allLevelsByProduct = new Map();
+    for (const level of allWarehouseLevels) {
+      const productKey = String(level.product_id);
+      const levels = allLevelsByProduct.get(productKey) || new Map();
+      levels.set(String(level.warehouse_id), level);
+      allLevelsByProduct.set(productKey, levels);
+    }
     const warehouseStockByProduct = new Map(
       warehouseStockLevels.map((level) => [String(level.product_id), level]),
     );
-    const quarantinedByProduct = new Map(quarantinedRows.map((row) => [String(row.productId), Number(row._sum?.qtyOnHand || 0)]));
+    const quarantinedByProductWarehouse = new Map(quarantinedRows.map((row) => [`${String(row.productId)}:${String(row.warehouseId)}`, Number(row._sum?.qtyOnHand || 0)]));
+    const quarantinedByProduct = new Map(quarantinedRows
+      .filter((row) => !warehouseId || String(row.warehouseId) === String(warehouseId))
+      .map((row) => [String(row.productId), Number(row._sum?.qtyOnHand || 0)]));
 
     // Enhance with availability info
     const enhancedProducts = products.map(p => {
@@ -3117,6 +3175,17 @@ exports.getPosProducts = async (req, res, next) => {
           ? (p.category.name || categoryById.get(String(p.category.id || p.category._id || p.category.categoryId || '').trim())?.name || null)
           : (categoryById.get(String(p.category || '').trim())?.name || (isObjectIdString(p.category) ? null : p.category)),
         isNoDiscount: Boolean(p.isNoDiscount),
+        wholesale: normalizeWholesaleConfig(p),
+        warehouseAvailability: availabilityWarehouses.map((warehouse) => {
+          const level = allLevelsByProduct.get(String(p._id))?.get(String(warehouse.id));
+          const onHand = toNumber(level?.qty_on_hand);
+          const reserved = toNumber(level?.qty_reserved);
+          const quarantined = quarantinedByProductWarehouse.get(`${String(p._id)}:${String(warehouse.id)}`) || 0;
+          return {
+            warehouseId: String(warehouse.id), warehouseName: warehouse.name, warehouseCode: warehouse.code || '',
+            onHand, reserved, available: Math.max(0, onHand - reserved - quarantined),
+          };
+        }),
         categoryNoDiscount: Boolean(p.category && typeof p.category === 'object' && p.category.isNoDiscount)
           || Boolean(categoryById.get(String(p.category?.id || p.category?._id || p.category || '').trim())?.isNoDiscount),
         isAvailable: currentStock > 0 || p.isStockable === false,

@@ -6,6 +6,7 @@ const {
   rebindAgent,
   issueDrawerAuthorization,
   consumeDrawerAuthorization,
+  recordDrawerAuthorizationOutcome,
 } = require('../services/posPrintAgentService');
 
 const companyIdFor = (req) => String(req.user.company?._id || req.user.companyId || '');
@@ -166,9 +167,13 @@ exports.consumeDrawerAuthorization = async (req, res, next) => {
         metadata: {
           authorizationId: result.authorization?.id || null,
           actionId: result.authorization?.actionId || null,
+          actionType: result.authorization?.actionType || null,
+          shiftId: result.authorization?.shiftId || null,
+          approvalId: result.authorization?.approvalId || null,
           requesterId: result.authorization?.requesterId || null,
           reason: result.authorization?.reason || null,
           denialCode: result.code,
+          outcome: 'denied',
         },
         ip: requestIp(req),
       });
@@ -189,6 +194,7 @@ exports.consumeDrawerAuthorization = async (req, res, next) => {
         approvalId: result.authorization.approvalId,
         requesterId: result.authorization.requesterId,
         reason: result.authorization.reason,
+        outcome: 'authorized',
       },
       ip: requestIp(req),
     });
@@ -196,9 +202,53 @@ exports.consumeDrawerAuthorization = async (req, res, next) => {
   } catch (error) { return next(error); }
 };
 
+exports.recordAgentDrawerOutcome = async (req, res, next) => {
+  try {
+    const agent = req.printAgent;
+    const authorizationId = String(req.params.authorizationId || '');
+    const outcome = String(req.body.outcome || '');
+    if (!/^[a-f\d]{24}$/i.test(authorizationId) || !['opened', 'failed'].includes(outcome)) {
+      return res.status(400).json({ success: false, code: 'PRINT_DRAWER_OUTCOME_INVALID', message: 'Drawer outcome is invalid.' });
+    }
+    const result = await recordDrawerAuthorizationOutcome({
+      authorizationId,
+      companyId: String(agent.companyId),
+      registerId: String(agent.registerId),
+      outcome,
+    });
+    if (result.code) {
+      const status = result.code === 'PRINT_DRAWER_AUTHORIZATION_NOT_FOUND' ? 404 : 409;
+      return res.status(status).json({ success: false, code: result.code, message: 'The drawer outcome could not be recorded.' });
+    }
+    const authorization = result.authorization;
+    await writePosAuditLog({
+      companyId: String(agent.companyId),
+      registerId: String(agent.registerId),
+      userId: authorization.requesterId || null,
+      event: 'PRINT_DRAWER_KICK_OUTCOME_RECORDED',
+      metadata: {
+        authorizationId: authorization.id,
+        actionType: authorization.actionType,
+        actionId: authorization.actionId,
+        approvalId: authorization.approvalId,
+        shiftId: authorization.shiftId,
+        requesterId: authorization.requesterId,
+        reason: authorization.reason,
+        outcome,
+        outcomeAt: authorization.outcomeAt,
+      },
+      ip: requestIp(req),
+    });
+    return res.json({ success: true, data: { authorizationId, outcome, outcomeAt: authorization.outcomeAt } });
+  } catch (error) { return next(error); }
+};
+
 exports.issueSessionDrawerAuthorization = async (req, res, next) => {
   try {
     const session = req.posSession;
+    if (String(req.body.actionType || '') === 'test') {
+      return res.status(403).json({ success: false, code: 'PRINT_DRAWER_TEST_ADMIN_REQUIRED', message: 'Drawer diagnostics require an administrator.' });
+    }
     const registerId = String(req.body.registerId || '');
     if (registerId !== String(session.registerId)) {
       return res.status(403).json({ success: false, code: 'PRINT_DRAWER_AUTHORIZATION_REGISTER_MISMATCH', message: 'Authorization register must match the active cashier session.' });
@@ -260,6 +310,12 @@ exports.consumeSessionDrawerAuthorization = async (req, res, next) => {
         metadata: {
           authorizationId: result.authorization?.id || null,
           actionId: result.authorization?.actionId || null,
+          actionType: result.authorization?.actionType || null,
+          shiftId: result.authorization?.shiftId || null,
+          approvalId: result.authorization?.approvalId || null,
+          requesterId: result.authorization?.requesterId || null,
+          reason: result.authorization?.reason || null,
+          outcome: 'denied',
           denialCode: result.code,
         },
         ip: requestIp(req),
@@ -280,9 +336,53 @@ exports.consumeSessionDrawerAuthorization = async (req, res, next) => {
         actionId: result.authorization.actionId,
         shiftId: result.authorization.shiftId,
         approvalId: result.authorization.approvalId,
+        requesterId: result.authorization.requesterId,
+        reason: result.authorization.reason,
+        outcome: 'authorized',
       },
       ip: requestIp(req),
     });
     return res.json({ success: true, data: { authorized: true, authorizationId: result.authorization.id } });
+  } catch (error) { return next(error); }
+};
+
+exports.recordSessionDrawerOutcome = async (req, res, next) => {
+  try {
+    const session = req.posSession;
+    const authorizationId = String(req.params.authorizationId || '');
+    const outcome = String(req.body.outcome || '');
+    if (!/^[a-f\d]{24}$/i.test(authorizationId) || !['opened', 'failed'].includes(outcome)) {
+      return res.status(400).json({ success: false, code: 'PRINT_DRAWER_OUTCOME_INVALID', message: 'Drawer outcome is invalid.' });
+    }
+    const result = await recordDrawerAuthorizationOutcome({
+      authorizationId,
+      companyId: String(session.companyId),
+      registerId: String(session.registerId),
+      outcome,
+    });
+    if (result.code) {
+      const status = result.code === 'PRINT_DRAWER_AUTHORIZATION_NOT_FOUND' ? 404 : 409;
+      return res.status(status).json({ success: false, code: result.code, message: 'The drawer outcome could not be recorded.' });
+    }
+    const authorization = result.authorization;
+    await writePosAuditLog({
+      companyId: String(session.companyId),
+      registerId: String(session.registerId),
+      userId: String(session.userId),
+      event: 'PRINT_DRAWER_KICK_OUTCOME_RECORDED',
+      metadata: {
+        authorizationId: authorization.id,
+        actionType: authorization.actionType,
+        actionId: authorization.actionId,
+        approvalId: authorization.approvalId,
+        shiftId: authorization.shiftId,
+        requesterId: authorization.requesterId,
+        reason: authorization.reason,
+        outcome,
+        outcomeAt: authorization.outcomeAt,
+      },
+      ip: requestIp(req),
+    });
+    return res.json({ success: true, data: { authorizationId, outcome, outcomeAt: authorization.outcomeAt } });
   } catch (error) { return next(error); }
 };

@@ -15,6 +15,27 @@ const mockPrisma = {
   posRegister: {
     findFirst: jest.fn(),
   },
+  systemSettings: {
+    findUnique: jest.fn(),
+  },
+  invoice: {
+    findFirst: jest.fn(),
+  },
+  posPayment: {
+    findMany: jest.fn(),
+  },
+  posCashMovement: {
+    findFirst: jest.fn(),
+  },
+  posShift: {
+    findFirst: jest.fn(),
+  },
+  posManagerApproval: {
+    findFirst: jest.fn(),
+  },
+  tillSession: {
+    findFirst: jest.fn(),
+  },
   posPrintDrawerAuthorization: {
     create: jest.fn(),
   },
@@ -283,15 +304,24 @@ describe('POS print agent Phase 1 foundation', () => {
   test('drawer authorization is short-lived, register-bound, and consumed once', async () => {
     const companyId = 'a'.repeat(24);
     const registerId = 'b'.repeat(24);
-    mockPrisma.posRegister.findFirst.mockResolvedValue({ id: registerId });
+    const shiftId = 'c'.repeat(24);
+    const activityId = '9'.repeat(24);
+    mockPrisma.posRegister.findFirst.mockResolvedValue({ id: registerId, code: 'register-1', systemTillType: 'retail' });
+    mockPrisma.systemSettings.findUnique.mockResolvedValue({ posDrawerSettings: null });
+    mockPrisma.posManagerApproval.findFirst.mockResolvedValue({ id: 'e'.repeat(24), managerId: 'f'.repeat(24) });
+    mockPrisma.tillSession.findFirst.mockResolvedValue({
+      id: shiftId,
+      registerId: 'register-1',
+      cashActivity: [{ id: activityId, type: 'no_sale', recordedBy: 'd'.repeat(24), approvedById: 'f'.repeat(24) }],
+    });
     mockPrisma.posPrintDrawerAuthorization.create.mockImplementation(async ({ data }) => data);
 
     const issued = await issueDrawerAuthorization({
       companyId,
       registerId,
       actionType: 'no-sale',
-      actionId: 'till-session-1',
-      shiftId: 'c'.repeat(24),
+      actionId: activityId,
+      shiftId,
       requesterId: 'd'.repeat(24),
       approvalId: 'e'.repeat(24),
       reason: 'Manager-approved no-sale',
@@ -302,6 +332,7 @@ describe('POS print agent Phase 1 foundation', () => {
     expect(issued.authorization.tokenHash).toBe(hash(issued.token));
     expect(issued.authorization.expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 30000);
     expect(issued.authorization.approvalId).toBe('e'.repeat(24));
+    expect(issued.authorization.actionId).toBe(activityId);
 
     const authorization = {
       id: 'f'.repeat(24),
@@ -340,6 +371,140 @@ describe('POS print agent Phase 1 foundation', () => {
     });
     expect(reused.code).toBe('PRINT_DRAWER_AUTHORIZATION_REUSED');
     expect(tx.posPrintDrawerAuthorization.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  test('cash-sale drawer policy excludes non-cash tenders and applies the change-due setting', () => {
+    const {
+      drawerActionEnabled,
+      resolveDrawerSettings,
+    } = require('../services/posDrawerPolicyService');
+    const settings = resolveDrawerSettings({
+      companyDefaults: { cashSale: true, onlyWhenChangeDue: true },
+      tillTypeOverrides: { retail: { cashSale: false } },
+      registerOverrides: { registerA: { cashSale: true } },
+    }, 'retail', 'registerA');
+
+    expect(drawerActionEnabled(settings, 'cash-sale', { cashTenderAmount: 0, changeDue: 10 })).toBe(false);
+    expect(drawerActionEnabled(settings, 'cash-sale', { cashTenderAmount: 50, changeDue: 0 })).toBe(false);
+    expect(drawerActionEnabled(settings, 'cash-sale', { cashTenderAmount: 50, changeDue: 10 })).toBe(true);
+    expect(drawerActionEnabled(
+      resolveDrawerSettings({ companyDefaults: { cashSale: true } }, 'retail', 'registerA'),
+      'cash-sale',
+      { cashTenderAmount: 50, changeDue: 0 },
+    )).toBe(true);
+  });
+
+  test('paid-out, shift-count, and no-sale drawer triggers require their configured conditions', () => {
+    const { drawerActionEnabled } = require('../services/posDrawerPolicyService');
+    const settings = {
+      cashSale: false,
+      onlyWhenChangeDue: false,
+      paidIn: false,
+      paidOut: true,
+      shiftOpen: true,
+      shiftClose: true,
+      noSale: true,
+    };
+
+    expect(drawerActionEnabled(settings, 'paid-out')).toBe(true);
+    expect(drawerActionEnabled(settings, 'paid-in')).toBe(false);
+    expect(drawerActionEnabled(settings, 'shift-open')).toBe(true);
+    expect(drawerActionEnabled(settings, 'shift-close')).toBe(true);
+    expect(drawerActionEnabled(settings, 'no-sale', { reason: 'Till check' })).toBe(false);
+    expect(drawerActionEnabled(settings, 'no-sale', { approvalId: 'approved', reason: 'Till check' })).toBe(true);
+  });
+
+  test('hardware profiles support per-register printer IDs and portable role selectors', () => {
+    const { validatePrinterRoles } = require('../services/posDrawerPolicyService');
+    expect(validatePrinterRoles({
+      receipt: 'a'.repeat(24),
+      report: 'role:report',
+      a4: null,
+    })).toEqual({
+      receipt: 'a'.repeat(24),
+      report: 'role:report',
+      a4: null,
+    });
+    expect(validatePrinterRoles({ a4: 'role:unknown' })).toBeNull();
+  });
+
+  test('cash-sale authorization requires a cash tender and cash change when configured', async () => {
+    const companyId = 'a'.repeat(24);
+    const registerId = 'b'.repeat(24);
+    const requesterId = 'd'.repeat(24);
+    mockPrisma.posRegister.findFirst.mockResolvedValue({ id: registerId, code: 'register-1', systemTillType: 'retail' });
+    mockPrisma.invoice.findFirst.mockResolvedValue({
+      id: 'c'.repeat(24),
+      shiftId: 'e'.repeat(24),
+      tillSessionId: null,
+      cashierId: requesterId,
+    });
+    mockPrisma.systemSettings.findUnique.mockResolvedValue({
+      posDrawerSettings: { companyDefaults: { cashSale: true, onlyWhenChangeDue: true } },
+    });
+    mockPrisma.posPayment.findMany.mockResolvedValue([
+      { method: 'CASH', amount: 100, changeGiven: 0 },
+      { method: 'MOBILE_MONEY', amount: 50, changeGiven: 10 },
+    ]);
+
+    const noCashChange = await issueDrawerAuthorization({
+      companyId,
+      registerId,
+      actionType: 'cash-sale',
+      actionId: 'c'.repeat(24),
+      shiftId: 'e'.repeat(24),
+      requesterId,
+      reason: 'Cash sale',
+    });
+    expect(noCashChange.code).toBe('PRINT_DRAWER_CHANGE_NOT_DUE');
+    expect(mockPrisma.posPrintDrawerAuthorization.create).not.toHaveBeenCalled();
+
+    mockPrisma.posPayment.findMany.mockResolvedValue([
+      { method: 'CASH', amount: 100, changeGiven: 5 },
+      { method: 'MOBILE_MONEY', amount: 50, changeGiven: 0 },
+    ]);
+    mockPrisma.posPrintDrawerAuthorization.create.mockImplementation(async ({ data }) => data);
+    const cashChange = await issueDrawerAuthorization({
+      companyId,
+      registerId,
+      actionType: 'cash-sale',
+      actionId: 'c'.repeat(24),
+      shiftId: 'e'.repeat(24),
+      requesterId,
+      reason: 'Cash sale with change',
+    });
+    expect(cashChange.authorization.actionType).toBe('cash-sale');
+  });
+
+  test('paid-in, paid-out, and shift-count authorizations validate the persisted action', async () => {
+    const companyId = 'a'.repeat(24);
+    const registerId = 'b'.repeat(24);
+    const requesterId = 'd'.repeat(24);
+    const shiftId = 'e'.repeat(24);
+    mockPrisma.posRegister.findFirst.mockResolvedValue({ id: registerId, code: 'register-1', systemTillType: 'retail' });
+    mockPrisma.systemSettings.findUnique.mockImplementation(async ({ select }) => ({
+      posDrawerSettings: { companyDefaults: { paidIn: true, paidOut: true, shiftOpen: true, shiftClose: true } },
+    }));
+    mockPrisma.posCashMovement.findFirst.mockResolvedValue({
+      id: 'c'.repeat(24),
+      amount: 100,
+      performedById: requesterId,
+    });
+    mockPrisma.posShift.findFirst.mockResolvedValue({ id: shiftId });
+    mockPrisma.posPrintDrawerAuthorization.create.mockImplementation(async ({ data }) => data);
+
+    for (const actionType of ['paid-in', 'paid-out', 'shift-open', 'shift-close']) {
+      const issued = await issueDrawerAuthorization({
+        companyId,
+        registerId,
+        actionType,
+        actionId: actionType.startsWith('shift-') ? shiftId : 'c'.repeat(24),
+        shiftId,
+        requesterId,
+        reason: `Authorized ${actionType}`,
+      });
+      expect(issued.authorization.actionType).toBe(actionType);
+    }
   });
 
   test('drawer authorization refuses expired and different-register tokens', async () => {

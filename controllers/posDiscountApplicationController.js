@@ -3,6 +3,7 @@
 const Product = require('../models/Product');
 const { prisma, dbClient } = require('../lib/prisma');
 const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
+const { resolveWholesaleLine } = require('../utils/posWholesalePricing');
 const { resolveProductTaxRate } = require('../services/posCheckoutCoreService');
 const {
   DEFAULT_DISCOUNT_SETTINGS,
@@ -45,7 +46,7 @@ exports.apply = async (req, res, next) => {
 
     const [products, categories, settingsRow, roleAssignments, priceListPricing] = await Promise.all([
       Product.find({ _id: { $in: productIds }, company: companyId })
-        .select('name sellingPrice isActive isNoDiscount category taxRate taxCode')
+        .select('name sellingPrice isActive isNoDiscount category taxRate taxCode customFields')
         .lean(),
       dbClient().category.findMany({
         where: { companyId, isNoDiscount: true },
@@ -61,11 +62,18 @@ exports.apply = async (req, res, next) => {
       }),
       getWarehousePriceListPrices(companyId, warehouseId, productIds),
     ]);
+    const baseQuantityByProduct = new Map();
+    for (const item of items) {
+      const productId = String(item?.productId || '');
+      baseQuantityByProduct.set(productId, (baseQuantityByProduct.get(productId) || 0) + Number(item?.quantity || 0));
+    }
     const productsById = new Map(products.map((product) => {
       const id = String(product._id);
+      const storePrice = effectivePrice(id, product.sellingPrice, priceListPricing.priceByProduct);
+      const wholesalePrice = resolveWholesaleLine({ product, quantity: baseQuantityByProduct.get(id) || 0, basePrice: storePrice, totalBaseQuantity: baseQuantityByProduct.get(id) || 0 });
       return [id, {
         ...product,
-        sellingPrice: effectivePrice(id, product.sellingPrice, priceListPricing.priceByProduct),
+        sellingPrice: wholesalePrice.unitPrice,
         taxRate: resolveProductTaxRate(product),
       }];
     }));

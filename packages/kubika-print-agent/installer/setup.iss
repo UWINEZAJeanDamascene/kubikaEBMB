@@ -1,5 +1,5 @@
 #define AppName "Kubika Print Agent"
-#define AppVersion "0.1.4"
+#define AppVersion "0.1.5"
 #define AppPublisher "Kubika"
 #define AppExeName "service.exe"
 
@@ -36,13 +36,28 @@ Filename: "{app}\open-setup.cmd"; Description: "Open Kubika Print Agent setup pa
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\uninstall.ps1"" ""{app}"""; RunOnceId: "KubikaPrintAgentUninstall"; Flags: runhidden waituntilterminated
 
 [Code]
+function InitializeSetup(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := True;
+  if FileExists(ExpandConstant('{app}\service.exe')) then
+  begin
+    if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "if (Get-Service -Name ''KubikaPrintAgent'' -ErrorAction SilentlyContinue) { Stop-Service -Name ''KubikaPrintAgent'' -Force; (Get-Service -Name ''KubikaPrintAgent'').WaitForStatus(''Stopped'', [TimeSpan]::FromSeconds(30)) }"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
+    begin
+      MsgBox('Kubika Print Agent could not be stopped for upgrade. Close pending print operations and try again.', mbError, MB_OK);
+      Result := False;
+    end;
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    if MsgBox('Delete the paired credentials, printer configuration, and print history from this shop computer?', mbConfirmation, MB_YESNO) = IDYES then
+    if (not WizardSilent) and (MsgBox('Keep the paired credentials, printer configuration, and print history on this shop computer?', mbConfirmation, MB_YESNO) = IDNO) then
     begin
       Exec('cmd.exe', '/C rmdir /S /Q "%ProgramData%\Kubika\PrintAgent"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;

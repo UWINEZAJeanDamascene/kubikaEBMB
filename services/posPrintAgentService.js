@@ -1,6 +1,7 @@
 const { createHash, randomBytes } = require('crypto');
 const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
+const { drawerActionEnabled, resolveDrawerSettings } = require('./posDrawerPolicyService');
 
 const ACCESS_TTL_MS = 15 * 60 * 1000;
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -212,15 +213,109 @@ async function issueDrawerAuthorization({
     || !actionId
     || !requesterId
     || !reason
-    || (actionType === 'no-sale' && !approvalId)
+    || (actionType !== 'test' && !shiftId)
+    || (actionType === 'no-sale' && (!approvalId || !/^[a-f\d]{24}$/i.test(String(actionId))))
   ) {
     return { code: 'PRINT_DRAWER_AUTHORIZATION_INVALID' };
   }
   const register = await prisma.posRegister.findFirst({
     where: { id: registerId, companyId, isActive: true },
-    select: { id: true },
+    select: { id: true, code: true, systemTillType: true },
   });
   if (!register) return { code: 'POS_REGISTER_NOT_FOUND' };
+
+  const companySettings = await prisma.systemSettings.findUnique({
+    where: { companyId },
+    select: { posDrawerSettings: true },
+  });
+  const settings = resolveDrawerSettings(companySettings?.posDrawerSettings, register.systemTillType, registerId);
+  let actionContext = { approvalId, reason };
+  let authorizedShiftId = shiftId || null;
+
+  if (actionType === 'cash-sale') {
+    const sale = await prisma.invoice.findFirst({
+      where: {
+        id: String(actionId),
+        companyId,
+        OR: [{ registerId }, ...(register.code ? [{ registerId: register.code }] : [])],
+      },
+      select: { id: true, shiftId: true, tillSessionId: true, cashierId: true },
+    });
+    if (!sale
+      || (sale.cashierId && String(sale.cashierId) !== String(requesterId))
+      || (shiftId && ![sale.shiftId, sale.tillSessionId].some((id) => String(id || '') === String(shiftId)))) {
+      return { code: 'PRINT_DRAWER_ACTION_NOT_FOUND' };
+    }
+    authorizedShiftId = sale.shiftId || sale.tillSessionId || authorizedShiftId;
+    const tenders = await prisma.posPayment.findMany({
+      where: { companyId, saleId: sale.id, registerId, status: 'SUCCESS' },
+      select: { method: true, amount: true, changeGiven: true },
+    });
+    actionContext = {
+      ...actionContext,
+      cashTenderAmount: tenders.filter((payment) => payment.method === 'CASH')
+        .reduce((total, payment) => total + Number(payment.amount || 0), 0),
+      changeDue: tenders.filter((payment) => payment.method === 'CASH')
+        .reduce((total, payment) => total + Number(payment.changeGiven || 0), 0),
+    };
+  } else if (actionType === 'paid-in' || actionType === 'paid-out') {
+    const movement = await prisma.posCashMovement.findFirst({
+      where: {
+        id: String(actionId),
+        companyId,
+        registerId,
+        shiftId: shiftId || undefined,
+        type: actionType === 'paid-in' ? 'cash_in' : 'cash_out',
+      },
+      select: { id: true, amount: true, performedById: true },
+    });
+    if (!movement || Number(movement.amount) <= 0 || String(movement.performedById) !== String(requesterId)) {
+      return { code: 'PRINT_DRAWER_ACTION_NOT_FOUND' };
+    }
+  } else if (actionType === 'shift-open' || actionType === 'shift-close') {
+    const shift = await prisma.posShift.findFirst({
+      where: {
+        id: shiftId || String(actionId),
+        companyId,
+        registerId,
+        ...(actionType === 'shift-open'
+          ? { status: { in: ['open', 'reopened'] }, openedById: requesterId }
+          : { status: 'closed', closedById: requesterId }),
+      },
+      select: { id: true, managerId: true },
+    });
+    if (!shift) return { code: 'PRINT_DRAWER_ACTION_NOT_FOUND' };
+  } else if (actionType === 'no-sale') {
+    const approval = await prisma.posManagerApproval.findFirst({
+      where: {
+        id: approvalId,
+        companyId,
+        cashierId: requesterId,
+        action: 'no_sale',
+        subjectId: shiftId,
+        usedAt: { not: null },
+      },
+      select: { id: true, managerId: true },
+    });
+    const till = await prisma.tillSession.findFirst({
+      where: { id: shiftId, companyId, openedById: requesterId, status: 'open' },
+      select: { id: true, registerId: true, cashActivity: true },
+    });
+    const recordedNoSale = Array.isArray(till?.cashActivity) && till.cashActivity.some((activity) => (
+      activity?.type === 'no_sale'
+      && String(activity.id || '') === String(actionId)
+      && String(activity.recordedBy || '') === String(requesterId)
+      && String(activity.approvedById || '') === String(approval?.managerId || '')
+    ));
+    if (!approval || !till || (till.registerId !== 'legacy' && till.registerId !== register.code) || !recordedNoSale) {
+      return { code: 'PRINT_DRAWER_APPROVAL_REQUIRED' };
+    }
+  }
+  if (!drawerActionEnabled(settings, actionType, actionContext)) {
+    return { code: actionType === 'cash-sale' && settings.onlyWhenChangeDue === true
+      ? 'PRINT_DRAWER_CHANGE_NOT_DUE'
+      : 'PRINT_DRAWER_TRIGGER_DISABLED' };
+  }
 
   const token = secureRandom(32);
   const now = new Date();
@@ -233,7 +328,7 @@ async function issueDrawerAuthorization({
       tokenHash: hash(token),
       actionType,
       actionId: String(actionId).slice(0, 160),
-      shiftId: shiftId || null,
+      shiftId: authorizedShiftId,
       requesterId,
       approvalId: approvalId || null,
       reason: String(reason).trim().slice(0, 500),
@@ -272,6 +367,24 @@ async function consumeDrawerAuthorization({ token, agent }) {
   });
 }
 
+async function recordDrawerAuthorizationOutcome({ authorizationId, companyId, registerId, outcome }) {
+  if (!authorizationId || !companyId || !registerId || !['opened', 'failed'].includes(outcome)) {
+    return { code: 'PRINT_DRAWER_OUTCOME_INVALID' };
+  }
+  const authorization = await prisma.posPrintDrawerAuthorization.findFirst({
+    where: { id: authorizationId, companyId, registerId, usedAt: { not: null } },
+  });
+  if (!authorization) return { code: 'PRINT_DRAWER_AUTHORIZATION_NOT_FOUND' };
+  if (authorization.outcome !== 'authorized') return { code: 'PRINT_DRAWER_OUTCOME_ALREADY_RECORDED', authorization };
+  const outcomeAt = new Date();
+  const updated = await prisma.posPrintDrawerAuthorization.updateMany({
+    where: { id: authorization.id, companyId, registerId, usedAt: authorization.usedAt, outcome: 'authorized' },
+    data: { outcome, outcomeAt },
+  });
+  if (updated.count !== 1) return { code: 'PRINT_DRAWER_OUTCOME_ALREADY_RECORDED', authorization };
+  return { authorization: { ...authorization, outcome, outcomeAt } };
+}
+
 module.exports = {
   ACCESS_TTL_MS,
   REFRESH_TTL_MS,
@@ -283,4 +396,5 @@ module.exports = {
   rebindAgent,
   issueDrawerAuthorization,
   consumeDrawerAuthorization,
+  recordDrawerAuthorizationOutcome,
 };

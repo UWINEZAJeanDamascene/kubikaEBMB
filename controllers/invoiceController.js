@@ -16,6 +16,7 @@ const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const JournalService = require("../services/journalService");
 const { runInTransaction } = require("../services/transactionService");
 const { dbClient } = require("../lib/prisma");
+const { PassThrough } = require("stream");
 const { generateObjectId } = require("../utils/objectId");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
 const { buildInvoiceTaxCorrection } = require("../utils/invoiceDeliveryNoteTax");
@@ -1806,6 +1807,42 @@ exports.generateInvoicePDF = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+
+exports.renderInvoicePdfBuffer = async (invoiceId, companyId) => {
+  const response = new PassThrough();
+  const chunks = [];
+  let statusCode = 200;
+  let responseBody = null;
+  response.setHeader = () => response;
+  response.status = (status) => {
+    statusCode = status;
+    return response;
+  };
+  response.json = (body) => {
+    responseBody = body;
+    response.end();
+    return response;
+  };
+  response.on('data', (chunk) => chunks.push(chunk));
+
+  const finished = new Promise((resolve, reject) => {
+    response.once('end', resolve);
+    response.once('error', reject);
+  });
+  await exports.generateInvoicePDF(
+    { params: { id: invoiceId }, user: { company: { _id: companyId } } },
+    response,
+    (error) => response.destroy(error),
+  );
+  await finished;
+  if (statusCode !== 200 || responseBody || chunks.length === 0) {
+    throw Object.assign(new Error(responseBody?.message || 'Invoice PDF could not be generated.'), {
+      statusCode: statusCode === 200 ? 500 : statusCode,
+      code: responseBody?.code || 'INVOICE_PDF_UNAVAILABLE',
+    });
+  }
+  return Buffer.concat(chunks);
 };
 
 // @desc    Send invoice via email

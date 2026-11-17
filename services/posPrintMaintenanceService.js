@@ -17,6 +17,14 @@ async function expireAndCleanup() {
       leasedUntil: null,
     },
   });
+  const payloadPurgeBefore = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  await prisma.$executeRaw`
+    UPDATE pos_print_jobs
+    SET payload_json = '{}'::jsonb
+    WHERE status IN ('transmitted', 'confirmed', 'failed', 'expired', 'uncertain', 'cancelled')
+      AND updated_at < ${payloadPurgeBefore}
+      AND payload_json <> '{}'::jsonb
+  `;
   const purgeBefore = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   await prisma.posPrintJob.deleteMany({
     where: {     status: { in: ['transmitted', 'confirmed', 'failed', 'expired', 'uncertain', 'cancelled'] }, updatedAt: { lt: purgeBefore } },

@@ -33,6 +33,7 @@ const posPublicReceiptController = require('../controllers/posPublicReceiptContr
 const posDiscountApplicationController = require('../controllers/posDiscountApplicationController');
 const posVoucherController = require('../controllers/posVoucherController');
 const posScannerSettingsController = require('../controllers/posScannerSettingsController');
+const posStockReservationController = require('../controllers/posStockReservationController');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 
 const requirePosSessionAuth = requirePosSession();
@@ -198,6 +199,10 @@ router.post('/offline-conflicts/:conflictId/resolve', canManagePromotions, idem(
 // Get products for POS with stock availability
 router.get('/products', canReadPosCatalog, getPosProducts);
 router.get('/products/:productId/serial-numbers', canReadPosCatalog, getPosAvailableSerialNumbers);
+router.get('/stock-reservations', canReadSale, requirePosSessionAuth, posStockReservationController.list);
+router.post('/stock-reservations', canCreateSale, requirePosSessionAuth, idem(posStockReservationController.create));
+router.post('/stock-reservations/:reservationId/allocate-backorder', canCreateSale, requirePosSessionAuth, idem(posStockReservationController.allocateBackorder));
+router.post('/stock-reservations/:reservationId/cancel', canCreateSale, requirePosSessionAuth, idem(posStockReservationController.cancel));
 
 // Get receipt for printing
 router.get('/receipt/:invoiceId', canReadSale, getReceipt);
@@ -211,9 +216,9 @@ router.post('/receipt/:invoiceId/share-whatsapp', canReadSale, requirePosSession
 // Older callers now receive a public digital receipt link, never a plaintext receipt over SMS.
 router.post('/receipt/:invoiceId/send-sms', canReadSale, requirePosSessionAuth, requireReceiptSharePermission, idem(posPublicReceiptController.shareSms));
 router.post('/receipt/:invoiceId/send-whatsapp', canReadSale, requirePosSessionAuth, requireReceiptSharePermission, idem(posPublicReceiptController.shareWhatsApp));
-router.get('/non-posting-documents', canReadSale, requireOnlinePosSession, requirePosSessionPermission('pos.document.create'), posNonPostingDocumentController.list);
-router.post('/training-documents', canCreateSale, requireOnlinePosSession, requirePosSessionPermission('pos.document.create'), idem(posNonPostingDocumentController.createTraining));
-router.post('/proformas', canCreateSale, requireOnlinePosSession, requirePosSessionPermission('pos.document.create'), idem(posNonPostingDocumentController.createProforma));
-router.post('/proformas/:documentId/convert', canCreateSale, requireOnlinePosSession, requirePosSessionPermission('pos.document.create'), idem(posNonPostingDocumentController.convertProforma));
+router.get('/non-posting-documents', canReadSale, requireOnlinePosSession, posNonPostingDocumentController.list);
+router.post('/training-documents', canCreateSale, requireOnlinePosSession, idem(posNonPostingDocumentController.createTraining));
+router.post('/proformas', canCreateSale, requireOnlinePosSession, idem(posNonPostingDocumentController.createProforma));
+router.post('/proformas/:documentId/convert', canCreateSale, requireOnlinePosSession, idem(posNonPostingDocumentController.convertProforma));
 
 module.exports = router;

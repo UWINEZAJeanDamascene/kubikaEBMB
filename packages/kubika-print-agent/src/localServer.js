@@ -2,6 +2,8 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { randomBytes } = require('crypto');
+const { readRedactedDiagnostics } = require('./structuredLogger');
+const VERSION = require('../package.json').version;
 
 const BROWSER_SESSION_TTL_MS = 15 * 60 * 1000;
 const BROWSER_SESSION_ROUTES = new Set([
@@ -10,6 +12,7 @@ const BROWSER_SESSION_ROUTES = new Set([
   'POST /v1/printers/refresh',
   'POST /v1/printers/select',
   'POST /v1/unpair',
+  'GET /v1/diagnostics',
 ]);
 
 const DEFAULT_ALLOWED_ORIGINS = new Set([
@@ -32,12 +35,10 @@ function isAllowedOrigin(origin, origins = allowedOrigins()) {
   if (!origin) return true;
   try {
     const parsed = new URL(origin);
-    if (origins.has(origin)) return true;
-    if (parsed.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(parsed.hostname)) return true;
+    return parsed.origin === origin && origins.has(parsed.origin);
   } catch {
     return false;
   }
-  return false;
 }
 
 function getRequestToken(req) {
@@ -51,7 +52,7 @@ function getRequestToken(req) {
 function createRateLimiter(limit = 40, windowMs = 60000) {
   const buckets = new Map();
   return function rateLimit(req, res, next) {
-    const key = `${req.ip || 'unknown'}::${req.path}`;
+    const key = req.ip || 'unknown';
     const now = Date.now();
     const current = buckets.get(key) || { count: 0, resetAt: now + windowMs };
     if (now > current.resetAt) {
@@ -76,6 +77,8 @@ function createLocalServer({
   transmitDirect,
   onPair,
   authorizeDrawer,
+  recordDrawerOutcome,
+  diagnosticsPath,
   rateLimitOptions,
 }) {
   const app = express();
@@ -97,6 +100,7 @@ function createLocalServer({
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
+  app.use(rateLimit);
   app.use(express.json({ limit: '10mb' }));
   app.use((req, res, next) => {
     const publicSetupRead = req.method === 'GET'
@@ -123,8 +127,6 @@ function createLocalServer({
     }
     return next();
   });
-  app.use(rateLimit);
-
   app.get('/v1/status', (_req, res) => {
     res.json({
       success: true,
@@ -132,9 +134,18 @@ function createLocalServer({
         paired: Boolean(credentialStore.load()),
         printers: discoverPrinters(),
         service: 'kubika-print-agent',
-        version: '0.1.4',
+        version: VERSION,
       },
     });
+  });
+
+  app.get('/v1/diagnostics', (_req, res) => {
+    try {
+      res.setHeader('Content-Disposition', 'attachment; filename="kubika-print-agent-diagnostics.json"');
+      res.json({ success: true, data: readRedactedDiagnostics(diagnosticsPath || path.join(process.cwd(), 'logs', 'agent.jsonl')) });
+    } catch {
+      res.status(500).json({ success: false, code: 'PRINT_AGENT_DIAGNOSTICS_FAILED', message: 'Diagnostics could not be exported.' });
+    }
   });
 
   app.post('/v1/printers/refresh', (_req, res) => {
@@ -169,20 +180,57 @@ function createLocalServer({
   });
 
   app.post('/v1/jobs', async (req, res) => {
+    let drawerAuthorization = null;
     try {
       if (req.body?.jobType === 'drawer-open') {
         if (typeof authorizeDrawer !== 'function') {
           return res.status(503).json({ success: false, code: 'PRINT_DRAWER_AUTHORIZATION_UNAVAILABLE', message: 'The server must authorize every drawer kick.' });
         }
-        await authorizeDrawer(String(req.body.drawerAuthorizationToken || ''));
+        const authorization = await authorizeDrawer(String(req.body.drawerAuthorizationToken || ''));
+        drawerAuthorization = authorization?.data || authorization;
+        if (!drawerAuthorization?.authorizationId || typeof recordDrawerOutcome !== 'function') {
+          return res.status(503).json({ success: false, code: 'PRINT_DRAWER_OUTCOME_UNAVAILABLE', message: 'The server must record every drawer-kick outcome.' });
+        }
       }
-      const result = await transmitDirect(req.body);
+      let result;
+      try {
+        result = await transmitDirect(req.body);
+      } catch (error) {
+        if (drawerAuthorization) {
+          try {
+            await recordDrawerOutcome(drawerAuthorization.authorizationId, 'failed');
+          } catch (auditError) {
+            throw Object.assign(
+              new AggregateError([error, auditError], 'Drawer pulse failed and its outcome could not be recorded.'),
+              { status: 502, code: 'PRINT_DRAWER_OUTCOME_RECORD_FAILED' },
+            );
+          }
+        }
+        throw error;
+      }
+      if (drawerAuthorization) {
+        if (result?.transmitted !== true) {
+          await recordDrawerOutcome(drawerAuthorization.authorizationId, 'failed');
+          return res.status(503).json({ success: false, code: 'PRINT_DRAWER_OUTCOME_UNCERTAIN', message: 'The agent could not confirm the drawer pulse. Check the drawer before retrying.' });
+        }
+        try {
+          await recordDrawerOutcome(drawerAuthorization.authorizationId, 'opened');
+        } catch (error) {
+          throw Object.assign(new Error('The drawer pulse may have completed, but its outcome could not be recorded. Do not retry until you check the drawer.'), {
+            status: 502,
+            code: 'PRINT_DRAWER_OUTCOME_RECORD_FAILED',
+            cause: error,
+          });
+        }
+      }
       res.json({ success: true, data: result });
     } catch (error) {
       const drawerAuthorizationFailure = req.body?.jobType === 'drawer-open';
-      res.status(error.status || (drawerAuthorizationFailure ? 403 : 400)).json({
+      res.status(error.status || (drawerAuthorization ? 502 : drawerAuthorizationFailure ? 403 : 400)).json({
         success: false,
-        code: error.code || (drawerAuthorizationFailure ? 'PRINT_DRAWER_AUTHORIZATION_REQUIRED' : 'LOCAL_PRINT_FAILED'),
+        code: error.code || (drawerAuthorization
+          ? 'PRINT_DRAWER_PULSE_FAILED'
+          : drawerAuthorizationFailure ? 'PRINT_DRAWER_AUTHORIZATION_REQUIRED' : 'LOCAL_PRINT_FAILED'),
         message: error.message || (drawerAuthorizationFailure ? 'The drawer kick was not authorized.' : 'Local print failed.'),
       });
     }
@@ -271,7 +319,7 @@ function createLocalServer({
         paired,
         printers: discoverPrinters(),
         service: 'kubika-print-agent',
-        version: '0.1.4',
+        version: VERSION,
       },
     });
   });

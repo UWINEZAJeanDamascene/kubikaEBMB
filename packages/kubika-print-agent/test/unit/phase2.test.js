@@ -27,6 +27,82 @@ test('drawer command uses configured pin and pulse', () => {
   assert.deepEqual([...bytes], [0x1b, 0x70, 0x01, 25, 50]);
 });
 
+test('A4 printing downloads the signed document and uses the selected printer and copy count', async () => {
+  const previousFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return {
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name) => name.toLowerCase() === 'content-type' ? 'application/pdf' : '12',
+      },
+      arrayBuffer: async () => Uint8Array.from(Buffer.from('%PDF-test')).buffer,
+    };
+  };
+  const ledger = {
+    get: () => null,
+    save: () => {},
+    markPrinted: () => {},
+  };
+  const printed = [];
+  try {
+    await transmitJob({
+      id: 'a4-job-1',
+      jobType: 'invoice-pdf',
+      payloadJson: {
+        signedUrl: 'https://pos.example.test/api/pos/print-agent/documents/aaaaaaaaaaaaaaaaaaaaaaaa?expires=9999999999&signature=' + 'a'.repeat(64),
+        copies: 3,
+        tray: 'Tray 2',
+        duplex: true,
+      },
+    }, {
+      name: 'Selected A4 printer',
+      address: 'Selected A4 printer',
+      transport: 'windows-spooler',
+    }, ledger, {
+      backendUrl: 'https://pos.example.test',
+      printPdf: async (...args) => { printed.push(args); },
+    });
+  } finally {
+    global.fetch = previousFetch;
+  }
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url.startsWith('https://pos.example.test/api/pos/print-agent/documents/'), true);
+  assert.deepEqual(printed, [[
+    'Selected A4 printer',
+    Buffer.from('%PDF-test'),
+    3,
+    { tray: 'Tray 2', duplex: true },
+  ]]);
+});
+
+test('A4 printing rejects signed-document URLs from another origin', async () => {
+  const ledger = {
+    get: () => null,
+    save: () => {},
+    markPrinted: () => {},
+  };
+  let downloaded = false;
+  await assert.rejects(transmitJob({
+    id: 'a4-job-foreign-origin',
+    jobType: 'invoice-pdf',
+    payloadJson: { signedUrl: 'https://attacker.example/file.pdf', copies: 1 },
+  }, {
+    name: 'Selected A4 printer',
+    address: 'Selected A4 printer',
+    transport: 'windows-spooler',
+  }, ledger, {
+    backendUrl: 'https://pos.example.test',
+    printPdf: async () => {},
+  }).then(() => { downloaded = true; }), {
+    code: 'PRINT_DOCUMENT_URL_INVALID',
+  });
+  assert.equal(downloaded, false);
+});
+
 test('SQLite ledger persists transmitted job state and survives reopen', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kubika-ledger-'));
   const ledger = new PrintLedger(dir);

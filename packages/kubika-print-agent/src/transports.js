@@ -2,6 +2,7 @@ const net = require('net');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
 
 function printTcp9100(address, bytes, timeoutMs = 5000) {
@@ -50,21 +51,117 @@ function printWindowsSpoolerRaw(printerName, bytes) {
   });
 }
 
-function printPdfWindows(printerName, pdfBuffer, copies = 1) {
+function findSumatraPdfPath() {
+  const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+  const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+  const candidates = [
+    process.env.KUBIKA_SUMATRA_PDF_PATH,
+    path.join(__dirname, '..', 'tools', 'SumatraPDF.exe'),
+    path.join(path.dirname(process.execPath), 'SumatraPDF.exe'),
+    path.join(programFiles, 'SumatraPDF', 'SumatraPDF.exe'),
+    path.join(programFilesX86, 'SumatraPDF', 'SumatraPDF.exe'),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'SumatraPDF', 'SumatraPDF.exe') : null,
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+}
+
+function printPdfWithSumatra(printerName, pdfBuffer, copies, options) {
+  const sumatraPath = options.sumatraPdfPath === null
+    ? null
+    : options.sumatraPdfPath || findSumatraPdfPath();
+  if (!sumatraPath) {
+    return Promise.reject(Object.assign(
+      new Error('Install SumatraPDF or set KUBIKA_SUMATRA_PDF_PATH to apply A4 tray or duplex settings.'),
+      { code: 'PRINT_A4_OPTIONS_RUNTIME_MISSING' },
+    ));
+  }
+  const tray = options.tray == null ? null : String(options.tray).trim();
+  if (tray && (tray.length > 80 || /[\u0000-\u001f\u007f,=]/.test(tray))) {
+    return Promise.reject(Object.assign(new Error('The A4 printer tray name contains unsupported characters.'), {
+      code: 'PRINT_A4_TRAY_INVALID',
+    }));
+  }
+  if (options.duplex !== undefined && typeof options.duplex !== 'boolean') {
+    return Promise.reject(Object.assign(new Error('The A4 duplex setting must be true or false.'), {
+      code: 'PRINT_A4_DUPLEX_INVALID',
+    }));
+  }
+  const settings = ['shrink', 'paper=A4', 'ignore-pdf-print-settings'];
+  if (tray) settings.push(`bin=${tray}`);
+  if (options.duplex === true) settings.push('duplexlong');
+  if (options.duplex === false) settings.push('simplex');
+  settings.push(`${copies}x`);
+
+  const tempDirectory = options.tempDirectory || os.tmpdir();
+  const tempFile = path.join(tempDirectory, `kubika-${process.pid}-${randomUUID()}.pdf`);
+  fs.writeFileSync(tempFile, pdfBuffer);
+  const spawnProcess = options.spawnProcess || spawn;
+  return new Promise((resolve, reject) => {
+    let stderr = '';
+    const cleanup = () => {
+      if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+    };
+    let child;
+    try {
+      child = spawnProcess(sumatraPath, [
+        '-print-to',
+        printerName,
+        '-print-settings',
+        settings.join(','),
+        '-silent',
+        tempFile,
+      ], { windowsHide: true });
+    } catch (error) {
+      cleanup();
+      reject(error);
+      return;
+    }
+    child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', (error) => {
+      cleanup();
+      reject(Object.assign(new Error(`SumatraPDF could not start: ${error.message}`), {
+        code: 'PRINT_A4_RUNTIME_LAUNCH_FAILED',
+        cause: error,
+      }));
+    });
+    child.on('close', (code) => {
+      cleanup();
+      if (code === 0) resolve();
+      else reject(Object.assign(
+        new Error(stderr.trim() || `SumatraPDF printing failed with exit code ${code}.`),
+        { code: 'PRINT_A4_TRANSMIT_FAILED' },
+      ));
+    });
+  });
+}
+
+function printPdfWindows(printerName, pdfBuffer, copies = 1, options = {}) {
+  const printer = String(printerName || '').trim();
+  const copyCount = Number(copies);
+  if (!printer || !Number.isInteger(copyCount) || copyCount < 1 || copyCount > 10) {
+    return Promise.reject(new Error('A named Windows printer and 1 to 10 copies are required for PDF printing.'));
+  }
+  if (Object.hasOwn(options, 'tray') || Object.hasOwn(options, 'duplex')) {
+    return printPdfWithSumatra(printer, pdfBuffer, copyCount, options);
+  }
   return new Promise((resolve, reject) => {
     const tempFile = path.join(os.tmpdir(), `kubika-${process.pid}-${Date.now()}.pdf`);
     fs.writeFileSync(tempFile, pdfBuffer);
-    const printerArg = printerName ? ` -printerName '${String(printerName).replace(/'/g, "''")}'` : '';
-    const script = `$shell=New-Object -ComObject Shell.Application; $item=$shell.NameSpace((Split-Path -Parent '${tempFile.replace(/'/g, "''")}')).ParseName((Split-Path -Leaf '${tempFile.replace(/'/g, "''")}')); $verb=$item.Verbs() | Where-Object {$_.Name -match 'print'}; if($verb){$verb.DoIt(); Start-Sleep -Seconds 2}else{throw 'No Windows print verb for PDF'}${printerArg}`;
+    const file = tempFile.replace(/'/g, "''");
+    const targetPrinter = printer.replace(/'/g, "''");
+    const script = `$file='${file}';$printer='${targetPrinter}';for($copy=0;$copy -lt ${copyCount};$copy++){Start-Process -FilePath $file -Verb PrintTo -ArgumentList ('"' + $printer + '"') -Wait -ErrorAction Stop}`;
     const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true });
     let stderr = '';
     child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-    child.on('error', (error) => { fs.unlinkSync(tempFile); reject(error); });
+    child.on('error', (error) => {
+      if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+      reject(error);
+    });
     child.on('close', (code) => {
-      fs.unlinkSync(tempFile);
+      if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
       code === 0 ? resolve() : reject(new Error(stderr.trim() || `PDF print failed with code ${code}`));
     });
   });
 }
 
-module.exports = { printTcp9100, printWindowsSpoolerRaw, printPdfWindows };
+module.exports = { findSumatraPdfPath, printTcp9100, printWindowsSpoolerRaw, printPdfWindows };

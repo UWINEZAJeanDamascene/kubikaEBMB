@@ -7,7 +7,7 @@ function retryDelay(attemptCount) {
   return [2000, 5000, 10000, 30000][Math.min(Math.max(attemptCount - 1, 0), 3)];
 }
 
-async function transmitJob(job, printer, ledger, { afterBytesSent } = {}) {
+async function transmitJob(job, printer, ledger, { afterBytesSent, backendUrl, printPdf = printPdfWindows } = {}) {
   const jobType = job.jobType || job.job_type;
   const payload = job.payloadJson || job.payload_json || {};
   const receipt = payload.receiptDocument || payload.receipt || (payload.version === 1 ? payload : null);
@@ -45,6 +45,10 @@ async function transmitJob(job, printer, ledger, { afterBytesSent } = {}) {
     jobId: ledgerJobId,
     status: 'transmitting',
     printerId: printer?.id || null,
+    companyId: job.companyId,
+    registerId: job.registerId,
+    jobType,
+    localOnly: job.localOnly,
     payloadHash: hash,
     attemptCount: (existing?.attempt_count || 0) + 1,
     error: null,
@@ -58,11 +62,55 @@ async function transmitJob(job, printer, ledger, { afterBytesSent } = {}) {
       const bytes = drawerCommand(pin, onMs, offMs);
       await sendBytes(printer, bytes);
     } else if (['invoice-pdf', 'statement-pdf', 'report-pdf'].includes(jobType)) {
-      const base64 = payload.pdfBase64 || payload.pdfData || payload.base64 || null;
-      if (!base64) throw new Error('PDF payload is missing pdfBase64.');
-      await printPdfWindows(printer?.address || printer?.name, Buffer.from(base64, 'base64'), Number(payload.copies || 1));
+      if (printer?.transport !== 'windows-spooler') {
+        throw Object.assign(new Error('A4 PDF printing requires a selected Windows spooler printer.'), {
+          code: 'PRINT_A4_PRINTER_UNAVAILABLE',
+        });
+      }
+      const signedUrl = payload.signedUrl || payload.downloadUrl || payload.url;
+      let pdf;
+      if (signedUrl) {
+        if (!backendUrl) throw new Error('The configured backend origin is unavailable for signed PDF retrieval.');
+        const target = new URL(String(signedUrl), backendUrl);
+        const backendOrigin = new URL(backendUrl).origin;
+        if (target.origin !== backendOrigin
+          || !target.pathname.startsWith('/api/pos/print-agent/documents/')
+          || !target.searchParams.has('expires')
+          || !target.searchParams.has('signature')) {
+          throw Object.assign(new Error('The A4 document URL is not a valid signed Kubika print URL.'), {
+            code: 'PRINT_DOCUMENT_URL_INVALID',
+          });
+        }
+        const response = await fetch(target, { redirect: 'manual', signal: AbortSignal.timeout(30000) });
+        if (!response.ok || response.status >= 300) {
+          throw Object.assign(new Error(`Signed invoice download failed with HTTP ${response.status}.`), {
+            code: response.status === 403 || response.status === 410 ? 'PRINT_DOCUMENT_URL_EXPIRED' : 'PRINT_DOCUMENT_DOWNLOAD_FAILED',
+          });
+        }
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        const contentLength = Number(response.headers.get('content-length') || 0);
+        if (!contentType.startsWith('application/pdf') || (contentLength && contentLength > 20 * 1024 * 1024)) {
+          throw Object.assign(new Error('The signed document response is not a supported PDF.'), {
+            code: 'PRINT_DOCUMENT_INVALID',
+          });
+        }
+        pdf = Buffer.from(await response.arrayBuffer());
+      } else {
+        const base64 = payload.pdfBase64 || payload.pdfData || payload.base64 || null;
+        if (!base64) throw new Error('PDF payload is missing a signed document URL.');
+        pdf = Buffer.from(base64, 'base64');
+      }
+      if (!pdf.length || pdf.length > 20 * 1024 * 1024) throw new Error('The invoice PDF is empty or exceeds 20 MB.');
+      const printOptions = {};
+      const tray = Object.prototype.hasOwnProperty.call(payload, 'tray') ? payload.tray : printer?.tray;
+      const duplex = Object.prototype.hasOwnProperty.call(payload, 'duplex') ? payload.duplex : printer?.duplex;
+      if (tray !== undefined) printOptions.tray = tray;
+      if (duplex !== undefined) printOptions.duplex = duplex;
+      await printPdf(printer.address || printer.name, pdf, Number(payload.copies || printer.copies || 1), printOptions);
     } else {
-      const columns = Number(printer?.columns ?? payload.columns ?? (payload.paperWidthMm === 58 ? 32 : 42));
+      const columns = Number(['gift-card-slip', 'z-report'].includes(jobType)
+        ? payload.columns ?? printer?.columns ?? (payload.paperWidthMm === 58 ? 32 : 42)
+        : printer?.columns ?? payload.columns ?? (payload.paperWidthMm === 58 ? 32 : 42));
       const renderOptions = {
           columns,
           codeTable: Number(printer?.codePage ?? printer?.code_page ?? payload.codeTable ?? 16),
@@ -83,6 +131,10 @@ async function transmitJob(job, printer, ledger, { afterBytesSent } = {}) {
       jobId: ledgerJobId,
       status: 'transmitted',
       printerId: printer?.id || null,
+      companyId: job.companyId,
+      registerId: job.registerId,
+      jobType,
+      localOnly: job.localOnly,
       payloadHash: hash,
       printedAt: new Date().toISOString(),
       attemptCount: (existing?.attempt_count || 0) + 1,
@@ -94,6 +146,10 @@ async function transmitJob(job, printer, ledger, { afterBytesSent } = {}) {
       jobId: ledgerJobId,
       status: 'uncertain',
       printerId: printer?.id || null,
+      companyId: job.companyId,
+      registerId: job.registerId,
+      jobType,
+      localOnly: job.localOnly,
       payloadHash: hash,
       error: error.message,
       attemptCount: (existing?.attempt_count || 0) + 1,

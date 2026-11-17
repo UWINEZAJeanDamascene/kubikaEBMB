@@ -7,6 +7,7 @@ const { findClaimedRegister, registerClaimRequiredError } = require('../services
 const { findOpenPosShiftForRegisterCode } = require('../services/posShiftLinkService');
 const { consumeApproval } = require('./posManagerApprovalController');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
+const { generateObjectId } = require('../utils/objectId');
 
 function largeVarianceManagerThreshold() {
   const configured = Number(process.env.POS_TILL_LARGE_VARIANCE_THRESHOLD_RWF);
@@ -308,11 +309,13 @@ exports.recordNoSale = async (req, res, next) => {
       );
 
       const now = new Date();
+      const activityId = generateObjectId();
       const activity = Array.isArray(till.cash_activity) ? till.cash_activity : [];
       const updated = await tx.tillSession.update({
         where: { id: tillSessionId },
         data: {
           cashActivity: [...activity, {
+            id: activityId,
             type: 'no_sale',
             recordedBy: cashierId,
             approvedById: approvalRows[0]?.manager_id ? String(approvalRows[0].manager_id).trim() : null,
@@ -321,7 +324,7 @@ exports.recordNoSale = async (req, res, next) => {
           }],
         },
       });
-      return { till: tillSessionToApi(updated) };
+      return { till: tillSessionToApi(updated), activityId };
     });
     if (result.code === 'POS_TILL_SESSION_CHANGED') {
       return res.status(409).json({
@@ -330,7 +333,7 @@ exports.recordNoSale = async (req, res, next) => {
         message: 'This till is no longer open for the signed-in cashier. Refresh the POS shift.',
       });
     }
-    return res.json({ success: true, data: result.till });
+    return res.json({ success: true, data: { ...result.till, activityId: result.activityId } });
   } catch (error) {
     if (['POS_MANAGER_APPROVAL_REQUIRED', 'POS_MANAGER_APPROVAL_INVALID'].includes(error?.code)) {
       return res.status(error.statusCode || 409).json({
