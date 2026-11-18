@@ -93,6 +93,7 @@ function request(overrides = {}) {
     posAuthContext: {
       company: { id: COMPANY_ID },
       register: { id: REGISTER_ID, code: 'REGISTER-1', claimedDeviceId: 'device-1' },
+      posDevice: { deviceId: 'device-1' },
       user: { id: CASHIER_ID, name: 'Cashier' },
       session: { id: 'session-id' },
     },

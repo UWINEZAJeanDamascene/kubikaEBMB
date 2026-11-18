@@ -1,7 +1,7 @@
 jest.mock('../lib/prisma', () => ({
   prisma: {
     posRegister: { findFirst: jest.fn() },
-    posDevice: { findFirst: jest.fn() },
+    posDevice: { findFirst: jest.fn(), findUnique: jest.fn() },
     posUserCredential: { findUnique: jest.fn() },
     posRegisterAccess: { update: jest.fn(), findFirst: jest.fn() },
     posSession: {
@@ -169,6 +169,7 @@ describe('POS authentication endpoints', () => {
       companyId: COMPANY_ID,
       registerId: REGISTER_ID,
       userId: CASHIER_ID,
+      deviceId: 'device-1',
       status: 'active',
       startedAt: new Date('2026-10-29T13:00:00.000Z'),
       lastActivityAt: new Date(),
@@ -176,7 +177,18 @@ describe('POS authentication endpoints', () => {
     };
 
     prisma.posRegister.findFirst.mockResolvedValue(register);
-    prisma.posDevice.findFirst.mockResolvedValue({ deviceId: 'device-1', status: 'active', publicKey: 'test-key' });
+    const device = {
+      id: 'device-row',
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      deviceId: 'device-1',
+      deviceTokenHash: DEVICE_TOKEN_HASH,
+      status: 'active',
+      publicKey: 'test-key',
+      register,
+    };
+    prisma.posDevice.findFirst.mockResolvedValue(device);
+    prisma.posDevice.findUnique.mockResolvedValue(device);
     prisma.user.findFirst.mockImplementation(async ({ where }) => (
       where.id === SECOND_CASHIER_ID
         ? { ...cashier, id: SECOND_CASHIER_ID, name: 'Cashier Two' }
@@ -228,6 +240,9 @@ describe('POS authentication endpoints', () => {
     });
 
     expect(token.exp - token.iat).toBe(15 * 60);
+    expect(tx.posSession.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ deviceId: 'device-1' }),
+    }));
     expect(res.body.data.refreshToken).toBeTruthy();
     expect(res.body.data.refreshExpiresAt).toBeTruthy();
     expect(JSON.stringify(res.body)).not.toContain(PIN);
@@ -263,6 +278,7 @@ describe('POS authentication endpoints', () => {
     ));
     const req = request({ body: { registerId: REGISTER_ID, refreshToken: initial.refreshToken } });
     req.posRegister = register;
+    req.posDevice = { deviceId: 'device-1' };
 
     const firstResponse = createResponse();
     await refreshSessionToken(req, firstResponse, (error) => { throw error; });
@@ -376,6 +392,7 @@ describe('POS authentication endpoints', () => {
 
   test('does not authenticate with a token from another register or company', async () => {
     prisma.posRegister.findFirst.mockResolvedValue(null);
+    prisma.posDevice.findUnique.mockResolvedValueOnce(null);
     const res = createResponse();
     await pinLogin(request({ body: { registerId: REGISTER_ID, userId: CASHIER_ID, pin: PIN } }), res, (error) => { throw error; });
     expect(res.statusCode).toBe(401);

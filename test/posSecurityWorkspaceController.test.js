@@ -71,8 +71,9 @@ describe('POS security workspace controller', () => {
   test('lists only tenant active sessions and revokes one session with a transactional audit event', async () => {
     prisma.posSession.findMany.mockResolvedValue([{
       id: '507f1f77bcf86cd799439011', status: 'active', startedAt: new Date(), lastActivityAt: new Date(), lockedAt: null,
+      deviceId: 'device-123456',
       user: { name: 'Aline', email: 'aline@example.test' },
-      register: { name: 'Front till', code: 'REG-A', claimedDeviceId: 'device-123456' },
+      register: { name: 'Front till', code: 'REG-A' },
     }]);
     const listed = response();
     await controller.activeSessions({ user: { companyId: 'company-a' } }, listed);

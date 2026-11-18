@@ -216,7 +216,7 @@ exports.createPendingSale = (req, res, next) => {
   req.body = {
     ...req.body,
     registerId: auth.register.code,
-    deviceId: auth.register.claimedDeviceId,
+    deviceId: auth.posDevice.deviceId,
   };
   req.posPaymentFlow = 'PAYMENTS_V2';
   return createDirectSale(req, res, next);
@@ -1527,7 +1527,7 @@ exports.completeSale = async (req, res, next) => {
       displayTotal: invoice.posCheckoutPayload.displayTotal ?? total,
       clientId: invoice.clientId,
       registerId: register.code,
-      deviceId: register.claimedDeviceId,
+      deviceId: auth.posDevice.deviceId,
       tillSession: { id: invoice.tillSessionId },
       payments: payments.flatMap((payment) => {
         if (payment.method === 'CREDIT') {

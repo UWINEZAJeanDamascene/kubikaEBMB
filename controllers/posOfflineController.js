@@ -84,7 +84,7 @@ exports.issueSnapshot = async (req, res, next) => {
     if (!deviceId || deviceId.length > 160 || !registerId || !warehouseId) {
       return res.status(400).json({ success: false, code: 'POS_OFFLINE_SNAPSHOT_BINDING_INVALID', message: 'A device, assigned register, and warehouse are required.' });
     }
-    if (deviceId.toLowerCase() !== String(posContext.register.claimedDeviceId || '').toLowerCase()
+    if (deviceId.toLowerCase() !== String(posContext.posDevice.deviceId || '').toLowerCase()
       || registerId !== String(posContext.register.code)) {
       return res.status(403).json({ success: false, code: 'POS_OFFLINE_SNAPSHOT_BINDING_INVALID', message: 'The active POS session does not match this device and register.' });
     }

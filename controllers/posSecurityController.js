@@ -131,14 +131,14 @@ exports.activeSessions = async (req, res) => {
       orderBy: { lastActivityAt: 'desc' }, take: 500,
       include: {
         user: { select: { id: true, name: true, email: true } },
-        register: { select: { id: true, name: true, code: true, claimedDeviceId: true } },
+        register: { select: { name: true, code: true } },
       },
     });
     return res.json({ success: true, data: rows.map((row) => ({
       id: row.id, status: row.status, startedAt: row.startedAt, lastActivityAt: row.lastActivityAt,
       lockedAt: row.lockedAt, cashier: row.user?.name || row.user?.email || 'Unknown cashier',
       register: row.register?.name || row.register?.code || 'Unknown register',
-      device: row.register?.claimedDeviceId ? `Device ${String(row.register.claimedDeviceId).slice(-6)}` : 'Unassigned device',
+      device: row.deviceId ? `Device ${String(row.deviceId).slice(-6)}` : 'Unassigned device',
     })) });
   } catch (error) {
     console.error('POS active sessions read failed:', error);

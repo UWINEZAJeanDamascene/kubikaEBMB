@@ -33,10 +33,10 @@ function sendError(res, error) {
 }
 
 function auditEvent(client, req, { companyId, registerId, userId, event, metadata, deviceId: explicitDeviceId }) {
-  // The register's claimed device is the trusted device context for a POS
-  // event. Store its public identifier only; never persist the device token.
   const deviceId = String(explicitDeviceId ||
-    req?.posAuthContext?.register?.claimedDeviceId
+    req?.posAuthContext?.posDevice?.deviceId
+      || req?.posDevice?.deviceId
+      || req?.posAuthContext?.register?.claimedDeviceId
       || req?.posRegister?.claimedDeviceId
       || req?.posRegister?.deviceId
       || '',
@@ -95,18 +95,6 @@ function hashDeviceToken(token) {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
-function secureEqual(left, right) {
-  const leftBuffer = Buffer.from(String(left || ''), 'hex');
-  const rightBuffer = Buffer.from(String(right || ''), 'hex');
-  return leftBuffer.length === rightBuffer.length
-    && leftBuffer.length > 0
-    && timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function deviceTokenMatches(register, token) {
-  return Boolean(token && register?.deviceTokenHash && secureEqual(hashDeviceToken(token), register.deviceTokenHash));
-}
-
 async function publicRegister(register) {
   const branch = register?.branchId
     ? await prisma.warehouse.findFirst({
@@ -136,20 +124,15 @@ function publicUser(user) {
 async function findActiveDeviceRegister(req, requestedRegisterId) {
   const token = deviceTokenFrom(req);
   if (!token || !requestedRegisterId) return null;
-  const register = await prisma.posRegister.findFirst({
-    where: { id: String(requestedRegisterId), isActive: true },
+  const device = await prisma.posDevice.findUnique({
+    where: { deviceTokenHash: hashDeviceToken(token) },
+    include: { register: true },
   });
-  if (!deviceTokenMatches(register, token)) return null;
-  const device = await prisma.posDevice.findFirst({
-    where: {
-      companyId: String(register.companyId),
-      registerId: String(register.id),
-      deviceId: String(register.claimedDeviceId || ''),
-      status: 'active',
-      publicKey: { not: null },
-    },
-  });
-  return device ? register : null;
+  if (!device || device.status !== 'active' || !device.publicKey
+    || !device.register?.isActive
+    || String(device.registerId) !== String(requestedRegisterId)) return null;
+  req.posDevice = device;
+  return device.register;
 }
 
 async function findActiveCompanyUser(companyId, userId) {
@@ -328,12 +311,13 @@ async function endUserSessionsForRegisterPolicy(tx, req, companyId, userId, regi
   }
 }
 
-async function createSession(tx, companyId, registerId, userId, now) {
+async function createSession(tx, companyId, registerId, userId, deviceId, now) {
   return tx.posSession.create({
     data: {
       id: generateObjectId(),
       companyId: String(companyId),
       registerId: String(registerId),
+      deviceId: String(deviceId),
       userId: String(userId),
       status: 'active',
       startedAt: now,
@@ -375,7 +359,7 @@ exports.pinLogin = async (req, res, next) => {
       await auditEvent(prisma, req, {
         companyId: register.companyId,
         registerId: register.id,
-        deviceId: register.claimedDeviceId,
+        deviceId: req.posDevice?.deviceId,
         event: 'PIN_LOGIN_FAILED',
         metadata: { flow: 'pin_login', reason: 'POS_CASHIER_UNAVAILABLE' },
       });
@@ -393,7 +377,7 @@ exports.pinLogin = async (req, res, next) => {
         companyId: register.companyId,
         registerId: register.id,
         userId: identity.user.id,
-        deviceId: register.claimedDeviceId,
+        deviceId: req.posDevice?.deviceId,
         error: verified.error,
         flow: 'pin_login',
       });
@@ -407,7 +391,7 @@ exports.pinLogin = async (req, res, next) => {
     const offlineUnlockVerifier = offlineSettings?.posOfflineEnabled
       ? await createOfflinePinVerifier({
         companyId: register.companyId,
-        deviceId: register.claimedDeviceId,
+        deviceId: req.posDevice?.deviceId,
         registerId: register.id,
         userId: identity.user.id,
         pin,
@@ -417,14 +401,14 @@ exports.pinLogin = async (req, res, next) => {
     const result = await prisma.$transaction(async (tx) => {
       const now = new Date();
       await endUserSessionsForRegisterPolicy(tx, req, register.companyId, identity.user.id, register.id, now);
-      const session = await createSession(tx, register.companyId, register.id, identity.user.id, now);
+      const session = await createSession(tx, register.companyId, register.id, identity.user.id, req.posDevice.deviceId, now);
       await auditEvent(tx, req, {
         companyId: register.companyId,
         registerId: register.id,
         userId: identity.user.id,
         event: 'PIN_LOGIN_SUCCESS',
         metadata: { sessionId: session.id },
-        deviceId: register.claimedDeviceId,
+        deviceId: req.posDevice?.deviceId,
       });
       const tokens = await tokenResponse(tx, session);
       return { ok: true, session, tokens };
@@ -468,7 +452,10 @@ exports.refreshSessionToken = async (req, res, next) => {
           refreshExpiresAt: { gt: now },
         },
       });
-      if (!session?.refreshTokenHash) return null;
+      if (!session?.refreshTokenHash
+        || (session.deviceId
+          ? String(session.deviceId) !== String(req.posDevice?.deviceId || '')
+          : String(register.claimedDeviceId || '') !== String(req.posDevice?.deviceId || ''))) return null;
       const providedHash = hashPosRefreshToken(refreshToken);
       const provided = Buffer.from(providedHash, 'hex');
       const stored = Buffer.from(session.refreshTokenHash, 'hex');
@@ -729,7 +716,7 @@ exports.unlock = async (req, res, next) => {
         companyId: context.session.companyId,
         registerId: context.session.registerId,
         userId: identity.user.id,
-        deviceId: context.register.claimedDeviceId,
+        deviceId: context.posDevice.deviceId,
         error: verified.error,
         flow: 'unlock',
       });
@@ -801,7 +788,7 @@ exports.switchCashier = async (req, res, next) => {
         companyId: context.session.companyId,
         registerId: context.session.registerId,
         userId: identity.user.id,
-        deviceId: context.register.claimedDeviceId,
+        deviceId: context.posDevice.deviceId,
         error: verified.error,
         flow: 'cashier_switch',
       });
@@ -815,7 +802,7 @@ exports.switchCashier = async (req, res, next) => {
     const offlineUnlockVerifier = offlineSettings?.posOfflineEnabled
       ? await createOfflinePinVerifier({
         companyId: context.session.companyId,
-        deviceId: context.register.claimedDeviceId,
+        deviceId: context.posDevice.deviceId,
         registerId: context.session.registerId,
         userId: identity.user.id,
         pin,
@@ -835,7 +822,7 @@ exports.switchCashier = async (req, res, next) => {
       });
       if (ended.count !== 1) return { ok: false, error: responseError(409, 'POS_SESSION_CHANGED', 'POS session changed; refresh before switching cashier.') };
       await endUserSessionsForRegisterPolicy(tx, req, context.session.companyId, identity.user.id, context.session.registerId, now);
-      const session = await createSession(tx, context.session.companyId, context.session.registerId, identity.user.id, now);
+      const session = await createSession(tx, context.session.companyId, context.session.registerId, identity.user.id, context.posDevice.deviceId, now);
       const tokens = await tokenResponse(tx, session);
       await auditEvent(tx, req, {
         companyId: context.session.companyId,

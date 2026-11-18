@@ -107,19 +107,6 @@ function hashToken(token) {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
-function secureEqual(left, right) {
-  const leftBuffer = Buffer.from(String(left || ''), 'hex');
-  const rightBuffer = Buffer.from(String(right || ''), 'hex');
-  return leftBuffer.length > 0
-    && leftBuffer.length === rightBuffer.length
-    && timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function deviceTokenMatches(register, token) {
-  return Boolean(token && register?.deviceTokenHash
-    && secureEqual(hashToken(token), register.deviceTokenHash));
-}
-
 function requestCompanyId(req) {
   const company = req.company || req.user?.company || null;
   const id = company?.id || company?._id || req.user?.companyId || null;
@@ -184,7 +171,7 @@ async function resolvePosSession(req, allowedStatuses = ['active']) {
   }
 
   const token = deviceTokenFrom(req);
-  const [session, register, user, company, settings] = await Promise.all([
+  const [session, register, user, company, settings, posDevice] = await Promise.all([
     prisma.posSession.findFirst({
       where: {
         id: String(claims.sid),
@@ -223,27 +210,30 @@ async function resolvePosSession(req, allowedStatuses = ['active']) {
       where: { companyId: String(claims.companyId) },
       select: { posIdleLockMinutes: true, posRolePermissions: true, posCashOutApprovalLimit: true },
     }),
+    prisma.posDevice.findUnique({
+      where: { deviceTokenHash: hashToken(token) },
+    }),
   ]);
 
   if (!session) return { error: responseError(401, 'POS_SESSION_INACTIVE', 'POS session is locked, ended, or no longer active.') };
-  if (!register || !deviceTokenMatches(register, token)) {
+  if (!register || !token || !posDevice
+    || String(posDevice.companyId) !== String(register.companyId)
+    || String(posDevice.registerId) !== String(register.id)) {
     return { error: responseError(401, 'POS_DEVICE_INVALID', 'This POS device is not active or its device token is invalid.') };
-  }
-  const posDevice = await prisma.posDevice.findFirst({
-    where: {
-      companyId: String(register.companyId),
-      registerId: String(register.id),
-      deviceId: String(register.claimedDeviceId || ''),
-    },
-  });
-  if (!posDevice || !posDevice.publicKey || posDevice.status === 'needs_enrollment') {
-    return { error: responseError(403, 'POS_DEVICE_ENROLLMENT_REQUIRED', 'Enroll this POS device before signing in.') };
   }
   if (posDevice.status === 'disabled') {
     return { error: responseError(403, 'POS_DEVICE_DISABLED', 'This POS device has been disabled by a manager.') };
   }
   if (posDevice.status !== 'active') {
     return { error: responseError(403, 'POS_SYNC_DEVICE_REVOKED', 'This POS device has been revoked.') };
+  }
+  if (!posDevice.publicKey) {
+    return { error: responseError(403, 'POS_DEVICE_ENROLLMENT_REQUIRED', 'Enroll this POS device before signing in.') };
+  }
+  if (session.deviceId
+    ? String(session.deviceId) !== String(posDevice.deviceId)
+    : String(register.claimedDeviceId || '') !== String(posDevice.deviceId)) {
+    return { error: responseError(401, 'POS_SESSION_DEVICE_MISMATCH', 'Sign in on this paired POS device to continue.') };
   }
   if (!user || !company?.isActive || company.approvalStatus !== 'approved') {
     return { error: responseError(401, 'POS_USER_INACTIVE', 'Cashier or company is inactive.') };
@@ -353,28 +343,27 @@ function requireDevice() {
           ...(claims?.companyId ? { companyId: String(claims.companyId) } : {}),
         },
       });
-      if (!register || !deviceTokenMatches(register, deviceTokenFrom(req))) {
+      const token = deviceTokenFrom(req);
+      const posDevice = token
+          ? await prisma.posDevice.findUnique({ where: { deviceTokenHash: hashToken(token) } })
+          : null;
+      if (!register || !posDevice
+          || String(posDevice.registerId) !== String(register.id)
+          || String(posDevice.companyId) !== String(register.companyId)) {
         return res.status(401).json({
           success: false,
           code: 'POS_DEVICE_INVALID',
           message: 'This POS device is not active or its device token is invalid.',
         });
       }
-      const posDevice = await prisma.posDevice.findFirst({
-        where: {
-          companyId: String(register.companyId),
-          registerId: String(register.id),
-          deviceId: String(register.claimedDeviceId || ''),
-          status: 'active',
-          publicKey: { not: null },
-        },
-      });
-      if (!posDevice) {
-        return res.status(403).json({
-          success: false,
-          code: 'POS_DEVICE_ENROLLMENT_REQUIRED',
-          message: 'Enroll this POS device before continuing.',
-        });
+      if (posDevice.status !== 'active' || !posDevice.publicKey) {
+          return res.status(403).json({
+            success: false,
+            code: posDevice.status === 'disabled' ? 'POS_DEVICE_DISABLED' : 'POS_DEVICE_ENROLLMENT_REQUIRED',
+            message: posDevice.status === 'disabled'
+              ? 'This POS device has been disabled by a manager.'
+              : 'Enroll this POS device before continuing.',
+          });
       }
       req.posRegister = register;
       req.posDevice = posDevice;
@@ -587,7 +576,6 @@ module.exports = {
   requireCashMovementPermission,
   requireApproval,
   resolvePosSession,
-  deviceTokenMatches,
   permissionsForUser,
   hasPosPermission,
 };

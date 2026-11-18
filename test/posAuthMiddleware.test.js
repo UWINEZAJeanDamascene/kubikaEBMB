@@ -2,7 +2,7 @@ jest.mock('../lib/prisma', () => ({
   prisma: {
     posSession: { findFirst: jest.fn(), updateMany: jest.fn() },
     posRegister: { findFirst: jest.fn() },
-    posDevice: { findFirst: jest.fn() },
+    posDevice: { findFirst: jest.fn(), findUnique: jest.fn() },
     user: { findFirst: jest.fn() },
     company: { findUnique: jest.fn() },
     systemSettings: { findUnique: jest.fn() },
@@ -87,6 +87,7 @@ describe('POS session authorization middleware', () => {
       companyId: COMPANY_ID,
       registerId: REGISTER_ID,
       userId: USER_ID,
+      deviceId: 'device-1',
       status: 'active',
       lastActivityAt: new Date(),
     };
@@ -103,6 +104,8 @@ describe('POS session authorization middleware', () => {
       companyId: COMPANY_ID,
       registerId: REGISTER_ID,
       publicKey: 'device-public-key',
+      deviceId: 'device-1',
+      deviceTokenHash: createHash('sha256').update(DEVICE_TOKEN).digest('hex'),
       status: 'active',
     };
     user = {
@@ -139,6 +142,7 @@ describe('POS session authorization middleware', () => {
     }));
     prisma.posRegister.findFirst.mockResolvedValue(register);
     prisma.posDevice.findFirst.mockResolvedValue(device);
+    prisma.posDevice.findUnique.mockResolvedValue(device);
     prisma.user.findFirst.mockResolvedValue(user);
     prisma.company.findUnique.mockResolvedValue(company);
     prisma.systemSettings.findUnique.mockResolvedValue(settings);
@@ -232,13 +236,25 @@ describe('POS session authorization middleware', () => {
   });
 
   test('rejects invalid device credentials', async () => {
-    register.deviceTokenHash = '0'.repeat(64);
+    prisma.posDevice.findUnique.mockResolvedValueOnce(null);
     const res = response();
     const next = jest.fn();
     await requirePosSession()(request(), res, next);
 
     expect(res.statusCode).toBe(401);
     expect(res.body.code).toBe('POS_DEVICE_INVALID');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  test('binds an authenticated cashier session to its own paired device', async () => {
+    session.deviceId = 'another-device';
+    const res = response();
+    const next = jest.fn();
+
+    await requirePosSession()(request(), res, next);
+
+    expect(res.statusCode).toBe(401);
+    expect(res.body.code).toBe('POS_SESSION_DEVICE_MISMATCH');
     expect(next).not.toHaveBeenCalled();
   });
 

@@ -646,7 +646,7 @@ async function quarantineRequestOperation(req, operation, code, message) {
   const context = req.posAuthContext;
   const device = req.posDevice || context?.posDevice;
   const companyId = String(device?.companyId || context?.company?.id || '');
-  const deviceId = String(device?.deviceId || context?.register?.claimedDeviceId || '');
+  const deviceId = String(device?.deviceId || context?.posDevice?.deviceId || context?.register?.claimedDeviceId || '');
   if (!companyId || !deviceId) return;
   await quarantineOperation(companyId, deviceId, operation, code, message);
 }
@@ -815,7 +815,7 @@ async function processOperation(req, operation) {
     req.posAuthContext.register.code || req.posAuthContext.register.id || '',
   );
   if (operation.registerId !== authenticatedRegisterId
-    || operation.deviceId !== String(req.posAuthContext.register.claimedDeviceId || '')) {
+    || operation.deviceId !== String(req.posAuthContext.posDevice.deviceId || '')) {
     await quarantineRequestOperation(
       req,
       operation,
@@ -1061,7 +1061,7 @@ exports.push = async (req, res, next) => {
       unusedReceiptNumbersRetired = await dbClient().$transaction(async (tx) => (
         retireUnusedReceiptNumbersForSnapshots(tx, {
           companyId: String(req.posAuthContext.company.id),
-          deviceId: String(req.posAuthContext.register.claimedDeviceId),
+          deviceId: String(req.posAuthContext.posDevice.deviceId),
           snapshotIds,
         })
       ));

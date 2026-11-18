@@ -107,6 +107,7 @@ describe('POS offline controller', () => {
       posAuthContext: {
         session: { userId: cashierId },
         company: { id: IDS.company },
+        posDevice: { deviceId },
         register: { code: IDS.registerCode, claimedDeviceId: '77777777-7777-4777-8777-777777777777' },
       },
       body: { deviceId, registerId: registerCode, warehouseId: IDS.warehouse },

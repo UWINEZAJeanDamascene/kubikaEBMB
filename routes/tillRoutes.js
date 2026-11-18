@@ -55,11 +55,11 @@ function bindSessionIdentity(req, res, next) {
   // from a caller-supplied register/device query parameter.
   if (req.query) {
     req.query.registerId = String(context.register.code);
-    req.query.deviceId = String(context.register.claimedDeviceId || '');
+    req.query.deviceId = String(context.posDevice.deviceId);
   }
   if (req.body && typeof req.body === 'object') {
     req.body.registerId = String(context.register.code);
-    req.body.deviceId = String(context.register.claimedDeviceId || '');
+    req.body.deviceId = String(context.posDevice.deviceId);
   }
   return next();
 }

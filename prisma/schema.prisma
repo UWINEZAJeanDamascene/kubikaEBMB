@@ -1855,6 +1855,7 @@ model PosSession {
   id               String           @id @db.Char(24)
   companyId        String           @map("company_id") @db.Char(24)
   registerId       String           @map("register_id") @db.Char(24)
+  deviceId         String?          @map("device_id") @db.VarChar(80)
   userId           String           @map("user_id") @db.Char(24)
   status           PosSessionStatus @default(active)
   startedAt        DateTime         @default(now()) @map("started_at") @db.Timestamptz(3)
@@ -1869,6 +1870,7 @@ model PosSession {
   user             User             @relation("PosSessionUser", fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([companyId, registerId, status])
+  @@index([companyId, deviceId, status])
   @@index([companyId, userId, status])
   @@index([companyId, lastActivityAt])
   @@map("pos_sessions")

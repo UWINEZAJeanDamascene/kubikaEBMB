@@ -15,6 +15,7 @@ jest.mock('../lib/prisma', () => ({
     posDevice: {
       findFirst: jest.fn(),
       findMany: jest.fn(),
+      count: jest.fn(),
       upsert: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
@@ -51,6 +52,7 @@ const {
   recoverDeviceCredential,
   revokeDevice,
   listRegisters,
+  setDeviceStatus,
 } = require('../controllers/posRegisterController');
 const enrollmentKeys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
 const enrollmentPublicKey = enrollmentKeys.publicKey
@@ -107,6 +109,7 @@ describe('same-device credential recovery', () => {
     publicKey: enrollmentPublicKey,
     deviceTokenHash: 'old-token-hash',
     status: 'active',
+    register,
   };
 
   beforeEach(() => {
@@ -154,7 +157,7 @@ describe('same-device credential recovery', () => {
     expect(prisma.posSession.updateMany).not.toHaveBeenCalled();
   });
 
-  test('rotates both token hashes after valid device proof and preserves the active shift/session', async () => {
+  test('rotates the device credential and preserves the active shift/session', async () => {
     const challenge = require('crypto').randomBytes(32).toString('base64url');
     const expiry = new Date(Date.now() + 60_000);
     const payload = recoveryPayload(challenge, expiry.toISOString());
@@ -182,10 +185,7 @@ describe('same-device credential recovery', () => {
     expect(res.body.data.deviceToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(res.body.data.register).toMatchObject({ _id: registerId, registerId: 'POS-TEST' });
     const tokenHash = require('crypto').createHash('sha256').update(res.body.data.deviceToken).digest('hex');
-    expect(prisma.posRegister.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ claimedDeviceId: enrollmentPayload.deviceId, deviceTokenHash: 'old-token-hash' }),
-      data: { deviceTokenHash: tokenHash },
-    }));
+    expect(prisma.posRegister.updateMany).not.toHaveBeenCalled();
     expect(prisma.posDevice.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ recoveryChallengeHash: expect.any(String) }),
       data: {
@@ -268,6 +268,25 @@ describe('POS register listing', () => {
       where: { companyId: 'company-1', isActive: true },
     }));
   });
+
+  test('returns the active paired-device count for each register', async () => {
+    prisma.posRegister.findMany.mockResolvedValue([
+      { id: 'register-a', companyId: 'company-1', isActive: true, claimedDeviceId: 'device-a' },
+    ]);
+    prisma.posDevice.findMany.mockResolvedValue([
+      { registerId: 'register-a' },
+      { registerId: 'register-a' },
+    ]);
+
+    const res = createResponse();
+    await listRegisters(
+      { user: { company: { _id: 'company-1' } } },
+      res,
+      (error) => { throw error; },
+    );
+
+    expect(res.body.data[0]).toMatchObject({ claimed: true, pairedDeviceCount: 2 });
+  });
 });
 
 describe('POS register activation', () => {
@@ -296,6 +315,7 @@ describe('POS register activation', () => {
       posSession: { updateMany: prisma.posSession.updateMany },
       posDevice: {
         findFirst: prisma.posDevice.findFirst,
+        count: prisma.posDevice.count,
         upsert: prisma.posDevice.upsert,
         updateMany: prisma.posDevice.updateMany,
       },
@@ -352,12 +372,9 @@ describe('POS register activation', () => {
     const { createHash } = require('crypto');
     expect(storedHash).toBe(createHash('sha256').update(deviceToken).digest('hex'));
     expect(storedHash).not.toBe(deviceToken);
-    expect(prisma.posSession.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { companyId, registerId, status: { in: ['active', 'locked'] } },
-      data: { status: 'ended', endedAt: expect.any(Date), endReason: 'REVOKED' },
-    }));
+    expect(prisma.posSession.updateMany).not.toHaveBeenCalled();
     expect(prisma.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ event: 'REGISTER_ACTIVATED' }),
+      data: expect.objectContaining({ event: 'REGISTER_DEVICE_PAIRED' }),
     }));
   });
 
@@ -665,17 +682,8 @@ describe('POS register deletion with retained history', () => {
     await deleteRegister(req, res, (error) => { throw error; });
 
     expect(prisma.posDevice.updateMany).toHaveBeenCalledWith({
-      where: {
-        companyId,
-        registerId,
-        deviceId: enrollmentPayload.deviceId,
-        status: { not: 'revoked' },
-      },
-      data: {
-        status: 'revoked',
-        wipeRequestedAt: expect.any(Date),
-        wipeAcknowledgedAt: null,
-      },
+      where: { companyId, registerId, status: { not: 'revoked' } },
+      data: { status: 'revoked', wipeRequestedAt: expect.any(Date), wipeAcknowledgedAt: null },
     });
   });
 });
@@ -715,8 +723,10 @@ describe('POS register one-time pairing codes', () => {
       },
       posSession: { updateMany: prisma.posSession.updateMany },
       posDevice: {
+        count: prisma.posDevice.count,
         findFirst: prisma.posDevice.findFirst,
         upsert: prisma.posDevice.upsert,
+        updateMany: prisma.posDevice.updateMany,
       },
       $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
       posAuditLog: { create: prisma.posAuditLog.create, findFirst: jest.fn().mockResolvedValue(null) },
@@ -760,6 +770,31 @@ describe('POS register one-time pairing codes', () => {
     expect(prisma.posRegister.updateMany).not.toHaveBeenCalled();
   });
 
+  test('pairs an additional device without replacing the existing device during an open shift', async () => {
+    const primaryDeviceId = '88888888-8888-4888-8888-888888888888';
+    prisma.posRegister.findFirst.mockResolvedValue({
+      ...register,
+      claimedDeviceId: primaryDeviceId,
+      deviceTokenHash: 'primary-device-hash',
+    });
+    prisma.tillSession.findFirst.mockResolvedValue({ id: 'open-shift' });
+    const res = createResponse();
+    await claimRegister(request(), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.tillSession.findFirst).not.toHaveBeenCalled();
+    expect(prisma.posRegister.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: { claimCodeUsedAt: expect.any(Date) },
+    }));
+    expect(prisma.posDevice.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      create: expect.objectContaining({ deviceId, registerId: register.id, status: 'active' }),
+    }));
+    expect(prisma.posSession.updateMany).not.toHaveBeenCalled();
+    expect(prisma.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ event: 'REGISTER_DEVICE_PAIRED' }),
+    }));
+  });
+
   test('reports an expired code in plain language', async () => {
     prisma.posRegister.findFirst.mockResolvedValue({ ...register, claimExpiresAt: new Date(Date.now() - 1) });
     const res = createResponse();
@@ -795,7 +830,7 @@ describe('POS register one-time pairing codes', () => {
     expect(prisma.posRegister.updateMany).not.toHaveBeenCalled();
   });
 
-  test('issues pairing codes with a 10 minute expiry and revokes the previous device token', async () => {
+  test('issues pairing codes during an open shift without revoking paired devices or sessions', async () => {
     const res = createResponse();
     const startedAt = Date.now();
     prisma.tillSession.findFirst.mockResolvedValue({ id: 'open-shift-1' });
@@ -812,13 +847,11 @@ describe('POS register one-time pairing codes', () => {
       data: expect.objectContaining({
         claimCodeHash: expect.any(String),
         claimCodeUsedAt: null,
-        deviceTokenHash: null,
       }),
     }));
-    expect(prisma.posSession.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ companyId, registerId: register.id, status: { in: ['active', 'locked'] } }),
-      data: expect.objectContaining({ status: 'ended', endReason: 'REVOKED' }),
-    }));
+    expect(prisma.posRegister.update.mock.calls[0][0].data).not.toHaveProperty('deviceTokenHash');
+    expect(prisma.posSession.updateMany).not.toHaveBeenCalled();
+    expect(prisma.tillSession.findFirst).not.toHaveBeenCalled();
     expect(res.body.claimCode).not.toBe(prisma.posRegister.update.mock.calls[0][0].data.claimCodeHash);
   });
 
@@ -846,5 +879,63 @@ describe('POS register one-time pairing codes', () => {
     expect(prisma.posAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ event: 'REGISTER_DEVICE_REVOKED' }),
     }));
+  });
+});
+
+describe('paired POS device isolation', () => {
+  const companyId = '507f1f77bcf86cd799439011';
+  const registerId = '507f1f77bcf86cd799439012';
+  const primaryDeviceId = '88888888-8888-4888-8888-888888888888';
+  const deviceId = enrollmentPayload.deviceId;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.posDevice.findFirst.mockResolvedValue({
+      id: 'device-row',
+      companyId,
+      registerId,
+      deviceId,
+      status: 'active',
+      register: { id: registerId, code: 'POS-TEST', isActive: true, claimedDeviceId: primaryDeviceId },
+    });
+    prisma.posDevice.update.mockResolvedValue({
+      deviceId,
+      status: 'revoked',
+      register: { code: 'POS-TEST', name: 'Test Register' },
+    });
+    prisma.$transaction.mockImplementation((callback) => callback({
+      posDevice: {
+        update: prisma.posDevice.update,
+        findFirst: prisma.posDevice.findFirst,
+      },
+      posSession: { updateMany: prisma.posSession.updateMany },
+      posRegister: { updateMany: prisma.posRegister.updateMany },
+      $queryRaw: jest.fn().mockResolvedValue([{ correlationId: null }]),
+      posAuditLog: {
+        create: prisma.posAuditLog.create,
+        findFirst: jest.fn().mockResolvedValue(null),
+      },
+    }));
+  });
+
+  test('revoking one device ends only its sessions and leaves its register peers untouched', async () => {
+    const res = createResponse();
+    await setDeviceStatus({
+      user: { id: 'manager-1', company: { _id: companyId } },
+      params: { deviceId },
+      body: { status: 'revoked' },
+    }, res, (error) => { throw error; });
+
+    expect(res.body.success).toBe(true);
+    expect(prisma.posSession.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        companyId,
+        registerId,
+        status: { in: ['active', 'locked'] },
+        OR: [{ deviceId }],
+      },
+    }));
+    expect(prisma.posDevice.findFirst).toHaveBeenCalledTimes(1);
+    expect(prisma.posRegister.updateMany).not.toHaveBeenCalled();
   });
 });
