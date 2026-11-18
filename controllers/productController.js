@@ -1130,29 +1130,15 @@ exports.getProductBarcode = async (req, res, next) => {
       bcid = 'itf14';
     }
 
-    // Build a scan-friendly payload URL for QR use and for context
-    const frontendBase = process.env.FRONTEND_BASE_URL || req.get('origin') || '';
-    const code = product.barcode || product.sku || String(product._id);
-    const query = new URLSearchParams({
-      code,
-      sku: product.sku || '',
-      barcode: product.barcode || ''
-    });
-    const payloadUrl = frontendBase ? `${frontendBase.replace(/\/$/, '')}/products/${product._id}?${query.toString()}` : `product:${product._id}`;
-
-    // Fallback text/value
     const text = product.barcode || product.sku || String(product._id);
 
     // Validate and normalize numeric barcode types
     let codeText = String(text);
     if (['ean13', 'ean8', 'upca'].includes(bcid)) {
       codeText = codeText.replace(/[^0-9]/g, '');
-      if (bcid === 'ean13' || bcid === 'upca') {
+      if (bcid === 'upca') {
         if (codeText.length < 12) codeText = codeText.padStart(12, '0');
         if (codeText.length > 12) codeText = codeText.slice(0, 12);
-      } else if (bcid === 'ean8') {
-        if (codeText.length < 7) codeText = codeText.padStart(7, '0');
-        if (codeText.length > 7) codeText = codeText.slice(0, 7);
       }
     }
 
@@ -1210,15 +1196,12 @@ exports.getProductQRCode = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
 
-    // Build a default URL for product lookup. Prefer FRONTEND_BASE_URL env, else origin.
+    // Keep the QR payload useful to both phone cameras and the in-app POS scanner.
     const frontendBase = process.env.FRONTEND_BASE_URL || req.get('origin') || '';
-    const code = product.barcode || product.sku || String(product._id);
-    const query = new URLSearchParams({
-      code,
-      sku: product.sku || '',
-      barcode: product.barcode || ''
-    });
-    const payloadUrl = frontendBase ? `${frontendBase.replace(/\/$/, '')}/products/${product._id}?${query.toString()}` : `product:${product._id}`;
+    const productId = encodeURIComponent(String(product._id));
+    const payloadUrl = frontendBase
+      ? `${frontendBase.replace(/\/$/, '')}/products/${productId}`
+      : `product:${productId}`;
 
     const pngBuffer = await QRCode.toBuffer(payloadUrl, {
       type: 'png',
