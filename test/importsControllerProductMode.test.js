@@ -91,4 +91,35 @@ describe('Smart Import product mode handoff', () => {
       code: 'IMPORT_EBM_ENTITLEMENT_CHANGED',
     }));
   });
+
+  it('returns final product row errors instead of enqueueing an invalid import', async () => {
+    const rowErrors = [{ field: 'category', message: 'Select an existing category from this workspace.' }];
+    ImportService.validateImport.mockResolvedValue({
+      errorRows: 1,
+      validRows: 0,
+      rows: [{ rowNumber: 2, valid: false, errors: rowErrors }],
+      fiscalEbmEnabled: false,
+      fiscalEntitlementVersion: 8,
+    });
+    const res = response();
+
+    await importsController.process({
+      user: { _id: 'user-1' },
+      body: {
+        entityType: 'products',
+        rows: [{ rowNumber: 2, source: { 'Product Name': 'Rice', SKU: 'RICE-01' } }],
+        columnMapping: { name: 'Product Name', sku: 'SKU' },
+        fiscalEntitlementVersion: 8,
+      },
+    }, res);
+
+    expect(res.status).toHaveBeenCalledWith(422);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'PRODUCT_IMPORT_REVALIDATION_FAILED',
+      message: 'One or more product rows failed the final validation. Review the row errors and retry.',
+      data: expect.objectContaining({ rows: [expect.objectContaining({ errors: rowErrors })] }),
+    }));
+    expect(ImportLog.create).not.toHaveBeenCalled();
+    expect(ImportQueue.enqueueImport).not.toHaveBeenCalled();
+  });
 });

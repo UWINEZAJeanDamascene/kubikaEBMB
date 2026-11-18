@@ -162,7 +162,7 @@ exports.process = async (req, res) => {
         return res.status(422).json({
           success: false,
           code: 'PRODUCT_IMPORT_REVALIDATION_FAILED',
-          message: 'Product data changed or no longer satisfies the current import rules. Review the validation results and retry.',
+          message: 'One or more product rows failed the final validation. Review the row errors and retry.',
           data: revalidated,
         });
       }

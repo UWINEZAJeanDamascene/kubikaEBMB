@@ -146,6 +146,45 @@ describe('Smart Import product EBM mode behavior', () => {
     expect(EBMItemClass.find).not.toHaveBeenCalled();
   });
 
+  it('revalidates EBM-off source rows consistently before processing', async () => {
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 6 });
+    const mapping = {
+      name: 'Product Name',
+      sku: 'SKU',
+      category: 'Category',
+      unit: 'Unit',
+      sellingPrice: 'Price',
+      taxRate: 'Tax Rate (%)',
+    };
+    const source = {
+      'Product Name': 'Rice',
+      SKU: 'RICE-01',
+      Category: 'General',
+      Unit: 'kg',
+      Price: '1200',
+      'Tax Rate (%)': '7.5',
+    };
+    const firstValidation = await ImportService.validateImport({
+      entityType: 'products',
+      companyId: 'company-1',
+      expectedFiscalEntitlementVersion: 6,
+      mapping,
+      rows: [source],
+    });
+    const finalValidation = await ImportService.validateImport({
+      entityType: 'products',
+      companyId: 'company-1',
+      expectedFiscalEntitlementVersion: 6,
+      mapping,
+      rows: firstValidation.rows.filter((row) => row.valid).map((row) => row.source),
+      rowNumbers: firstValidation.rows.filter((row) => row.valid).map((row) => row.rowNumber),
+    });
+
+    expect(firstValidation.validRows).toBe(1);
+    expect(finalValidation.errorRows).toBe(0);
+    expect(finalValidation.rows[0].data).toMatchObject({ taxRate: 7.5, taxCode: 'B' });
+  });
+
   it('omits EBM metadata from off-mode product payloads but retains the ordinary tax rate', () => {
     const payload = ImportService.__test__.productPayload('company-1', 'user-1', {
       name: 'Rice',
