@@ -1,6 +1,7 @@
 const EBMSubmissionQueue = require('../models/EBMSubmissionQueue');
 const EBMAlert = require('../models/EBMAlert');
-const Company = require('../models/Company');
+const moduleEntitlementService = require('./moduleEntitlementService');
+const ebmService = require('./ebmService');
 const mongoose = require('mongoose');
 const { SAVE_SALES_ENDPOINT, SAVE_SALES_ENDPOINTS } = require('../constants/ebmSalesEndpoint');
 
@@ -405,23 +406,8 @@ async function getCompanyEbmSetting(companyId) {
   }
 
   try {
-    const companyQuery = await Company.findById(companyId);
-    const company = companyQuery && typeof companyQuery.lean === 'function' ? await companyQuery.lean() : companyQuery;
-    if (!company) {
-      const error = new Error('The company could not be found while checking EBM authorization.');
-      error.code = 'EBM_COMPANY_NOT_FOUND';
-      error.statusCode = 404;
-      error.retryable = false;
-      throw error;
-    }
-    const enabled = company.ebmEnabled !== false && company.ebm_enabled !== false;
-    return {
-      enabled,
-      reason: company.ebmToggleReason || company.ebm_toggle_reason || null,
-      changedAt: company.ebmToggleChangedAt || company.ebm_toggle_changed_at || null,
-      changedBy: company.ebmToggleChangedBy || company.ebm_toggle_changed_by || null,
-      version: Number(company.ebmToggleVersion || company.ebm_toggle_version || 0) || 0,
-    };
+    const entitlement = await moduleEntitlementService.getEntitlement(companyId, 'fiscal.ebm', { useCache: false });
+    return { enabled: entitlement.status === 'on', version: entitlement.version };
   } catch (error) {
     console.warn('[EBMQueue] Unable to resolve company EBM setting:', error?.message || error);
     if (error.code) throw error;
@@ -435,7 +421,7 @@ async function getCompanyEbmSetting(companyId) {
 
 async function assertEbmEnabled(companyId, { operationName = 'EBM submission' } = {}) {
   const setting = await getCompanyEbmSetting(companyId);
-  if (setting.enabled !== false) return setting;
+  if (setting.enabled !== false || ebmService.isSandboxMode()) return setting;
   const error = new Error(`${operationName} is blocked because EBM is disabled for this company. Re-enable the platform EBM setting to resume fiscal processing.`);
   error.code = 'EBM_DISABLED';
   error.statusCode = 403;

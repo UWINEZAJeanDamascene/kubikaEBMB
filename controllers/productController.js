@@ -15,11 +15,18 @@ const { notifyLowStock, notifyOutOfStock, notifyStockReceived } = require('../se
 const cacheService = require('../services/cacheService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
 const slowQueryMonitor = require('../utils/slowQueryMonitor');
+const moduleEntitlementService = require('../services/moduleEntitlementService');
 const {
   slimProductForHistory,
   buildProductHistoryChanges,
   enrichProductHistory,
 } = require('../utils/productHistoryHelpers');
+
+function stripEbmProductFields(body) {
+  for (const key of Object.keys(body)) {
+    if (/^ebm/i.test(key)) delete body[key];
+  }
+}
 
 async function timedQuery(label, fn) {
   const start = Date.now();
@@ -476,7 +483,11 @@ exports.createProduct = async (req, res, next) => {
       req.body.averageCost = req.body.costPrice;
     }
 
-    await applySyncedEbmTaxRate(req.body, companyId);
+    if (await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm', { useCache: false })) {
+      await applySyncedEbmTaxRate(req.body, companyId);
+    } else {
+      stripEbmProductFields(req.body);
+    }
 
     const product = await Product.create(req.body);
 
@@ -572,6 +583,8 @@ exports.updateProduct = async (req, res, next) => {
       return res.status(422).json({ success: false, errors: accountErrors });
     }
 
+    const ebmEnabled = await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm', { useCache: false });
+    if (!ebmEnabled) stripEbmProductFields(req.body);
     const taxSettingsSubmitted = Object.prototype.hasOwnProperty.call(req.body, 'taxCode')
       || (req.body.ebm && typeof req.body.ebm === 'object' && !Array.isArray(req.body.ebm)
         && (Object.prototype.hasOwnProperty.call(req.body.ebm, 'taxTyCd')
@@ -579,12 +592,12 @@ exports.updateProduct = async (req, res, next) => {
 
     // Merge the ebm payload so an edit never drops RRA registration state
     // (ebmItemCode, isRegisteredWithEBM, registration timestamps) that the form does not submit.
-    if (req.body.ebm && typeof req.body.ebm === 'object' && !Array.isArray(req.body.ebm)) {
+    if (ebmEnabled && req.body.ebm && typeof req.body.ebm === 'object' && !Array.isArray(req.body.ebm)) {
       const existingEbm = (product.ebm && typeof product.ebm === 'object') ? product.ebm : {};
       req.body.ebm = { ...existingEbm, ...req.body.ebm };
     }
 
-    if (taxSettingsSubmitted) {
+    if (ebmEnabled && taxSettingsSubmitted) {
       await applySyncedEbmTaxRate(req.body, companyId, product);
     }
 
@@ -1232,7 +1245,7 @@ exports.registerProductWithEBM = async (req, res, next) => {
     const EBMProductService = require('../services/ebmProductService');
 
     // Allow optional tin override or other options via body
-    const options = {};
+    const options = { allowSandboxWhileOff: true };
     if (req.body && req.body.tin) options.tin = req.body.tin;
 
     const product = await EBMProductService.registerProduct(companyId, productId, options);
@@ -1252,7 +1265,7 @@ exports.registerAllProductsWithEBM = async (req, res, next) => {
     const company = req.user && req.user.company;
     const companyId = (company && company._id) ? company._id : company;
     const EBMProductService = require('../services/ebmProductService');
-    const options = {};
+    const options = { allowSandboxWhileOff: true };
     if (req.body && req.body.tin) options.tin = req.body.tin;
     const result = await EBMProductService.registerAllProducts(companyId, options);
       return res.json({

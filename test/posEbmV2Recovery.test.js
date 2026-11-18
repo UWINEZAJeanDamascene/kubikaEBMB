@@ -43,6 +43,19 @@ describe('V2 EBM recovery policy', () => {
     expect(recovery.HTTP_TIMEOUT_MS + recovery.LEASE_MARGIN_MS).toBeGreaterThan(recovery.HTTP_TIMEOUT_MS);
   });
 
+  test('retry eligibility is independent of shifts and pending-off timestamps', async () => {
+    prisma.$queryRawUnsafe = jest.fn().mockResolvedValue([]);
+    await recovery.claimDueIds();
+    const query = prisma.$queryRawUnsafe.mock.calls[0][0];
+    expect(query).toContain("e.status = 'on'");
+    expect(query).toContain("e.pending_status <> 'off'");
+    expect(query).toContain("q.ebm_status = 'submitted' AND q.signed_at IS NOT NULL AND q.source_applied_at IS NULL");
+    expect(query).toContain('NOT (EXISTS (');
+    expect(query).toContain('AS "sourceOnly"');
+    expect(query).not.toContain('pending_effective_at');
+    expect(query).not.toContain('pos_shifts');
+  });
+
   test('commits request_sent_at and consumes a resend authorization together immediately before send', async () => {
     const tx = makeTx();
     prisma.$transaction.mockImplementation(async (fn) => fn(tx));
@@ -124,7 +137,7 @@ describe('V2 EBM recovery policy', () => {
     const submitInvoice = jest.fn().mockResolvedValue({});
     const sweep = jest.spyOn(recovery, 'sweepExpiredLeases').mockResolvedValue([]);
     const due = jest.spyOn(recovery, 'claimDueIds').mockResolvedValue([{ id: 'committed-outbox', documentId: 'committed-invoice', companyId: 'company-id' }]);
-    jest.doMock('../services/ebmSalesService', () => ({ submitInvoice }));
+    jest.doMock('../services/fiscalService', () => ({ submitInvoice }));
     const sweeper = require('../services/posEbmV2RetryJob');
     const result = await sweeper.runOnce();
     expect(result.due).toBe(1);

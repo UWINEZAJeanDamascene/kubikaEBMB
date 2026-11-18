@@ -4,6 +4,7 @@ const Client = require('../models/Client');
 const Company = require('../models/Company');
 const { prisma } = require('../lib/prisma');
 const ebmService = require('./ebmService');
+const moduleEntitlementService = require('./moduleEntitlementService');
 const { VSDC_ENDPOINTS } = ebmService;
 const { assertPharmacyInsurance } = require('./ebmOperationPolicy');
 const { sanitizeForEndpoint } = require('../utils/vsdcPayloadSanitizer');
@@ -382,6 +383,7 @@ class EBMBranchService {
   }
 
   static async submitBranchUsers(companyId, branchId, registrar = null) {
+    if (!await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm')) return null;
     const normalizedBranchId = normalizeBranchId(branchId);
     await assertUniqueBranchMapping(companyId, normalizedBranchId);
     const branch = await Warehouse.findOne({
@@ -533,6 +535,7 @@ class EBMBranchService {
   }
 
   static async saveBranchCustomer(companyId, clientId, branchId = '00', registrarUser = null) {
+    if (!await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm')) return null;
     const normalizedBranchId = normalizeBranchId(branchId);
     const [company, client] = await Promise.all([
       Company.findById(companyId).lean(),

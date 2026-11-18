@@ -35,6 +35,10 @@ const mockDb = {
     findMany: jest.fn(async () => []),
     findFirst: jest.fn(async () => null),
   },
+  stockBatch: {
+    groupBy: jest.fn(async () => []),
+    findMany: jest.fn(async () => []),
+  },
   warehouseInventoryCost: {
     findMany: jest.fn(async () => [{ productId: 'product-1', totalQty: 10, totalValue: 50 }]),
     findUnique: jest.fn(async ({ where }) => where.companyId_warehouseId_productId.warehouseId === 'warehouse-1'

@@ -31,7 +31,8 @@ const { resolveOriginalUnitCost } = require("../utils/creditNoteCost");
 const { generateObjectId, toIdString } = require("../utils/objectId");
 const { writePosAuditLog, requestIp } = require('../services/posAuditService');
 
-const EBMSalesService = require("../services/ebmSalesService");
+const FiscalService = require("../services/fiscalService");
+const moduleEntitlementService = require("../services/moduleEntitlementService");
 const { emitDataChanged } = require("../lib/realtimeEvents");
 const PDFDocument = require("pdfkit");
 const EBMCode = require("../models/EBMCode");
@@ -273,12 +274,23 @@ exports.generateCreditNotePDF = async (req, res, next) => {
     if (!note) return res.status(404).json({ success: false, message: "Credit note not found" });
 
     const company = await Company.findById(companyId).lean();
-    const refundCode = note.ebm?.rfdRsnCd || note.ebm?.refundRsnCd;
+    const hasStoredFiscalData = Boolean(
+      note.ebm?.rcptNo || note.ebm?.rcptSign || note.ebm?.qrCode
+      || note.ebm?.orgRcptNo || note.ebm?.rfdRsnCd || note.ebm?.salesPayload
+      || note.ebm?.submittedAt || ['submitted', 'failed'].includes(String(note.ebm?.ebmStatus || '').toLowerCase()),
+    );
+    const ebmEnabled = note.fiscalMode == null && !hasStoredFiscalData
+      ? await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm')
+      : false;
+    const showFiscalDetails = note.fiscalMode === 'ebm'
+      || (note.fiscalMode !== 'none' && ebmEnabled)
+      || hasStoredFiscalData;
+    const refundCode = showFiscalDetails ? note.ebm?.rfdRsnCd || note.ebm?.refundRsnCd : null;
     const refundReason = refundCode
       ? await EBMCode.findOne({ company: companyId, code: refundCode, active: true }).lean()
       : null;
-    const fiscalMode = String(note.ebm?.fiscalEnvironment || note.ebm?.mode || note.ebm?.environment || '').toLowerCase();
-    const qrPng = fiscalMode === 'production' && note.ebm?.ebmStatus === 'submitted'
+    const fiscalEnvironment = String(note.ebm?.fiscalEnvironment || note.ebm?.mode || note.ebm?.environment || '').toLowerCase();
+    const qrPng = showFiscalDetails && fiscalEnvironment === 'production' && note.ebm?.ebmStatus === 'submitted'
       ? await generateQrPng(note.ebm, { width: 110 })
       : null;
     const originalInvoice = note.invoice || {};
@@ -327,8 +339,12 @@ exports.generateCreditNotePDF = async (req, res, next) => {
     doc.text(`Credit Note No: ${note.referenceNo || note.creditNoteNumber}`, 60, 170, { width: 205 });
     doc.text(`Credit Date: ${fmtDate(note.creditDate)}`, 60, 186, { width: 205 });
     doc.text(`Invoice No: ${originalInvoice.referenceNo || originalInvoice.invoiceNumber || note.relatedInvoice || "N/A"}`, 60, 202, { width: 205 });
-    doc.text(`Original RRA Receipt No: ${note.ebm?.orgRcptNo || originalInvoice.ebm?.rcptNo || "N/A"}`, 60, 218, { width: 205 });
-    doc.text(`Refund Reason: ${refundReason?.description || refundReason?.name || refundCode || note.reason}`, 60, 234, { width: 205 });
+    if (showFiscalDetails) {
+      doc.text(`Original RRA Receipt No: ${note.ebm?.orgRcptNo || originalInvoice.ebm?.rcptNo || "N/A"}`, 60, 218, { width: 205 });
+      doc.text(`Refund Reason: ${refundReason?.description || refundReason?.name || refundCode || note.reason}`, 60, 234, { width: 205 });
+    } else {
+      doc.text(`Reason: ${note.reason || "N/A"}`, 60, 218, { width: 205 });
+    }
 
     doc.rect(300, 140, 250, 112).fillAndStroke("#ffffff", "#e5e7eb");
     doc.font("Helvetica-Bold").fontSize(10).fillColor("#374151").text("CUSTOMER", 310, 150);
@@ -362,7 +378,7 @@ exports.generateCreditNotePDF = async (req, res, next) => {
       doc.text(String(index + 1), 56, y);
       doc.text(line.product?.name || line.productName || "Item", 80, y, { width: 220 });
       doc.fontSize(7).fillColor("#6b7280");
-      doc.text(`Class: ${tax.itemClassCd}  Tax Type: ${tax.taxTypeLabel}  Taxable: ${tax.taxableAmount == null ? "Not recorded" : formatRwf(-tax.taxableAmount)}`, 80, y + 12, { width: 240 });
+      doc.text(`${showFiscalDetails && tax.itemClassCd ? `Class: ${tax.itemClassCd}  ` : ''}Tax Type: ${tax.taxTypeLabel}  Taxable: ${tax.taxableAmount == null ? "Not recorded" : formatRwf(-tax.taxableAmount)}`, 80, y + 12, { width: 240 });
       doc.fontSize(9).fillColor("#111827");
       doc.text(String(line.quantity || 0), 318, y, { width: 35, align: "right" });
       doc.text(formatRwf(line.unitPrice), 365, y, { width: 70, align: "right" });
@@ -379,7 +395,7 @@ exports.generateCreditNotePDF = async (req, res, next) => {
       x: doc.page.width - 310,
       y,
       width: 260,
-      ebm: note.ebm || {},
+      ebm: showFiscalDetails ? note.ebm || {} : {},
       fallback: note.toObject ? note.toObject({ virtuals: true }) : note,
       title: "AMOUNT REFUNDED",
       negative: true,
@@ -390,14 +406,16 @@ exports.generateCreditNotePDF = async (req, res, next) => {
       doc.addPage();
       y = 70;
     }
-    drawEbmCertificationBlock(doc, {
-      y,
-      ebm: note.ebm || {},
-      qrPng,
-      title: "RRA EBM CERTIFICATION - CREDIT NOTE",
-      receiptDateFormatter: formatReceiptDate,
-      originalReceiptNo: note.ebm?.orgRcptNo || originalInvoice.ebm?.rcptNo || null,
-    });
+    if (showFiscalDetails) {
+      drawEbmCertificationBlock(doc, {
+        y,
+        ebm: note.ebm || {},
+        qrPng,
+        title: "RRA EBM CERTIFICATION - CREDIT NOTE",
+        receiptDateFormatter: formatReceiptDate,
+        originalReceiptNo: note.ebm?.orgRcptNo || originalInvoice.ebm?.rcptNo || null,
+      });
+    }
 
     doc.end();
   } catch (err) {
@@ -541,6 +559,7 @@ exports.createCreditNote = async (req, res, next) => {
 exports.approveCreditNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const ebmEnabled = await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm');
     const note = await CreditNote.findOne({
       _id: req.params.id,
       company: companyId,
@@ -552,31 +571,36 @@ exports.approveCreditNote = async (req, res, next) => {
         .status(400)
         .json({ success: false, message: "Only draft notes can be approved" });
 
-    const refundRsnCd = req.body.refundRsnCd || req.body.rfdRsnCd || note.ebm?.rfdRsnCd;
-    if (!refundRsnCd) {
-      return res.status(400).json({
-        success: false,
-        code: "ERR_EBM_REFUND_REASON_REQUIRED",
-        message: "RRA refund reason code is required before confirming this credit note.",
-      });
-    }
+    const ebmRequired = ebmEnabled && note.fiscalMode !== 'none';
+    const refundRsnCd = ebmRequired
+      ? req.body.refundRsnCd || req.body.rfdRsnCd || note.ebm?.rfdRsnCd
+      : undefined;
+    if (ebmRequired) {
+      if (!refundRsnCd) {
+        return res.status(400).json({
+          success: false,
+          code: "ERR_EBM_REFUND_REASON_REQUIRED",
+          message: "RRA refund reason code is required before confirming this credit note.",
+        });
+      }
 
-    const originalInvoiceForEbm = await Invoice.findOne({
-      _id: note.invoice,
-      company: companyId,
-    }).select("referenceNo invoiceNumber ebm");
-    if (!originalInvoiceForEbm?.ebm?.rcptNo || originalInvoiceForEbm.ebm.ebmStatus !== "submitted") {
-      return res.status(409).json({
-        success: false,
-        code: "ERR_EBM_ORIGINAL_INVOICE_NOT_SUBMITTED",
-        message: originalInvoiceForEbm?.ebm?.ebmStatus === "pending"
-          ? "Original invoice EBM submission is still pending. Wait until it is submitted before confirming this credit note."
-          : "Original invoice has not been submitted to RRA. Submit the original invoice before confirming this credit note.",
-      });
+      const originalInvoiceForEbm = await Invoice.findOne({
+        _id: note.invoice,
+        company: companyId,
+      }).select("referenceNo invoiceNumber ebm");
+      if (!originalInvoiceForEbm?.ebm?.rcptNo || originalInvoiceForEbm.ebm.ebmStatus !== "submitted") {
+        return res.status(409).json({
+          success: false,
+          code: "ERR_EBM_ORIGINAL_INVOICE_NOT_SUBMITTED",
+          message: originalInvoiceForEbm?.ebm?.ebmStatus === "pending"
+            ? "Original invoice EBM submission is still pending. Wait until it is submitted before confirming this credit note."
+            : "Original invoice has not been submitted to RRA. Submit the original invoice before confirming this credit note.",
+        });
+      }
+      note.ebm = note.ebm || {};
+      note.ebm.orgRcptNo = String(originalInvoiceForEbm.ebm.rcptNo);
+      note.ebm.rfdRsnCd = refundRsnCd;
     }
-    note.ebm = note.ebm || {};
-    note.ebm.orgRcptNo = String(originalInvoiceForEbm.ebm.rcptNo);
-    note.ebm.rfdRsnCd = refundRsnCd;
 
     const creditAmount = Number(note.totalAmount || note.grandTotal || note.total || 0);
     const creditTax = Number(note.taxAmount || note.totalTax || 0);
@@ -805,9 +829,9 @@ exports.approveCreditNote = async (req, res, next) => {
     }
 
     let responseNote = note;
-    if (journalEntry) {
+    if (journalEntry && ebmEnabled && note.fiscalMode !== 'none') {
       try {
-        responseNote = await EBMSalesService.submitCreditNote(note._id, {
+        responseNote = await FiscalService.submitCreditNote(note._id, {
           companyId,
           refundRsnCd,
           modifierUserId: req.user.id || req.user._id,
@@ -1665,7 +1689,7 @@ exports.confirmCreditNote = async (req, res, next) => {
     let v2RefundOutboxId = null;
     if (creditNote.posOrigin) {
       try {
-        preparedV2Refund = await EBMSalesService.prepareV2RefundSubmission(creditNote._id, {
+        preparedV2Refund = await FiscalService.prepareV2RefundSubmission(creditNote._id, {
           companyId,
           refundRsnCd: req.body.refundRsnCd || req.body.rfdRsnCd || creditNote.ebm?.rfdRsnCd,
           modifierUserId: req.user.id || req.user._id,
@@ -2337,7 +2361,7 @@ exports.confirmCreditNote = async (req, res, next) => {
     let responseNote = creditNote;
     if (refundRsnCd || v2RefundOutboxId) {
       try {
-        responseNote = await EBMSalesService.submitCreditNote(creditNote._id, {
+        responseNote = await FiscalService.submitCreditNote(creditNote._id, {
           companyId,
           refundRsnCd,
           modifierUserId: req.user.id || req.user._id,
@@ -2394,6 +2418,13 @@ exports.submitCreditNoteEbm = async (req, res, next) => {
     if (!note) {
       return res.status(404).json({ success: false, message: "Credit note not found" });
     }
+    if (note.fiscalMode === 'none') {
+      return res.status(409).json({
+        success: false,
+        code: 'EBM_DOCUMENT_NOT_FISCAL',
+        message: 'This credit note was created while EBM was off and cannot be submitted retroactively.',
+      });
+    }
     if (note.status !== "confirmed" && note.status !== "issued") {
       return res.status(400).json({
         success: false,
@@ -2416,7 +2447,7 @@ exports.submitCreditNoteEbm = async (req, res, next) => {
 
     let responseNote;
     try {
-      responseNote = await EBMSalesService.submitCreditNote(note._id, {
+      responseNote = await FiscalService.submitCreditNote(note._id, {
         companyId,
         refundRsnCd,
         modifierUserId: req.user.id || req.user._id,

@@ -1,8 +1,7 @@
 const EXACT_DECIMAL_FIELDS = new Set(['invcFcurAmt', 'invcFcurExcrt']);
 const NUMBER_MARKER = '__ebmJsonNumberLiteral__';
 
-/** Parse VSDC JSON without rounding import invoice currency amount/rate literals. */
-function preserveImportDecimalPrecision(raw) {
+function preserveNumberFields(raw, exactFields, preserveAll = false) {
   if (typeof raw !== 'string') return raw;
   let marked = '';
   let inString = false;
@@ -49,7 +48,7 @@ function preserveImportDecimalPrecision(raw) {
     const keys = Object.keys(value);
     if (keys.length === 1 && keys[0] === NUMBER_MARKER) {
       const literal = value[NUMBER_MARKER];
-      return EXACT_DECIMAL_FIELDS.has(parentField) ? literal : Number(literal);
+      return preserveAll || exactFields.has(parentField) ? literal : Number(literal);
     }
     return Object.fromEntries(keys.map((key) => [key, restore(value[key], key)]));
   }
@@ -57,4 +56,28 @@ function preserveImportDecimalPrecision(raw) {
   return restore(parsed);
 }
 
-module.exports = { preserveImportDecimalPrecision };
+/** Parse VSDC JSON without rounding import invoice currency amount/rate literals. */
+function preserveImportDecimalPrecision(raw) {
+  return preserveNumberFields(raw, EXACT_DECIMAL_FIELDS);
+}
+
+function preservePurchaseSelectNumberPrecision(raw) {
+  return preserveNumberFields(raw, new Set(), true);
+}
+
+function preserveStockSelectNumberPrecision(raw) {
+  return preserveNumberFields(raw, new Set(), true);
+}
+
+function preserveSaveSalesResponse(raw) {
+  return preserveNumberFields(raw, new Set([
+    'rcptNo', 'curRcptNo', 'totRcptNo', 'rptNo',
+  ]));
+}
+
+module.exports = {
+  preserveImportDecimalPrecision,
+  preservePurchaseSelectNumberPrecision,
+  preserveStockSelectNumberPrecision,
+  preserveSaveSalesResponse,
+};

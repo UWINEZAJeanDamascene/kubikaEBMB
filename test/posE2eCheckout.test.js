@@ -51,6 +51,10 @@ jest.mock('../services/ebmService', () => ({
   getConfig: jest.fn(() => ({ mode: 'mock' })),
   VSDC_ENDPOINTS: { SAVE_SALES: '/saveSales' },
 }));
+jest.mock('../services/moduleEntitlementService', () => ({
+  hasModule: jest.fn().mockResolvedValue(true),
+  getEntitlement: jest.fn().mockResolvedValue({ status: 'on', version: 1 }),
+}));
 jest.mock('../services/ebmSalesService', () => ({
   submitInvoiceAsync: jest.fn(),
   prepareV2SaleSubmission: jest.fn(),
@@ -107,6 +111,7 @@ const cacheService = require('../services/cacheService');
 const { consumeApproval } = require('../controllers/posManagerApprovalController');
 const { findClaimedRegister } = require('../services/posRegisterService');
 const { writePosAuditLog } = require('../services/posAuditService');
+const moduleEntitlementService = require('../services/moduleEntitlementService');
 const posPaymentService = require('../services/posPaymentService');
 const { dbClient } = require('../lib/prisma');
 const { createDirectSale, getCheckoutPaymentFlow } = require('../controllers/salesLegacyController');
@@ -252,6 +257,8 @@ function stubHappyPathDeps({ stockMatchedCount = 1, momoBank = null } = {}) {
 describe('POS E2E — checkout (sales-legacy)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    moduleEntitlementService.hasModule.mockResolvedValue(true);
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'on', version: 1 });
     dbClient.mockReturnValue({
       systemSettings: { findUnique: jest.fn().mockResolvedValue(null) },
       userRole: { findMany: jest.fn().mockResolvedValue([]) },
@@ -605,6 +612,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
   });
 
   test('V2 offline cash creates a pending sale with the original operation metadata', async () => {
+    moduleEntitlementService.hasModule.mockResolvedValue(false);
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 1 });
     const { db } = stubHappyPathDeps();
     process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
     const paymentService = require('../services/posPaymentService');
@@ -613,6 +622,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     const expiresAt = issuedAt + 24 * 60 * 60 * 1000;
     const snapshotId = '333333333333333333333333';
     const snapshotData = {
+      fiscalMode: 'none',
+      entitlementVersion: 1,
       products: {
         [IDS.product]: {
           name: 'Widget at snapshot',
@@ -649,6 +660,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
           warehouseId: IDS.warehouse,
           tillSessionId: IDS.till,
           snapshotData,
+          fiscalMode: 'none',
+          entitlementVersion: 1,
           queueLimit: 10000,
           expiresAt: new Date(expiresAt),
         }];
@@ -669,6 +682,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
         registerId: IDS.registerId,
         warehouseId: IDS.warehouse,
         tillSessionId: IDS.till,
+        fiscalMode: 'none',
+        entitlementVersion: 1,
         paymentFlow: 'PAYMENTS_V2',
         issuedAt,
         expiresAt,
@@ -706,6 +721,82 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     );
     expect(StockLevel.updateMany).not.toHaveBeenCalled();
     expect(JournalService.createEntriesAtomic).not.toHaveBeenCalled();
+  });
+
+  test('holds an offline sale for review when the fiscal entitlement changed after snapshot issue', async () => {
+    moduleEntitlementService.hasModule.mockResolvedValue(false);
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'on', version: 2 });
+    const { db } = stubHappyPathDeps();
+    process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
+    const issuedAt = Date.now() - 1000;
+    const expiresAt = issuedAt + 24 * 60 * 60 * 1000;
+    const snapshotId = '333333333333333333333333';
+    const snapshotData = {
+      fiscalMode: 'none',
+      entitlementVersion: 1,
+      products: {},
+    };
+    db.$transaction = jest.fn(async (callback) => callback(db));
+    db.posSyncException = {
+      upsert: jest.fn().mockResolvedValue({ id: 'sync-exception-1', status: 'open' }),
+    };
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('SELECT request_key AS')) return [];
+      if (String(sql).includes('FROM pos_offline_snapshots WHERE id =')) {
+        return [{
+          id: snapshotId,
+          warehouseId: IDS.warehouse,
+          tillSessionId: IDS.till,
+          snapshotData,
+          fiscalMode: 'none',
+          entitlementVersion: 1,
+          queueLimit: 10000,
+          expiresAt: new Date(expiresAt),
+        }];
+      }
+      return [];
+    });
+    const operationId = 'offline-operation-changed-01';
+    const body = checkoutBody({
+      offlineSnapshotCapability: issueCapability({
+        id: snapshotId,
+        companyId: IDS.company,
+        userId: IDS.cashier,
+        deviceId: IDS.deviceId,
+        registerId: IDS.registerId,
+        warehouseId: IDS.warehouse,
+        tillSessionId: IDS.till,
+        fiscalMode: 'none',
+        entitlementVersion: 1,
+        issuedAt,
+        expiresAt,
+      }),
+      offlineSaleId: operationId,
+      offlineOperationId: operationId,
+      offlineCreatedAt: new Date(issuedAt + 500).toISOString(),
+    });
+    const res = mockRes();
+
+    await createDirectSale(makeReq({ body }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({
+      code: 'POS_OFFLINE_FISCAL_ENTITLEMENT_CHANGED',
+      syncExceptionId: 'sync-exception-1',
+    });
+    expect(db.posSyncException.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      create: expect.objectContaining({
+        companyId: IDS.company,
+        deviceId: IDS.deviceId,
+        operationId,
+        errorCode: 'POS_OFFLINE_FISCAL_ENTITLEMENT_CHANGED',
+        status: 'open',
+      }),
+    }));
+    expect(Invoice.create).not.toHaveBeenCalled();
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'POS_OFFLINE_FISCAL_ENTITLEMENT_CHANGED',
+    }), db);
   });
 
   test('V2 completion reuses the pending invoice and posts revenue plus COGS in one journal entry', async () => {
@@ -1950,12 +2041,16 @@ describe('POS E2E — checkout (sales-legacy)', () => {
   });
 
   test('posts signed offline checkout against snapshot prices and records a stock conflict', async () => {
+    moduleEntitlementService.hasModule.mockResolvedValue(false);
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 1 });
     const { db } = stubHappyPathDeps();
     process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
     const issuedAt = Date.now() - 1000;
     const expiresAt = issuedAt + 24 * 60 * 60 * 1000;
     const snapshotId = '333333333333333333333333';
     const snapshotData = {
+      fiscalMode: 'none',
+      entitlementVersion: 1,
       products: {
         [IDS.product]: {
           name: 'Widget at snapshot',
@@ -1995,6 +2090,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
           warehouseId: IDS.warehouse,
           tillSessionId: IDS.till,
           snapshotData,
+          fiscalMode: 'none',
+          entitlementVersion: 1,
           queueLimit: 10000,
           expiresAt: new Date(expiresAt),
         }];
@@ -2018,7 +2115,9 @@ describe('POS E2E — checkout (sales-legacy)', () => {
         registerId: IDS.registerId,
         warehouseId: IDS.warehouse,
         tillSessionId: IDS.till,
+        fiscalMode: 'none',
         receiptNumbers: ['INV-2026-00002'],
+        entitlementVersion: 1,
         issuedAt,
         expiresAt,
       }),
@@ -2100,6 +2199,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
   });
 
   test('posts an offline batch sale against the exact signed FEFO allocation', async () => {
+    moduleEntitlementService.hasModule.mockResolvedValue(false);
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 1 });
     const { db } = stubHappyPathDeps();
     process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
     const issuedAt = Date.now() - 1000;
@@ -2107,6 +2208,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     const snapshotId = '333333333333333333333333';
     const batchId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
     const snapshotData = {
+      fiscalMode: 'none',
+      entitlementVersion: 1,
       products: {
         [IDS.product]: {
           name: 'Widget at snapshot',
@@ -2150,6 +2253,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
           warehouseId: IDS.warehouse,
           tillSessionId: IDS.till,
           snapshotData,
+          fiscalMode: 'none',
+          entitlementVersion: 1,
           queueLimit: 10000,
           expiresAt: new Date(expiresAt),
         }];
@@ -2192,6 +2297,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
         registerId: IDS.registerId,
         warehouseId: IDS.warehouse,
         tillSessionId: IDS.till,
+        fiscalMode: 'none',
+        entitlementVersion: 1,
         issuedAt,
         expiresAt,
       }),
@@ -2246,6 +2353,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
   });
 
   test('reconstructs FEFO batches for a legacy offline snapshot and audits the allocation', async () => {
+    moduleEntitlementService.hasModule.mockResolvedValue(false);
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 1 });
     const { db } = stubHappyPathDeps();
     process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
     const issuedAt = Date.now() - 1000;
@@ -2254,6 +2363,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     const batchId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
     const expiryDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
     const snapshotData = {
+      fiscalMode: 'none',
+      entitlementVersion: 1,
       products: {
         [IDS.product]: {
           name: 'Widget at snapshot',
@@ -2299,6 +2410,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
           warehouseId: IDS.warehouse,
           tillSessionId: IDS.till,
           snapshotData,
+          fiscalMode: 'none',
+          entitlementVersion: 1,
           queueLimit: 10000,
           expiresAt: new Date(expiresAt),
         }];
@@ -2340,6 +2453,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
         registerId: IDS.registerId,
         warehouseId: IDS.warehouse,
         tillSessionId: IDS.till,
+        fiscalMode: 'none',
+        entitlementVersion: 1,
         issuedAt,
         expiresAt,
       }),

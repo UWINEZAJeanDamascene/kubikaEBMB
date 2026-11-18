@@ -29,8 +29,8 @@ const { createHash, randomBytes } = require('crypto');
 const { dbClient } = require('../lib/prisma');
 const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
 const { writePosAuditLog, requestIp } = require('../services/posAuditService');
-const ebmService = require('../services/ebmService');
-const EBMSalesService = require('../services/ebmSalesService');
+const FiscalService = require('../services/fiscalService');
+const moduleEntitlementService = require('../services/moduleEntitlementService');
 const { verifyCapability: verifyPosOfflineCapability } = require('../services/posOfflineCapabilityService');
 const { shouldBlockOfflineFiscalSale } = require('../services/posOfflinePolicyService');
 const { reserveOfflineActionUsage } = require('../services/posOfflineActionUsageService');
@@ -68,6 +68,60 @@ const {
 } = require('../services/posDiscountSettingsService');
 const { buildDiscountApprovalContext } = require('../services/posDiscountApplicationService');
 const { hasPosPermission } = require('../middleware/posAuthMiddleware');
+
+async function recordOfflineFiscalSyncException({
+  companyId,
+  deviceId,
+  operationId,
+  userId,
+  registerId,
+  payload,
+  snapshotMode,
+  snapshotVersion,
+  currentMode,
+  currentVersion,
+}) {
+  const safePayload = { ...payload };
+  delete safePayload.offlineSnapshotCapability;
+  return dbClient().$transaction(async (tx) => {
+    const exception = await tx.posSyncException.upsert({
+      where: {
+        companyId_deviceId_operationId: {
+          companyId: String(companyId),
+          deviceId: String(deviceId),
+          operationId: String(operationId),
+        },
+      },
+      create: {
+        id: randomBytes(12).toString('hex'),
+        companyId: String(companyId),
+        deviceId: String(deviceId),
+        operationId: String(operationId),
+        errorCode: 'POS_OFFLINE_FISCAL_ENTITLEMENT_CHANGED',
+        message: 'The company fiscal setting changed after this offline sale was authorized. Review the sale before syncing it.',
+        operationPayload: safePayload,
+        status: 'open',
+      },
+      update: {},
+    });
+    await writePosAuditLog({
+      companyId,
+      registerId: String(registerId || ''),
+      userId: String(userId || ''),
+      event: 'POS_OFFLINE_FISCAL_ENTITLEMENT_CHANGED',
+      metadata: {
+        operationId: String(operationId),
+        syncExceptionId: exception.id,
+        snapshotMode,
+        snapshotVersion,
+        currentMode,
+        currentVersion,
+        status: exception.status,
+      },
+    }, tx);
+    return exception;
+  });
+}
 const { normalizeScannerConfiguration } = require('../services/posScannerSettingsService');
 
 async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash }) {
@@ -124,8 +178,11 @@ exports.createDirectSale = async (req, res, next) => {
     // Mock mode is intentionally manual so development/test checkouts never
     // acquire fabricated fiscal receipts. Sandbox and production POS sales
     // are submitted after the sale transaction commits.
-    const fiscalMode = String(ebmService.getConfig().mode || 'mock').toLowerCase();
-    const autoFiscalSubmission = fiscalMode !== 'mock';
+    const ebmEnabled = await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm', { useCache: false });
+    const fiscalMode = ebmEnabled
+      ? String(await FiscalService.getCurrentEnvironment(companyId) || 'mock').toLowerCase()
+      : 'none';
+    const autoFiscalSubmission = ebmEnabled && fiscalMode !== 'mock';
     const proformaDocumentId = String(req.body?.proformaDocumentId || '').trim();
     if (proformaDocumentId) {
       proformaDocument = await dbClient().posNonPostingDocument.findFirst({ where: { id: proformaDocumentId, companyId: String(companyId) } });
@@ -240,7 +297,7 @@ exports.createDirectSale = async (req, res, next) => {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_CAPABILITY_BINDING_INVALID', message: 'The signed offline POS capability does not authorize this cashier, device, register, or sale time.' });
       }
       const snapshots = await dbClient().$queryRawUnsafe(
-        'SELECT id, warehouse_id AS "warehouseId", till_session_id AS "tillSessionId", snapshot_data AS "snapshotData", queue_limit AS "queueLimit", expires_at AS "expiresAt" FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 AND user_id = $3 AND device_id = $4 AND register_id = $5 LIMIT 1',
+        'SELECT id, warehouse_id AS "warehouseId", till_session_id AS "tillSessionId", snapshot_data AS "snapshotData", fiscal_mode AS "fiscalMode", entitlement_version AS "entitlementVersion", queue_limit AS "queueLimit", expires_at AS "expiresAt" FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 AND user_id = $3 AND device_id = $4 AND register_id = $5 LIMIT 1',
         claims.id, companyId, req.user.id, req.body.deviceId, requestedRegisterId,
       );
       const snapshot = snapshots[0];
@@ -255,18 +312,58 @@ exports.createDirectSale = async (req, res, next) => {
         || new Date(snapshot.expiresAt).getTime() !== claims.expiresAt) {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_SNAPSHOT_UNAVAILABLE', message: 'The signed offline catalog snapshot is unavailable or does not match this sale.' });
       }
-      const fiscalPolicyRows = await dbClient().$queryRawUnsafe(
-        `SELECT c.ebm_enabled AS "ebmEnabled", s.pos_offline_policy AS "offlinePolicy"
-           FROM companies c LEFT JOIN system_settings s ON s.company_id = c.id
-          WHERE c.id = $1 LIMIT 1`, String(companyId),
-      );
+      const [fiscalPolicyRows, currentEntitlement] = await Promise.all([
+        dbClient().$queryRawUnsafe(
+          `SELECT s.pos_offline_policy AS "offlinePolicy"
+             FROM system_settings s
+            WHERE s.company_id = $1 LIMIT 1`, String(companyId),
+        ),
+        moduleEntitlementService.getEntitlement(companyId, 'fiscal.ebm', { useCache: false }),
+      ]);
       const fiscalPolicyRow = fiscalPolicyRows[0];
       const storedOfflinePolicy = typeof fiscalPolicyRow?.offlinePolicy === 'string'
         ? JSON.parse(fiscalPolicyRow.offlinePolicy)
         : fiscalPolicyRow?.offlinePolicy;
+      const snapshotFiscalMode = snapshot?.fiscalMode || snapshotData?.fiscalMode || null;
+      const snapshotEntitlementVersion = snapshot?.entitlementVersion == null
+        ? snapshotData?.entitlementVersion
+        : Number(snapshot.entitlementVersion);
+      const currentFiscalMode = currentEntitlement.status === 'on' ? 'ebm' : 'none';
+      const snapshotCapabilityMatches = ['none', 'ebm'].includes(snapshotFiscalMode)
+        && Number.isSafeInteger(Number(snapshotEntitlementVersion))
+        && Number(snapshotEntitlementVersion) > 0
+        && snapshot?.fiscalMode === snapshotFiscalMode
+        && Number(snapshot?.entitlementVersion) === Number(snapshotEntitlementVersion)
+        && snapshotData?.fiscalMode === snapshotFiscalMode
+        && Number(snapshotData?.entitlementVersion) === Number(snapshotEntitlementVersion)
+        && claims.fiscalMode === snapshotFiscalMode
+        && Number(claims.entitlementVersion) === Number(snapshotEntitlementVersion);
+      const fiscalCapabilityChanged = !snapshotCapabilityMatches
+        || currentFiscalMode !== snapshotFiscalMode
+        || currentEntitlement.version !== Number(snapshotEntitlementVersion);
+      if (fiscalCapabilityChanged) {
+        const syncException = await recordOfflineFiscalSyncException({
+          companyId,
+          deviceId: req.body.deviceId,
+          operationId: offlineOperationId,
+          userId: req.user.id,
+          registerId: requestedRegisterId,
+          payload: req.body,
+          snapshotMode: snapshotFiscalMode,
+          snapshotVersion: snapshotEntitlementVersion ?? null,
+          currentMode: currentFiscalMode,
+          currentVersion: currentEntitlement.version,
+        });
+        return res.status(409).json({
+          success: false,
+          code: 'POS_OFFLINE_FISCAL_ENTITLEMENT_CHANGED',
+          message: 'This offline sale needs review because the company fiscal setting changed after the snapshot was issued.',
+          syncExceptionId: syncException.id,
+        });
+      }
       if (shouldBlockOfflineFiscalSale({
-        ebmEnabled: fiscalPolicyRow?.ebmEnabled,
-        snapshotRequiresFiscalSubmission: snapshotData?.offlinePolicy?.requiresFiscalSubmission,
+        ebmEnabled: snapshotFiscalMode === 'ebm',
+        snapshotRequiresFiscalSubmission: snapshotFiscalMode === 'ebm',
         capabilityAllowsProvisionalReceipt: claims.provisionalFiscalReceiptsAllowed,
         companyAllowsProvisionalReceipt: storedOfflinePolicy?.provisionalFiscalReceiptsAllowed,
       })) {
@@ -342,6 +439,8 @@ exports.createDirectSale = async (req, res, next) => {
         claims,
         snapshotId: String(snapshot.id),
         snapshotData,
+        fiscalMode: snapshotFiscalMode,
+        entitlementVersion: Number(snapshotEntitlementVersion),
         queueLimit: Number(snapshot.queueLimit),
         offlineSaleId,
         operationId: offlineOperationId,
@@ -2356,11 +2455,12 @@ exports.createDirectSale = async (req, res, next) => {
       }
       if (offlineContext) {
         await dbClient().$executeRawUnsafe(
-          'INSERT INTO pos_offline_sales (id, company_id, snapshot_id, offline_sale_id, request_key, cashier_id, device_id, register_id, warehouse_id, invoice_id, total, payload_hash, reported_sale_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::numeric, $12, $13::timestamptz)',
+          'INSERT INTO pos_offline_sales (id, company_id, snapshot_id, offline_sale_id, request_key, cashier_id, device_id, register_id, warehouse_id, invoice_id, total, payload_hash, fiscal_mode, entitlement_version, reported_sale_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::numeric, $12, $13, $14, $15::timestamptz)',
           randomBytes(12).toString('hex'), String(companyId), offlineContext.snapshotId,
           offlineContext.offlineSaleId, requestKey || offlineContext.operationId, String(req.user.id), String(req.body.deviceId),
           String(requestedRegisterId), String(warehouseId), String(invoice._id), grandTotal,
-          payloadHash, offlineContext.saleCreatedAt,
+          payloadHash, offlineContext.fiscalMode, offlineContext.entitlementVersion,
+          offlineContext.saleCreatedAt,
         );
         const escalationAt = new Date(
           offlineContext.saleCreatedAt.getTime()
@@ -2618,7 +2718,7 @@ exports.createDirectSale = async (req, res, next) => {
           throw error;
         }
       }
-      if (req.posV2Completion && autoFiscalSubmission) {
+      if (req.posV2Completion && autoFiscalSubmission && invoice.fiscalMode !== 'none') {
         const txDb = dbClient();
         const registerId = String(claimedRegister.id);
         const shiftId = String(activePosShift.id);
@@ -2644,7 +2744,7 @@ exports.createDirectSale = async (req, res, next) => {
           let fiscalPayload = null;
           let preparationError = null;
           try {
-            const prepared = await EBMSalesService.prepareV2SaleSubmission(invoice._id, {
+            const prepared = await FiscalService.prepareV2SaleSubmission(invoice._id, {
               companyId,
               modifierUserId: posCashierId || req.user._id,
               journalLines: createdEntries[0]?.lines || journalEntries[0]?.lines || [],
@@ -2661,7 +2761,7 @@ exports.createDirectSale = async (req, res, next) => {
             ? createHash('sha256').update(JSON.stringify(payload)).digest('hex')
             : null;
           const environment = String(fiscalMode || 'sandbox');
-          const endpoint = require('../services/ebmService').VSDC_ENDPOINTS.SAVE_SALES;
+          const endpoint = await FiscalService.getSaleSubmissionEndpoint(companyId);
           const createdOutbox = await txDb.ebmSubmissionQueue.create({
             data: {
               id: outboxId,
@@ -2760,15 +2860,23 @@ exports.createDirectSale = async (req, res, next) => {
     if (autoFiscalSubmission && req.posV2Completion && fiscalOutboxId) {
       // The queue row committed with the sale. Dispatch is only a fast path;
       // database recovery can find the same durable pending row after a crash.
-      EBMSalesService.submitInvoiceAsync(invoice._id, {
-        companyId,
-        modifierUserId: posCashierId || req.user._id,
-        outboxId: fiscalOutboxId,
-      });
+      try {
+        await FiscalService.submitInvoiceAsync(invoice._id, {
+          companyId,
+          modifierUserId: posCashierId || req.user._id,
+          outboxId: fiscalOutboxId,
+        });
+      } catch (fiscalDispatchError) {
+        console.error('[createDirectSale] EBM submission dispatch failed after sale commit:', fiscalDispatchError.message);
+      }
     } else if (autoFiscalSubmission && !req.posV2Completion) {
       // Fiscal communication must not roll back a completed sale. The service
       // records failures and retryable payloads in the durable EBM queue.
-      EBMSalesService.submitInvoiceAsync(invoice._id, { companyId, modifierUserId: posCashierId || req.user._id });
+      try {
+        await FiscalService.submitInvoiceAsync(invoice._id, { companyId, modifierUserId: posCashierId || req.user._id });
+      } catch (fiscalDispatchError) {
+        console.error('[createDirectSale] EBM submission dispatch failed after sale commit:', fiscalDispatchError.message);
+      }
     }
 
     // Delivery/alert failures are isolated from the already committed sale.

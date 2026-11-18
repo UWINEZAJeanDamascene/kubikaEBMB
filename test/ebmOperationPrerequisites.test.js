@@ -22,10 +22,16 @@ jest.mock('../models/Company', () => ({
   findByIdAndUpdate: jest.fn(),
 }));
 
+jest.mock('../services/moduleEntitlementService', () => ({
+  getEntitlement: jest.fn(async () => ({ status: 'on', version: 1 })),
+  hasModule: jest.fn(async () => true),
+}));
+
 describe('EBM operation prerequisite checks', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     require('../models/Company').findById.mockResolvedValue({ _id: 'company-1', ebmEnabled: true });
+    require('../services/moduleEntitlementService').getEntitlement.mockResolvedValue({ status: 'on', version: 1 });
   });
 
   it('persists successful operation correlation and prerequisite metadata', async () => {
@@ -159,9 +165,9 @@ describe('EBM operation prerequisite checks', () => {
   });
 
   it('blocks EBM submissions while the tenant EBM setting is disabled', async () => {
-    const Company = require('../models/Company');
+    const moduleEntitlementService = require('../services/moduleEntitlementService');
     const EBMQueueService = require('../services/ebmQueueService');
-    Company.findById.mockResolvedValue({ _id: 'company-1', ebmEnabled: false, ebmToggleReason: 'Paused for maintenance.' });
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 2 });
 
     await expect(EBMQueueService.markSalesSubmissionStarted({
       companyId: 'company-1',
@@ -404,6 +410,7 @@ describe('EBM operation prerequisite checks', () => {
   it('does not submit a retry while its prerequisite is unresolved', async () => {
     jest.resetModules();
     jest.doMock('../services/ebmQueueService', () => ({
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({
         satisfied: false,
         reason: 'The required EBM operation has not been confirmed as submitted.',
@@ -436,6 +443,7 @@ describe('EBM operation prerequisite checks', () => {
   it('does not retry a queue record from a different VSDC environment', async () => {
     jest.resetModules();
     jest.doMock('../services/ebmQueueService', () => ({
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
     }));
     jest.doMock('../services/ebmService', () => ({
@@ -468,6 +476,7 @@ describe('EBM operation prerequisite checks', () => {
       data: { rcptNo: 24, rcptSign: 'signature' },
     };
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markSalesSubmissionStarted: jest.fn().mockResolvedValue({}),
       markSubmitted: jest.fn().mockResolvedValue({
@@ -530,6 +539,7 @@ describe('EBM operation prerequisite checks', () => {
   it('recovers accepted sales by dispatching stock without resubmitting sales', async () => {
     jest.resetModules();
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markSalesSourceApplied: jest.fn(),
       markSalesDependentsDispatched: jest.fn().mockResolvedValue({ dependentsDispatchedAt: new Date() }),
@@ -573,6 +583,7 @@ describe('EBM operation prerequisite checks', () => {
   it('leaves accepted-sale stock dependent pending when stock dispatch fails', async () => {
     jest.resetModules();
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markSalesDependentsDispatched: jest.fn(),
     };
@@ -615,6 +626,7 @@ describe('EBM operation prerequisite checks', () => {
     jest.resetModules();
     const acceptedResponse = { resultCd: '000', data: { rcptNo: '9001', rcptSign: 'signature' } };
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markSalesSubmissionStarted: jest.fn().mockResolvedValue({}),
       markSubmitted: jest.fn().mockRejectedValue(new Error('database write failed')),
@@ -656,6 +668,7 @@ describe('EBM operation prerequisite checks', () => {
   it('does not automatically resend a sale after an ambiguous transport failure', async () => {
     jest.resetModules();
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markSalesSubmissionStarted: jest.fn().mockResolvedValue({}),
       markSalesOutcomeUnknown: jest.fn().mockResolvedValue({ ebmStatus: 'failed' }),
@@ -697,6 +710,7 @@ describe('EBM operation prerequisite checks', () => {
   it('does not send stock master while its movement prerequisite is unresolved', async () => {
     jest.resetModules();
     jest.doMock('../services/ebmQueueService', () => ({
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({
         satisfied: false,
         reason: 'The required EBM operation has not been confirmed as submitted.',
@@ -740,6 +754,7 @@ describe('EBM operation prerequisite checks', () => {
   it('records stock-master retry success separately from stock movement status', async () => {
     jest.resetModules();
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markOperationSubmissionStarted: jest.fn().mockResolvedValue({ ebmStatus: 'submitting' }),
       markSubmitted: jest.fn().mockResolvedValue({ ebmStatus: 'submitted' }),
@@ -809,6 +824,7 @@ describe('EBM operation prerequisite checks', () => {
   it('recovers an accepted purchase confirmation locally without resubmitting it', async () => {
     jest.resetModules();
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markSourceApplied: jest.fn().mockResolvedValue({ sourceAppliedAt: new Date() }),
     };
@@ -866,6 +882,7 @@ describe('EBM operation prerequisite checks', () => {
   it('never automatically retries a remotely accepted purchase when response persistence fails', async () => {
     jest.resetModules();
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markOperationSubmissionStarted: jest.fn().mockResolvedValue({}),
       markSubmitted: jest.fn().mockResolvedValue(null),
@@ -914,6 +931,7 @@ describe('EBM operation prerequisite checks', () => {
   it('does not automatically retry a purchase confirmation with an ambiguous outcome', async () => {
     jest.resetModules();
     const queueService = {
+      getCompanyEbmSetting: jest.fn().mockResolvedValue({ enabled: true, version: 1 }),
       checkPrerequisite: jest.fn().mockResolvedValue({ satisfied: true }),
       markOperationSubmissionStarted: jest.fn().mockResolvedValue({}),
       markOperationOutcomeUnknown: jest.fn().mockResolvedValue({ ebmStatus: 'failed' }),

@@ -28,7 +28,7 @@ const STOCK_SELECT_ITEM = {
   splyAmt: '9999999999999999.99',
   totDcAmt: '9999999999999999.99',
   taxblAmt: '9999999999999999.99',
-  taxTyCd: '12345',
+  taxTyCd: 'D',
   taxAmt: '9999999999999999.99',
   totAmt: '9999999999999999.99',
 };
@@ -59,7 +59,7 @@ const STOCK_SAVE_ITEM = {
   pkg: '99999999999.99', qtyUnitCd: '12345', qty: '99999999999.99',
   itemExprDt: '20261231', prc: '9999999999999.99',
   splyAmt: '9999999999999999.99', totDcAmt: '9999999999999999.99',
-  taxblAmt: '9999999999999999.99', taxTyCd: '12345',
+  taxblAmt: '9999999999999999.99', taxTyCd: 'D',
   taxAmt: '9999999999999999.99', totAmt: '9999999999999999.99',
 };
 
@@ -67,7 +67,7 @@ const stockSavePayload = () => ({
   tin: '123456789', bhfId: '12',
   sarNo: '99999999999999999999999999999999999999',
   orgSarNo: '99999999999999999999999999999999999999',
-  regTyCd: '12345', custTin: '123456789', custNm: 'n'.repeat(100), custBhfId: '12',
+  regTyCd: 'M', custTin: '123456789', custNm: 'n'.repeat(100), custBhfId: '12',
   sarTyCd: '12345', ocrnDt: '20261231', totItemCnt: '1',
   totTaxblAmt: '9999999999999999.99', totTaxAmt: '9999999999999999.99',
   totAmt: '9999999999999999.99', remark: 'r'.repeat(400),

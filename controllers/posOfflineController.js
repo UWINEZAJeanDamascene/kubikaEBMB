@@ -14,6 +14,7 @@ const { findClaimedRegister } = require('../services/posRegisterService');
 const { runInTransaction } = require('../services/transactionService');
 const { dbClient } = require('../lib/prisma');
 const { issueCapability } = require('../services/posOfflineCapabilityService');
+const moduleEntitlementService = require('../services/moduleEntitlementService');
 const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
 const { getWarehouseTransferVisibility } = require('../services/posTransferVisibilityService');
 const { nextReferenceNo } = require('../utils/referenceNumbers');
@@ -88,11 +89,9 @@ exports.issueSnapshot = async (req, res, next) => {
       return res.status(403).json({ success: false, code: 'POS_OFFLINE_SNAPSHOT_BINDING_INVALID', message: 'The active POS session does not match this device and register.' });
     }
     const settings = await SystemSettingsService.get(companyId);
-    const fiscalCompanyRows = await dbClient().$queryRawUnsafe(
-      'SELECT ebm_enabled AS "ebmEnabled" FROM companies WHERE id = $1 LIMIT 1', companyId,
-    );
-    // Company EBM is enabled by default. Missing company data must fail closed.
-    const requiresFiscalSubmission = fiscalCompanyRows[0]?.ebmEnabled !== false;
+    const fiscalEntitlement = await moduleEntitlementService.getEntitlement(companyId, 'fiscal.ebm', { useCache: false });
+    const requiresFiscalSubmission = fiscalEntitlement.status === 'on';
+    const fiscalMode = requiresFiscalSubmission ? 'ebm' : 'none';
     const claimedRegister = await findClaimedRegister(companyId, registerId, deviceId);
     if (!claimedRegister) {
       return res.status(403).json({ success: false, code: 'POS_REGISTER_CLAIM_REQUIRED', message: 'This device is not assigned to the requested POS register.' });
@@ -291,6 +290,8 @@ exports.issueSnapshot = async (req, res, next) => {
         size: RECEIPT_BLOCK_SIZE,
       });
       snapshotData = {
+        fiscalMode,
+        entitlementVersion: fiscalEntitlement.version,
         products: productSnapshots,
         transfersByProduct: transferVisibility,
         priceListId: priceListPricing.priceListId,
@@ -325,9 +326,9 @@ exports.issueSnapshot = async (req, res, next) => {
         },
       };
       await tx.$executeRawUnsafe(
-        'INSERT INTO pos_offline_snapshots (id, company_id, user_id, device_id, register_id, warehouse_id, till_session_id, snapshot_data, queue_limit, issued_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::numeric, $10::timestamptz, $11::timestamptz)',
+        'INSERT INTO pos_offline_snapshots (id, company_id, user_id, device_id, register_id, warehouse_id, till_session_id, snapshot_data, fiscal_mode, entitlement_version, queue_limit, issued_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::numeric, $12::timestamptz, $13::timestamptz)',
         snapshotId, companyId, userId, deviceId, registerId, warehouseId, String(till._id),
-        JSON.stringify(snapshotData), queueLimit, new Date(issuedAt), new Date(expiresAt),
+        JSON.stringify(snapshotData), fiscalMode, fiscalEntitlement.version, queueLimit, new Date(issuedAt), new Date(expiresAt),
       );
     });
     const capability = issueCapability({
@@ -341,6 +342,8 @@ exports.issueSnapshot = async (req, res, next) => {
       paymentFlow,
       receiptNumbers,
       requiresFiscalSubmission,
+      fiscalMode,
+      entitlementVersion: fiscalEntitlement.version,
       provisionalFiscalReceiptsAllowed: offlinePolicy.provisionalFiscalReceiptsAllowed === true,
       issuedAt,
       expiresAt,

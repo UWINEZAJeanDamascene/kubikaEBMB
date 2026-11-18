@@ -15,6 +15,7 @@ const { requestIp, writePosAuditLog } = require('./posAuditService');
 const { lineTaxDetails, extractPayloadTotals, formatRwf, taxTypeLabel, generateQrPng } = require('../utils/pdfUtils');
 const { extractSaveSalesFiscalData } = require('../utils/vsdcPayloadSanitizer');
 const environment = require('../src/config/environment');
+const moduleEntitlementService = require('./moduleEntitlementService');
 
 const config = environment.getConfig();
 const PUBLIC_RECEIPT_NOT_FOUND = Object.assign(new Error('Receipt not found.'), { statusCode: 404, code: 'POS_PUBLIC_RECEIPT_NOT_FOUND' });
@@ -79,13 +80,14 @@ async function loadSavedReceipt(companyIdValue, invoiceIdValue) {
   }
 
   const plain = invoice.toObject({ virtuals: true });
-  const [company, settings, submission] = await Promise.all([
+  const [company, settings, submission, fiscalSnapshot] = await Promise.all([
     Company.findById(companyId).lean(),
     prisma.systemSettings.findUnique({ where: { companyId }, select: { posReceiptSettings: true } }),
     prisma.ebmSubmissionQueue.findFirst({
       where: { companyId, documentType: 'pos', documentId: invoiceId, salesTyCd: 'N', rcptTyCd: 'S' },
       orderBy: [{ signedAt: 'desc' }, { createdAt: 'desc' }],
     }),
+    moduleEntitlementService.getFiscalSnapshot(companyId),
   ]);
   const registerId = submission?.registerId || plain.posRegisterId || null;
   const register = registerId ? await prisma.posRegister.findFirst({ where: { id: registerId, companyId }, select: { name: true, branchId: true } }) : null;
@@ -93,9 +95,10 @@ async function loadSavedReceipt(companyIdValue, invoiceIdValue) {
   receiptSettings.logoUrl ||= company?.logo_url || '';
   if (receiptSettings.digitalReceiptsEnabled === false) throw PUBLIC_RECEIPT_NOT_FOUND;
 
-  const signedSubmission = Boolean(submission && submission.ebmStatus === 'submitted' && submission.signedAt);
+  const ebmEnabled = fiscalSnapshot.fiscalMode === 'ebm';
+  const signedSubmission = ebmEnabled && Boolean(submission && submission.ebmStatus === 'submitted' && submission.signedAt);
   const legacyFiscalStatus = String(plain.ebm?.ebmStatus || '').toLowerCase();
-  const useLegacyFiscalData = !submission && ['submitted', 'success'].includes(legacyFiscalStatus);
+  const useLegacyFiscalData = ebmEnabled && !submission && ['submitted', 'success'].includes(legacyFiscalStatus);
   const ebm = signedSubmission ? (() => {
     const signed = extractSaveSalesFiscalData(submission.fiscalResponse);
     return {

@@ -8,8 +8,10 @@ const posFiscalReconciliationController = require('../controllers/posFiscalRecon
 const posEbmManagerController = require('../controllers/posEbmManagerController');
 const posManagerApprovalController = require('../controllers/posManagerApprovalController');
 const { protect } = require('../middleware/auth');
+const requirePlatformAdmin = require('../middleware/requirePlatformAdmin');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const { attachCompanyId } = require('../middleware/companyContext');
+const requireModule = require('../middleware/requireModule');
 const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
 const { cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
@@ -18,16 +20,28 @@ const invalidateWarehouses = cacheInvalidationMiddleware({ type: 'warehouse', in
 
 router.use(protect);
 
-function requirePlatformAdmin(req, res, next) {
-  if (req.user?.role !== 'platform_admin') {
-    return res.status(403).json({
-      success: false,
-      code: 'EBM_PLATFORM_ADMIN_REQUIRED',
-      message: 'Only a platform administrator can manage platform-wide EBM settings.',
-    });
-  }
-  return next();
+const sandboxSetupRoutes = new Set([
+  'GET /operations',
+  'GET /devices',
+  'GET /readiness',
+  'GET /codes/status',
+  'GET /branches/reconciliation',
+  'GET /codes',
+  'GET /codes/item-classes',
+  'GET /codes/tins',
+  'GET /branches/insurance/status',
+  'POST /codes/sync',
+  'POST /devices/initialize',
+  'POST /branches/register',
+  'POST /branches/insurance/submit',
+]);
+
+function isSandboxSetupRoute(req) {
+  return sandboxSetupRoutes.has(`${req.method} ${req.path}`);
 }
+
+const requireEbmEnabled = requireModule('fiscal.ebm');
+const requireSandboxSetupAccess = requireModule('fiscal.ebm', { allowSandboxWhenOff: true });
 
 function validateRraBranchIdBody() {
   return [
@@ -62,7 +76,7 @@ router.patch('/platform/company/:companyId/setting',
   requirePlatformAdmin,
   param('companyId').isMongoId().withMessage('Invalid company ID'),
   body('enabled').isBoolean().withMessage('enabled is required and must be a boolean'),
-  body('reason').optional({ nullable: true }).isString().trim().isLength({ min: 1, max: 500 }).withMessage('reason must be 1-500 chars when supplied'),
+  body('reason').isString().trim().isLength({ min: 1, max: 500 }).withMessage('reason is required and must be 1-500 chars'),
   validateRequest,
   stripUnvalidatedBody,
   ebmController.updateCompanyEbmSetting,
@@ -88,6 +102,10 @@ router.patch('/platform/company/:companyId/rra-approval',
 );
 
 router.use(attachCompanyId);
+router.use((req, res, next) => {
+  const gate = isSandboxSetupRoute(req) ? requireSandboxSetupAccess : requireEbmEnabled;
+  return gate(req, res, next);
+});
 
 router.get('/operations', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getOperationCatalog);
 router.get('/devices', requirePermissionOrRoles('ebm', 'read', ['admin', 'stock_manager']), ebmController.getDeviceStatus);
@@ -353,3 +371,4 @@ router.post(
 );
 
 module.exports = router;
+module.exports.__test__ = { isSandboxSetupRoute };

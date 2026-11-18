@@ -12,7 +12,7 @@ const TaxAutomationService = require('./taxAutomationService');
 const warehouseService = require('./warehouseService');
 const stockValidationService = require('./stockValidationService');
 const cacheService = require('./cacheService');
-const EBMSalesService = require('./ebmSalesService');
+const FiscalService = require('./fiscalService');
 const { prisma } = require('../lib/prisma');
 const { resolveCogsUnitCost } = require('../utils/productCost');
 const { notifyPaymentReceived } = require('./notificationHelper');
@@ -316,7 +316,7 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
 
   if (!submitEbm) return invoice;
   try {
-    return await EBMSalesService.submitInvoice(invoice._id, { companyId, modifierUserId: userId });
+    return await FiscalService.submitInvoice(invoice._id, { companyId, modifierUserId: userId });
   } catch (error) {
     console.error('EBM sales submission failed after invoice confirmation:', error.message);
     return error.invoice || Invoice.findOne({ _id: invoice._id, company: companyId })

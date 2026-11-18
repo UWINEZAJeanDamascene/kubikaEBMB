@@ -595,6 +595,8 @@ model PosOfflineSnapshot {
   warehouseId   String                  @map("warehouse_id") @db.Char(24)
   tillSessionId String                  @map("till_session_id") @db.Char(24)
   snapshotData  Json                    @map("snapshot_data")
+  fiscalMode    String?                 @map("fiscal_mode") @db.VarChar(8)
+  entitlementVersion Int?               @map("entitlement_version")
   queueLimit    Decimal                 @map("queue_limit") @db.Decimal(19, 2)
   usedValue     Decimal                 @default(0) @map("used_value") @db.Decimal(19, 2)
   issuedAt      DateTime                @map("issued_at") @db.Timestamptz(3)
@@ -637,6 +639,8 @@ model PosOfflineSale {
   invoiceId      String   @map("invoice_id") @db.Char(24)
   total          Decimal  @db.Decimal(19, 2)
   payloadHash    String   @map("payload_hash") @db.Char(64)
+  fiscalMode     String?  @map("fiscal_mode") @db.VarChar(8)
+  entitlementVersion Int? @map("entitlement_version")
   reportedSaleAt DateTime @map("reported_sale_at") @db.Timestamptz(3)
   syncedAt       DateTime @default(now()) @map("synced_at") @db.Timestamptz(3)
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -857,6 +861,7 @@ model Company {
   email                       String?
   phone                       String?
   website                     String?
+  timezone                    String?                     @db.VarChar(64)
   address                     Json                        @default("{}")
   logoUrl                     String?                     @map("logo_url")
   baseCurrency                String                      @default("RWF") @map("base_currency")
@@ -878,7 +883,7 @@ model Company {
   featureAccess               Json                        @default("{}") @map("feature_access")
   subscriptionModules         String[]                    @default([]) @map("subscription_modules")
   platformNotes               String                      @default("") @map("platform_notes")
-  ebmEnabled                  Boolean                     @default(true) @map("ebm_enabled")
+  ebmEnabled                  Boolean                     @default(false) @map("ebm_enabled")
   ebmToggleReason             String?                     @map("ebm_toggle_reason")
   ebmToggleChangedAt          DateTime?                   @map("ebm_toggle_changed_at") @db.Timestamptz(3)
   ebmToggleChangedBy          String?                     @map("ebm_toggle_changed_by") @db.Char(24)
@@ -1058,6 +1063,8 @@ model Company {
   timesheets                  Timesheet[]
   users                       User[]
   warehouses                  Warehouse[]
+  moduleEntitlements          CompanyModuleEntitlement[]
+  platformModuleAuditLogs     PlatformModuleAuditLog[]
 
   @@index([isActive])
   @@map("companies")
@@ -1158,6 +1165,8 @@ model User {
   createdBy                   User?                      @relation("UserCreatedBy", fields: [createdById], references: [id])
   createdUsers                User[]                     @relation("UserCreatedBy")
   projectMemberships          ProjectMember[]
+  changedModuleEntitlements   CompanyModuleEntitlement[] @relation("CompanyModuleEntitlementChangedBy")
+  platformModuleAuditLogs     PlatformModuleAuditLog[]   @relation("PlatformModuleAuditActor")
 
   @@unique([companyId, email])
   @@index([email])
@@ -1326,6 +1335,52 @@ model AuditLog {
   @@index([companyId, entityType, entityId])
   @@index([companyId, action])
   @@map("audit_logs")
+}
+
+model CompanyModuleEntitlement {
+  id                   String    @id @db.Char(24)
+  companyId            String    @map("company_id") @db.Char(24)
+  moduleCode           String    @map("module_code") @db.VarChar(80)
+  status               String    @db.VarChar(8)
+  changedById          String?   @map("changed_by") @db.Char(24)
+  reason               String
+  effectiveAt          DateTime  @map("effective_at") @db.Timestamptz(3)
+  version              Int       @default(1)
+  pendingStatus        String?   @map("pending_status") @db.VarChar(8)
+  pendingEffectiveAt   DateTime? @map("pending_effective_at") @db.Timestamptz(3)
+  pendingCorrelationId String?   @map("pending_correlation_id") @db.Uuid
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company              Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  changedBy            User?     @relation("CompanyModuleEntitlementChangedBy", fields: [changedById], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, moduleCode], map: "company_module_entitlements_company_module_key")
+  @@index([companyId, status], map: "company_module_entitlements_company_status_idx")
+  @@index([moduleCode, status], map: "company_module_entitlements_module_status_idx")
+  @@index([moduleCode, pendingStatus, pendingEffectiveAt], map: "company_module_entitlements_pending_idx")
+  @@map("company_module_entitlements")
+}
+
+model PlatformModuleAuditLog {
+  id            String    @id @db.Char(24)
+  companyId     String    @map("company_id") @db.Char(24)
+  moduleCode    String    @map("module_code") @db.VarChar(80)
+  actorUserId   String    @map("actor_user_id") @db.Char(24)
+  eventType     String    @map("event_type") @db.VarChar(32)
+  oldStatus     String?   @map("old_status") @db.VarChar(8)
+  newStatus     String?   @map("new_status") @db.VarChar(8)
+  reason        String
+  result        String    @db.VarChar(32)
+  correlationId String    @map("correlation_id") @db.Uuid
+  effectiveAt   DateTime? @map("effective_at") @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  company       Company   @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  actor         User      @relation("PlatformModuleAuditActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  @@index([companyId, moduleCode, createdAt], map: "platform_module_audit_company_module_created_idx")
+  @@index([actorUserId, createdAt], map: "platform_module_audit_actor_created_idx")
+  @@index([correlationId], map: "platform_module_audit_correlation_idx")
+  @@map("platform_module_audit_logs")
 }
 
 /// Cashier till sessions: the POS/direct-sale flow refuses to record a sale
@@ -3018,6 +3073,8 @@ model StockMovement {
   performedById        String?             @map("performed_by") @db.Char(24)
   movementDate         DateTime            @default(now()) @map("movement_date") @db.Timestamptz(3)
   ebm                  Json                @default("{}")
+  fiscalMode           String?             @map("fiscal_mode") @db.VarChar(8)
+  fiscalStatus         String?             @map("fiscal_status") @db.VarChar(32)
   createdAt            DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt            DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
   company              Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
@@ -3120,6 +3177,8 @@ model StockTransfer {
   signatures        Json                       @default("[]")
   journalEntryId    String?                    @map("journal_entry_id") @db.Char(24)
   ebm               Json                       @default("{}")
+  fiscalMode        String?                  @map("fiscal_mode") @db.VarChar(8)
+  fiscalStatus      String?                  @map("fiscal_status") @db.VarChar(32)
   createdById       String?                    @map("created_by") @db.Char(24)
   createdAt         DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt         DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -3663,6 +3722,8 @@ model Invoice {
   posPromotion             Json?                    @map("pos_promotion")
   posPricingSnapshot       Json?                    @map("pos_pricing_snapshot")
   ebm                      Json                     @default("{}")
+  fiscalMode               String?                  @map("fiscal_mode") @db.VarChar(8)
+  fiscalStatus             String?                  @map("fiscal_status") @db.VarChar(32)
   terms                    String?
   notes                    String?
   createdById              String?                  @map("created_by") @db.Char(24)
@@ -3787,6 +3848,8 @@ model CreditNote {
   stockReversed                Boolean          @default(false) @map("stock_reversed")
   payments                     Json             @default("[]")
   ebm                          Json             @default("{}")
+  fiscalMode                   String?          @map("fiscal_mode") @db.VarChar(8)
+  fiscalStatus                 String?          @map("fiscal_status") @db.VarChar(32)
   createdById                  String?          @map("created_by") @db.Char(24)
   confirmedById                String?          @map("confirmed_by") @db.Char(24)
   confirmedAt                  DateTime?        @map("confirmed_at") @db.Timestamptz(3)
@@ -4148,6 +4211,8 @@ model PurchaseOrder {
   payments             Json                @default("[]")
   freight              Json                @default("{}")
   ebm                  Json                @default("{}")
+  fiscalMode           String?             @map("fiscal_mode") @db.VarChar(8)
+  fiscalStatus         String?             @map("fiscal_status") @db.VarChar(32)
   notes                String?
   approvedById         String?             @map("approved_by") @db.Char(24)
   approvedAt           DateTime?           @map("approved_at") @db.Timestamptz(3)
@@ -4205,6 +4270,8 @@ model Purchase {
   purchaseDate          DateTime         @default(now()) @map("purchase_date") @db.Timestamptz(3)
   stockAdded            Boolean          @default(false) @map("stock_added")
   ebm                   Json             @default("{}")
+  fiscalMode            String?          @map("fiscal_mode") @db.VarChar(8)
+  fiscalStatus          String?          @map("fiscal_status") @db.VarChar(32)
   supplierSnapshot      Json             @default("{}") @map("supplier_snapshot")
   createdById           String?          @map("created_by") @db.Char(24)
   createdAt             DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -4257,6 +4324,8 @@ model GoodsReceivedNote {
   journalEntryId     String?               @map("journal_entry_id") @db.Char(24)
   freight            Json                  @default("{}")
   ebm                Json                  @default("{}")
+  fiscalMode         String?               @map("fiscal_mode") @db.VarChar(8)
+  fiscalStatus       String?               @map("fiscal_status") @db.VarChar(32)
   ebmImportReference String?               @map("ebm_import_reference")
   createdById        String?               @map("created_by") @db.Char(24)
   confirmedById      String?               @map("confirmed_by") @db.Char(24)

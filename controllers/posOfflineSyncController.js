@@ -36,6 +36,14 @@ const RETRYABLE_REVIEW_ERRORS = new Set([
 ]);
 const OFFLINE_RECEIPT_NUMBER_PATTERN = /^[A-Z]{2,8}-\d{4}-\d{5,}$/;
 
+function withoutOfflineCapabilities(value) {
+  if (Array.isArray(value)) return value.map(withoutOfflineCapabilities);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => key !== 'offlineSnapshotCapability')
+    .map(([key, child]) => [key, withoutOfflineCapabilities(child)]));
+}
+
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === 'object') {
@@ -568,6 +576,7 @@ async function persistOutcome(companyId, deviceId, operationId, outcome) {
     code: outcome.code,
     message: outcome.message,
   });
+  const operationPayload = outcome.success ? null : withoutOfflineCapabilities(outcome.payload);
   if (outcome.success) {
     await dbClient().$executeRawUnsafe(
       `UPDATE pos_sync_exceptions
@@ -607,7 +616,7 @@ async function persistOutcome(companyId, deviceId, operationId, outcome) {
       operationId,
       outcome.code,
       outcome.message,
-      JSON.stringify(outcome.payload),
+      JSON.stringify(operationPayload),
     );
   }
 }
@@ -627,7 +636,9 @@ async function quarantineOperation(companyId, deviceId, operation, code, message
     operationId,
     code,
     message,
-    JSON.stringify(operation && typeof operation === 'object' ? operation : { value: operation }),
+    JSON.stringify(withoutOfflineCapabilities(
+      operation && typeof operation === 'object' ? operation : { value: operation },
+    )),
   );
 }
 

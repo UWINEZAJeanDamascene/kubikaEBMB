@@ -10,6 +10,7 @@ const PurchaseOrder = require('../models/PurchaseOrder');
 const Purchase = require('../models/Purchase');
 const Supplier = require('../models/Supplier');
 const ebmService = require('./ebmService');
+const moduleEntitlementService = require('./moduleEntitlementService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
 const EBMQueueService = require('./ebmQueueService');
 const { formatVsdcDate, formatVsdcDateTime, VSDC_ENDPOINTS } = require('./ebmService');
@@ -18,6 +19,7 @@ const { toVsdcFiscalNumber, buildPurchaseSaveRequest } = require('../utils/vsdcP
 const { EBM_SYNC_TYPES } = require('../constants/ebmSyncTypes');
 const { assertHeadOfficeOperation } = require('./ebmOperationPolicy');
 const { EBM_SEQUENCE_TYPES, allocate: allocateFiscalSequence } = require('./ebmFiscalSequenceService');
+const { isExplicitlyNonFiscal } = require('../utils/fiscalDocumentSnapshot');
 
 const FIRST_SYNC_DT = '20000101000000';
 const SYNC_TYPE = EBM_SYNC_TYPES.PURCHASE_SALES;
@@ -698,6 +700,7 @@ async function applyAcceptedPurchaseConfirmation(doc, payload, response, queueRe
 
 async function confirmMatchedDocument(doc, type, branchId = null, operator = null) {
   if (!doc || doc.ebm?.ebmPurchaseMatchStatus !== 'matched') return doc;
+  if (isExplicitlyNonFiscal(doc)) return doc;
   const resolvedBranchId = assertHeadOfficeOperation('EBM purchase confirmation', branchId || await resolveBranchIdForDocument(doc, doc.company));
   const queueIdentity = {
     companyId: doc.company,
@@ -997,6 +1000,7 @@ class EBMPurchaseService {
     }).lean();
     const summary = [];
     for (const device of devices) {
+      if (!await moduleEntitlementService.hasModule(device.company, 'fiscal.ebm')) continue;
       const state = await EBMSyncState.findOne({
         company: device.company,
         branchId: device.branchId,

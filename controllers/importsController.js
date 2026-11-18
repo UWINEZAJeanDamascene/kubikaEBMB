@@ -3,7 +3,6 @@ const fs = require('fs');
 const multer = require('multer');
 const ImportTemplate = require('../models/ImportTemplate');
 const ImportLog = require('../models/ImportLog');
-const { listEntityDefinitions } = require('../services/importDefinitions');
 const ImportService = require('../services/universalImportService');
 const ImportQueue = require('../services/importQueueService');
 const PurchaseOcrService = require('../services/purchaseOcrService');
@@ -41,16 +40,28 @@ function userId(req) {
 }
 
 function sendError(res, error) {
-  return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  return res.status(error.statusCode || 500).json({
+    success: false,
+    ...(error.code ? { code: error.code } : {}),
+    message: error.message,
+  });
 }
 
 exports.getEntityTypes = async (req, res) => {
-  res.json({ success: true, data: listEntityDefinitions() });
+  try {
+    res.json({ success: true, ...(await ImportService.getImportEntityTypes(companyId(req))) });
+  } catch (error) {
+    sendError(res, error);
+  }
 };
 
 exports.parseHeaders = async (req, res) => {
   try {
-    const parsed = await ImportService.parseHeaders(req.file, req.body.entityType || req.query.entityType);
+    const parsed = await ImportService.parseHeaders(
+      req.file,
+      req.body.entityType || req.query.entityType,
+      companyId(req),
+    );
     const templates = await ImportTemplate.find({ companyId: companyId(req), entityType: req.body.entityType || req.query.entityType })
       .sort({ lastUsedAt: -1, createdAt: -1 })
       .limit(5)
@@ -109,7 +120,8 @@ exports.validate = async (req, res) => {
       mapping: columnMapping,
       rows: req.body.rows,
       file: req.file,
-      companyId: companyId(req)
+      companyId: companyId(req),
+      expectedFiscalEntitlementVersion: req.body.fiscalEntitlementVersion,
     });
     res.json({ success: true, data: validation });
   } catch (error) {
@@ -120,12 +132,53 @@ exports.validate = async (req, res) => {
 exports.process = async (req, res) => {
   try {
     const company = companyId(req);
+    let rows = req.body.rows || [];
+    let fiscalImportContext = null;
+    if (req.body.entityType === 'products') {
+      if (!Array.isArray(rows) || !rows.length || !req.body.columnMapping || typeof req.body.columnMapping !== 'object') {
+        return res.status(400).json({
+          success: false,
+          code: 'PRODUCT_IMPORT_SOURCE_REQUIRED',
+          message: 'Revalidate the product file before importing.',
+        });
+      }
+      const sourceRows = rows.map((row) => row?.source);
+      if (sourceRows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
+        return res.status(400).json({
+          success: false,
+          code: 'PRODUCT_IMPORT_SOURCE_INVALID',
+          message: 'The validated product rows are incomplete. Upload and validate the file again.',
+        });
+      }
+      const revalidated = await ImportService.validateImport({
+        entityType: 'products',
+        mapping: req.body.columnMapping,
+        rows: sourceRows,
+        companyId: company,
+        expectedFiscalEntitlementVersion: req.body.fiscalEntitlementVersion,
+        rowNumbers: rows.map((row) => row.rowNumber),
+      });
+      if (revalidated.errorRows > 0) {
+        return res.status(422).json({
+          success: false,
+          code: 'PRODUCT_IMPORT_REVALIDATION_FAILED',
+          message: 'Product data changed or no longer satisfies the current import rules. Review the validation results and retry.',
+          data: revalidated,
+        });
+      }
+      rows = revalidated.rows;
+      fiscalImportContext = {
+        fiscalEbmEnabled: revalidated.fiscalEbmEnabled,
+        fiscalEntitlementVersion: revalidated.fiscalEntitlementVersion,
+      };
+    }
+
     const log = await ImportLog.create({
       companyId: company,
       entityType: req.body.entityType,
       importedBy: userId(req),
       fileName: req.body.fileName || 'uploaded-file',
-      totalRows: Array.isArray(req.body.rows) ? req.body.rows.length : 0,
+      totalRows: Array.isArray(rows) ? rows.length : 0,
       templateUsed: req.body.templateId || null,
       status: 'pending'
     });
@@ -142,8 +195,9 @@ exports.process = async (req, res) => {
       entityType: req.body.entityType,
       companyId: company,
       userId: userId(req),
-      rows: req.body.rows || [],
-      duplicateAction: req.body.duplicateAction || 'skip'
+      rows,
+      duplicateAction: req.body.duplicateAction || 'skip',
+      ...(fiscalImportContext || {}),
     });
     res.status(202).json({ success: true, data: { jobId: job.jobId, logId: log._id, backend: job.backend } });
   } catch (error) {
@@ -227,7 +281,11 @@ exports.downloadResultsReport = async (req, res) => {
 
 exports.downloadTemplate = async (req, res) => {
   try {
-    const buffer = await ImportService.generateTemplate(req.params.entityType, companyId(req));
+    const buffer = await ImportService.generateTemplate(
+      req.params.entityType,
+      companyId(req),
+      req.query.fiscalEntitlementVersion,
+    );
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${req.params.entityType}_import_template.xlsx"`);
     res.send(Buffer.from(buffer));

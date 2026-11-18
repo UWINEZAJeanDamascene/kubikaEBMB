@@ -20,6 +20,7 @@ const {
   sendInvoiceEmail
 } = require('../controllers/invoiceController');
 const { protect } = require('../middleware/auth');
+const requireModule = require('../middleware/requireModule');
 const { requirePermission } = require('../middleware/rbacMiddleware');
 const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
 const Invoice = require('../models/Invoice');
@@ -52,8 +53,10 @@ router.route('/:id')
 router.put('/:id/confirm', requirePermission('sales_invoices', 'approve'), logAction('invoice'), confirmInvoice);
 router.put('/:id/correct-tax-from-delivery-note', requirePermission('sales_invoices', 'update'), logAction('invoice'), correctInvoiceTaxFromDeliveryNote);
 
-router.post('/:id/ebm/verify-tin', requirePermission('sales_invoices', 'update'), verifyInvoiceCustomerTin);
-router.post('/:id/ebm/submit', requirePermission('sales_invoices', 'update'), logAction('invoice'), submitInvoiceEbm);
+router.post('/:id/ebm/verify-tin', requireModule('fiscal.ebm'), requirePermission('sales_invoices', 'update'), verifyInvoiceCustomerTin);
+router.post('/:id/ebm/submit', requireModule('fiscal.ebm', {
+  allowSandboxWhenOff: (req) => req.body?.sandboxTest === true,
+}), requirePermission('sales_invoices', 'update'), logAction('invoice'), submitInvoiceEbm);
 // Record payment
 router.post('/:id/payment', requirePermission('ar_receipts', 'create'), logAction('invoice'), recordPayment);
 

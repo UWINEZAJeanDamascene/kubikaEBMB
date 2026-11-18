@@ -19,8 +19,7 @@ const TaxAutomationService = require("../services/taxAutomationService");
 const transactionService = require("../services/transactionService");
 const cacheService = require("../services/cacheService");
 const emailService = require("../services/emailService");
-const EBMPurchaseService = require("../services/ebmPurchaseService");
-const EBMStockService = require("../services/ebmStockService");
+const FiscalService = require("../services/fiscalService");
 const DEFAULT_ACCOUNTS =
   require("../constants/chartOfAccounts").DEFAULT_ACCOUNTS;
 const StockLevel = require("../models/StockLevel");
@@ -1135,12 +1134,12 @@ exports.confirmGRN = async (req, res, next) => {
           company: companyId,
         });
         if (poForEbm) {
-          const processedPo = await EBMPurchaseService.processPurchaseDocument(companyId, poForEbm, "PurchaseOrder", {
+          const processedPo = await FiscalService.processPurchaseDocument(companyId, poForEbm, "PurchaseOrder", {
             branchId: req.body.branchId || req.body.bhfId,
             operator: { id: req.user?._id || req.user?.id, name: req.user?.name },
           });
           if (processedPo?.ebm?.ebmStatus !== "failed") {
-            await EBMStockService.submitStockForGRN(result._id, {
+            await FiscalService.submitStockForGRN(result._id, {
               companyId,
               branchId: req.body.branchId || req.body.bhfId,
             });

@@ -21,6 +21,7 @@ const EBMQueueService = require("./ebmQueueService");
 const EBMFiscalSequenceService = require("./ebmFiscalSequenceService");
 const EBMTinService = require("./ebmCustomerTinService");
 const { extractSaveSalesFiscalData, mapVsdcErrorCode, sanitizeForEndpoint } = require("../utils/vsdcPayloadSanitizer");
+const { isExplicitlyNonFiscal } = require('../utils/fiscalDocumentSnapshot');
 const { formatVsdcDate, VSDC_ENDPOINTS } = require("./ebmService");
 const { getPosEbmSettings } = require('./posEbmSettingsService');
 const { getActiveTx } = require('../lib/txContext');
@@ -1011,6 +1012,9 @@ async function prepareV2SaleSubmission(invoiceId, {
   const invoice = await Invoice.findOne({ _id: invoiceId, company: companyId })
     .populate('client').populate('deliveryNote').populate('lines.product').populate('createdBy');
   if (!invoice) throw sourceFieldError('EBM_INVOICE_NOT_FOUND', 'The completed sale could not be loaded for fiscal preparation.');
+  if (isExplicitlyNonFiscal(invoice)) {
+    throw sourceFieldError('EBM_DOCUMENT_NOT_FISCAL', 'This sale was created while EBM was off and cannot be submitted retroactively.');
+  }
   await EBMQueueService.assertEbmEnabled(companyId, { operationName: 'Fiscal sale submission' });
   const company = await Company.findById(companyId).lean();
   if (!company) throw sourceFieldError('EBM_COMPANY_NOT_FOUND', 'The company could not be loaded for fiscal preparation.');
@@ -1220,7 +1224,7 @@ async function submitPreparedV2RefundOutbox(note, companyId, outbox) {
   }
 }
 
-async function applyResolvedV2Receipt(invoiceId, companyId, outboxId) {
+async function applyResolvedV2Receipt(invoiceId, companyId, outboxId, { sourceOnly = false } = {}) {
   const db = require('../lib/prisma').prisma;
   const outbox = await db.ebmSubmissionQueue.findFirst({ where: { id: String(outboxId), companyId: String(companyId), documentId: String(invoiceId), signedAt: { not: null } } });
   if (!outbox?.fiscalResponse) throw sourceFieldError('EBM_V2_SIGNED_RESPONSE_MISSING', 'The signed receipt data is not available for the sale.');
@@ -1231,12 +1235,14 @@ async function applyResolvedV2Receipt(invoiceId, companyId, outboxId) {
     });
     const note = await CreditNote.findOne({ _id: String(invoiceId), company: String(companyId) }).populate('invoice client lines.product items.product');
     if (!note) throw sourceFieldError('EBM_V2_REFUND_NOTE_MISSING', 'The credit note for this fiscal refund could not be found.');
+    if (isExplicitlyNonFiscal(note)) return note;
     let applied = note;
     if (!outbox.sourceAppliedAt) {
       applied = await applyCreditNoteSuccess(invoiceId, companyId, outbox.fiscalResponse, outbox.payload);
       if (!applied) throw sourceFieldError('EBM_V2_SOURCE_RECOVERY_FAILED', 'The signed fiscal refund could not be applied to the credit note.');
       await db.ebmSubmissionQueue.updateMany({ where: { id: String(outbox.id), companyId: String(companyId), signedAt: { not: null }, sourceAppliedAt: null }, data: { sourceAppliedAt: new Date() } });
     }
+    if (sourceOnly) return applied;
     if (!outbox.dependentsDispatchedAt) {
       const stockResult = await require('./ebmStockService').submitStockForCreditNote(invoiceId, { companyId, branchId: outbox.payload?.bhfId });
       assertStockDependentAccepted(stockResult, 'Credit-note');
@@ -1249,6 +1255,9 @@ async function applyResolvedV2Receipt(invoiceId, companyId, outboxId) {
     companyId, documentType: 'pos', documentId: invoiceId, endpoint: outbox.endpoint,
     operationKey: outbox.operationKey || 'default', environment: outbox.environment,
   };
+  const sourceInvoice = await Invoice.findOne({ _id: invoiceId, company: String(companyId) });
+  if (!sourceInvoice) throw sourceFieldError('EBM_V2_SOURCE_INVOICE_MISSING', 'The sale for this fiscal receipt could not be found.');
+  if (isExplicitlyNonFiscal(sourceInvoice)) return sourceInvoice;
   if (!outbox.sourceAppliedAt) {
     applied = await applySuccess(invoiceId, companyId, outbox.fiscalResponse, outbox.payload);
     if (!applied) throw sourceFieldError('EBM_V2_SOURCE_RECOVERY_FAILED', 'The signed receipt could not be applied to the sale record.');
@@ -1259,8 +1268,9 @@ async function applyResolvedV2Receipt(invoiceId, companyId, outboxId) {
     fiscalQueueStatus: 'submitted', fiscalDataSource: outbox.fiscalDataSource,
     fiscalLastError: null, fiscalLastErrorCode: null,
   });
+  if (sourceOnly) return applied || Invoice.findOne({ _id: invoiceId, company: companyId });
   if (!outbox.dependentsDispatchedAt) {
-    const invoice = applied || await Invoice.findOne({ _id: invoiceId, company: companyId });
+    const invoice = applied || sourceInvoice;
     const branch = await resolveBranch(invoice, companyId);
     const stockResult = await require('./ebmStockService').submitStockForInvoice(invoiceId, { companyId, branchId: branch.rraBranchId });
     assertStockDependentAccepted(stockResult, 'Invoice');
@@ -1313,6 +1323,7 @@ async function prepareV2RefundSubmission(noteId, { companyId, refundRsnCd = null
   const note = await CreditNote.findOne({ _id: String(noteId), company: String(companyId) })
     .populate('invoice client lines.product items.product createdBy');
   if (!note || !note.posOrigin) return null;
+  if (isExplicitlyNonFiscal(note)) return null;
   const invoiceId = String(note.invoice?._id || note.invoice || '');
   const originalSubmission = await db.ebmSubmissionQueue.findFirst({
     where: {
@@ -1638,6 +1649,7 @@ async function submitCreditNote(
     error.retryable = false;
     throw error;
   }
+  if (isExplicitlyNonFiscal(note)) return note;
   if (outboxId) {
     const db = require('../lib/prisma').prisma;
     const outbox = await db.ebmSubmissionQueue.findFirst({ where: {
@@ -1835,7 +1847,7 @@ async function submitCreditNote(
   }
 }
 
-async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserAcceptance = null, modifierUserId = null, outboxId = null } = {}) {
+async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserAcceptance = null, modifierUserId = null, outboxId = null, allowSandboxWhileOff = false } = {}) {
   if (!companyId) {
     const error = new Error('Authenticated company context is required for fiscal sales submission.');
     error.code = 'EBM_COMPANY_CONTEXT_REQUIRED';
@@ -1854,6 +1866,8 @@ async function submitInvoice(invoiceId, { companyId, branchId = null, purchaserA
     error.retryable = false;
     throw error;
   }
+  if (isExplicitlyNonFiscal(invoice)
+    && !(allowSandboxWhileOff === true && ebmService.isSandboxMode())) return invoice;
 
   if (!outboxId && invoice.ebm?.ebmStatus === "submitted") return invoice;
   if (purchaserAcceptance !== null && !['Y', 'N'].includes(String(purchaserAcceptance).trim().toUpperCase())) {

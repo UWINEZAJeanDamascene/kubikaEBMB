@@ -19,6 +19,7 @@ const EBMQueueService = require("./ebmQueueService");
 const EBMFiscalSequenceService = require("./ebmFiscalSequenceService");
 const { formatVsdcDate, VSDC_ENDPOINTS } = require("./ebmService");
 const { sanitizeForEndpoint } = require('../utils/vsdcPayloadSanitizer');
+const { isExplicitlyNonFiscal } = require('../utils/fiscalDocumentSnapshot');
 const Decimal = require('@prisma/client').Prisma.Decimal;
 const { cursorSemanticsConfirmed } = require('../utils/ebmCursorPolicy');
 const { getStockSaveBlock } = require('./ebmStockContractGate');
@@ -1270,7 +1271,7 @@ async function submitStockForGRN(grnId, { companyId, branchId = null } = {}) {
     .populate("lines.product")
     .populate("supplier")
     .lean();
-  if (!grn || grn.ebm?.stockStatus === "submitted") return grn;
+  if (!grn || isExplicitlyNonFiscal(grn) || grn.ebm?.stockStatus === "submitted") return grn;
   const purchaseOrder = grn.purchaseOrder
     ? await PurchaseOrder.findOne({ _id: grn.purchaseOrder, company: companyId }).lean()
     : null;
@@ -1336,7 +1337,7 @@ async function submitStockForDirectPurchase(
     .populate("items.product")
     .populate("supplier")
     .lean();
-  if (!purchase || purchase.ebm?.stockStatus === "submitted") return purchase;
+  if (!purchase || isExplicitlyNonFiscal(purchase) || purchase.ebm?.stockStatus === "submitted") return purchase;
   const branch = await resolveBranchByWarehouse(
     companyId,
     purchase.warehouse || purchase.items?.[0]?.warehouse,
@@ -1396,7 +1397,7 @@ async function submitStockForInvoice(
     .populate("lines.product")
     .populate("client")
     .lean();
-  if (!invoice || invoice.ebm?.stockStatus === "submitted") return invoice;
+  if (!invoice || isExplicitlyNonFiscal(invoice) || invoice.ebm?.stockStatus === "submitted") return invoice;
   if (invoice.ebm?.ebmStatus !== "submitted") return invoice;
   const firstWarehouse = invoice.lines.find(
     (line) => line.warehouse,
@@ -1457,7 +1458,7 @@ async function submitStockForCreditNote(
     .populate("items.product")
     .populate("client")
     .lean();
-  if (!note || note.ebm?.stockStatus === "submitted") return note;
+  if (!note || isExplicitlyNonFiscal(note) || note.ebm?.stockStatus === "submitted") return note;
   if (note.ebm?.ebmStatus !== "submitted") return note;
   const lines = note.lines?.length ? note.lines : note.items || [];
   const branch = await resolveBranchByWarehouse(
@@ -1512,7 +1513,7 @@ async function submitStockAdjustment(
   })
     .populate("product")
     .lean();
-  if (!movement || movement.ebm?.stockStatus === "submitted") return movement;
+  if (!movement || isExplicitlyNonFiscal(movement) || movement.ebm?.stockStatus === "submitted") return movement;
   const branch = await resolveBranchByWarehouse(
     companyId,
     movement.warehouse,
@@ -1568,19 +1569,19 @@ async function submitStockAdjustment(
 }
 
 async function submitBranchTransfer(transferId, { companyId } = {}) {
-  if (!cursorSemanticsConfirmed(ebmService.getConfig().mode, 'EBM_STOCK_BRANCH_TRANSFER_SEMANTICS_CONFIRMED')) {
-    const error = new Error('RRA branch-transfer stock movement semantics are unconfirmed. The transfer was not submitted to VSDC.');
-    error.code = 'EBM_STOCK_TRANSFER_SEMANTICS_UNCONFIRMED';
-    error.retryable = false;
-    throw error;
-  }
   const transfer = await StockTransfer.findOne({
     _id: transferId,
     company: companyId,
   })
     .populate({ path: "items", populate: { path: "product" } })
     .lean();
-  if (!transfer || transfer.ebm?.stockStatus === "submitted") return transfer;
+  if (!transfer || isExplicitlyNonFiscal(transfer) || transfer.ebm?.stockStatus === "submitted") return transfer;
+  if (!cursorSemanticsConfirmed(ebmService.getConfig().mode, 'EBM_STOCK_BRANCH_TRANSFER_SEMANTICS_CONFIRMED')) {
+    const error = new Error('RRA branch-transfer stock movement semantics are unconfirmed. The transfer was not submitted to VSDC.');
+    error.code = 'EBM_STOCK_TRANSFER_SEMANTICS_UNCONFIRMED';
+    error.retryable = false;
+    throw error;
+  }
   const hasExplicitOrgSarNumbers = transfer.orgSarNo != null || transfer.ebm?.orgSarNo != null;
   const hasExplicitInboundOrgSarNumber = transfer.orgSarNoIn != null || transfer.ebm?.orgSarNoIn != null;
   if ((!hasExplicitOrgSarNumbers || !hasExplicitInboundOrgSarNumber)

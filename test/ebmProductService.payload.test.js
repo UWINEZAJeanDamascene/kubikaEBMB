@@ -1,4 +1,5 @@
 jest.mock('../models/Product', () => ({
+  find: jest.fn(),
   findOne: jest.fn(),
   exists: jest.fn(),
 }));
@@ -34,12 +35,18 @@ jest.mock('../services/ebmBranchService', () => ({
 
 jest.mock('../services/ebmService', () => ({
   getConfig: jest.fn(() => ({ mode: 'mock' })),
+  isSandboxMode: jest.fn(),
   saveItems: jest.fn(async () => ({
     ok: true,
     resultCd: '000',
     data: null,
     raw: { resultCd: '000', resultMsg: 'It is succeeded', resultDt: '20261015120000', data: null },
   })),
+}));
+
+jest.mock('../services/moduleEntitlementService', () => ({
+  getEntitlement: jest.fn(async () => ({ status: 'on', version: 1 })),
+  hasModule: jest.fn(async () => true),
 }));
 
 const Product = require('../models/Product');
@@ -151,6 +158,46 @@ describe('EBM product registration payload', () => {
     });
     expect(product.ebm.ebmRegisteredAt).toBeInstanceOf(Date);
     expect(product.ebm.registeredAt).toEqual(product.ebm.ebmRegisteredAt);
+  });
+
+  it('allows explicit product registration while EBM is off only in sandbox setup mode', async () => {
+    const product = baseProduct();
+    Product.findOne.mockResolvedValue(product);
+    Warehouse.findOne.mockReturnValue({
+      lean: jest.fn(async () => ({ _id: 'warehouse-1', rraBranchId: '00' })),
+    });
+    require('../services/moduleEntitlementService').hasModule.mockResolvedValueOnce(false);
+    ebmService.isSandboxMode.mockReturnValueOnce(true);
+    ebmService.getConfig.mockReturnValueOnce({ mode: 'sandbox' });
+
+    await EBMProductService.registerProduct('company-1', 'product-1', {
+      allowSandboxWhileOff: true,
+    });
+
+    expect(ebmService.saveItems).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows bulk product setup while EBM is off only in sandbox mode', async () => {
+    const backfill = jest.spyOn(EBMProductService, 'backfillDefaultWarehouses').mockResolvedValue({ updated: 0 });
+    Product.find.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      sort: jest.fn().mockReturnThis(),
+      limit: jest.fn().mockReturnValue({ lean: jest.fn().mockResolvedValue([]) }),
+    });
+    require('../services/moduleEntitlementService').hasModule.mockResolvedValueOnce(false);
+    ebmService.isSandboxMode.mockReturnValueOnce(true);
+
+    try {
+      const result = await EBMProductService.registerAllProducts('company-1', {
+        allowSandboxWhileOff: true,
+      });
+
+      expect(result.notRequired).toBeUndefined();
+      expect(result.attempted).toBe(0);
+      expect(backfill).toHaveBeenCalledWith('company-1', { allowSandboxWhileOff: true });
+    } finally {
+      backfill.mockRestore();
+    }
   });
 
   it.each(['1', '2', '3'])('sends product type %s unchanged and embeds it unchanged in generated itemCd', async (itemTyCd) => {

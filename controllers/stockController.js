@@ -11,7 +11,7 @@ const StockBatch = require('../models/StockBatch');
 const StockSerialNumber = require('../models/StockSerialNumber');
 const JournalService = require('../services/journalService');
 const { runInTransaction } = require('../services/transactionService');
-const EBMStockService = require('../services/ebmStockService');
+const FiscalService = require('../services/fiscalService');
 const OpeningStockService = require('../services/openingStockService');
 const inventoryService = require('../services/inventoryService');
 const { parseBoundedPage } = require('../utils/querySafety');
@@ -671,7 +671,7 @@ exports.adjustStock = async (req, res, next) => {
       return movement;
     });
 
-    EBMStockService.submitStockAdjustment(result._id, {
+    FiscalService.submitStockAdjustment(result._id, {
       companyId,
       branchId: req.body.branchId || req.body.bhfId,
     }).catch((ebmErr) => {

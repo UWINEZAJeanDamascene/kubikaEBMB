@@ -5,6 +5,7 @@
 
 const { prisma } = require('../lib/prisma');
 const { buildTenantModel } = require('../utils/masterDataCommon');
+const { withFiscalSnapshot } = require('../utils/fiscalDocumentSnapshot');
 const {
   stockMovementToApi,
   stockMovementTranslateCreate,
@@ -56,7 +57,7 @@ const base = buildTenantModel({
   delegateName: 'stockMovement',
   fieldMap: FIELD_MAP,
   toApi: stockMovementToApi,
-  translateCreate: stockMovementTranslateCreate,
+  translateCreate: withFiscalSnapshot(stockMovementTranslateCreate),
   translateUpdate: stockMovementTranslateUpdate,
   include: buildInclude,
   mutable: true,

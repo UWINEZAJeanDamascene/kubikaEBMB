@@ -16,6 +16,7 @@ const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const JournalService = require("../services/journalService");
 const { runInTransaction } = require("../services/transactionService");
 const { dbClient } = require("../lib/prisma");
+const moduleEntitlementService = require("../services/moduleEntitlementService");
 const { PassThrough } = require("stream");
 const { generateObjectId } = require("../utils/objectId");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
@@ -1168,8 +1169,8 @@ exports.verifyInvoiceCustomerTin = async (req, res, next) => {
       .populate('deliveryNote');
     if (!invoice) return res.status(404).json({ success: false, code: 'EBM_INVOICE_NOT_FOUND', message: 'Invoice not found for RRA customer TIN verification.' });
     const requestedBranch = req.body.branchId || req.body.bhfId || null;
-    const branch = await require('../services/ebmSalesService').resolveBranch(invoice, companyId, requestedBranch);
-    const result = await require('../services/ebmCustomerTinService').verifyInvoiceCustomerTin(
+    const branch = await require('../services/fiscalService').resolveBranch(invoice, companyId, requestedBranch);
+    const result = await require('../services/fiscalService').verifyInvoiceCustomerTin(
       companyId,
       req.params.id,
       { branchId: branch.rraBranchId },
@@ -1190,12 +1191,21 @@ exports.submitInvoiceEbm = async (req, res, next) => {
       return res.status(422).json({ success: false, code: 'EBM_BRANCH_ID_CONFLICT', message: 'Provide one matching RRA branch ID.' });
     }
     const companyId = String(req.user.company._id || req.user.company.id);
-    const invoice = await require('../services/ebmSalesService').submitInvoice(req.params.id, {
+    const invoice = await require('../services/fiscalService').submitInvoice(req.params.id, {
       companyId,
       branchId: req.body.branchId || req.body.bhfId || null,
       purchaserAcceptance: req.body.prchrAcptcYn ?? null,
       modifierUserId: req.user.id || req.user._id,
+      allowSandboxWhileOff: req.body.sandboxTest === true,
     });
+    if (invoice?.fiscalMode === 'none'
+      && !(req.body.sandboxTest === true && require('../services/ebmService').isSandboxMode())) {
+      return res.status(409).json({
+        success: false,
+        code: 'EBM_DOCUMENT_NOT_FISCAL',
+        message: 'This invoice was created while EBM was off and cannot be submitted retroactively.',
+      });
+    }
     res.json({ success: true, message: 'Invoice submitted to EBM.', data: await hydrateInvoiceRelations(invoice, companyId) });
   } catch (error) {
     if (error.invoice) {
@@ -1346,6 +1356,8 @@ exports.generateInvoicePDF = async (req, res, next) => {
 
     // Get company info
     const company = await Company.findById(companyId);
+    const ebmEnabled = await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm');
+    if (!ebmEnabled) invoice.ebm = {};
 
     const fiscalMode = String(invoice.ebm?.fiscalEnvironment || invoice.ebm?.mode || invoice.ebm?.environment || '').toLowerCase();
     const qrPng = fiscalMode === 'production' && invoice.ebm?.ebmStatus === 'submitted'
@@ -1506,23 +1518,25 @@ exports.generateInvoicePDF = async (req, res, next) => {
 
       doc.fillColor("#64748b").text("Currency", 62, startY + 65);
       doc.fillColor("#111827").text(currency, 145, startY + 65);
-      doc.fillColor("#64748b").text("RRA branch", 62, startY + 82);
-      doc.fillColor("#111827").text(branchId || "Not assigned", 145, startY + 82);
-      doc.fillColor("#64748b").text("Fiscal status", 62, startY + 99);
-      const fiscalStatusLabel = fiscalMode === 'mock'
-        ? 'Mock only - not RRA certified'
-        : fiscalMode === 'sandbox'
-          ? 'Sandbox - not production certified'
-          : fiscalMode === 'production' && invoice.ebm?.ebmStatus === 'submitted'
-            ? 'RRA response accepted'
-            : invoice.ebm?.ebmStatus === 'failed'
-              ? 'Submission failed'
-              : 'Not yet fiscalized';
-      doc.fillColor(fiscalMode === 'mock' || fiscalMode === 'sandbox' ? "#b45309" : "#0f766e").font("Helvetica-Bold").fontSize(7.5).text(fiscalStatusLabel, 145, startY + 99, { width: 135 });
-      doc.font("Helvetica").fontSize(8).fillColor("#64748b").text("VSDC invoice no", 62, startY + 116);
-      doc.fillColor("#111827").text(fiscalPayload.invcNo == null ? "Not allocated" : String(fiscalPayload.invcNo), 145, startY + 116, { width: 135 });
-      doc.fillColor("#64748b").text("Original invoice no", 62, startY + 133);
-      doc.fillColor("#111827").text(fiscalPayload.orgInvcNo == null ? "-" : String(fiscalPayload.orgInvcNo), 145, startY + 133, { width: 135 });
+      if (ebmEnabled) {
+        doc.fillColor("#64748b").text("RRA branch", 62, startY + 82);
+        doc.fillColor("#111827").text(branchId || "Not assigned", 145, startY + 82);
+        doc.fillColor("#64748b").text("Fiscal status", 62, startY + 99);
+        const fiscalStatusLabel = fiscalMode === 'mock'
+          ? 'Mock only - not RRA certified'
+          : fiscalMode === 'sandbox'
+            ? 'Sandbox - not production certified'
+            : fiscalMode === 'production' && invoice.ebm?.ebmStatus === 'submitted'
+              ? 'RRA response accepted'
+              : invoice.ebm?.ebmStatus === 'failed'
+                ? 'Submission failed'
+                : 'Not yet fiscalized';
+        doc.fillColor(fiscalMode === 'mock' || fiscalMode === 'sandbox' ? "#b45309" : "#0f766e").font("Helvetica-Bold").fontSize(7.5).text(fiscalStatusLabel, 145, startY + 99, { width: 135 });
+        doc.font("Helvetica").fontSize(8).fillColor("#64748b").text("VSDC invoice no", 62, startY + 116);
+        doc.fillColor("#111827").text(fiscalPayload.invcNo == null ? "Not allocated" : String(fiscalPayload.invcNo), 145, startY + 116, { width: 135 });
+        doc.fillColor("#64748b").text("Original invoice no", 62, startY + 133);
+        doc.fillColor("#111827").text(fiscalPayload.orgInvcNo == null ? "-" : String(fiscalPayload.orgInvcNo), 145, startY + 133, { width: 135 });
+      }
 
       // Bill To
       doc.roundedRect(305, startY, 240, 150, 7).fillAndStroke("#f8fafc", "#dbe4ee");
@@ -1799,7 +1813,7 @@ exports.generateInvoicePDF = async (req, res, next) => {
       drawHeader();
       y = 140;
     }
-    drawRraDetails(y + 12);
+    if (ebmEnabled) drawRraDetails(y + 12);
 
     // Finalize: draw footer on last page then end
     drawFooter(pageNumber);

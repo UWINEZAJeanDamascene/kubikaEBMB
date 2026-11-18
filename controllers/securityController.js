@@ -17,7 +17,7 @@ exports.setup2FA = async (req, res) => {
     const secret = speakeasy.generateSecret({ name: `StockApp (${user.email})` });
     await prisma.user.update({
       where: { id: user.id },
-      data: { twoFASecret: secret.base32, twoFAConfirmed: false },
+      data: { twoFAEnabled: false, twoFASecret: secret.base32, twoFAConfirmed: false },
     });
 
     const otpAuthUrl = secret.otpauth_url;
@@ -39,12 +39,28 @@ exports.verify2FA = async (req, res) => {
     const verified = speakeasy.totp.verify({ secret: user.twoFASecret, encoding: 'base32', token, window: 1 });
     if (!verified) return res.status(400).json({ success: false, message: 'Invalid token' });
 
-    await prisma.user.update({
+    const verifiedUser = await prisma.user.update({
       where: { id: user.id },
       data: { twoFAEnabled: true, twoFAConfirmed: true },
+      select: { twoFAEnabled: true, twoFAConfirmed: true, twoFASecret: true },
     });
 
-    res.status(200).json({ success: true, message: '2FA verified and enabled' });
+    if (!verifiedUser.twoFAEnabled || !verifiedUser.twoFAConfirmed || !verifiedUser.twoFASecret) {
+      return res.status(500).json({
+        success: false,
+        code: 'TWO_FACTOR_STATE_NOT_PERSISTED',
+        message: 'The authenticator code was accepted, but two-factor status was not saved. Try again or contact support.',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: '2FA verified and enabled',
+      data: {
+        twoFAEnabled: verifiedUser.twoFAEnabled,
+        twoFAConfirmed: verifiedUser.twoFAConfirmed,
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: '2FA verification failed' });
@@ -55,6 +71,13 @@ exports.disable2FA = async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: toIdString(req.user._id) } });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    if (user.role === 'platform_admin') {
+      return res.status(403).json({
+        success: false,
+        code: 'PLATFORM_ADMIN_MFA_REQUIRED',
+        message: 'Platform administrator multi-factor authentication cannot be disabled from this account.',
+      });
+    }
     await prisma.user.update({
       where: { id: user.id },
       data: { twoFAEnabled: false, twoFASecret: null, twoFAConfirmed: false },
@@ -91,6 +114,7 @@ exports.getSecurityOverview = async (req, res) => {
       // Account security
       twoFAEnabled: user.twoFAEnabled || false,
       twoFAConfirmed: user.twoFAConfirmed || false,
+      twoFAReady: user.twoFAEnabled === true && user.twoFAConfirmed === true && Boolean(user.twoFASecret),
       isLocked: Boolean(user.lockedUntil && new Date() < user.lockedUntil),
       lockedUntil: user.lockedUntil || null,
       failedLoginAttempts: user.failedLoginAttempts || 0,

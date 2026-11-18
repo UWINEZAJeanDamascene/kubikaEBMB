@@ -22,6 +22,8 @@ describe('POS offline capability', () => {
       deviceId: 'device-id',
       registerId: 'register-id',
       warehouseId: 'warehouse-id',
+      fiscalMode: 'none',
+      entitlementVersion: 3,
       issuedAt: 1000,
       expiresAt: 2000,
     };
@@ -34,6 +36,14 @@ describe('POS offline capability', () => {
     const changedPayload = Buffer.from(JSON.stringify({ issuedAt: 1000, expiresAt: 9000 })).toString('base64url');
     expect(() => verifyCapability(`${changedPayload}.${signature}`)).toThrow(/signature/i);
     expect(() => verifyCapability('not-a-token')).toThrow(/invalid/i);
+  });
+
+  test('rejects an incomplete fiscal entitlement binding', () => {
+    expect(() => verifyCapability(issueCapability({
+      issuedAt: 1000,
+      expiresAt: 2000,
+      fiscalMode: 'none',
+    }))).toThrow(/fiscal capability claims are invalid/i);
   });
 
   test('fails closed if the signing secret is not configured', () => {

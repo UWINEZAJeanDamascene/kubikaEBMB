@@ -7,6 +7,9 @@ jest.mock('../models/StockMovement', () => ({ findOne: jest.fn(), updateMany: je
 jest.mock('../models/TillSession', () => ({ findOne: jest.fn() }));
 jest.mock('../models/Warehouse', () => ({ findOne: jest.fn() }));
 jest.mock('../services/systemSettingsService', () => ({ get: jest.fn() }));
+jest.mock('../services/moduleEntitlementService', () => ({
+  getEntitlement: jest.fn().mockResolvedValue({ status: 'on', version: 1 }),
+}));
 jest.mock('../services/posPaymentService', () => ({
   getPaymentSettings: jest.fn(),
   resolvePaymentFlow: jest.fn(),
@@ -33,6 +36,7 @@ const StockMovement = require('../models/StockMovement');
 const TillSession = require('../models/TillSession');
 const Warehouse = require('../models/Warehouse');
 const SystemSettingsService = require('../services/systemSettingsService');
+const moduleEntitlementService = require('../services/moduleEntitlementService');
 const posPaymentService = require('../services/posPaymentService');
 const AuditLogService = require('../services/AuditLogService');
 const { findClaimedRegister } = require('../services/posRegisterService');
@@ -82,6 +86,7 @@ describe('POS offline controller', () => {
     process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
     posPaymentService.getPaymentSettings.mockResolvedValue({});
     posPaymentService.resolvePaymentFlow.mockReturnValue('LEGACY');
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'on', version: 1 });
     const tx = {
       $queryRawUnsafe: jest.fn().mockResolvedValue([]),
       $executeRawUnsafe: jest.fn().mockResolvedValue(1),
@@ -186,6 +191,8 @@ describe('POS offline controller', () => {
       warehouseId: IDS.warehouse,
       tillSessionId: IDS.till,
       paymentFlow: 'PAYMENTS_V2',
+      fiscalMode: 'ebm',
+      entitlementVersion: 1,
       requiresFiscalSubmission: true,
       provisionalFiscalReceiptsAllowed: false,
     });
@@ -203,6 +210,8 @@ describe('POS offline controller', () => {
       actions: expect.objectContaining({ cash_sales: true, refunds: false, shift_close: false }),
     });
     expect(snapshotData.paymentFlow).toBe('PAYMENTS_V2');
+    expect(snapshotData.fiscalMode).toBe('ebm');
+    expect(snapshotData.entitlementVersion).toBe(1);
     expect(snapshotData.receiptNumbers).toEqual(res.body.data.receiptNumbers);
     expect(snapshotData.products[IDS.product]).toMatchObject({ price: 75, standardPrice: 100 });
     expect(snapshotData.products[IDS.product]).toMatchObject({ taxRate: 18, taxCode: 'B' });
@@ -217,6 +226,8 @@ describe('POS offline controller', () => {
       IDS.warehouse,
       IDS.till,
       expect.stringContaining('"taxRate":18'),
+      'ebm',
+      1,
       100000,
       expect.any(Date),
       expect.any(Date),

@@ -3,7 +3,7 @@ const StockTransfer = require("../models/StockTransfer");
 const StockTransferLine = require("../models/StockTransferLine");
 const stockTransferService = require("../services/stockTransferService");
 const StockLevel = require("../models/StockLevel");
-const EBMStockService = require("../services/ebmStockService");
+const FiscalService = require("../services/fiscalService");
 const { emitDataChanged } = require("../lib/realtimeEvents");
 const crypto = require("crypto");
 
@@ -93,7 +93,7 @@ exports.confirm = async (req, res, next) => {
       transferSignature("dispatched", req, req.body?.notes || "Transfer dispatched"),
     ];
     await transfer.save();
-    EBMStockService.submitBranchTransfer(transfer._id, {
+    FiscalService.submitBranchTransfer(transfer._id, {
       companyId: transfer.company || req.user.company._id,
     }).catch((ebmErr) => {
       console.error("EBM branch transfer submission failed:", ebmErr.message);
@@ -788,7 +788,7 @@ exports.approveStockTransfer = async (req, res, next) => {
       { path: "items.product", select: "name sku" },
     ]);
 
-    EBMStockService.submitBranchTransfer(transfer._id, { companyId })
+    FiscalService.submitBranchTransfer(transfer._id, { companyId })
       .catch((ebmErr) => {
         console.error("EBM branch transfer submission failed after approval:", ebmErr.message);
       });

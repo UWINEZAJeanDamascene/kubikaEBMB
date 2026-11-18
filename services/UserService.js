@@ -33,6 +33,7 @@ const MAX_LOGIN_ATTEMPTS = 5;
 const LOCK_DURATION_MINUTES = 0; // DISABLED: was 30 — re-enable by setting back to 30
 
 const USER_ERRORS = {
+  PLATFORM_ROLE_ASSIGNMENT_FORBIDDEN: 'PLATFORM_ROLE_ASSIGNMENT_FORBIDDEN',
   EMAIL_ALREADY_REGISTERED: 'EMAIL_ALREADY_REGISTERED',
   INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
   ACCOUNT_LOCKED: 'ACCOUNT_LOCKED',
@@ -122,6 +123,9 @@ class UserService {
    */
   static async register(userData) {
     const { email, password, name, companyId, role = 'viewer' } = userData;
+    if (String(role).trim().toLowerCase() === 'platform_admin') {
+      throw serviceError(USER_ERRORS.PLATFORM_ROLE_ASSIGNMENT_FORBIDDEN);
+    }
     const emailLower = String(email).toLowerCase();
 
     const existingUser = await prisma.user.findFirst({

@@ -1,6 +1,6 @@
 'use strict';
 
-const { randomBytes } = require('crypto');
+const { randomBytes, randomUUID } = require('crypto');
 
 function validatedScratchUrl(value) {
   if (!value) throw new Error('POS_TEST_DATABASE_URL must be set for POS EBM database tests.');
@@ -21,8 +21,8 @@ const legacyQueueId = '000000000000000000000002';
 
 function id() { return randomBytes(12).toString('hex'); }
 
-async function insertCompany(companyId = id()) {
-  await prisma.$executeRaw`
+async function insertCompany(companyId = id(), client = prisma) {
+  await client.$executeRaw`
     INSERT INTO companies (id, name, code, updated_at)
     VALUES (${companyId}, ${`EBM test ${companyId}`}, ${`ebm-${companyId}`}, NOW())
   `;
@@ -89,6 +89,87 @@ describe('POS EBM additive schema on the designated scratch database', () => {
   afterAll(async () => {
     await cleanupCompany(legacyCompanyId);
     await prisma.$disconnect();
+  });
+
+  test('backfills one matching fiscal entitlement for every existing company', async () => {
+    const [result] = await prisma.$queryRaw`
+      SELECT
+        COUNT(*) FILTER (WHERE e.id IS NULL)::int AS missing,
+        COUNT(*) FILTER (
+          WHERE e.id IS NOT NULL
+            AND e.status <> CASE WHEN c.ebm_enabled THEN 'on' ELSE 'off' END
+        )::int AS mismatched
+      FROM companies c
+      LEFT JOIN company_module_entitlements e
+        ON e.company_id = c.id AND e.module_code = 'fiscal.ebm'
+    `;
+    expect(result.missing).toBe(0);
+    expect(result.mismatched).toBe(0);
+  });
+
+  test('new companies default to EBM off in the legacy mirror and entitlement', async () => {
+    const companyId = await insertCompany();
+    try {
+      const rows = await prisma.$queryRaw`
+        SELECT c.ebm_enabled, e.status AS module_status
+        FROM companies c
+        JOIN company_module_entitlements e
+          ON e.company_id = c.id AND e.module_code = 'fiscal.ebm'
+        WHERE c.id = ${companyId}
+      `;
+      expect(rows).toEqual([{ ebm_enabled: false, module_status: 'off' }]);
+    } finally {
+      await cleanupCompany(companyId);
+    }
+  });
+
+  test('platform module audit rows reject update, delete and truncate', async () => {
+    async function expectMutationBlocked(operation) {
+      const companyId = id();
+      const actorId = id();
+      const auditId = id();
+      let mutationError;
+      try {
+        await prisma.$transaction(async (tx) => {
+          await insertCompany(companyId, tx);
+          await tx.$executeRaw`
+            INSERT INTO users (id, name, email, password, updated_at)
+            VALUES (${actorId}, 'Audit probe', ${`audit-probe-${actorId}@example.invalid`}, 'unused', NOW())
+          `;
+          await tx.$executeRaw`
+            INSERT INTO platform_module_audit_logs
+              (id, company_id, module_code, actor_user_id, event_type, old_status, new_status,
+               reason, result, correlation_id, effective_at, created_at)
+            VALUES
+              (${auditId}, ${companyId}, 'fiscal.ebm', ${actorId}, 'probe', 'on', 'off',
+               'Rollback-only immutability probe', 'probe', ${randomUUID()}::uuid, NOW(), NOW())
+          `;
+          if (operation === 'UPDATE') {
+            await tx.$executeRaw`
+              UPDATE platform_module_audit_logs SET result = 'tampered' WHERE id = ${auditId}
+            `;
+          } else {
+            await tx.$executeRaw`
+              DELETE FROM platform_module_audit_logs WHERE id = ${auditId}
+            `;
+          }
+          throw new Error('__AUDIT_MUTATION_SUCCEEDED__');
+        });
+      } catch (error) {
+        mutationError = error;
+      }
+      expect(mutationError).toBeDefined();
+      const errorMessage = `${mutationError.message} ${mutationError.meta?.message || ''}`;
+      expect(errorMessage).not.toContain('__AUDIT_MUTATION_SUCCEEDED__');
+      expect(errorMessage).toMatch(/Platform module audit rows are append-only/);
+    }
+
+    await expectMutationBlocked('UPDATE');
+    await expectMutationBlocked('DELETE');
+    await expect(prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`TRUNCATE TABLE platform_module_audit_logs`;
+      throw new Error('__TRUNCATE_SUCCEEDED__');
+    })).rejects.toThrow(/Platform module audit rows are append-only/);
   });
 
   test('does not reuse legacy resolved_at as the V2 resolution timestamp', async () => {

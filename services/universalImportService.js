@@ -4,12 +4,30 @@ const crypto = require('crypto');
 const ExcelJS = require('exceljs');
 const { parse } = require('csv-parse/sync');
 const { stringify } = require('csv-stringify/sync');
-const { getEntityDefinition } = require('./importDefinitions');
+const { getEntityDefinition, listEntityDefinitions, EBM_PRODUCT_FIELD_KEYS } = require('./importDefinitions');
 const { mapColumns } = require('./importMappingEngine');
 const { RRA_CODE_CLASS_IDS } = require('../constants/ebmCodeClasses');
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_ROWS = 10000;
+const EBM_PRODUCT_HEADERS = new Set([
+  'taxtypecode',
+  'rrataxtypecode',
+  'taxtycd',
+  'itemtypecode',
+  'rraitemtypecode',
+  'itemtycd',
+  'originnationcode',
+  'rraoriginnationcode',
+  'orgnnatcd',
+  'itemclasscode',
+  'itemclassificationcode',
+  'rraclasscode',
+  'packagingunitcode',
+  'pkgunitcd',
+  'quantityunitcode',
+  'qtyunitcd',
+]);
 const PROCESSABLE_ENTITY_TYPES = new Set([
   'products',
   'customers',
@@ -29,6 +47,40 @@ const PROCESSABLE_ENTITY_TYPES = new Set([
 function getCompanyId(req) {
   const userCompany = req.user?.company;
   return req.company?._id || req.companyId || userCompany?._id || userCompany || req.headers['x-company-id'];
+}
+
+async function getProductImportEntitlement(companyId) {
+  if (!companyId) {
+    const error = new Error('A company is required to import products.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const moduleEntitlementService = require('./moduleEntitlementService');
+  const entitlement = await moduleEntitlementService.getEntitlement(companyId, 'fiscal.ebm', { useCache: false });
+  return {
+    ebmEnabled: entitlement.status === 'on',
+    entitlementVersion: Number(entitlement.version),
+  };
+}
+
+function assertExpectedEntitlementVersion(expectedVersion, entitlement) {
+  if (expectedVersion == null) return;
+  if (!Number.isSafeInteger(Number(expectedVersion))
+    || Number(expectedVersion) !== entitlement.entitlementVersion) {
+    const error = new Error('The EBM setting changed during this import. Refresh the product import fields, then validate the file again.');
+    error.code = 'IMPORT_EBM_ENTITLEMENT_CHANGED';
+    error.statusCode = 409;
+    throw error;
+  }
+}
+
+async function getImportEntityTypes(companyId) {
+  const entitlement = await getProductImportEntitlement(companyId);
+  return {
+    data: listEntityDefinitions({ ebmEnabled: entitlement.ebmEnabled }),
+    fiscalEbmEnabled: entitlement.ebmEnabled,
+    fiscalEntitlementVersion: entitlement.entitlementVersion,
+  };
 }
 
 function extOf(fileName) {
@@ -106,7 +158,7 @@ function assertUploadLimits(file) {
   }
 }
 
-async function parseHeaders(file, entityType) {
+async function parseHeaders(file, entityType, companyId) {
   assertUploadLimits(file);
   const parsed = await parseWorkbook(file.buffer, file.originalname, 11);
   if (parsed.rows.length > MAX_ROWS) {
@@ -115,11 +167,16 @@ async function parseHeaders(file, entityType) {
     throw error;
   }
   const previewRows = parsed.rows.slice(0, 5);
+  const entitlement = entityType === 'products' ? await getProductImportEntitlement(companyId) : null;
   return {
     fileName: file.originalname,
     headers: parsed.headers,
     previewRows,
-    mapping: mapColumns(entityType, parsed.headers, parsed.rows.slice(0, 10))
+    mapping: mapColumns(entityType, parsed.headers, parsed.rows.slice(0, 10), entitlement || undefined),
+    ...(entitlement ? {
+      fiscalEbmEnabled: entitlement.ebmEnabled,
+      fiscalEntitlementVersion: entitlement.entitlementVersion,
+    } : {}),
   };
 }
 
@@ -142,6 +199,13 @@ function valueFor(row, mapping, fieldKey) {
 
 function isBlank(value) {
   return value === undefined || value === null || String(value).trim() === '';
+}
+
+function hasOffModeEbmValues(row) {
+  return Object.entries(row || {}).some(([header, value]) => {
+    const normalized = String(header).toLowerCase().replace(/[\s_-]+/g, '');
+    return EBM_PRODUCT_HEADERS.has(normalized) && !isBlank(value);
+  });
 }
 
 function escapeRegExp(value) {
@@ -354,13 +418,11 @@ function isTaxTypeCode(code) { return ebmCodeClassId(code) === RRA_CODE_CLASS_ID
 function isPackagingUnitCode(code) { return ebmCodeClassId(code) === RRA_CODE_CLASS_IDS.PACKAGING_UNIT; }
 function isQuantityUnitCode(code) { return ebmCodeClassId(code) === RRA_CODE_CLASS_IDS.QUANTITY_UNIT; }
 
-async function buildProductEnrichmentContext(companyId) {
+async function buildProductEnrichmentContext(companyId, ebmEnabled) {
   const Category = require('../models/Category');
   const Warehouse = require('../models/Warehouse');
   const Supplier = require('../models/Supplier');
   const Product = require('../models/Product');
-  const EBMItemClass = require('../models/EBMItemClass');
-  const EBMCode = require('../models/EBMCode');
   const ChartOfAccount = require('../models/ChartOfAccount');
   const Company = require('../models/Company');
 
@@ -381,22 +443,32 @@ async function buildProductEnrichmentContext(companyId) {
     }
   };
 
-  const [company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts] = await Promise.all([
+  const [company, categories, warehouses, suppliers, products, accounts] = await Promise.all([
     Company.findById(companyId).lean(),
     readAllPages(() => Category.find({ company: companyId })),
     readAllPages(() => Warehouse.find({ company: companyId, isActive: { $ne: false } })),
     readAllPages(() => Supplier.find({ company: companyId, isActive: { $ne: false } })),
     readAllPages(() => Product.find({ company: companyId }).select('brand')),
-    readAllPages(() => EBMItemClass.find({ company: companyId, active: { $ne: false } })),
-    readAllPages(() => EBMCode.find({ company: companyId, active: { $ne: false } })),
     readAllPages(() => ChartOfAccount.find({ company: companyId, isActive: true })),
   ]);
 
-  return { company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts };
+  let itemClasses = [];
+  let ebmCodes = [];
+  if (ebmEnabled) {
+    const EBMItemClass = require('../models/EBMItemClass');
+    const EBMCode = require('../models/EBMCode');
+    [itemClasses, ebmCodes] = await Promise.all([
+      readAllPages(() => EBMItemClass.find({ company: companyId, active: { $ne: false } })),
+      readAllPages(() => EBMCode.find({ company: companyId, active: { $ne: false } })),
+    ]);
+  }
+
+  return { company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts, ebmEnabled };
 }
 
 async function enrichProductRow(companyId, clean, context, rowNumber) {
   const warnings = [];
+  const ebmEnabled = context.ebmEnabled !== false;
   const category = context.categories.find((candidate) => normalizeMatch(candidate.name) === normalizeMatch(clean.category));
   if (category) {
     clean.category = category.name;
@@ -435,60 +507,74 @@ async function enrichProductRow(companyId, clean, context, rowNumber) {
     if (brandMatch && brandMatch.score >= 0.8) clean.brand = brandMatch.candidate.name;
   }
 
-  const taxDefault = context.company?.is_vat_registered === false ? 'A' : 'B';
-  clean.taxTypeCode = String(clean.taxTypeCode || taxDefault).toUpperCase();
-  // RRA tax type B is the standard 18% VAT rate. An imported explicit B code
-  // must not become zero-rate just because the company VAT flag is unset or stale.
-  clean.taxRate = clean.taxTypeCode === 'B' ? 18 : 0;
-
-  const unitCode = String(clean.quantityUnitCode || '').toUpperCase();
-  clean.quantityUnitCode = unitCode;
-  clean.packagingUnitCode = String(clean.packagingUnitCode || '').toUpperCase();
-
-  clean.itemTypeCode = String(clean.itemTypeCode || '').trim();
-  const selectedItemType = context.ebmCodes.find((code) => ebmCodeClassId(code) === '24' && String(code.code) === clean.itemTypeCode);
-  if (!isBlank(clean.itemTypeCode) && (!['1', '2', '3'].includes(clean.itemTypeCode) || !selectedItemType)) {
-    clean.itemTypeCode = null;
-    warnings.push({ field: 'itemTypeCode', blocking: true, message: 'Select an active product type from this workspace’s synced RRA code class 24.' });
-  }
-
-  clean.originNationCode = String(clean.originNationCode || '').trim();
-  const selectedOriginNation = context.ebmCodes.find((code) => ebmCodeClassId(code) === '05' && String(code.code) === clean.originNationCode);
-  if (!isBlank(clean.originNationCode) && !selectedOriginNation) {
-    clean.originNationCode = null;
-    warnings.push({ field: 'originNationCode', blocking: true, message: 'Select an active origin nation from this workspace’s synced RRA code class 05.' });
-  }
-
-  const suppliedItemClassCode = String(clean.itemClassCode || '').trim();
-  const exactClass = context.itemClasses.find((itemClass) => String(itemClass.itemClassCode) === suppliedItemClassCode);
-  if (exactClass) {
-    clean.itemClassCode = exactClass.itemClassCode;
-  } else {
-    clean.itemClassCode = null;
-    warnings.push({ field: 'itemClassCode', blocking: true, message: 'Select a synced RRA item classification code before importing.' });
-  }
-
   clean.unit = String(clean.unit || 'pcs').toLowerCase();
   clean.costingMethod = String(clean.costingMethod || 'fifo').toLowerCase();
   clean.trackingType = String(clean.trackingType || 'none').toLowerCase();
   clean.isStockable = isBlank(clean.isStockable) ? true : ['true', 'yes', '1'].includes(String(clean.isStockable).toLowerCase());
   clean.barcodeType = clean.barcodeType || 'CODE128';
   clean.barcodeType = String(clean.barcodeType).toUpperCase();
-  clean.taxTypeCode = String(clean.taxTypeCode || (context.company?.is_vat_registered === false ? 'A' : 'B')).toUpperCase();
-  const isTaxType = isTaxTypeCode;
-  const isPackagingUnit = isPackagingUnitCode;
-  const isQuantityUnit = isQuantityUnitCode;
-  const selectedTaxType = context.ebmCodes.find((code) => isTaxType(code) && String(code.code).toUpperCase() === clean.taxTypeCode);
-  const taxTypesAvailable = context.ebmCodes.some(isTaxType);
-  if (!taxTypesAvailable || !selectedTaxType) warnings.push({ field: 'taxTypeCode', blocking: true, message: 'Sync RRA tax type codes, then choose a code from this workspace dropdown.' });
-  if (!context.itemClasses.some((itemClass) => String(itemClass.itemClassCode) === String(clean.itemClassCode || ''))) {
-    warnings.push({ field: 'itemClassCode', blocking: true, message: 'Select an item class from this workspace’s synced RRA item classes.' });
-  }
-  if (!context.ebmCodes.some((code) => isPackagingUnit(code) && String(code.code).toUpperCase() === String(clean.packagingUnitCode || '').toUpperCase())) {
-    warnings.push({ field: 'packagingUnitCode', blocking: true, message: 'Select a packaging unit from this workspace’s synced RRA codes.' });
-  }
-  if (!context.ebmCodes.some((code) => isQuantityUnit(code) && String(code.code).toUpperCase() === String(clean.quantityUnitCode || '').toUpperCase())) {
-    warnings.push({ field: 'quantityUnitCode', blocking: true, message: 'Select a quantity unit from this workspace’s synced RRA codes.' });
+
+  if (ebmEnabled) {
+    const taxDefault = context.company?.is_vat_registered === false ? 'A' : 'B';
+    clean.taxTypeCode = String(clean.taxTypeCode || taxDefault).toUpperCase();
+    const TaxAutomationService = require('./taxAutomationService');
+    const activeTaxRate = await TaxAutomationService.getActiveTaxRate(companyId, {
+      code: clean.taxTypeCode,
+      date: new Date(),
+    });
+    const configuredTaxRate = activeTaxRate?.ratePct == null ? NaN : Number(activeTaxRate.ratePct);
+    if (!Number.isFinite(configuredTaxRate) || configuredTaxRate < 0 || configuredTaxRate > 100) {
+      clean.taxRate = null;
+      warnings.push({
+        field: 'taxTypeCode',
+        blocking: true,
+        message: `Configure an active company tax rate for code ${clean.taxTypeCode} before importing products.`,
+      });
+    } else {
+      clean.taxRate = configuredTaxRate;
+    }
+    clean.quantityUnitCode = String(clean.quantityUnitCode || '').toUpperCase();
+    clean.packagingUnitCode = String(clean.packagingUnitCode || '').toUpperCase();
+
+    clean.itemTypeCode = String(clean.itemTypeCode || '').trim();
+    const selectedItemType = context.ebmCodes.find((code) => ebmCodeClassId(code) === '24' && String(code.code) === clean.itemTypeCode);
+    if (!isBlank(clean.itemTypeCode) && (!['1', '2', '3'].includes(clean.itemTypeCode) || !selectedItemType)) {
+      clean.itemTypeCode = null;
+      warnings.push({ field: 'itemTypeCode', blocking: true, message: 'Select an active product type from this workspace’s synced RRA code class 24.' });
+    }
+
+    clean.originNationCode = String(clean.originNationCode || '').trim();
+    const selectedOriginNation = context.ebmCodes.find((code) => ebmCodeClassId(code) === '05' && String(code.code) === clean.originNationCode);
+    if (!isBlank(clean.originNationCode) && !selectedOriginNation) {
+      clean.originNationCode = null;
+      warnings.push({ field: 'originNationCode', blocking: true, message: 'Select an active origin nation from this workspace’s synced RRA code class 05.' });
+    }
+
+    const suppliedItemClassCode = String(clean.itemClassCode || '').trim();
+    const exactClass = context.itemClasses.find((itemClass) => String(itemClass.itemClassCode) === suppliedItemClassCode);
+    if (exactClass) {
+      clean.itemClassCode = exactClass.itemClassCode;
+    } else {
+      clean.itemClassCode = null;
+      warnings.push({ field: 'itemClassCode', blocking: true, message: 'Select a synced RRA item classification code before importing.' });
+    }
+
+    const selectedTaxType = context.ebmCodes.find((code) => isTaxTypeCode(code) && String(code.code).toUpperCase() === clean.taxTypeCode);
+    const taxTypesAvailable = context.ebmCodes.some(isTaxTypeCode);
+    if (!taxTypesAvailable || !selectedTaxType) warnings.push({ field: 'taxTypeCode', blocking: true, message: 'Sync RRA tax type codes, then choose a code from this workspace dropdown.' });
+    if (!context.itemClasses.some((itemClass) => String(itemClass.itemClassCode) === String(clean.itemClassCode || ''))) {
+      warnings.push({ field: 'itemClassCode', blocking: true, message: 'Select an item class from this workspace’s synced RRA item classes.' });
+    }
+    if (!context.ebmCodes.some((code) => isPackagingUnitCode(code) && String(code.code).toUpperCase() === String(clean.packagingUnitCode || '').toUpperCase())) {
+      warnings.push({ field: 'packagingUnitCode', blocking: true, message: 'Select a packaging unit from this workspace’s synced RRA codes.' });
+    }
+    if (!context.ebmCodes.some((code) => isQuantityUnitCode(code) && String(code.code).toUpperCase() === String(clean.quantityUnitCode || '').toUpperCase())) {
+      warnings.push({ field: 'quantityUnitCode', blocking: true, message: 'Select a quantity unit from this workspace’s synced RRA codes.' });
+    }
+  } else {
+    const fallbackRate = context.company?.is_vat_registered === false ? 0 : 18;
+    clean.taxRate = isBlank(clean.taxRate) ? fallbackRate : parseNumber(clean.taxRate);
+    clean.taxCode = clean.taxRate > 0 ? 'B' : 'A';
   }
   const openingQuantity = parseNumber(clean.openingStockQuantity) || 0;
   clean.reorderLevel = isBlank(clean.reorderLevel) ? Math.round(openingQuantity * 0.2 * 100) / 100 : clean.reorderLevel;
@@ -558,8 +644,7 @@ async function detectDuplicate(entityType, companyId, clean) {
   return { duplicate: false };
 }
 
-function cleanMappedRow(entityType, row, mapping) {
-  const definition = getEntityDefinition(entityType);
+function cleanMappedRow(entityType, row, mapping, definition = getEntityDefinition(entityType)) {
   const clean = {};
   for (const field of definition.fields) {
     const value = valueFor(row, mapping, field.key);
@@ -581,8 +666,7 @@ function cleanMappedRow(entityType, row, mapping) {
   return clean;
 }
 
-function validateCleanRow(entityType, clean, rowNumber) {
-  const definition = getEntityDefinition(entityType);
+function validateCleanRow(entityType, clean, rowNumber, definition = getEntityDefinition(entityType)) {
   const errors = [];
   const warnings = [];
 
@@ -592,12 +676,15 @@ function validateCleanRow(entityType, clean, rowNumber) {
     }
   }
 
-  for (const key of ['sellingPrice', 'costPrice', 'openingStockQuantity', 'reorderLevel', 'reorderQuantity', 'weight', 'creditLimit', 'budgetLimit', 'openingBalance', 'basicSalary', 'transportAllowance', 'housingAllowance', 'otherAllowances', 'defaultDirectPercentage', 'debitBalance', 'creditBalance', 'cost', 'accumulatedDepreciation', 'salvageValue', 'decliningRate', 'insuredValue', 'usefulLifeYears', 'budgetedAmount', 'fiscalYear', 'exchangeRate', 'quantity', 'costPerUnit', 'amountOutstanding']) {
+  for (const key of ['sellingPrice', 'costPrice', 'taxRate', 'openingStockQuantity', 'reorderLevel', 'reorderQuantity', 'weight', 'creditLimit', 'budgetLimit', 'openingBalance', 'basicSalary', 'transportAllowance', 'housingAllowance', 'otherAllowances', 'defaultDirectPercentage', 'debitBalance', 'creditBalance', 'cost', 'accumulatedDepreciation', 'salvageValue', 'decliningRate', 'insuredValue', 'usefulLifeYears', 'budgetedAmount', 'fiscalYear', 'exchangeRate', 'quantity', 'costPerUnit', 'amountOutstanding']) {
     if (!isBlank(clean[key]) && Number.isNaN(parseNumber(clean[key]))) {
       errors.push(buildValidationError(rowNumber, key, `${key} must be a number - found '${clean[key]}'.`, clean[key]));
     }
   }
 
+  if (!isBlank(clean.taxRate) && (parseNumber(clean.taxRate) < 0 || parseNumber(clean.taxRate) > 100)) {
+    errors.push(buildValidationError(rowNumber, 'taxRate', 'Tax rate must be from 0 to 100 percent.', clean.taxRate));
+  }
   if (!isBlank(clean.taxTypeCode) && !['A', 'B', 'C', 'D'].includes(String(clean.taxTypeCode).toUpperCase())) {
     errors.push(buildValidationError(rowNumber, 'taxTypeCode', `Tax type must be A, B, C, or D - found '${clean.taxTypeCode}'.`, clean.taxTypeCode));
   }
@@ -867,8 +954,18 @@ async function validateRelatedRecords(entityType, clean, companyId, cache) {
   return errors;
 }
 
-async function validateImport({ entityType, mapping, rows, file, companyId }) {
-  const definition = getEntityDefinition(entityType);
+async function validateImport({
+  entityType,
+  mapping,
+  rows,
+  file,
+  companyId,
+  expectedFiscalEntitlementVersion,
+  rowNumbers,
+}) {
+  const entitlement = entityType === 'products' ? await getProductImportEntitlement(companyId) : null;
+  if (entitlement) assertExpectedEntitlementVersion(expectedFiscalEntitlementVersion, entitlement);
+  const definition = getEntityDefinition(entityType, entitlement || undefined);
   if (!definition) {
     const error = new Error('Invalid import entity type.');
     error.statusCode = 400;
@@ -884,14 +981,25 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
   const warehouseCache = new Map(); // lower(name) -> warehouse
   const openingKeySeen = new Set(); // productId-warehouseId within file
   const openingExistingCache = new Map(); // key -> true if opening already exists in DB
-  const productContext = entityType === 'products' ? await buildProductEnrichmentContext(companyId) : null;
+  const productContext = entityType === 'products'
+    ? await buildProductEnrichmentContext(companyId, entitlement.ebmEnabled)
+    : null;
   const fileDuplicateKeys = new Map();
   const relatedRecordCache = new Map();
 
   for (let index = 0; index < fullRows.length; index++) {
-    const rowNumber = index + 2;
-    const clean = cleanMappedRow(entityType, fullRows[index], mapping);
-    const { errors, warnings } = validateCleanRow(entityType, clean, rowNumber);
+    const requestedRowNumber = rowNumbers?.[index];
+    const rowNumber = Number.isSafeInteger(requestedRowNumber) && requestedRowNumber >= 2
+      ? requestedRowNumber
+      : index + 2;
+    const clean = cleanMappedRow(entityType, fullRows[index], mapping, definition);
+    const { errors, warnings } = validateCleanRow(entityType, clean, rowNumber, definition);
+    if (entityType === 'products' && !entitlement.ebmEnabled && hasOffModeEbmValues(fullRows[index])) {
+      warnings.push({
+        field: '_ebm',
+        message: 'RRA/EBM columns were ignored because EBM is off. Standard product and tax fields were imported.',
+      });
+    }
     const relatedErrors = await validateRelatedRecords(entityType, clean, companyId, relatedRecordCache);
     for (const relatedError of relatedErrors) errors.push(buildValidationError(rowNumber, relatedError.field, relatedError.message, clean[relatedError.field]));
     if (productContext) {
@@ -1023,6 +1131,10 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
 
   return {
     entityType,
+    ...(entitlement ? {
+      fiscalEbmEnabled: entitlement.ebmEnabled,
+      fiscalEntitlementVersion: entitlement.entitlementVersion,
+    } : {}),
     totalRows: results.length,
     validRows,
     errorRows,
@@ -1414,12 +1526,16 @@ async function writeOpeningGl(companyId, userId, rows) {
   return OpeningBalanceService.import(companyId, { asOfDate: rows[0]?.asOfDate, balances }, userId);
 }
 
-function productPayload(companyId, userId, data) {
+function productPayload(companyId, userId, data, { ebmEnabled = true } = {}) {
   const ebmQuantityUnit = String(data.quantityUnitCode || '').toUpperCase();
   const unit = String(data.unit || (ebmQuantityUnit === 'KGM' ? 'kg' : ebmQuantityUnit === 'U' ? 'pcs' : 'pcs')).toLowerCase();
-  const taxCode = String(data.taxTypeCode || 'A').trim().toUpperCase();
   const importedTaxRate = parseNumber(data.taxRate);
-  const taxRate = importedTaxRate > 0 ? importedTaxRate : (taxCode === 'B' ? 18 : 0);
+  const taxCode = ebmEnabled
+    ? String(data.taxTypeCode || 'A').trim().toUpperCase()
+    : ((importedTaxRate || 0) > 0 ? 'B' : 'A');
+  const taxRate = ebmEnabled
+    ? (importedTaxRate > 0 ? importedTaxRate : (taxCode === 'B' ? 18 : 0))
+    : (importedTaxRate == null ? 0 : importedTaxRate);
   return {
     company: companyId,
     name: data.name,
@@ -1450,7 +1566,7 @@ function productPayload(companyId, userId, data) {
     revenueAccount: data.revenueAccount || null,
     taxCode,
     taxRate,
-    ebm: {
+    ...(ebmEnabled ? { ebm: {
       taxTyCd: taxCode,
       itemTyCd: data.itemTypeCode || null,
       orgnNatCd: data.originNationCode || null,
@@ -1463,7 +1579,7 @@ function productPayload(companyId, userId, data) {
       originCountryCode: data.originNationCode || null,
       packagingUnitCode: data.packagingUnitCode,
       quantityUnitCode: data.quantityUnitCode
-    },
+    } } : {}),
     createdBy: userId,
     ...(data.supplierId ? { supplier: data.supplierId, preferredSupplier: data.supplierId } : {})
   };
@@ -1473,7 +1589,7 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
   if (entityType === 'products') {
     const Product = require('../models/Product');
     const warehouseId = data.warehouseId || await resolveWarehouseId(companyId, data.warehouse);
-    const payload = productPayload(companyId, userId, data);
+    const payload = productPayload(companyId, userId, data, { ebmEnabled: context.ebmEnabled !== false });
     if (warehouseId) payload.defaultWarehouse = warehouseId;
     payload.category = await ensureCategory(companyId, data.category);
     const existing = await Product.findOne({ company: companyId, sku: payload.sku });
@@ -1512,6 +1628,9 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
     }
     if (existing && duplicateAction === 'update') {
       const updatePayload = { ...payload };
+      if (context.ebmEnabled !== false && updatePayload.ebm) {
+        updatePayload.ebm = { ...(existing.ebm || {}), ...updatePayload.ebm };
+      }
       delete updatePayload.currentStock;
       const movementStock = await calculateStockFromMovements(companyId, existing._id);
       if (movementStock != null) updatePayload.currentStock = movementStock;
@@ -1731,13 +1850,40 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
   throw new Error(`${entityType} import is not available yet. No records were written.`);
 }
 
-async function processValidatedRows({ logId, entityType, companyId, userId, rows, duplicateAction = 'skip', onProgress }) {
+async function processValidatedRows({
+  logId,
+  entityType,
+  companyId,
+  userId,
+  rows,
+  duplicateAction = 'skip',
+  fiscalEbmEnabled,
+  fiscalEntitlementVersion,
+  onProgress,
+}) {
   const ImportLog = require('../models/ImportLog');
   const outcomes = [];
   let successRows = 0;
   let errorRows = 0;
   let skippedRows = 0;
   const context = { arBalances: new Map(), apBalances: new Map(), departmentCache: new Map(), budgetReferenceCache: new Map() };
+  if (entityType === 'products') {
+    if (typeof fiscalEbmEnabled !== 'boolean' || !Number.isSafeInteger(Number(fiscalEntitlementVersion))) {
+      const error = new Error('Product import mode was not recorded. Validate the product file again before importing.');
+      error.code = 'PRODUCT_IMPORT_MODE_REQUIRED';
+      error.statusCode = 409;
+      throw error;
+    }
+    const currentEntitlement = await getProductImportEntitlement(companyId);
+    if (currentEntitlement.ebmEnabled !== fiscalEbmEnabled
+      || currentEntitlement.entitlementVersion !== Number(fiscalEntitlementVersion)) {
+      const error = new Error('The EBM setting changed before product import started. Validate the product file again.');
+      error.code = 'IMPORT_EBM_ENTITLEMENT_CHANGED';
+      error.statusCode = 409;
+      throw error;
+    }
+    context.ebmEnabled = currentEntitlement.ebmEnabled;
+  }
   await ImportLog.updateOne({ _id: logId, companyId }, { $set: { status: 'processing', startedAt: new Date() } });
 
   if (entityType === 'opening_gl_balances') {
@@ -1757,8 +1903,26 @@ async function processValidatedRows({ logId, entityType, companyId, userId, rows
     return { totalRows: rows.length, successRows, errorRows, skippedRows, outcomes, ...reports };
   }
 
-  for (let offset = 0; offset < rows.length; offset += 100) {
-    const batch = rows.slice(offset, offset + 100);
+  const batchSize = entityType === 'products' ? 10 : 100;
+  for (let offset = 0; offset < rows.length; offset += batchSize) {
+    const batch = rows.slice(offset, offset + batchSize);
+    if (entityType === 'products') {
+      const currentEntitlement = await getProductImportEntitlement(companyId);
+      if (currentEntitlement.ebmEnabled !== fiscalEbmEnabled
+        || currentEntitlement.entitlementVersion !== Number(fiscalEntitlementVersion)) {
+        const message = 'The EBM setting changed during product import. Remaining rows were not processed; validate and retry them.';
+        for (const row of rows.slice(offset)) {
+          errorRows += 1;
+          outcomes.push({
+            rowNumber: row.rowNumber,
+            status: 'error',
+            errors: [{ code: 'IMPORT_EBM_ENTITLEMENT_CHANGED', message }],
+            data: row.data,
+          });
+        }
+        break;
+      }
+    }
     for (const row of batch) {
       if (!row.valid) {
         errorRows += 1;
@@ -1819,8 +1983,10 @@ async function writeReports(logId, outcomes) {
   return { resultsReportUrl: `/downloads/${resultsFile}`, errorReportUrl };
 }
 
-async function generateTemplate(entityType, companyId) {
-  const definition = getEntityDefinition(entityType);
+async function generateTemplate(entityType, companyId, expectedFiscalEntitlementVersion) {
+  const entitlement = entityType === 'products' ? await getProductImportEntitlement(companyId) : null;
+  if (entitlement) assertExpectedEntitlementVersion(expectedFiscalEntitlementVersion, entitlement);
+  const definition = getEntityDefinition(entityType, entitlement || undefined);
   if (!definition) throw new Error('Invalid import entity type.');
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Kubika Smart Import';
@@ -1844,17 +2010,11 @@ async function generateTemplate(entityType, companyId) {
   fieldGuide.getRow(1).font = { bold: true, color: { argb: 'FF111827' } };
   fieldGuide.columns = [{ width: 38 }, { width: 32 }, { width: 14 }, { width: 100 }];
   if (entityType === 'products' && companyId) {
-    const context = await buildProductEnrichmentContext(companyId);
+    const context = await buildProductEnrichmentContext(companyId, entitlement.ebmEnabled);
     const options = {
       category: context.categories.map((item) => item.name).filter(Boolean),
       supplier: context.suppliers.map((item) => item.name).filter(Boolean),
       warehouse: context.warehouses.map((item) => item.name).filter(Boolean),
-      taxTypeCode: context.ebmCodes.filter(isTaxTypeCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
-      itemTypeCode: context.ebmCodes.filter((item) => ebmCodeClassId(item) === '24').map((item) => `${String(item.code)} - ${item.name || item.description || item.code}`),
-      originNationCode: context.ebmCodes.filter((item) => ebmCodeClassId(item) === '05').map((item) => `${String(item.code)} - ${item.name || item.description || item.code}`),
-      itemClassCode: context.itemClasses.map((item) => `${item.itemClassCode} - ${item.itemClassName || item.itemClassCode}`).filter(Boolean),
-      packagingUnitCode: context.ebmCodes.filter(isPackagingUnitCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
-      quantityUnitCode: context.ebmCodes.filter(isQuantityUnitCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
       inventoryAccount: context.accounts.filter((item) => String(item.type).toLowerCase() === 'asset').map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
       cogsAccount: context.accounts.filter((item) => ['cogs', 'expense'].includes(String(item.type).toLowerCase())).map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
       revenueAccount: context.accounts.filter((item) => String(item.type).toLowerCase() === 'revenue').map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
@@ -1864,6 +2024,18 @@ async function generateTemplate(entityType, companyId) {
       trackingType: ['none', 'batch', 'serial'],
       isStockable: ['TRUE', 'FALSE'],
     };
+    if (entitlement.ebmEnabled) {
+      Object.assign(options, {
+        taxTypeCode: context.ebmCodes.filter(isTaxTypeCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+        itemTypeCode: context.ebmCodes.filter((item) => ebmCodeClassId(item) === '24').map((item) => `${String(item.code)} - ${item.name || item.description || item.code}`),
+        originNationCode: context.ebmCodes.filter((item) => ebmCodeClassId(item) === '05').map((item) => `${String(item.code)} - ${item.name || item.description || item.code}`),
+        itemClassCode: context.itemClasses.map((item) => `${item.itemClassCode} - ${item.itemClassName || item.itemClassCode}`).filter(Boolean),
+        packagingUnitCode: context.ebmCodes.filter(isPackagingUnitCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+        quantityUnitCode: context.ebmCodes.filter(isQuantityUnitCode).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+      });
+    } else {
+      instructions.addRow(['EBM mode', 'EBM is off. This template uses the standard Tax Rate (%) field and does not include RRA codes or registration fields.']);
+    }
     optionSheet.addRow(['Field', 'Allowed values (also used by dropdowns)']);
     const ranges = {};
     for (const [key, rawValues] of Object.entries(options)) {
@@ -1902,7 +2074,12 @@ async function generateTemplate(entityType, companyId) {
       }
     });
     optionSheet.views = [{ state: 'frozen', ySplit: 1 }];
-    instructions.addRow(['Workspace choices', 'Dropdowns use active categories, suppliers, warehouses, synced RRA item classes/codes, and this workspace chart of accounts. Download a fresh template after master data changes.']);
+    instructions.addRow([
+      'Workspace choices',
+      entitlement.ebmEnabled
+        ? 'Dropdowns use active categories, suppliers, warehouses, synced RRA item classes/codes, and this workspace chart of accounts. Download a fresh template after master data changes.'
+        : 'Dropdowns use active categories, suppliers, warehouses, and this workspace chart of accounts. EBM is off; the template uses a standard tax rate and does not require RRA code data.',
+    ]);
   }
   instructions.addRows([
     ['Smart Import Template', definition.label],
@@ -1927,6 +2104,7 @@ module.exports = {
   MAX_ROWS,
   PROCESSABLE_ENTITY_TYPES,
   getCompanyId,
+  getImportEntityTypes,
   parseHeaders,
   validateImport,
   processValidatedRows,

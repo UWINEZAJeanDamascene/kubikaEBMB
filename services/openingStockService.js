@@ -13,7 +13,7 @@ const StockBatch = require('../models/StockBatch');
 const StockSerialNumber = require('../models/StockSerialNumber');
 const { createLayer } = require('./inventoryService');
 const JournalService = require('./journalService');
-const EBMStockService = require('./ebmStockService');
+const FiscalService = require('./fiscalService');
 const { runInTransaction } = require('./transactionService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const ChartOfAccount = require('../models/ChartOfAccount');
@@ -287,7 +287,7 @@ async function createOpeningStock({
 
   // Submit to VSDC/EBM outside transaction
   if (movement) {
-    EBMStockService.submitStockAdjustment(movement._id, { companyId, branchId }).catch((err) => {
+    FiscalService.submitStockAdjustment(movement._id, { companyId, branchId }).catch((err) => {
       console.error('EBM opening stock submission failed:', err.message);
     });
   }

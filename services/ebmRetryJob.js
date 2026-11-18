@@ -299,6 +299,11 @@ async function createAbandonedNotification(record) {
 }
 
 async function processRecord(record) {
+  const entitlement = await EBMQueueService.getCompanyEbmSetting(record.companyId);
+  if (!entitlement.enabled) {
+    return { id: record._id, status: 'skipped', reason: 'EBM is disabled for this company.' };
+  }
+
   const activeEnvironment = ebmService.getConfig().mode;
   if (record.environment && record.environment !== activeEnvironment) {
     record.nextRetryAt = new Date(Date.now() + getIntervalMs());
@@ -679,6 +684,11 @@ async function runOnce() {
     const results = [];
     for (const record of records.values()) {
       try {
+        const entitlement = await EBMQueueService.getCompanyEbmSetting(record.companyId);
+        if (!entitlement.enabled) {
+          results.push({ id: record._id, status: 'skipped', reason: 'EBM is disabled for this company.' });
+          continue;
+        }
         if (record.ebmStatus === 'submitting') {
           const unknown = new Error('The worker stopped before a VSDC response was durably recorded.');
           if (isSalesQueueRecord(record)) {

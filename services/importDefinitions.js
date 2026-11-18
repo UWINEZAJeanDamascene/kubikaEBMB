@@ -236,21 +236,46 @@ const ENTITY_DEFINITIONS = {
   }
 };
 
-function getEntityDefinition(entityType) {
+const EBM_PRODUCT_FIELD_KEYS = [
+  'taxTypeCode',
+  'itemTypeCode',
+  'originNationCode',
+  'itemClassCode',
+  'packagingUnitCode',
+  'quantityUnitCode',
+];
+
+const STANDARD_PRODUCT_TAX_RATE_FIELD = {
+  key: 'taxRate',
+  label: 'Tax Rate (%)',
+  required: false,
+  section: 'Tax',
+  example: '18',
+  instructions: 'Optional standard tax rate from 0 to 100. No RRA tax-code lookup or fiscal submission is used while EBM is off.',
+};
+
+function getEntityDefinition(entityType, { ebmEnabled = true } = {}) {
   const key = String(entityType || '').trim();
-  return ENTITY_DEFINITIONS[key] || null;
+  const definition = ENTITY_DEFINITIONS[key];
+  if (!definition || key !== 'products' || ebmEnabled) return definition || null;
+
+  const fields = definition.fields.filter((field) => !EBM_PRODUCT_FIELD_KEYS.includes(field.key));
+  const sellingPriceIndex = fields.findIndex((field) => field.key === 'sellingPrice');
+  fields.splice(sellingPriceIndex + 1, 0, STANDARD_PRODUCT_TAX_RATE_FIELD);
+  return { ...definition, fields };
 }
 
-function listEntityDefinitions() {
+function listEntityDefinitions(options) {
   return Object.entries(ENTITY_DEFINITIONS).filter(([, value]) => !value.aliasOf).map(([key, value]) => ({
     key,
     label: value.label,
-    fields: value.fields
+    fields: getEntityDefinition(key, options).fields
   }));
 }
 
 module.exports = {
   ENTITY_DEFINITIONS,
+  EBM_PRODUCT_FIELD_KEYS,
   getEntityDefinition,
   listEntityDefinitions
 };

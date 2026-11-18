@@ -15,15 +15,21 @@ async function runOnce() {
     const results = [];
     for (const row of due) {
       try {
+        const fiscalService = require('./fiscalService');
+        if (row.sourceOnly && row.signedAt && !row.sourceAppliedAt) {
+          await fiscalService.applyResolvedV2Receipt(row.documentId, row.companyId, row.id);
+          results.push({ id: row.id, status: 'source_recovered' });
+          continue;
+        }
         // submitInvoice consumes the same durable row using an atomic lease.
         // Concurrent workers may discover a row, but only one can claim it.
         if (row.documentType === 'creditNote') {
-          await require('./ebmSalesService').submitCreditNote(row.documentId, {
+          await fiscalService.submitCreditNote(row.documentId, {
             companyId: row.companyId,
             outboxId: row.id,
           });
         } else {
-          await require('./ebmSalesService').submitInvoice(row.documentId, {
+          await fiscalService.submitInvoice(row.documentId, {
             companyId: row.companyId,
             outboxId: row.id,
           });

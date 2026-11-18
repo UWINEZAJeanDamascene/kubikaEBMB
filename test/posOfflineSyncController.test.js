@@ -297,6 +297,33 @@ describe('POS offline sync operation processing', () => {
     expect(createDirectSale.mock.calls[0][0].get('Idempotency-Key')).toBe('offline-operation-0001');
   });
 
+  test('removes signed snapshot capabilities from review exception payloads', async () => {
+    createDirectSale.mockRejectedValueOnce(Object.assign(
+      new Error('Review this offline sale because fiscal entitlement changed.'),
+      { code: 'POS_OFFLINE_FISCAL_ENTITLEMENT_CHANGED', statusCode: 409 },
+    ));
+    const signedOperation = operation({
+      payload: {
+        displayTotal: 1200,
+        paymentMethod: 'cash',
+        paymentAmount: 1200,
+        offlineSnapshotCapability: 'secret-capability-token',
+        items: [{ productId: 'product-1', quantity: 1 }],
+      },
+    });
+
+    await expect(_private.processOperation(request, signedOperation)).resolves.toMatchObject({
+      status: 'needs_review',
+      error: { code: 'POS_OFFLINE_FISCAL_ENTITLEMENT_CHANGED' },
+    });
+
+    const exceptionInsert = db.$executeRawUnsafe.mock.calls.find(([sql]) => (
+      String(sql).includes('INSERT INTO pos_sync_exceptions')
+    ));
+    expect(exceptionInsert).toBeDefined();
+    expect(JSON.parse(exceptionInsert[7])).not.toHaveProperty('offlineSnapshotCapability');
+  });
+
   test('matches the operation register code to the authenticated register code', async () => {
     const result = await _private.processOperation(
       request,

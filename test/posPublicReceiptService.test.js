@@ -13,12 +13,16 @@ jest.mock('../services/posAuditService', () => ({
   requestIp: jest.fn(() => '127.0.0.1'),
   writePosAuditLog: jest.fn(),
 }));
+jest.mock('../services/moduleEntitlementService', () => ({
+  getFiscalSnapshot: jest.fn().mockResolvedValue({ fiscalMode: 'ebm', fiscalStatus: 'not_submitted' }),
+}));
 jest.mock('../src/config/environment', () => ({ getConfig: () => ({ server: { frontendUrl: 'http://localhost:5173' } }) }));
 
 const Invoice = require('../models/Invoice');
 const Company = require('../models/Company');
 const PDFDocument = require('pdfkit');
 const { writePosAuditLog } = require('../services/posAuditService');
+const moduleEntitlementService = require('../services/moduleEntitlementService');
 const {
   PUBLIC_RECEIPT_NOT_FOUND,
   loadSavedReceipt,
@@ -71,6 +75,10 @@ function configureSavedSale({ companyId = COMPANY_A, invoiceId = INVOICE_A, ebm 
 
 beforeEach(() => {
   jest.clearAllMocks();
+  moduleEntitlementService.getFiscalSnapshot.mockResolvedValue({
+    fiscalMode: 'ebm',
+    fiscalStatus: 'not_submitted',
+  });
   configureSavedSale();
   const tx = {
     $queryRaw: jest.fn().mockResolvedValue([{ id: '333333333333333333333333', companyId: COMPANY_A, invoiceId: INVOICE_A }]),
@@ -263,5 +271,39 @@ describe('public POS receipt protections', () => {
 
     expect(receiptDocument.fiscal).toBeNull();
     expect(JSON.stringify(receiptDocument)).not.toContain('unsigned-signature');
+  });
+
+  it('omits previously issued fiscal details from public receipts while EBM is disabled', async () => {
+    configureSavedSale({
+      ebm: {
+        ebmStatus: 'submitted',
+        mode: 'production',
+        rcptNo: '12345',
+        rcptSign: 'private-fiscal-signature',
+        intrlData: 'private-internal-data',
+      },
+    });
+    moduleEntitlementService.getFiscalSnapshot.mockResolvedValue({
+      fiscalMode: 'none',
+      fiscalStatus: 'not_required',
+    });
+    mockPrisma.ebmSubmissionQueue.findFirst.mockResolvedValue({
+      id: 'signed-submission',
+      ebmStatus: 'submitted',
+      signedAt: new Date('2026-11-02T09:00:00.000Z'),
+      environment: 'production',
+      fiscalResponse: {
+        rcptNo: '12345',
+        rcptSign: 'private-fiscal-signature',
+        intrlData: 'private-internal-data',
+      },
+      payload: {},
+    });
+
+    const { receiptDocument } = await loadSavedReceipt(COMPANY_A, INVOICE_A);
+
+    expect(receiptDocument.fiscal).toBeNull();
+    expect(JSON.stringify(receiptDocument)).not.toContain('private-fiscal-signature');
+    expect(JSON.stringify(receiptDocument)).not.toContain('private-internal-data');
   });
 });

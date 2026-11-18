@@ -336,6 +336,7 @@ async function initializeServer() {
   };
 
   apiRouter.use('/auth', require('./routes/authRoutes'));
+  apiRouter.use('/capabilities', require('./routes/capabilityRoutes'));
   apiRouter.use('/companies', require('./routes/companyRoutes'));
   apiRouter.use('/users', require('./routes/userRoutes'));
   apiRouter.use('/products', require('./routes/productRoutes'));

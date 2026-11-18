@@ -5,6 +5,7 @@ const ARReceipt = require('../models/ARReceipt');
 const EBMBranchService = require('../services/ebmBranchService');
 const { writePosAuditLog } = require('../services/posAuditService');
 const { prisma } = require('../lib/prisma');
+const moduleEntitlementService = require('../services/moduleEntitlementService');
 function sanitizeClientBody(body = {}) {
   const {
     registerWithEbmBranch,
@@ -30,10 +31,12 @@ function getRequestedBranchId(body = {}) {
 }
 
 async function trySaveClientBranchCustomer({ companyId, clientId, body, user }) {
-  if (!shouldRegisterBranchCustomer(body)) return null;
+  if (!shouldRegisterBranchCustomer(body)
+    || !await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm')) return null;
   const branchId = getRequestedBranchId(body);
   try {
     const result = await EBMBranchService.saveBranchCustomer(companyId, clientId, branchId, user);
+    if (!result) return null;
     return {
       success: true,
       branchId,

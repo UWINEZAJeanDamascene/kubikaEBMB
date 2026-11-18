@@ -69,6 +69,16 @@ function verifyCapability(token) {
       statusCode: 403,
     });
   }
+  const hasFiscalMode = payload.fiscalMode !== undefined;
+  const hasEntitlementVersion = payload.entitlementVersion !== undefined;
+  if (hasFiscalMode !== hasEntitlementVersion
+    || hasFiscalMode && !['none', 'ebm'].includes(payload.fiscalMode)
+    || hasEntitlementVersion && (!Number.isSafeInteger(payload.entitlementVersion) || payload.entitlementVersion < 1)) {
+    throw Object.assign(new Error('Offline POS fiscal capability claims are invalid.'), {
+      code: 'POS_OFFLINE_CAPABILITY_INVALID',
+      statusCode: 403,
+    });
+  }
   return payload;
 }
 

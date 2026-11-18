@@ -20,6 +20,7 @@ const {
 } = require('../controllers/productController');
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
+const requireModule = require('../middleware/requireModule');
 const logAction = require('../middleware/logAction');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
@@ -50,9 +51,9 @@ router.route('/:id')
 
 router.put('/:id/archive', requirePermission('products', 'delete'), logAction('product'), archiveProduct);
 router.put('/:id/restore', requirePermission('products', 'update'), logAction('product'), restoreProduct);
-router.post('/ebm/register-all', requirePermission('products', 'update'), logAction('product'), cacheInvalidationMiddleware({ type: 'product', invalidateAll: true }), registerAllProductsWithEBM);
+router.post('/ebm/register-all', requireModule('fiscal.ebm', { allowSandboxWhenOff: true }), requirePermission('products', 'update'), logAction('product'), cacheInvalidationMiddleware({ type: 'product', invalidateAll: true }), registerAllProductsWithEBM);
 router.post('/import/backfill-default-warehouses', requirePermission('products', 'update'), logAction('product'), cacheInvalidationMiddleware({ type: 'product', invalidateAll: true }), backfillProductWarehouses);
-router.post('/:id/ebm/register', requirePermission('products', 'update'), logAction('product'), registerProductWithEBM);
+router.post('/:id/ebm/register', requireModule('fiscal.ebm', { allowSandboxWhenOff: true }), requirePermission('products', 'update'), logAction('product'), registerProductWithEBM);
 router.get('/:id/reorder-analysis', requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 180, keyGenerator: (req) => cacheMiddlewareKey(req) }), analyzeReorder);
 router.post('/:id/auto-reorder', requirePermission('products', 'update'), logAction('product'), triggerAutoReorder);
 router.get('/:id/history', requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 300, keyGenerator: (req) => cacheMiddlewareKey(req) }), getProductHistory);

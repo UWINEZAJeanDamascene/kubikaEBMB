@@ -135,7 +135,9 @@ function stockMovementToApi(row) {
     notes: row.notes ?? null,
     performedBy: row.performedById ?? null,
     movementDate: row.movementDate,
-    ebm: row.ebm ?? {},
+    ...(row.fiscalMode === 'none' ? {} : { ebm: row.ebm ?? {} }),
+    fiscalMode: row.fiscalMode ?? null,
+    fiscalStatus: row.fiscalStatus ?? null,
     ...mapTimestamps(row),
   };
   if (row.product && typeof row.product === 'object') {
@@ -407,7 +409,9 @@ function stockTransferToApi(row) {
     referenceNumber: row.referenceNumber ?? null,
     signatures: row.signatures ?? [],
     journalEntry: row.journalEntryId ?? null,
-    ebm: row.ebm ?? {},
+    ...(row.fiscalMode === 'none' ? {} : { ebm: row.ebm ?? {} }),
+    fiscalMode: row.fiscalMode ?? null,
+    fiscalStatus: row.fiscalStatus ?? null,
     createdBy: row.createdById ?? null,
     ...mapTimestamps(row),
   };

@@ -35,6 +35,7 @@ const ALIASES = {
   accountType: ['account_type', 'type', 'ledger_type'],
   parentAccountCode: ['parent_account_code', 'parent code', 'parent', 'parent_code'],
   taxTypeCode: ['tax_type', 'tax_type_code', 'tax code', 'taxcode', 'vat', 'vat_code', 'tax_ty_cd'],
+  taxRate: ['tax_rate', 'tax rate', 'vat_rate', 'vat rate', 'rate_pct', 'tax_rate_pct'],
   itemTypeCode: ['item_type_code', 'item_ty_cd', 'item_type', 'product_type_code', 'product_type'],
   originNationCode: ['origin_nation_code', 'origin_country_code', 'origin_country', 'orgn_nat_cd', 'country_of_origin', 'origin_nation'],
   itemClassCode: ['item_class_code', 'item_classification_code', 'item_class_cd', 'rra_class_code'],
@@ -168,8 +169,8 @@ function detectPattern(values, fields) {
   return null;
 }
 
-function mapColumns(entityType, headers, rows = []) {
-  const definition = getEntityDefinition(entityType);
+function mapColumns(entityType, headers, rows = [], options) {
+  const definition = getEntityDefinition(entityType, options);
   if (!definition) throw new Error(`Unsupported import entity type: ${entityType}`);
 
   const mapping = {};

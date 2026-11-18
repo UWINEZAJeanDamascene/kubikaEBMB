@@ -55,6 +55,13 @@ exports.register = async (req, res, next) => {
       data: user
     });
   } catch (error) {
+    if (error.code === 'PLATFORM_ROLE_ASSIGNMENT_FORBIDDEN') {
+      return res.status(403).json({
+        success: false,
+        message: 'Platform administrator accounts can only be provisioned through the protected platform setup process.',
+        code: error.code,
+      });
+    }
     if (error.code === 'EMAIL_ALREADY_REGISTERED') {
       return res.status(409).json({
         success: false,

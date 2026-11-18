@@ -23,8 +23,7 @@ const inventoryService = require("../services/inventoryService");
 const emailService = require("../services/emailService");
 const mongoose = require("mongoose");
 const { runInTransaction } = require("../services/transactionService");
-const EBMPurchaseService = require("../services/ebmPurchaseService");
-const EBMStockService = require("../services/ebmStockService");
+const FiscalService = require("../services/fiscalService");
 const { parseBoundedPage } = require("../utils/querySafety");
 const { nextReferenceNo } = require("../utils/referenceNumbers");
 
@@ -939,12 +938,12 @@ exports.receivePurchase = async (req, res, next) => {
 
     let responsePurchase = purchase;
     try {
-      responsePurchase = await EBMPurchaseService.processPurchaseDocument(companyId, purchase, "Purchase", {
+      responsePurchase = await FiscalService.processPurchaseDocument(companyId, purchase, "Purchase", {
         branchId: req.body.branchId || req.body.bhfId,
         operator: { id: req.user?._id || req.user?.id, name: req.user?.name },
       });
       if (responsePurchase?.ebm?.ebmStatus !== "failed") {
-        await EBMStockService.submitStockForDirectPurchase(purchase._id, {
+        await FiscalService.submitStockForDirectPurchase(purchase._id, {
           companyId,
           branchId: req.body.branchId || req.body.bhfId,
         });

@@ -5,6 +5,7 @@ const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
 const Supplier = require('../models/Supplier');
 const ebmService = require('./ebmService');
+const moduleEntitlementService = require('./moduleEntitlementService');
 const crypto = require('crypto');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
 const { EBM_SYNC_TYPES } = require('../constants/ebmSyncTypes');
@@ -448,6 +449,7 @@ class EBMImportedItemService {
 
     const results = [];
     for (const device of devices) {
+      if (!await moduleEntitlementService.hasModule(device.company, 'fiscal.ebm')) continue;
       const state = await EBMSyncState.findOne({
         company: device.company,
         branchId: device.branchId,

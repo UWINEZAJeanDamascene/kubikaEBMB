@@ -1,6 +1,6 @@
 const Invoice = require('../models/Invoice');
 const Company = require('../models/Company');
-const ebmService = require('../services/ebmService');
+const FiscalService = require('../services/fiscalService');
 const { prisma } = require('../lib/prisma');
 const slowQueryMonitor = require('../utils/slowQueryMonitor');
 const { requestIp } = require('../services/posAuditService');
@@ -177,14 +177,25 @@ exports.getReceipt = async (req, res, next) => {
       salesPayload: v2Submission.payload,
       fiscalError: v2Submission.lastError || null,
     } : invoice.ebm;
-    const fiscalMode = String(storedSignedEbm?.fiscalEnvironment || storedSignedEbm?.environment || storedSignedEbm?.mode || ebmService.getConfig().mode || '').toLowerCase();
+    const storedInvoiceEbm = invoice.ebm && typeof invoice.ebm === 'object' ? invoice.ebm : null;
+    const hasLegacyFiscalData = Boolean(storedSignedEbm || (storedInvoiceEbm && Object.keys(storedInvoiceEbm).length));
+    const storedFiscalMode = invoice.fiscalMode
+      || storedSignedEbm?.fiscalEnvironment
+      || storedSignedEbm?.environment
+      || storedSignedEbm?.mode
+      || (hasLegacyFiscalData ? 'ebm' : null);
+    const fiscalMode = String(storedFiscalMode || await FiscalService.getCurrentEnvironment(companyId) || '').toLowerCase();
     const qrPng = fiscalMode === 'production' && storedSignedEbm?.ebmStatus === 'submitted'
       ? await generateQrPng(storedSignedEbm, { width: 110 })
       : null;
     const data = invoice.toObject({ virtuals: true });
-    data.ebm = storedSignedEbm || {};
-    data.ebm.environment = data.ebm.fiscalEnvironment || data.ebm.environment || fiscalMode || null;
-    data.ebm.fiscalEnvironment = data.ebm.fiscalEnvironment || fiscalMode || null;
+    if (fiscalMode === 'none') {
+      delete data.ebm;
+    } else {
+      data.ebm = storedSignedEbm || storedInvoiceEbm || {};
+      data.ebm.environment = data.ebm.fiscalEnvironment || data.ebm.environment || fiscalMode || null;
+      data.ebm.fiscalEnvironment = data.ebm.fiscalEnvironment || fiscalMode || null;
+    }
     const ebmStatus = data.ebm.ebmStatus || 'not_submitted';
     data.companyReceipt = {
       name: company?.name || 'Company',

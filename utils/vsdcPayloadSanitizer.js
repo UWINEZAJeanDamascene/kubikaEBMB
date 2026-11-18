@@ -14,8 +14,12 @@ const VSDC_ENDPOINTS = Object.freeze({
   SELECT_ITEMS: '/items/selectItems',
   SAVE_ITEMS: '/items/saveItems',
   SAVE_SALES: SAVE_SALES_ENDPOINT,
+  SELECT_SALES: '/transactions/selectTrnsSalesSummary',
   SELECT_PURCHASE_SALES: '/transactions/selectTrnsPurchaseSummary',
   SAVE_PURCHASES: '/transactions/savePurchases',
+  SELECT_IMPORT_ITEMS: SELECT_IMPORT_ITEMS_ENDPOINT,
+  SAVE_IMPORT_ITEMS: '/imports/updateImportItems',
+  UPDATE_IMPORT_ITEMS: '/imports/updateImportItems',
   SELECT_STOCK_ITEMS: '/stock/selectStockItems',
   SAVE_STOCK_ITEMS: '/stock/saveStockItems',
   SAVE_STOCK_MASTER: '/stock/saveStockMaster',
@@ -23,6 +27,7 @@ const VSDC_ENDPOINTS = Object.freeze({
   SAVE_BRANCH_CUSTOMER: '/branches/saveBrancheCustomers',
   SAVE_BRANCH_USER: '/branches/saveBrancheUsers',
   SAVE_BRANCH_INSURANCE: '/branches/saveBrancheInsurances',
+  SAVE_ITEM_COMPOSITION: '/items/saveItemComposition',
 });
 
 const LOOKUP_REQUEST_FIELDS = Object.freeze({
@@ -1609,6 +1614,36 @@ function sanitizeForEndpoint(endpoint, payload) {
   }
 }
 
+const VSDC_NUMBER_FIELDS = new Set([
+  ...SALES_NUMERIC_FIELDS,
+  ...SALES_RECEIPT_NUMERIC_FIELDS,
+  ...SALES_LINE_NUMERIC_FIELDS,
+  ...PURCHASE_NUMERIC_FIELDS,
+  'orgSarNo', 'sarNo', 'rsdQty', 'dftPrc', 'grpPrcL1', 'grpPrcL2',
+  'grpPrcL3', 'grpPrcL4', 'grpPrcL5', 'sftyQty',
+]);
+
+function serializeVsdcRequest(value) {
+  const serialize = (item, key = null) => {
+    if (item === null || typeof item !== 'object') {
+      if (typeof item === 'string' && key && VSDC_NUMBER_FIELDS.has(key)) {
+        if (!/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(item)) {
+          throw new TypeError(`VSDC numeric field ${key} is not a valid JSON number.`);
+        }
+        return item;
+      }
+      const encoded = JSON.stringify(item);
+      return encoded === undefined ? 'null' : encoded;
+    }
+    if (Array.isArray(item)) return `[${item.map((entry) => serialize(entry)).join(',')}]`;
+    return `{${Object.entries(item).map(([field, entry]) => (
+      `${JSON.stringify(field)}:${serialize(entry, field)}`
+    )).join(',')}}`;
+  };
+
+  return serialize(value);
+}
+
 function extractInitInfo(data) {
   if (!data || typeof data !== 'object') return {};
   if (data.info && typeof data.info === 'object') return data.info;
@@ -1669,5 +1704,6 @@ module.exports = {
   mapVsdcErrorCode,
   toVsdcNumber,
   toVsdcFiscalNumber,
+  serializeVsdcRequest,
   FISCAL_INTEGER_FIELDS,
 };

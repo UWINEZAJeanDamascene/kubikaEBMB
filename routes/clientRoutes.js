@@ -27,6 +27,8 @@ const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 const { idempotentHandler } = require('../services/posIdempotencyService');
+const requireModule = require('../middleware/requireModule');
+const moduleEntitlementService = require('../services/moduleEntitlementService');
 
 const cacheClients = cacheMiddleware({ type: 'client', ttl: 300 });
 const invalidateClients = cacheInvalidationMiddleware({ type: 'client' });
@@ -37,7 +39,11 @@ function requireEbmUpdateWhenBranchSubmissionRequested(req, res, next) {
     .some((value) => value === true || value === 'true')
     || process.env.EBM_AUTO_SAVE_BRANCH_CUSTOMERS === 'true';
   if (!requested) return next();
-  return requireEbmBranchCustomerUpdate(req, res, next);
+  const companyId = req.companyId || req.user?.company?._id || req.user?.company?.id || req.user?.company;
+  if (!companyId) return next();
+  return moduleEntitlementService.hasModule(companyId, 'fiscal.ebm')
+    .then((enabled) => (enabled ? requireEbmBranchCustomerUpdate(req, res, next) : next()))
+    .catch(next);
 }
 
 requireEbmUpdateWhenBranchSubmissionRequested.conditionalPermission = {
@@ -67,6 +73,7 @@ router.route('/:id')
 router.put('/:id/toggle-status', requirePermission('clients', 'update'), invalidateClients, toggleClientStatus);
 router.post(
   '/:id/ebm/verify-tin',
+  requireModule('fiscal.ebm'),
   requirePermission('clients', 'update'),
   body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
@@ -77,6 +84,7 @@ router.post(
 );
 router.post(
   '/:id/ebm/branch-customer',
+  requireModule('fiscal.ebm'),
   requirePermission('clients', 'update'),
   requireEbmBranchCustomerUpdate,
   body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
@@ -88,6 +96,7 @@ router.post(
 );
 router.get(
   '/:id/ebm/branch-customer/status',
+  requireModule('fiscal.ebm'),
   requireEbmBranchCustomerUpdate,
   getClientBranchCustomerStatus,
 );

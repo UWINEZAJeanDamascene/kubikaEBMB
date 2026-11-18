@@ -26,7 +26,7 @@ describe('POS canonical receipt document', () => {
     expect(result.lines[0]).toMatchObject({ unitPriceRwf: 1000, discountRwf: 100, discountPercent: 5, discountReason: 'Damaged packaging', totalRwf: 1900, sku: 'TEA-1', barcode: '123' });
     expect(result.totals).toMatchObject({ subtotalRwf: 2000, discountRwf: 100, totalSavedRwf: 100, taxTotalRwf: 290, grandTotalRwf: 2190 });
     expect(result.totals.taxes).toEqual([{ code: 'B', label: 'VAT 18%', taxableRwf: 1900, taxRwf: 290 }]);
-    expect(result.payments).toEqual([{ method: 'CASH', amountRwf: 1000, reference: null, kind: null }, { method: 'CARD', amountRwf: 1190, reference: 'AUTH-1', kind: null }]);
+    expect(result.payments).toEqual([{ method: 'CASH', amountRwf: 1000, reference: null, kind: null }, { method: 'CARD', amountRwf: 1190, reference: '****TH-1', kind: null }]);
     expect(result.paymentSummary).toEqual({ amountPaidRwf: 2190, changeGivenRwf: 0 });
     expect(result.customer).toEqual({ name: 'Customer B', tin: '987654321' });
     expect(result.extension.template).toBe('retail');

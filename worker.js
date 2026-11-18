@@ -48,6 +48,7 @@ async function startWorker() {
   startSafely('prepaid-expense-amortizations', () => require('./services/prepaidExpenseScheduler').startScheduler());
   startSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').startScheduler());
   startSafely('ebm-retry', () => require('./services/ebmRetryJob').startRetryJob());
+  startSafely('platform-module-transitions', () => require('./services/platformModuleEntitlementService').startScheduler());
   startSafely('pos-ebm-v2-sweeper', () => require('./services/posEbmV2RetryJob').start());
   startSafely('pos-accounting-posting-retry', () => require('./services/posAccountingPostingService').start());
   startSafely('report-snapshots', () => require('./services/reportSchedulerService').initializeScheduler());
@@ -121,6 +122,7 @@ async function shutdown(signal) {
       try { fn(); } catch (e) { console.warn(`[worker] Error stopping ${label}:`, e.message || e); }
     };
     stopSafely('ebm-retry', () => require('./services/ebmRetryJob').stopRetryJob());
+    stopSafely('platform-module-transitions', () => require('./services/platformModuleEntitlementService').stopScheduler());
     stopSafely('pos-ebm-v2-sweeper', () => require('./services/posEbmV2RetryJob').stop());
     stopSafely('pos-accounting-posting-retry', () => require('./services/posAccountingPostingService').stop());
     stopSafely('report-snapshots', () => require('./services/reportSchedulerService').stopScheduler());

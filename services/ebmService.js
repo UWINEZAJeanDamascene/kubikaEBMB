@@ -1,9 +1,11 @@
 const crypto = require('crypto');
 const axios = require('axios');
 const {
+  VSDC_ENDPOINTS,
   sanitizeForEndpoint,
   extractInitInfo,
   mapVsdcErrorCode,
+  serializeVsdcRequest,
 } = require('../utils/vsdcPayloadSanitizer');
 const VSDC_1_0_5_CODE_DEFINITION_4_1_TO_4_3 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.1-4.3.json');
 const VSDC_1_0_5_CODE_DEFINITION_4_4 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.4.json');
@@ -13,8 +15,14 @@ const VSDC_1_0_5_CODE_DEFINITION_4_12 = require('../fixtures/rraVsdc/v1.0.5/code
 const VSDC_1_0_5_CODE_DEFINITION_4_13 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.13.json');
 const VSDC_1_0_5_STOCK_IN_OUT_TYPES_4_15 = require('../fixtures/rraVsdc/v1.0.5/stock-in-out-types-4.15.json');
 const VSDC_1_0_5_REFUND_REASON_CODES_4_16 = require('../fixtures/rraVsdc/v1.0.5/code-definitions-4.16.json');
-const { preserveImportDecimalPrecision } = require('../utils/ebmImportResponseParser');
+const {
+  preserveImportDecimalPrecision,
+  preservePurchaseSelectNumberPrecision,
+  preserveStockSelectNumberPrecision,
+  preserveSaveSalesResponse,
+} = require('../utils/ebmImportResponseParser');
 const { VSDC_API_RESPONSE_CODES, getVsdcApiResponseCode } = require('../utils/vsdcApiResponseCodes');
+const { getStockSaveBlock } = require('./ebmStockContractGate');
 
 const EBM_MODES = Object.freeze({
   MOCK: 'mock',
@@ -59,37 +67,6 @@ const DEFAULTS = Object.freeze({
   timeoutMs: 30000,
 });
 
-const VSDC_ENDPOINTS = Object.freeze({
-  INITIALIZE_DEVICE: '/initializer/selectInitInfo',
-
-  SELECT_CODES: '/code/selectCodes',
-  SELECT_ITEM_CLASSES: '/itemClass/selectItemsClass',
-  SELECT_CUSTOMER: '/customers/selectCustomer',
-  SELECT_BRANCHES: '/branches/selectBranches',
-  SELECT_NOTICES: '/notices/selectNotices',
-
-  SAVE_BRANCH_CUSTOMER: '/branches/saveBranchCustomer',
-  SAVE_BRANCH_USER: '/branches/saveBranchUser',
-  SAVE_BRANCH_INSURANCE: '/branches/saveBranchInsurance',
-
-  SELECT_ITEMS: '/items/selectItems',
-  SAVE_ITEMS: '/items/saveItems',
-  SAVE_ITEM_COMPOSITION: '/items/saveItemComposition',
-
-  SELECT_IMPORT_ITEMS: '/imports/selectImportItems',
-  SAVE_IMPORT_ITEMS: '/imports/saveImportItems',
-
-  SAVE_SALES: '/transactions/saveSales',
-  SELECT_SALES: '/transactions/selectTrnsSalesSummary',
-
-  SELECT_PURCHASE_SALES: '/transactions/selectTrnsPurchaseSummary',
-  SAVE_PURCHASES: '/transactions/savePurchases',
-
-  SELECT_STOCK_ITEMS: '/stock/selectStockItems',
-  SAVE_STOCK_ITEMS: '/stock/saveStockItems',
-  SAVE_STOCK_MASTER: '/stock/saveStockMaster',
-});
-
 const BRANCH_REGISTRATION_EXEMPT_ENDPOINTS = new Set([
   VSDC_ENDPOINTS.INITIALIZE_DEVICE,
   VSDC_ENDPOINTS.SELECT_CODES,
@@ -121,11 +98,13 @@ const SAVE_ENDPOINT_GATES = Object.freeze({
     flag: 'RRA_VSDC_BRANCH_USER_SAVE_ENABLED',
     errorCode: 'EBM_BRANCH_USER_CONTRACT_BLOCKED',
     specReference: 'section 3.3.3.2 (PDF pp. 29-30)',
+    mockAllowed: true,
   },
   [VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE]: {
     flag: 'RRA_VSDC_BRANCH_INSURANCE_SAVE_ENABLED',
     errorCode: 'EBM_BRANCH_INSURANCE_CONTRACT_BLOCKED',
     specReference: 'section 3.3.3.3 (PDF pp. 30-31)',
+    mockAllowed: true,
   },
   [VSDC_ENDPOINTS.SAVE_ITEMS]: {
     flag: 'RRA_VSDC_ITEM_SAVE_SANDBOX_ENABLED',
@@ -152,10 +131,9 @@ function isBranchSaveFeatureEnabled(endpoint) {
 function assertBranchSaveFeatureEnabled(endpoint, mode = resolveMode(), { allowMock = false } = {}) {
   const gate = SAVE_ENDPOINT_GATES[endpoint];
   if (!gate || (mode === EBM_MODES.MOCK && allowMock && gate.mockAllowed)) return true;
-  if (isBranchSaveFeatureEnabled(endpoint)) {
-    if (mode !== EBM_MODES.PRODUCTION
-      || (gate.productionFlags || []).every((flag) => process.env[flag] === 'true')) return true;
-  }
+  if (mode === EBM_MODES.PRODUCTION && gate.productionFlags?.length) {
+    if (gate.productionFlags.every((flag) => process.env[flag] === 'true')) return true;
+  } else if (isBranchSaveFeatureEnabled(endpoint)) return true;
 
   const error = new EBMServiceError(
     `${endpoint} is disabled until its RRA contract is confirmed for this environment. Set ${gate.flag}=true only after the required review for ${gate.specReference}.`,
@@ -181,6 +159,9 @@ class EBMServiceError extends Error {
     this.resultCd = options.resultCd ?? options.response?.resultCd ?? null;
     this.resultCodeSystem = options.resultCodeSystem ?? null;
     this.resultCodeDescription = options.resultCodeDescription ?? null;
+    this.dispatched = options.dispatched ?? null;
+    this.outcomeUnknown = options.outcomeUnknown ?? false;
+    this.requestId = options.requestId ?? null;
   }
 }
 
@@ -260,11 +241,48 @@ function normalizeAxiosError(error, mode, endpoint, payload) {
   );
 }
 
-function normalizeVsdcResponse(raw, mode, endpoint, payload) {
-  const response = raw && typeof raw === 'object' ? raw : {};
+function isValidVsdcTimestamp(value) {
+  if (typeof value !== 'string' || !/^\d{14}$/.test(value)) return false;
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(4, 6));
+  const day = Number(value.slice(6, 8));
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day
+    && Number(value.slice(8, 10)) <= 23
+    && Number(value.slice(10, 12)) <= 59
+    && Number(value.slice(12, 14)) <= 59;
+}
+
+function normalizeVsdcResponse(raw, mode, endpoint, payload, requestId = null) {
+  const response = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const resultCd = response.resultCd;
+  const outcomeUnknown = () => {
+    throw new EBMServiceError(
+      `VSDC returned an incomplete successful response for ${endpoint}; the fiscal outcome is unknown.`,
+      {
+        code: endpoint === VSDC_ENDPOINTS.SAVE_PURCHASES
+          ? 'EBM_PURCHASE_OUTCOME_UNKNOWN'
+          : 'EBM_SALES_OUTCOME_UNKNOWN',
+        mode,
+        endpoint,
+        response,
+        payload,
+        retryable: false,
+        resultCd,
+        dispatched: true,
+        outcomeUnknown: true,
+        requestId,
+      },
+    );
+  };
 
   if (resultCd !== RESULT_CODES.SUCCESS) {
+    if ((resultCd == null || resultCd === '')
+      && (endpoint === VSDC_ENDPOINTS.SAVE_SALES || endpoint === VSDC_ENDPOINTS.SAVE_PURCHASES)) {
+      outcomeUnknown();
+    }
     const codeDescription = mapVsdcErrorCode(resultCd) || RESULT_CODE_DETAILS[resultCd];
     const responseCode = getVsdcApiResponseCode(typeof resultCd === 'string' ? resultCd : '');
     throw new EBMServiceError(
@@ -279,6 +297,42 @@ function normalizeVsdcResponse(raw, mode, endpoint, payload) {
         resultCd,
         resultCodeSystem: responseCode?.system || null,
         resultCodeDescription: responseCode?.description || null,
+        dispatched: true,
+      },
+    );
+  }
+
+  if (endpoint === VSDC_ENDPOINTS.SAVE_SALES) {
+    const fiscalData = require('../utils/vsdcPayloadSanitizer').extractSaveSalesFiscalData(response);
+    if (!isValidVsdcTimestamp(response.resultDt)
+      || !response.data
+      || typeof response.data !== 'object'
+      || Array.isArray(response.data)
+      || !fiscalData.rcptNo
+      || !fiscalData.rcptSign
+      || !fiscalData.intrlData) {
+      outcomeUnknown();
+    }
+  }
+  if (endpoint === VSDC_ENDPOINTS.SAVE_PURCHASES
+    && (!isValidVsdcTimestamp(response.resultDt)
+      || !Object.prototype.hasOwnProperty.call(response, 'data')
+      || (response.data !== null && (typeof response.data !== 'object' || Array.isArray(response.data))))) {
+    outcomeUnknown();
+  }
+  if (endpoint === VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE
+    && (!Object.prototype.hasOwnProperty.call(response, 'data') || response.data !== null)) {
+    throw new EBMServiceError(
+      'VSDC returned a malformed branch-insurance response; the documented response data must be null.',
+      {
+        code: 'EBM_VSDC_RESPONSE_MALFORMED',
+        mode,
+        endpoint,
+        response,
+        payload,
+        retryable: false,
+        resultCd,
+        dispatched: true,
       },
     );
   }
@@ -290,7 +344,7 @@ function normalizeVsdcResponse(raw, mode, endpoint, payload) {
     resultCd,
     resultMsg: response.resultMsg,
     resultDt: response.resultDt,
-    data: response.data || null,
+    data: response.data ?? null,
     raw: response,
   };
 }
@@ -363,6 +417,36 @@ class EBMService {
       this.assertBranchSaveFeatureEnabled(endpoint, this.mode, { allowMock: this.isMockMode() });
     }
 
+    if (endpoint === VSDC_ENDPOINTS.SAVE_IMPORT_ITEMS && !this.isMockMode()) {
+      const error = new EBMServiceError(
+        'RRA import status updates remain disabled until the endpoint contract and local receipt workflow are confirmed.',
+        {
+          code: 'EBM_IMPORT_CONTRACT_UNCONFIRMED',
+          mode: this.mode,
+          endpoint,
+          status: 409,
+          retryable: false,
+          dispatched: false,
+        },
+      );
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const stockSaveBlock = getStockSaveBlock(endpoint, this.mode);
+    if (stockSaveBlock) {
+      const error = new EBMServiceError(stockSaveBlock.message, {
+        code: stockSaveBlock.code,
+        mode: this.mode,
+        endpoint,
+        status: 409,
+        retryable: false,
+        dispatched: false,
+      });
+      error.statusCode = 409;
+      throw error;
+    }
+
     if (endpoint !== VSDC_ENDPOINTS.INITIALIZE_DEVICE) {
       const EBMDeviceService = require('./ebmDeviceService');
       const companyId = context.companyId || payload.companyId || payload.company_id || payload.company;
@@ -393,10 +477,21 @@ class EBMService {
 
     const wirePayload = sanitizeForEndpoint(endpoint, payload);
     try {
-      const isImportSelection = endpoint === VSDC_ENDPOINTS.SELECT_IMPORT_ITEMS;
-      const requestConfig = isImportSelection
-        ? { responseType: 'text', transformResponse: [preserveImportDecimalPrecision] }
-        : undefined;
+      const responseTransform = endpoint === VSDC_ENDPOINTS.SELECT_IMPORT_ITEMS
+        ? preserveImportDecimalPrecision
+        : endpoint === VSDC_ENDPOINTS.SELECT_PURCHASE_SALES
+          ? preservePurchaseSelectNumberPrecision
+          : endpoint === VSDC_ENDPOINTS.SELECT_STOCK_ITEMS
+            ? preserveStockSelectNumberPrecision
+            : endpoint === VSDC_ENDPOINTS.SAVE_SALES
+              ? preserveSaveSalesResponse
+              : null;
+      const requestConfig = {
+        transformRequest: [serializeVsdcRequest],
+        ...(responseTransform
+          ? { responseType: 'text', transformResponse: [responseTransform] }
+          : {}),
+      };
       const { data } = await this.http.post(endpoint, wirePayload, requestConfig);
       return normalizeVsdcResponse(data, this.mode, endpoint, payload);
     } catch (error) {
@@ -932,7 +1027,6 @@ class EBMService {
 
       case VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMER:
       case VSDC_ENDPOINTS.SAVE_BRANCH_USER:
-      case VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE:
       case VSDC_ENDPOINTS.SAVE_ITEMS:
       case VSDC_ENDPOINTS.SAVE_ITEM_COMPOSITION:
       case VSDC_ENDPOINTS.SAVE_IMPORT_ITEMS:
@@ -941,6 +1035,9 @@ class EBMService {
           confmDt: now,
           invcNo: payload.spplrInvcNo || payload.invcNo || payload.purchaseSalesInvcNo,
         }, now);
+
+      case VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE:
+        return makeSuccessResponse(null, now);
 
       case VSDC_ENDPOINTS.SAVE_STOCK_ITEMS:
       case VSDC_ENDPOINTS.SAVE_STOCK_MASTER:
@@ -1074,6 +1171,10 @@ module.exports.extractInitInfo = extractInitInfo;
 module.exports.formatVsdcDate = formatVsdcDate;
 module.exports.formatVsdcDateTime = formatVsdcDateTime;
 module.exports.preserveImportDecimalPrecision = preserveImportDecimalPrecision;
+module.exports.preservePurchaseSelectNumberPrecision = preservePurchaseSelectNumberPrecision;
+module.exports.preserveStockSelectNumberPrecision = preserveStockSelectNumberPrecision;
+module.exports.preserveSaveSalesResponse = preserveSaveSalesResponse;
+module.exports.serializeVsdcRequest = serializeVsdcRequest;
 
 
 

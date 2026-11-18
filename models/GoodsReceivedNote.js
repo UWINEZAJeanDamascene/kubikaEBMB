@@ -3,6 +3,7 @@
  */
 
 const { buildDocumentModel, buildLineInclude } = require('../utils/salesApCommon');
+const { withFiscalSnapshot } = require('../utils/fiscalDocumentSnapshot');
 const {
   grnToApi,
   grnTranslateCreate,
@@ -34,7 +35,7 @@ module.exports = buildDocumentModel({
   delegateName: 'goodsReceivedNote',
   fieldMap: FIELD_MAP,
   toApi: grnToApi,
-  translateCreate: grnTranslateCreate,
+  translateCreate: withFiscalSnapshot(grnTranslateCreate),
   translateUpdate: grnTranslateUpdate,
   include: buildLineInclude(),
 });

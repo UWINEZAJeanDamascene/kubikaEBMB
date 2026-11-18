@@ -3,6 +3,7 @@
  */
 
 const { buildTenantModel } = require('../utils/masterDataCommon');
+const { withFiscalSnapshot } = require('../utils/fiscalDocumentSnapshot');
 const {
   stockTransferToApi,
   stockTransferTranslateCreate,
@@ -78,7 +79,7 @@ module.exports = buildTenantModel({
   delegateName: 'stockTransfer',
   fieldMap: FIELD_MAP,
   toApi: stockTransferToApi,
-  translateCreate: stockTransferTranslateCreate,
+  translateCreate: withFiscalSnapshot(stockTransferTranslateCreate),
   translateUpdate: stockTransferTranslateUpdate,
   include: buildInclude,
   mutable: true,

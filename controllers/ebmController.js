@@ -16,6 +16,7 @@ const EBMQueueService = require('../services/ebmQueueService');
 const EBMApprovalService = require('../services/ebmApprovalService');
 const EBMStockService = require('../services/ebmStockService');
 const EBMReadinessService = require('../services/ebmReadinessService');
+const platformModuleEntitlementService = require('../services/platformModuleEntitlementService');
 const EBMSalesSyncService = require('../services/ebmSalesSyncService');
 const EBMItemSyncService = require('../services/ebmItemSyncService');
 const { getOperationCatalog } = require('../constants/ebmOperationCatalog');
@@ -62,19 +63,10 @@ exports.getCompanyEbmSetting = async (req, res, next) => {
     if (!companyId) {
       return res.status(400).json({ success: false, code: 'EBM_COMPANY_ID_REQUIRED', message: 'companyId is required.' });
     }
-    const company = await Company.findById(companyId).lean();
-    if (!company) {
-      return res.status(404).json({ success: false, code: 'COMPANY_NOT_FOUND', message: 'Company not found.' });
-    }
+    const status = await platformModuleEntitlementService.getStatus(companyId);
     return res.json({
       success: true,
-      data: {
-        companyId: company.id || company._id,
-        ebmEnabled: company.ebmEnabled !== false && company.ebm_enabled !== false,
-        reason: company.ebmToggleReason || company.ebm_toggle_reason || null,
-        changedAt: company.ebmToggleChangedAt || company.ebm_toggle_changed_at || null,
-        changedBy: company.ebmToggleChangedBy || company.ebm_toggle_changed_by || null,
-      },
+      data: { ...status, companyId },
     });
   } catch (error) {
     next(error);
@@ -101,32 +93,30 @@ exports.updateCompanyEbmSetting = async (req, res, next) => {
     }
 
     const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
-    const company = await Company.findById(companyId);
-    if (!company) {
-      return res.status(404).json({ success: false, code: 'COMPANY_NOT_FOUND', message: 'Company not found.' });
-    }
-
-    const previousValue = company.ebmEnabled !== false && company.ebm_enabled !== false;
-    const update = {
-      ebmEnabled: enabled,
-      ebmToggleReason: enabled ? null : (reason || 'Platform administrator paused EBM integration.'),
-      ebmToggleChangedAt: new Date(),
-      ebmToggleChangedBy: req.user?._id || req.user?.id || null,
-    };
-    const nextCompany = await Company.findByIdAndUpdate(companyId, update, { new: true });
+    const status = await platformModuleEntitlementService.requestStatusChange({
+      companyId,
+      status: enabled ? 'on' : 'off',
+      actorUserId: req.user?._id || req.user?.id,
+      reason,
+    });
 
     return res.json({
       success: true,
       data: {
-        companyId: nextCompany.id || nextCompany._id,
-        ebmEnabled: nextCompany.ebmEnabled !== false && nextCompany.ebm_enabled !== false,
-        reason: nextCompany.ebmToggleReason || nextCompany.ebm_toggle_reason || null,
-        changedAt: nextCompany.ebmToggleChangedAt || nextCompany.ebm_toggle_changed_at || null,
-        changedBy: nextCompany.ebmToggleChangedBy || nextCompany.ebm_toggle_changed_by || null,
-        previousValue,
+        ...status,
+        companyId,
+        ebmEnabled: status.status === 'on',
       },
     });
   } catch (error) {
+    if (error.code === 'EBM_PENDING_FISCAL_DOCUMENTS') {
+      return res.status(error.statusCode || 409).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+        data: error.details,
+      });
+    }
     next(error);
   }
 };
@@ -708,7 +698,7 @@ exports.resolveV2FiscalQueueItem = async (req, res, next) => {
     let item;
     if (resolution === 'CONFIRMED_NOT_RECEIVED') {
       item = await recovery.resolveAsNotReceived({ companyId, id: req.params.id, userId, reason: req.body.reason });
-      const service = require('../services/ebmSalesService');
+      const service = require('../services/fiscalService');
       if (item.documentType === 'creditNote') {
         service.submitCreditNoteAsync(item.documentId, { companyId, modifierUserId: item.cashierId, outboxId: item.id });
       } else {
@@ -724,7 +714,7 @@ exports.resolveV2FiscalQueueItem = async (req, res, next) => {
         reason: req.body.reason,
         managerApprovalId: req.body.managerApprovalId,
       });
-      await require('../services/ebmSalesService').applyResolvedV2Receipt(item.documentId, companyId, item.id);
+      await require('../services/fiscalService').applyResolvedV2Receipt(item.documentId, companyId, item.id);
       return res.json({ success: true, message: 'The fiscal receipt data was saved for manager review.', data: item });
     }
     return res.status(400).json({ success: false, code: 'EBM_V2_RESOLUTION_INVALID', message: 'Choose confirmed signed or confirmed not received.' });

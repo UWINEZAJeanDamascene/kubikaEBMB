@@ -11,6 +11,17 @@ const BASE_BACKOFF_MS = 5000;
 const HTTP_TIMEOUT_MS = Math.max(1000, Number(process.env.EBM_HTTP_TIMEOUT_MS || 30000));
 const LEASE_MARGIN_MS = 15000;
 const V2_WHERE = `register_id IS NOT NULL AND sales_ty_cd = 'N' AND ((document_type = 'pos' AND rcpt_ty_cd = 'S') OR (document_type = 'creditNote' AND rcpt_ty_cd = 'R'))`;
+const EBM_ENABLED_COMPANY_FILTER = `EXISTS (
+  SELECT 1
+  FROM company_module_entitlements e
+  WHERE e.company_id = q.company_id
+    AND e.module_code = 'fiscal.ebm'
+    AND e.status = 'on'
+    AND (
+      e.pending_status IS NULL
+      OR e.pending_status <> 'off'
+    )
+)`;
 
 function jsonValue(value) {
   return value == null ? null : JSON.stringify(value);
@@ -224,8 +235,9 @@ async function sweepExpiredLeases() {
   return prisma.$transaction(async (tx) => {
     const changed = await tx.$queryRawUnsafe(
     `WITH expired AS (
-      SELECT id, company_id, document_type, request_sent_at FROM ebm_submission_queues
-      WHERE ${V2_WHERE} AND ebm_status = 'submitting' AND lease_expires_at <= CURRENT_TIMESTAMP
+      SELECT q.id, q.company_id, q.document_type, q.request_sent_at FROM ebm_submission_queues q
+      WHERE ${V2_WHERE} AND ${EBM_ENABLED_COMPANY_FILTER}
+        AND q.ebm_status = 'submitting' AND q.lease_expires_at <= CURRENT_TIMESTAMP
       ORDER BY lease_expires_at FOR UPDATE SKIP LOCKED LIMIT 100
     ), changed AS (
       UPDATE ebm_submission_queues q SET
@@ -260,12 +272,19 @@ async function sweepExpiredLeases() {
 
 async function claimDueIds(limit = 100) {
   return prisma.$queryRawUnsafe(
-    `SELECT id, company_id AS "companyId", document_type AS "documentType", document_id AS "documentId", original_submission_id AS "originalSubmissionId" FROM ebm_submission_queues WHERE ${V2_WHERE}
-      AND ((ebm_status = 'pending' AND is_retryable = TRUE AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
-        AND signed_at IS NULL)
-        OR (ebm_status = 'submitted' AND signed_at IS NOT NULL
-          AND (source_applied_at IS NULL OR dependents_dispatched_at IS NULL)))
-      ORDER BY COALESCE(next_retry_at, created_at), created_at LIMIT $1`,
+    `SELECT q.id, q.company_id AS "companyId", q.document_type AS "documentType", q.document_id AS "documentId", q.original_submission_id AS "originalSubmissionId",
+        q.signed_at AS "signedAt", q.source_applied_at AS "sourceAppliedAt",
+        NOT (${EBM_ENABLED_COMPANY_FILTER}) AS "sourceOnly"
+      FROM ebm_submission_queues q WHERE ${V2_WHERE}
+      AND (
+        (${EBM_ENABLED_COMPANY_FILTER}
+          AND ((q.ebm_status = 'pending' AND q.is_retryable = TRUE AND (q.next_retry_at IS NULL OR q.next_retry_at <= CURRENT_TIMESTAMP)
+            AND q.signed_at IS NULL)
+            OR (q.ebm_status = 'submitted' AND q.signed_at IS NOT NULL
+              AND (q.source_applied_at IS NULL OR q.dependents_dispatched_at IS NULL))))
+        OR (q.ebm_status = 'submitted' AND q.signed_at IS NOT NULL AND q.source_applied_at IS NULL)
+      )
+      ORDER BY COALESCE(q.next_retry_at, q.created_at), q.created_at LIMIT $1`,
     Math.min(500, Math.max(1, Number(limit) || 100)),
   );
 }

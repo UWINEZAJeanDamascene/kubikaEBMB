@@ -3,6 +3,7 @@ const Warehouse = require("../models/Warehouse");
 const EBMItemClass = require("../models/EBMItemClass");
 const EBMCode = require("../models/EBMCode");
 const ebmService = require("./ebmService");
+const moduleEntitlementService = require("./moduleEntitlementService");
 const EBMBranchService = require("./ebmBranchService");
 const Company = require("../models/Company");
 const { nextGlobalSequence } = require("./sequenceService");
@@ -358,6 +359,9 @@ class EBMProductService {
       error.statusCode = 404;
       throw error;
     }
+    const enabled = await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm');
+    const sandboxSetup = options.allowSandboxWhileOff === true && ebmService.isSandboxMode();
+    if (!enabled && !sandboxSetup) return product;
 
     product.ebm = product.ebm || {};
     const registrationMode = ebmService.getConfig().mode;
@@ -555,6 +559,19 @@ class EBMProductService {
   }
 
   static async registerAllProducts(companyId, options = {}) {
+    const enabled = await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm');
+    const sandboxSetup = options.allowSandboxWhileOff === true && ebmService.isSandboxMode();
+    if (!enabled && !sandboxSetup) {
+      return {
+        attempted: 0,
+        registered: 0,
+        failed: 0,
+        alreadyRegistered: 0,
+        reconciliationRequired: 0,
+        results: [],
+        notRequired: true,
+      };
+    }
     await EBMProductService.backfillDefaultWarehouses(companyId, options);
     const baseFilter = {
       company: companyId,
@@ -664,6 +681,7 @@ class EBMProductService {
   }
 
   static async assertProductsRegistered(companyId, productIds) {
+    if (!await moduleEntitlementService.hasModule(companyId, 'fiscal.ebm')) return;
     const ids = [...new Set((productIds || []).filter(Boolean).map(String))];
     if (!ids.length) return;
     const unregistered = await Product.find({

@@ -36,7 +36,7 @@ const registerValidation = [
   body('name').trim().notEmpty().withMessage('Name required'),
   body('companyId').optional().isMongoId().withMessage('Invalid company id'),
   body('role').optional().isIn([
-    'platform_admin', 'admin', 'stock_manager', 'sales', 'viewer',
+    'admin', 'stock_manager', 'sales', 'viewer',
     'accountant', 'manager', 'purchaser', 'warehouse_manager',
   ]).withMessage('Invalid role'),
 ];

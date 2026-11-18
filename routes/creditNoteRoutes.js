@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { posApiRateLimit } = require('../middleware/posRouteRateLimits');
 const { protect } = require('../middleware/auth');
+const requireModule = require('../middleware/requireModule');
 const { requireAssignedPermissions: requirePermission } = require('../middleware/posAuthorization');
 const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
 const { requirePosSession, requirePermission: requirePosPermission } = require('../middleware/posAuthMiddleware');
@@ -91,7 +92,7 @@ async function authorizeCreditNoteConfirmation(req, res, next) {
   }
 }
 router.post('/:id/confirm', authorizeCreditNoteConfirmation, auditPosCreditNoteOutcome, idemCreditNote(controller.confirmCreditNote));
-router.post('/:id/submit-ebm', requirePermission('credit_notes', 'approve'), idemCreditNote(controller.submitCreditNoteEbm));
+router.post('/:id/submit-ebm', requireModule('fiscal.ebm'), requirePermission('credit_notes', 'approve'), idemCreditNote(controller.submitCreditNoteEbm));
 
 // Legacy endpoints (backwards compatibility)
 router.put('/:id/approve', requirePermission('credit_notes', 'approve'), idemCreditNote(controller.confirmCreditNote));

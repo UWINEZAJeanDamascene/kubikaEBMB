@@ -11,6 +11,9 @@ jest.mock('../models/Warehouse', () => ({
 
 jest.mock('../lib/prisma', () => ({
   prisma: {
+    companyModuleEntitlement: {
+      findUnique: jest.fn().mockResolvedValue({ status: 'on', version: 1 }),
+    },
     warehouse: {
       findMany: jest.fn().mockResolvedValue([{ id: 'warehouse-01' }]),
     },
@@ -47,6 +50,7 @@ describe('EBM branch payload builders', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     ebmService.mode = 'production';
+    prisma.companyModuleEntitlement.findUnique.mockResolvedValue({ status: 'on', version: 1 });
     prisma.warehouse.findMany.mockResolvedValue([{ id: 'warehouse-01' }]);
     prisma.user.findMany.mockResolvedValue([
       { id: 'user-001', email: 'sales@example.com', ebmBranchUsers: [] },
