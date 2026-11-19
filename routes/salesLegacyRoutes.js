@@ -83,6 +83,12 @@ router.get(
   requirePosPaymentPermission,
   posOfflineSyncController.pull,
 );
+router.get(
+  '/scanner-offline-index',
+  requirePosSessionAuth,
+  requirePosSellPermission,
+  posScannerSettingsController.getOfflineIndex,
+);
 
 // All remaining routes require ERP authentication.
 router.use(protect);
@@ -182,7 +188,6 @@ router.get(
 );
 router.post('/discounts/apply', canCreateSale, requirePosSessionAuth, requirePosSessionPermission('pos.till.discount'), idem(posDiscountApplicationController.apply));
 router.post('/direct-sale', canCreateSale, requireOnlinePosSession, requireOnlinePosPaymentPermission, logAction('sales_legacy_direct_sale'), idem(createDirectSale));
-router.get('/scanner-offline-index', requirePosSessionAuth, requirePosSellPermission, posScannerSettingsController.getOfflineIndex);
 router.post(
   '/offline-snapshot',
   canCreateSale,

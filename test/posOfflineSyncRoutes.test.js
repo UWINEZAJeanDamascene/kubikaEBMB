@@ -3,10 +3,13 @@
 const router = require('../routes/salesLegacyRoutes');
 
 describe('POS offline sync route authentication', () => {
-  test('push and pull use POS-session middleware before ERP authentication', () => {
+  test('offline routes use POS-session middleware before ERP authentication', () => {
     const protectIndex = router.stack.findIndex((layer) => layer.name === 'protect');
     const syncRoutes = router.stack.filter((layer) => (
       layer.route && ['/offline-sync/push', '/offline-sync/pull'].includes(layer.route.path)
+    ));
+    const scannerIndexRoute = router.stack.find((layer) => (
+      layer.route && layer.route.path === '/scanner-offline-index'
     ));
 
     expect(protectIndex).toBeGreaterThanOrEqual(0);
@@ -18,5 +21,8 @@ describe('POS offline sync route authentication', () => {
     expect(pushRoute.route.stack).toHaveLength(3);
     expect(pushRoute.route.stack[1].name).toBe('offlineSyncDeviceAccess');
     expect(pullRoute.route.stack).toHaveLength(4);
+    expect(scannerIndexRoute).toBeDefined();
+    expect(router.stack.indexOf(scannerIndexRoute)).toBeLessThan(protectIndex);
+    expect(scannerIndexRoute.route.stack).toHaveLength(3);
   });
 });

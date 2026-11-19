@@ -189,8 +189,9 @@ exports.getReceipt = async (req, res, next) => {
       ? await generateQrPng(storedSignedEbm, { width: 110 })
       : null;
     const data = invoice.toObject({ virtuals: true });
-    if (fiscalMode === 'none') {
-      delete data.ebm;
+    const hideFiscalData = fiscalMode === 'none';
+    if (hideFiscalData) {
+      data.ebm = {};
     } else {
       data.ebm = storedSignedEbm || storedInvoiceEbm || {};
       data.ebm.environment = data.ebm.fiscalEnvironment || data.ebm.environment || fiscalMode || null;
@@ -323,6 +324,7 @@ exports.getReceipt = async (req, res, next) => {
       tillType: data.tillType || 'retail',
     });
 
+    if (hideFiscalData) delete data.ebm;
     res.json({ success: true, data });
   } catch (error) {
     next(error);
