@@ -1,4 +1,5 @@
 const { idOf } = require('./purchaseReturnRules');
+const { getPurchaseUnitSnapshot, toBaseQuantity } = require('./purchaseUnitRules');
 
 function receiptError(message, status = 422) {
   return Object.assign(new Error(message), { status });
@@ -50,6 +51,8 @@ function normalizeGRNLinesFromPurchaseOrder(po, requestedLines) {
         409,
       );
     }
+    const purchaseUnitSnapshot = getPurchaseUnitSnapshot(poLine, poLine.product);
+    toBaseQuantity(quantity, purchaseUnitSnapshot);
 
     return {
       product: sourceProductId,
@@ -58,6 +61,7 @@ function normalizeGRNLinesFromPurchaseOrder(po, requestedLines) {
       unitCost: Number(poLine.unitCost) || 0,
       landedUnitCost: null,
       taxRate: Number(poLine.taxRate) || 0,
+      purchaseUnitSnapshot,
       batchNo: line.batchNo ? String(line.batchNo).trim() : undefined,
       serialNumbers: Array.isArray(line.serialNumbers)
         ? line.serialNumbers.map((serial) => String(serial).trim())

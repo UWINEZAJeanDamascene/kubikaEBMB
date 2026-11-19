@@ -26,6 +26,271 @@ const { runInTransaction } = require("../services/transactionService");
 const FiscalService = require("../services/fiscalService");
 const { parseBoundedPage } = require("../utils/querySafety");
 const { nextReferenceNo } = require("../utils/referenceNumbers");
+const {
+  getPurchaseUnitSnapshot,
+  normalizePurchaseUnitSnapshot,
+  resolvePurchaseUnit,
+  toBaseQuantity,
+  toBaseUnitCost,
+} = require("../utils/purchaseUnitRules");
+
+async function snapshotPurchaseItems(items, companyId, existingItems = []) {
+  if (!Array.isArray(items)) {
+    throw Object.assign(new Error('Purchase items must be a list'), { status: 400 });
+  }
+  const productIds = [...new Set(items.map((item) => String(item.product?._id || item.product || '')).filter(Boolean))];
+  const products = productIds.length
+    ? await Product.find({ _id: { $in: productIds }, company: companyId })
+    : [];
+  const productsById = new Map(products.map((product) => [String(product._id), product]));
+
+  return items.map((item, index) => {
+    const productId = String(item.product?._id || item.product || '');
+    const product = productsById.get(productId);
+    if (!product) {
+      throw Object.assign(new Error(`Item ${index + 1}: select a product available in this company`), { status: 400 });
+    }
+
+    const existing = item._id
+      ? existingItems.find((candidate) => String(candidate._id || candidate.id) === String(item._id))
+      : existingItems[index];
+    const existingSnapshot = existing?.purchaseUnitSnapshot || existing?.extra?.purchaseUnitSnapshot;
+    const code = String(item.purchaseUnitCode || item.purchaseUnitSnapshot?.code || existingSnapshot?.code || 'base').toLowerCase();
+    const snapshot = existingSnapshot && existingSnapshot.code === code
+      ? normalizePurchaseUnitSnapshot(existingSnapshot, product.unit || 'unit')
+      : resolvePurchaseUnit(product, code);
+    return { ...item, purchaseUnitSnapshot: snapshot };
+  });
+}
+
+async function receivePaidPurchaseStock(purchase, req, supplier) {
+  const companyId = req.user.company._id;
+  const warehouseId = purchase.warehouse?._id || purchase.warehouse;
+  const warehouse = warehouseId
+    ? await Warehouse.findOne({ _id: warehouseId, company: companyId }).lean()
+    : null;
+  if (!warehouse) {
+    throw Object.assign(new Error('Select a valid receiving warehouse before stock is added.'), { status: 400 });
+  }
+
+  const serialsByProduct = new Map();
+  const stockLines = [];
+  for (const [index, item] of (purchase.items || []).entries()) {
+    const product = item.product;
+    const quantity = Number(item.quantity ?? item.qty ?? 0) || 0;
+    if (!product || quantity <= 0 || product.isStockable === false) continue;
+    if (!Number.isFinite(Number(item.unitCost)) || Number(item.unitCost) <= 0) {
+      throw Object.assign(new Error(`Line ${index + 1} (${product.name}): unit cost must be greater than zero before stock is added.`), { status: 400 });
+    }
+
+    const unitSnapshot = getPurchaseUnitSnapshot(item, product);
+    const baseQuantity = toBaseQuantity(quantity, unitSnapshot);
+    const trackingType = product.trackingType === 'serial' || product.trackSerialNumbers
+      ? 'serial'
+      : product.trackingType === 'batch' || product.trackBatch ? 'batch' : 'none';
+    const batchNo = trackingType === 'batch' ? String(item.batchNo || '').trim().toUpperCase() : null;
+    const serialNumbers = trackingType === 'serial'
+      ? (Array.isArray(item.serialNumbers) ? item.serialNumbers : [])
+        .map((serial) => String(serial).trim().toUpperCase()).filter(Boolean)
+      : [];
+    if (trackingType === 'batch' && !batchNo) {
+      throw Object.assign(new Error(`Line ${index + 1} (${product.name}): enter a batch number before stock is added.`), { status: 400 });
+    }
+    if (trackingType === 'serial'
+      && (!Number.isInteger(baseQuantity) || serialNumbers.length !== baseQuantity
+        || new Set(serialNumbers).size !== serialNumbers.length)) {
+      throw Object.assign(new Error(`Line ${index + 1} (${product.name}): enter exactly ${baseQuantity} unique base-unit serial number(s) before stock is added.`), { status: 400 });
+    }
+    if (serialNumbers.length) {
+      const productId = String(product._id || product);
+      const used = serialsByProduct.get(productId) || new Set();
+      const duplicate = serialNumbers.find((serial) => used.has(serial));
+      if (duplicate) {
+        throw Object.assign(new Error(`Serial number ${duplicate} appears more than once in this purchase.`), { status: 400 });
+      }
+      serialNumbers.forEach((serial) => used.add(serial));
+      serialsByProduct.set(productId, used);
+    }
+    stockLines.push({ item, productId: String(product._id || product), quantity, baseQuantity, unitSnapshot, trackingType, batchNo, serialNumbers });
+  }
+
+  const notifications = [];
+  await runInTransaction(async (trx) => {
+    const opts = trx ? { session: trx } : {};
+    const { dbClient } = require('../lib/prisma');
+    await dbClient().$queryRaw`
+      SELECT id FROM purchases
+      WHERE id = ${String(purchase._id)} AND company_id = ${String(companyId)}
+      FOR UPDATE`;
+    const persisted = await dbClient().purchase.findUnique({
+      where: { id: String(purchase._id) },
+      select: { companyId: true, status: true, stockAdded: true },
+    });
+    if (!persisted || persisted.companyId !== String(companyId) || persisted.stockAdded
+      || persisted.status !== 'draft') {
+      throw Object.assign(new Error('This purchase has already been received or is no longer receivable.'), { status: 409 });
+    }
+
+    for (const productId of [...new Set(stockLines.map((line) => line.productId))].sort()) {
+      await dbClient().$queryRaw`
+        SELECT id FROM products
+        WHERE id = ${productId} AND company_id = ${String(companyId)}
+        FOR UPDATE`;
+    }
+    const allSerials = [...serialsByProduct.entries()].flatMap(([productId, serials]) =>
+      [...serials].map((serialNo) => ({ product: productId, serialNo })),
+    );
+    if (allSerials.length) {
+      const existing = await StockSerialNumber.find({
+        company: companyId,
+        $or: allSerials.map(({ product, serialNo }) => ({ product, serialNo })),
+      }, null, opts).select('serialNo').lean();
+      if (existing.length) {
+        throw Object.assign(new Error(`Serial number ${existing[0].serialNo} is already recorded for this product.`), { status: 409 });
+      }
+    }
+
+    for (const line of stockLines) {
+      const { item, productId, baseQuantity, unitSnapshot, trackingType, batchNo, serialNumbers } = line;
+      const productQuery = Product.findOne({ _id: productId, company: companyId });
+      const product = trx ? await productQuery.session(trx) : await productQuery;
+      if (!product) throw Object.assign(new Error(`Product ${productId} is no longer available.`), { status: 404 });
+      const baseUnitCost = toBaseUnitCost(item.unitCost, unitSnapshot);
+      const previousStock = Number(product.currentStock) || 0;
+      const newStock = previousStock + baseQuantity;
+      const parseOptionalDate = (value) => {
+        if (!value) return null;
+        const date = value instanceof Date ? value : new Date(value);
+        if (!Number.isFinite(date.getTime())) throw Object.assign(new Error(`Invalid tracking date for ${product.name}.`), { status: 400 });
+        return date;
+      };
+      const manufactureDate = parseOptionalDate(item.manufactureDate);
+      const expiryDate = parseOptionalDate(item.expiryDate);
+      const lotNo = item.lotNo ? String(item.lotNo).trim().toUpperCase() : null;
+
+      await inventoryService.createLayer(
+        companyId,
+        product._id,
+        baseQuantity,
+        baseUnitCost,
+        { sourceType: 'purchase', sourceId: purchase._id },
+        trx
+          ? { session: trx, userId: req.user.id, warehouse: warehouse._id }
+          : { userId: req.user.id, warehouse: warehouse._id },
+      );
+      const movement = new StockMovement({
+        company: companyId,
+        product: product._id,
+        type: 'in',
+        reason: 'purchase',
+        quantity: baseQuantity,
+        warehouse: warehouse._id,
+        batchNumber: batchNo,
+        lotNumber: lotNo,
+        serialNumbers,
+        expiryDate,
+        previousStock,
+        newStock,
+        unitCost: baseUnitCost,
+        totalCost: baseUnitCost * baseQuantity,
+        supplier: purchase.supplier,
+        referenceType: 'purchase',
+        referenceNumber: purchase.purchaseNumber,
+        referenceDocument: purchase._id,
+        referenceModel: 'Purchase',
+        performedBy: req.user.id,
+      });
+      await movement.save(opts);
+      await StockLevel.recalculateWAC(companyId, product._id, warehouse._id, baseQuantity, baseUnitCost);
+
+      await new InventoryBatch({
+        company: companyId,
+        product: product._id,
+        warehouse: warehouse._id,
+        batchNumber: batchNo,
+        lotNumber: lotNo,
+        expiryDate,
+        manufacturingDate: manufactureDate,
+        quantity: baseQuantity,
+        availableQuantity: baseQuantity,
+        unitCost: baseUnitCost,
+        totalCost: baseUnitCost * baseQuantity,
+        supplier: purchase.supplier,
+        stockMovement: movement._id,
+        receivedDate: new Date(),
+        notes: `Direct purchase ${purchase.purchaseNumber}`,
+        createdBy: req.user.id,
+      }).save(opts);
+
+      if (trackingType === 'batch') {
+        let stockBatch = await StockBatch.findOne({
+          company: companyId,
+          product: product._id,
+          warehouse: warehouse._id,
+          batchNo,
+        }, null, opts);
+        if (!stockBatch) {
+          stockBatch = new StockBatch({
+            company: companyId,
+            product: product._id,
+            warehouse: warehouse._id,
+            batchNo,
+            qtyReceived: baseQuantity,
+            qtyOnHand: baseQuantity,
+            unitCost: baseUnitCost,
+            manufactureDate,
+            expiryDate,
+          });
+        } else {
+          const oldQty = Number(stockBatch.qtyOnHand) || 0;
+          const nextQty = oldQty + baseQuantity;
+          stockBatch.unitCost = nextQty > 0
+            ? (oldQty * (Number(stockBatch.unitCost) || 0) + baseQuantity * baseUnitCost) / nextQty
+            : baseUnitCost;
+          stockBatch.qtyOnHand = nextQty;
+          stockBatch.qtyReceived = (Number(stockBatch.qtyReceived) || 0) + baseQuantity;
+          if (manufactureDate) stockBatch.manufactureDate = manufactureDate;
+          if (expiryDate) stockBatch.expiryDate = expiryDate;
+        }
+        await stockBatch.save(opts);
+      }
+      if (trackingType === 'serial') {
+        await StockSerialNumber.create(serialNumbers.map((serialNo) => ({
+          company: companyId,
+          product: product._id,
+          warehouse: warehouse._id,
+          serialNo,
+          unitCost: baseUnitCost,
+          status: 'in_stock',
+          notes: `Direct purchase ${purchase.purchaseNumber}`,
+        })), opts);
+      }
+
+      product.currentStock = newStock;
+      product.averageCost = newStock > 0
+        ? ((Number(product.averageCost) || 0) * previousStock + baseUnitCost * baseQuantity) / newStock
+        : baseUnitCost;
+      await product.save(opts);
+      notifications.push({ product, quantity: baseQuantity, newStock });
+    }
+    purchase.stockAdded = true;
+    purchase.status = 'received';
+    purchase.receivedDate = new Date();
+    await purchase.save(opts);
+  });
+
+  for (const notification of notifications) {
+    try {
+      await notifyStockReceived(companyId, notification.product, notification.quantity, supplier);
+      if (notification.product.reorderPoint && notification.newStock <= notification.product.reorderPoint) {
+        await notifyLowStock(companyId, notification.product, notification.newStock);
+      }
+      if (notification.newStock === 0) await notifyOutOfStock(companyId, notification.product);
+    } catch (error) {
+      console.error('Failed to send stock notification:', error);
+    }
+  }
+}
 
 const sendPurchaseEmail = async (purchase, action, companyId) => {
   try {
@@ -143,7 +408,7 @@ exports.createPurchase = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const {
-      items,
+      items: requestedItems,
       supplier: supplierId,
       currency,
       paymentTerms,
@@ -168,6 +433,7 @@ exports.createPurchase = async (req, res, next) => {
         message: "Supplier not found",
       });
     }
+    const items = await snapshotPurchaseItems(requestedItems || [], companyId);
 
     // Resolve and validate project/budget coding before creating the purchase.
     const BudgetLine = require('../models/BudgetLine');
@@ -224,6 +490,10 @@ exports.createPurchase = async (req, res, next) => {
       const item = items[i];
       const product = productsById.get(String(item.product?._id || item.product));
       const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
+      if (qty > 0) toBaseQuantity(qty, item.purchaseUnitSnapshot);
+      if (product?.isStockable === false && item.purchaseUnitSnapshot.baseQuantity > 1) {
+        return res.status(400).json({ success: false, message: `Item ${i + 1}: purchase packs are only supported for stockable products` });
+      }
       const unitCost = Number(item.unitCost ?? 0) || 0;
       const subtotal = qty * unitCost;
       const discount = Number(item.discount || 0) || 0;
@@ -415,6 +685,7 @@ exports.updatePurchase = async (req, res, next) => {
 
     // Recalculate item totals if items are updated
     if (req.body.items) {
+      req.body.items = await snapshotPurchaseItems(req.body.items, companyId, purchase.items || []);
       req.body.items = req.body.items.map((item, index) => {
         const subtotal = item.quantity * item.unitCost;
         const discount = item.discount || 0;
@@ -430,6 +701,12 @@ exports.updatePurchase = async (req, res, next) => {
           totalWithTax,
         };
       });
+      req.body.subtotal = req.body.items.reduce(
+        (sum, item) => sum + Number(item.subtotal || 0) - Number(item.discount || 0),
+        0,
+      );
+      req.body.taxAmount = req.body.items.reduce((sum, item) => sum + Number(item.taxAmount || 0), 0);
+      req.body.totalAmount = req.body.subtotal + req.body.taxAmount;
     }
 
     const incomingItems = Array.isArray(req.body.items) ? req.body.items : null;
@@ -456,26 +733,10 @@ exports.updatePurchase = async (req, res, next) => {
           { _id: req.params.id, company: companyId },
           req.body,
           { new: true, runValidators: true },
-        ).populate("supplier items.product createdBy");
-        for (let index = 0; index < savedLines.length; index += 1) {
-          const item = incomingItems[index];
-          const extra = savedLines[index].extra && typeof savedLines[index].extra === 'object'
-            ? { ...savedLines[index].extra }
-            : {};
-          for (const field of ['trackingType', 'batchNo', 'lotNo', 'manufactureDate', 'expiryDate']) {
-            if (!Object.prototype.hasOwnProperty.call(item, field)) continue;
-            if (item[field] == null || item[field] === '') delete extra[field];
-            else extra[field] = String(item[field]).trim();
-          }
-          if (Object.prototype.hasOwnProperty.call(item, 'serialNumbers')) {
-            const serialNumbers = Array.isArray(item.serialNumbers)
-              ? item.serialNumbers.map((serial) => String(serial).trim().toUpperCase()).filter(Boolean)
-              : [];
-            if (serialNumbers.length) extra.serialNumbers = serialNumbers;
-            else delete extra.serialNumbers;
-          }
-          await dbClient().purchaseLine.update({ where: { id: savedLines[index].id }, data: { extra } });
-        }
+        );
+        updatedPurchase.items = incomingItems;
+        await updatedPurchase.save();
+        await updatedPurchase.populate("supplier items.product createdBy");
         return updatedPurchase;
       });
     } else {
@@ -483,7 +744,12 @@ exports.updatePurchase = async (req, res, next) => {
         { _id: req.params.id, company: companyId },
         req.body,
         { new: true, runValidators: true },
-      ).populate("supplier items.product createdBy");
+      );
+      if (incomingItems) {
+        purchase.items = incomingItems;
+        await purchase.save();
+      }
+      await purchase.populate("supplier items.product createdBy");
     }
 
     res.json({
@@ -601,10 +867,13 @@ exports.receivePurchase = async (req, res, next) => {
     // from the supplier's physical delivery, not from an inferred default.
     const serialsPerProduct = new Map();
     const receiveTrackingByIndex = new Map();
+    const baseQuantitiesByIndex = new Map();
     for (const [index, item] of (purchase.items || []).entries()) {
       const product = item.product;
       const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
       if (!product || qty <= 0) continue;
+      const baseQty = toBaseQuantity(qty, getPurchaseUnitSnapshot(item, product));
+      baseQuantitiesByIndex.set(index, baseQty);
       const submittedTracking = submittedLines.get(index);
       const tracking = { ...item, ...(submittedTracking || {}) };
       receiveTrackingByIndex.set(index, tracking);
@@ -615,8 +884,8 @@ exports.receivePurchase = async (req, res, next) => {
       if (trackingType === 'serial') {
         const serials = (Array.isArray(tracking.serialNumbers) ? tracking.serialNumbers : [])
           .map((serial) => String(serial).trim().toUpperCase()).filter(Boolean);
-        if (!Number.isInteger(qty) || serials.length !== qty) {
-          return res.status(400).json({ success: false, message: `Line ${index + 1} (${product.name}): enter exactly ${qty} unique serial number(s) before receiving.` });
+        if (!Number.isInteger(baseQty) || serials.length !== baseQty) {
+          return res.status(400).json({ success: false, message: `Line ${index + 1} (${product.name}): enter exactly ${baseQty} unique base-unit serial number(s) before receiving.` });
         }
         if (new Set(serials).size !== serials.length) {
           return res.status(400).json({ success: false, message: `Line ${index + 1} (${product.name}): serial numbers must be unique.` });
@@ -701,8 +970,11 @@ exports.receivePurchase = async (req, res, next) => {
           : await productQuery;
         if (!product) continue;
 
+        const baseQty = baseQuantitiesByIndex.get(itemIndex) || 0;
+        const unitSnapshot = getPurchaseUnitSnapshot(item, product);
+        const baseUnitCost = toBaseUnitCost(unitCost, unitSnapshot);
         const previousStock = Number(product.currentStock || 0);
-        const newStock = previousStock + qty;
+        const newStock = previousStock + baseQty;
         const trackingType = getTrackingType(product, item);
         const serialNumbers = trackingType === 'serial'
           ? (Array.isArray(tracking.serialNumbers) ? tracking.serialNumbers : []).map((serial) => String(serial).trim().toUpperCase()).filter(Boolean)
@@ -722,8 +994,8 @@ exports.receivePurchase = async (req, res, next) => {
         await inventoryService.createLayer(
           companyId,
           product._id,
-          qty,
-          unitCost,
+          baseQty,
+          baseUnitCost,
           { sourceType: "purchase", sourceId: purchase._id },
           useSession
             ? { session: trx, userId: req.user.id, warehouse: warehouse._id }
@@ -736,7 +1008,7 @@ exports.receivePurchase = async (req, res, next) => {
           product: product._id,
           type: "in",
           reason: "purchase",
-          quantity: qty,
+          quantity: baseQty,
           warehouse: warehouse._id,
           batchNumber: batchNo,
           lotNumber: lotNo,
@@ -744,8 +1016,8 @@ exports.receivePurchase = async (req, res, next) => {
           expiryDate,
           previousStock,
           newStock,
-          unitCost,
-          totalCost: Number(item.totalWithTax ?? item.lineTotal ?? qty * unitCost) || 0,
+          unitCost: baseUnitCost,
+          totalCost: baseUnitCost * baseQty,
           supplier: purchase.supplier,
           referenceType: "purchase",
           referenceNumber: purchase.purchaseNumber,
@@ -756,7 +1028,7 @@ exports.receivePurchase = async (req, res, next) => {
         });
         await sm.save(opts);
 
-        await StockLevel.recalculateWAC(companyId, product._id, warehouse._id, qty, unitCost);
+        await StockLevel.recalculateWAC(companyId, product._id, warehouse._id, baseQty, baseUnitCost);
 
         const inventoryBatch = new InventoryBatch({
           company: companyId,
@@ -766,10 +1038,10 @@ exports.receivePurchase = async (req, res, next) => {
           lotNumber: lotNo,
           expiryDate,
           manufacturingDate: manufactureDate,
-          quantity: qty,
-          availableQuantity: qty,
-          unitCost,
-          totalCost: qty * unitCost,
+          quantity: baseQty,
+          availableQuantity: baseQty,
+          unitCost: baseUnitCost,
+          totalCost: baseQty * baseUnitCost,
           supplier: purchase.supplier,
           stockMovement: sm._id,
           receivedDate: new Date(),
@@ -786,19 +1058,19 @@ exports.receivePurchase = async (req, res, next) => {
               product: product._id,
               warehouse: warehouse._id,
               batchNo,
-              qtyReceived: qty,
-              qtyOnHand: qty,
-              unitCost,
+              qtyReceived: baseQty,
+              qtyOnHand: baseQty,
+              unitCost: baseUnitCost,
               manufactureDate,
               expiryDate,
               notes: `Direct purchase ${purchase.purchaseNumber}`,
             });
           } else {
             const oldQty = Number(stockBatch.qtyOnHand) || 0;
-            const nextQty = oldQty + qty;
-            stockBatch.unitCost = nextQty > 0 ? ((oldQty * (Number(stockBatch.unitCost) || 0) + qty * unitCost) / nextQty) : unitCost;
+            const nextQty = oldQty + baseQty;
+            stockBatch.unitCost = nextQty > 0 ? ((oldQty * (Number(stockBatch.unitCost) || 0) + baseQty * baseUnitCost) / nextQty) : baseUnitCost;
             stockBatch.qtyOnHand = nextQty;
-            stockBatch.qtyReceived = (Number(stockBatch.qtyReceived) || 0) + qty;
+            stockBatch.qtyReceived = (Number(stockBatch.qtyReceived) || 0) + baseQty;
             if (manufactureDate) stockBatch.manufactureDate = manufactureDate;
             if (expiryDate) stockBatch.expiryDate = expiryDate;
           }
@@ -811,7 +1083,7 @@ exports.receivePurchase = async (req, res, next) => {
             product: product._id,
             warehouse: warehouse._id,
             serialNo,
-            unitCost,
+            unitCost: baseUnitCost,
             status: 'in_stock',
             notes: `Direct purchase ${purchase.purchaseNumber}`,
           })), opts);
@@ -820,11 +1092,11 @@ exports.receivePurchase = async (req, res, next) => {
         // Update product stock and average cost (ensure numeric coercion)
         product.currentStock = newStock;
         if (!product.averageCost) {
-          product.averageCost = unitCost;
+          product.averageCost = baseUnitCost;
         } else {
           const totalValue =
             Number(product.averageCost || 0) * previousStock +
-            unitCost * qty;
+            baseUnitCost * baseQty;
           product.averageCost = totalValue / newStock;
         }
         await product.save(opts);
@@ -834,7 +1106,7 @@ exports.receivePurchase = async (req, res, next) => {
           await notifyStockReceived(
             companyId,
             product,
-            qty,
+            baseQty,
             supplier,
           );
           if (product.reorderPoint && newStock <= product.reorderPoint) {
@@ -1077,71 +1349,7 @@ exports.recordPayment = async (req, res, next) => {
       purchase.status === "draft" &&
       (paymentMethod === "cash" || paymentMethod === "card")
     ) {
-      // Add stock
-      for (const item of purchase.items) {
-        const productId = item.product?._id || item.product;
-        const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
-        if (!productId || qty <= 0) continue;
-
-        const product = await Product.findOne({
-          _id: productId,
-          company: companyId,
-        });
-
-        if (product) {
-          const previousStock = Number(product.currentStock || 0);
-          const newStock = previousStock + qty;
-
-          await StockMovement.create({
-            company: companyId,
-            product: product._id,
-            type: "in",
-            reason: "purchase",
-            quantity: qty,
-            previousStock,
-            newStock,
-            unitCost: item.unitCost,
-            totalCost: item.totalWithTax ?? item.lineTotal,
-            supplier: purchase.supplier,
-            referenceType: "purchase",
-            referenceNumber: purchase.purchaseNumber,
-            referenceDocument: purchase._id,
-            referenceModel: "Purchase",
-            notes: `Purchase ${purchase.purchaseNumber}`,
-            performedBy: req.user.id,
-          });
-
-          product.currentStock = newStock;
-          if (product.averageCost === 0 || !product.averageCost) {
-            product.averageCost = item.unitCost;
-          }
-          await product.save();
-
-          // Send stock received notification
-          try {
-            await notifyStockReceived(
-              companyId,
-              product,
-              qty,
-              supplier,
-            );
-
-            // Check if stock is now low or out after adding
-            if (product.reorderPoint && newStock <= product.reorderPoint) {
-              await notifyLowStock(companyId, product, newStock);
-            }
-            if (newStock === 0) {
-              await notifyOutOfStock(companyId, product);
-            }
-          } catch (notifError) {
-            console.error("Failed to send stock notification:", notifError);
-          }
-        }
-      }
-
-      purchase.stockAdded = true;
-      purchase.status = "received";
-      purchase.receivedDate = new Date();
+      await receivePaidPurchaseStock(purchase, req, supplier);
     }
 
     // Update supplier stats (supplier was fetched earlier)

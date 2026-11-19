@@ -28,9 +28,22 @@ const { dbClient } = require("../lib/prisma");
 const { toIdString } = require("../utils/objectId");
 const { parseBoundedPage } = require("../utils/querySafety");
 const { normalizeGRNLinesFromPurchaseOrder } = require("../utils/purchaseReceiptRules");
+const {
+  getPurchaseUnitSnapshot,
+  toBaseQuantity,
+  toBaseUnitCost,
+} = require("../utils/purchaseUnitRules");
 
 function resolveRefId(value) {
   return toIdString(value);
+}
+
+function findPurchaseOrderLine(po, lineId) {
+  const targetId = resolveRefId(lineId);
+  if (!targetId) return null;
+  return (po?.lines || []).find(
+    (line) => resolveRefId(line?._id || line?.id) === targetId,
+  ) || null;
 }
 
 function resolveCompanyId(req) {
@@ -117,7 +130,7 @@ async function syncPoQtyReceivedFromConfirmedGrns(po, companyId, { excludeGrnId 
     if (excludeGrnId && String(confirmedGrn._id) === String(excludeGrnId)) continue;
     normalizeGrnRefs(confirmedGrn);
     for (const line of confirmedGrn.lines || []) {
-      const poLine = po.lines.id(line.purchaseOrderLine);
+      const poLine = findPurchaseOrderLine(po, line.purchaseOrderLine);
       if (poLine) {
         poLine.qtyReceived =
           Number(poLine.qtyReceived || 0) + Number(line.qtyReceived || 0);
@@ -525,7 +538,11 @@ exports.confirmGRN = async (req, res, next) => {
 
     // Compute total goods value for allocation and warning checks
     const totalGoodsValue = grn.lines.reduce((s, l) => s + (Number(l.unitCost) * Number(l.qtyReceived)), 0);
-    const totalQtyReceived = grn.lines.reduce((s, l) => s + Number(l.qtyReceived), 0);
+    const baseQuantities = new Map(grn.lines.map((line) => [
+      line,
+      toBaseQuantity(line.qtyReceived, getPurchaseUnitSnapshot(line)),
+    ]));
+    const totalQtyReceived = grn.lines.reduce((sum, line) => sum + baseQuantities.get(line), 0);
     if (freightAmount > 0 && includeFreightInCost && totalGoodsValue <= 0) {
       throw Object.assign(new Error("Freight cannot be allocated to a receipt with no goods value"), { status: 400 });
     }
@@ -591,6 +608,7 @@ exports.confirmGRN = async (req, res, next) => {
       }
 
       const trackingType = product.trackingType || "none";
+      const baseQuantity = baseQuantities.get(line);
 
       // Batch tracking: require batchNo
       if (trackingType === "batch") {
@@ -614,10 +632,10 @@ exports.confirmGRN = async (req, res, next) => {
             { status: 400 },
           );
         }
-        if (line.serialNumbers.length !== line.qtyReceived) {
+        if (!Number.isInteger(baseQuantity) || line.serialNumbers.length !== baseQuantity) {
           throw Object.assign(
             new Error(
-              `Serial numbers count (${line.serialNumbers.length}) must equal qty_received (${line.qtyReceived}) for product ${product.name}`,
+              `Serial numbers count (${line.serialNumbers.length}) must equal received base-unit quantity (${baseQuantity}) for product ${product.name}`,
             ),
             { status: 400 },
           );
@@ -638,7 +656,7 @@ exports.confirmGRN = async (req, res, next) => {
           allocatedFreight = freightAmount * (lineValue / totalGoodsValue);
         } else {
           // by_quantity
-          allocatedFreight = freightAmount * (Number(line.qtyReceived) / totalQtyReceived);
+          allocatedFreight = freightAmount * (baseQuantities.get(line) / totalQtyReceived);
         }
         const newUnitCost = lineValue > 0
           ? (lineValue + allocatedFreight) / Number(line.qtyReceived)
@@ -654,6 +672,11 @@ exports.confirmGRN = async (req, res, next) => {
     for (const line of grn.lines) {
       const product = getLineProduct(grnLineProducts, line);
       const trackingType = product.trackingType || "none";
+      const baseQuantity = baseQuantities.get(line);
+      const baseUnitCost = toBaseUnitCost(
+        line.landedUnitCost,
+        getPurchaseUnitSnapshot(line, product),
+      );
 
       // Helper to parse date safely
       const parseLineDate = (dateVal) => {
@@ -683,12 +706,12 @@ exports.confirmGRN = async (req, res, next) => {
         if (stockBatch) {
           // Update existing batch
           const oldQty = Number(stockBatch.qtyOnHand) || 0;
-          const receivedQty = Number(line.qtyReceived) || 0;
+          const receivedQty = baseQuantity;
           stockBatch.qtyOnHand = oldQty + receivedQty;
           stockBatch.qtyReceived = (Number(stockBatch.qtyReceived) || 0) + receivedQty;
           stockBatch.unitCost = stockBatch.qtyOnHand > 0
-            ? ((oldQty * (Number(stockBatch.unitCost) || 0)) + (receivedQty * (Number(line.landedUnitCost) || 0))) / stockBatch.qtyOnHand
-            : Number(line.landedUnitCost) || 0;
+            ? ((oldQty * (Number(stockBatch.unitCost) || 0)) + (receivedQty * baseUnitCost)) / stockBatch.qtyOnHand
+            : baseUnitCost;
           // Update manufacture and expiry dates if provided
           if (lineMfgDate) {
             stockBatch.manufactureDate = lineMfgDate;
@@ -708,9 +731,9 @@ exports.confirmGRN = async (req, res, next) => {
             warehouse: grn.warehouse,
             grn: grn._id,
             batchNo: line.batchNo.toUpperCase(),
-            qtyReceived: line.qtyReceived,
-            qtyOnHand: line.qtyReceived,
-            unitCost: line.landedUnitCost,
+            qtyReceived: baseQuantity,
+            qtyOnHand: baseQuantity,
+            unitCost: baseUnitCost,
             manufactureDate: mfgDate,
             expiryDate: expDate,
             isQuarantined: false,
@@ -758,7 +781,7 @@ exports.confirmGRN = async (req, res, next) => {
             warehouse: grn.warehouse,
             grn: grn._id,
             serialNo: serialNo.toUpperCase(),
-            unitCost: line.landedUnitCost,
+            unitCost: baseUnitCost,
             status: "in_stock",
           });
           await stockSerial.save(useSession ? { session: sess } : {});
@@ -771,9 +794,9 @@ exports.confirmGRN = async (req, res, next) => {
         company: companyId,
         product: line.product,
         warehouse: grn.warehouse,
-        quantity: line.qtyReceived,
-        availableQuantity: line.qtyReceived,
-        unitCost: line.landedUnitCost,
+        quantity: baseQuantity,
+        availableQuantity: baseQuantity,
+        unitCost: baseUnitCost,
         receivedDate: grn.receivedDate,
         createdBy: req.user.id,
       });
@@ -790,12 +813,12 @@ exports.confirmGRN = async (req, res, next) => {
         });
       }
       product.currentStock =
-        Number(product.currentStock || 0) + Number(line.qtyReceived);
+        Number(product.currentStock || 0) + baseQuantity;
 
       // Always update averageCost using weighted average formula for display purposes
       const existingValue = (Number(product.averageCost) || 0) * previousStock;
-      const receivedValue = Number(line.landedUnitCost) * Number(line.qtyReceived);
-      const newQty = previousStock + Number(line.qtyReceived);
+      const receivedValue = baseUnitCost * baseQuantity;
+      const newQty = previousStock + baseQuantity;
       product.averageCost =
         newQty > 0
           ? (existingValue + receivedValue) / newQty
@@ -809,8 +832,8 @@ exports.confirmGRN = async (req, res, next) => {
           companyId,
           line.product,
           grn.warehouse,
-          line.qtyReceived,
-          line.landedUnitCost,
+          baseQuantity,
+          baseUnitCost,
         );
       } catch (slErr) {
         throw Object.assign(
@@ -824,11 +847,11 @@ exports.confirmGRN = async (req, res, next) => {
         product: line.product,
         type: "in",
         reason: "purchase",
-        quantity: line.qtyReceived,
+        quantity: baseQuantity,
         previousStock,
         newStock: product.currentStock,
-        unitCost: line.landedUnitCost,
-        totalCost: line.landedUnitCost * line.qtyReceived,
+        unitCost: baseUnitCost,
+        totalCost: baseUnitCost * baseQuantity,
         warehouse: grn.warehouse,
         supplier: grn.supplier,
         batchNumber: trackingType === 'batch' && line.batchNo ? String(line.batchNo).trim().toUpperCase() : null,
@@ -847,7 +870,7 @@ exports.confirmGRN = async (req, res, next) => {
       await movement.save(useSession ? { session: sess } : {});
       createdMovements.push(movement._id);
 
-      const poLine = po.lines.id(line.purchaseOrderLine);
+      const poLine = findPurchaseOrderLine(po, line.purchaseOrderLine);
       if (poLine) {
         updatedPOLines.push({
           id: String(poLine._id),
@@ -863,7 +886,7 @@ exports.confirmGRN = async (req, res, next) => {
       const prev = productTotals.get(String(line.product)) || 0;
       productTotals.set(
         String(line.product),
-        prev + Number(line.landedUnitCost) * Number(line.qtyReceived),
+        prev + baseUnitCost * baseQuantity,
       );
     }
 
@@ -878,7 +901,7 @@ exports.confirmGRN = async (req, res, next) => {
     // partial deliveries. This leaves only the unreceived commitment open.
     const BudgetService = require('../services/budgetService');
     for (const receivedLine of grn.lines || []) {
-      const poLine = po.lines.id(receivedLine.purchaseOrderLine);
+      const poLine = findPurchaseOrderLine(po, receivedLine.purchaseOrderLine);
       if (!poLine?.encumbrance_id) continue; // Supports legacy POs created before budget integration.
       const netReceived = Number(receivedLine.qtyReceived || 0) * Number(receivedLine.unitCost || 0);
       const receivedTotal = Number((netReceived * (1 + (Number(poLine.taxRate) || 0) / 100)).toFixed(2));
@@ -1065,7 +1088,7 @@ exports.confirmGRN = async (req, res, next) => {
           }
           // restore PO lines
           for (const pl of updatedPOLines) {
-            const lineDoc = po.lines.id(pl.id);
+            const lineDoc = findPurchaseOrderLine(po, pl.id);
             if (lineDoc) lineDoc.qtyReceived = pl.previousQty;
           }
           // restore PO status

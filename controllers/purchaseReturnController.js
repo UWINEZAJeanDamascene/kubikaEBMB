@@ -18,6 +18,11 @@ const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNT
 const { parsePagination, paginationMeta } = require('../utils/pagination');
 const { nextReferenceNo } = require('../utils/referenceNumbers');
 const {
+  getPurchaseUnitSnapshot,
+  toBaseQuantity,
+  toBaseUnitCost,
+} = require('../utils/purchaseUnitRules');
+const {
   buildReturnLines,
   buildPurchaseReturnLines,
   calculateReturnTotals,
@@ -392,6 +397,8 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       const sourceLine = (isDirectPurchase ? purchase.items || [] : grn.lines || [])
         .find((item) => idOf(item._id || item.id) === sourceLineId);
       if (!sourceLine) throw Object.assign(new Error('Source purchase line not found'), { status: 404 });
+      const unitSnapshot = getPurchaseUnitSnapshot(sourceLine);
+      const baseQuantity = toBaseQuantity(line.qtyReturned, unitSnapshot);
 
       // Check warehouse stock
       const productQuery = Product.findOne({ _id: line.product, company: companyId });
@@ -406,8 +413,9 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       if (!stockLevel) throw Object.assign(new Error('No stock record exists for this product at the GRN warehouse'), { status: 409 });
       const onHand = Number(stockLevel.qty_on_hand) || 0;
       const reserved = Number(stockLevel.qty_reserved) || 0;
-      const stockFallbackCost = Number(stockLevel.avg_cost) || Number(product.averageCost) || Number(line.unitCost);
-      if (Number(line.qtyReturned) > Math.min(onHand - reserved, Number(product.currentStock) || 0) + 1e-9) {
+      const baseUnitCost = toBaseUnitCost(line.unitCost, unitSnapshot);
+      const stockFallbackCost = Number(stockLevel.avg_cost) || Number(product.averageCost) || baseUnitCost;
+      if (baseQuantity > Math.min(onHand - reserved, Number(product.currentStock) || 0) + 1e-9) {
         throw Object.assign(new Error('INSUFFICIENT_STOCK'), { status: 409 });
       }
       const trackingType = product.trackingType || 'none';
@@ -478,14 +486,14 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         }
         const batchOnHand = Number(stockBatch?.qtyOnHand) || 0;
         const batchReserved = Number(stockBatch?.reservedQuantity) || 0;
-        if (!stockBatch || Number(line.qtyReturned) > batchOnHand - batchReserved + 1e-9) {
+        if (!stockBatch || baseQuantity > batchOnHand - batchReserved + 1e-9) {
           throw Object.assign(new Error('Insufficient unreserved quantity in the source batch'), { status: 409 });
         }
         modifiedStockBatches.push({ id: stockBatch._id, qtyOnHand: batchOnHand });
-        stockBatch.qtyOnHand = batchOnHand - Number(line.qtyReturned);
+        stockBatch.qtyOnHand = batchOnHand - baseQuantity;
         await stockBatch.save(opts);
       }
-      let inventoryCostRemoved = stockFallbackCost * Number(line.qtyReturned);
+      let inventoryCostRemoved = stockFallbackCost * baseQuantity;
 
       // A return can be against an older receipt after the original FIFO layer
       // has been partially consumed, merged, or adjusted. Validate and consume
@@ -498,7 +506,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
           warehouse: pr.warehouse,
           availableQuantity: { $gt: 0 },
         }).sort({ receivedDate: 1 }).session(sess);
-        const requestedQuantity = Number(line.qtyReturned) || 0;
+        const requestedQuantity = baseQuantity;
         let remainingQuantity = requestedQuantity;
         let fifoCost = 0;
         for (const batch of batches) {
@@ -524,10 +532,10 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       // Reduce product and warehouse stock in the same transaction as the return.
       const previousStock = Number(product.currentStock) || 0;
       if (!modifiedProducts.has(String(product._id))) modifiedProducts.set(String(product._id), { prevStock: product.currentStock, prevAvg: product.averageCost });
-      product.currentStock = (product.currentStock || 0) - line.qtyReturned;
+      product.currentStock = (product.currentStock || 0) - baseQuantity;
       await product.save(opts);
-      const stockUnitCost = Number(line.qtyReturned) > 0 ? inventoryCostRemoved / Number(line.qtyReturned) : stockFallbackCost;
-      stockLevel.applyMovement('return_out', Number(line.qtyReturned), stockUnitCost);
+      const stockUnitCost = baseQuantity > 0 ? inventoryCostRemoved / baseQuantity : stockFallbackCost;
+      stockLevel.applyMovement('return_out', baseQuantity, stockUnitCost);
       await stockLevel.save(opts);
       inventoryValueByProduct.set(
         String(line.product),
@@ -543,11 +551,11 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         product: line.product,
         type: 'out',
         reason: 'return',
-        quantity: line.qtyReturned,
+        quantity: baseQuantity,
         previousStock,
         newStock: product.currentStock,
         unitCost: stockUnitCost,
-        totalCost: stockUnitCost * line.qtyReturned,
+        totalCost: stockUnitCost * baseQuantity,
         warehouse: sourceWarehouse,
         referenceType: 'return',
         referenceNumber: pr.referenceNo,

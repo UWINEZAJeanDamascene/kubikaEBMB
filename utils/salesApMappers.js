@@ -518,6 +518,9 @@ function purchaseOrderLineToApi(row) {
     taxRate: qtyNum(row.taxRate),
     taxAmount: qtyNum(row.taxAmount),
     lineTotal: qtyNum(row.lineTotal),
+    purchaseUnitSnapshot: row.unitSnapshot && typeof row.unitSnapshot === 'object'
+      ? row.unitSnapshot
+      : null,
     ...budgetRefs,
     // Keep the legacy API's snake-case fields while preserving the canonical
     // camel-case JSON keys used by Prisma.
@@ -601,6 +604,7 @@ function grnLineToApi(row) {
     batchNo: row.batchNo ?? null,
     serialNumbers: row.serialNumbers ?? [],
     ...(row.extra || {}),
+    purchaseUnitSnapshot: row.extra?.purchaseUnitSnapshot ?? null,
   };
 }
 
@@ -1202,6 +1206,9 @@ function purchaseReturnLineToApi(row) {
     qtyReturned: qtyNum(row.qtyReturned),
     unitCost: qtyNum(row.unitCost),
     serialNumbers: Array.isArray(row.serialNumbers) ? row.serialNumbers : [],
+    purchaseUnitSnapshot: row.unitSnapshot && typeof row.unitSnapshot === 'object'
+      ? row.unitSnapshot
+      : null,
     product: row.product && typeof row.product === 'object'
       ? { _id: row.product.id, name: row.product.name, sku: row.product.sku, unit: row.product.unit }
       : row.productId,
@@ -1714,6 +1721,7 @@ function purchaseOrderTranslateCreate(data) {
       taxRate,
       taxAmount: taxAmountLine,
       lineTotal,
+      unitSnapshot: line.purchaseUnitSnapshot || {},
       ...(Object.keys(budgetRefs).length ? { budgetRefs } : {}),
     });
   });
@@ -1780,6 +1788,7 @@ function purchaseTranslateCreate(data) {
         lineTotal: line.lineTotal ?? line.totalWithTax ?? 0,
         extra: {
           ...(line.extra && typeof line.extra === 'object' ? line.extra : {}),
+            ...(line.purchaseUnitSnapshot ? { purchaseUnitSnapshot: line.purchaseUnitSnapshot } : {}),
           ...(line.budgetId || line.budget_id ? { budgetId: toIdString(line.budgetId || line.budget_id) } : {}),
           ...(line.budget_line_id || line.budgetLineId ? { budget_line_id: toIdString(line.budget_line_id || line.budgetLineId) } : {}),
           ...(line.accountId || line.account_id ? { accountId: toIdString(line.accountId || line.account_id) } : {}),
@@ -1832,6 +1841,9 @@ function grnTranslateCreate(data) {
       taxRate: line.taxRate ?? 0,
       batchNo: line.batchNo ?? null,
       serialNumbers: Array.isArray(line.serialNumbers) ? line.serialNumbers : [],
+      extra: line.purchaseUnitSnapshot
+        ? { purchaseUnitSnapshot: line.purchaseUnitSnapshot }
+        : {},
     }));
 }
 
@@ -1870,6 +1882,7 @@ function purchaseReturnTranslateCreate(data) {
       qtyReturned: line.qtyReturned ?? line.qty ?? 0,
       unitCost: line.unitCost ?? 0,
       serialNumbers: Array.isArray(line.serialNumbers) ? line.serialNumbers : [],
+      unitSnapshot: line.purchaseUnitSnapshot || {},
     }));
 }
 

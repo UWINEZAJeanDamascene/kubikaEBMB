@@ -826,6 +826,7 @@ exports.createDirectSale = async (req, res, next) => {
     const missingProducts = [];
     const offlineConflicts = [];
     const offlineBatchUsageByProduct = new Map();
+    const stockRequiredByProduct = new Map();
     let offlineTaxPayloadMismatch = false;
     const selectedWarehouseLevels = await StockLevel.find({
       company_id: companyId,
@@ -1120,15 +1121,17 @@ exports.createDirectSale = async (req, res, next) => {
         const availableStock = stockLevel
           ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - Number(stockLevel.qty_reserved || 0) - (quarantinedByProduct.get(String(product._id)) || 0))
           : 0;
+        const totalRequired = (stockRequiredByProduct.get(String(product._id)) || 0) + quantity;
+        stockRequiredByProduct.set(String(product._id), totalRequired);
         const maySellBelowOnHand = allowNegativeStock
           && productTrackingType === 'none'
           && (quarantinedByProduct.get(String(product._id)) || 0) <= 0;
         const hasQuarantinedStock = (quarantinedByProduct.get(String(product._id)) || 0) > 0;
-        if (availableStock < quantity && (!offlineContext || hasQuarantinedStock) && !maySellBelowOnHand) {
+        if (availableStock < totalRequired && (!offlineContext || hasQuarantinedStock) && !maySellBelowOnHand) {
           return res.status(409).json({
             success: false,
             code: 'ERR_INSUFFICIENT_STOCK',
-            message: `Insufficient stock for ${product.name}. Available: ${availableStock}, Required: ${quantity}`,
+            message: `Insufficient stock for ${product.name}. Available: ${availableStock}, Required: ${totalRequired}`,
           });
         }
       }

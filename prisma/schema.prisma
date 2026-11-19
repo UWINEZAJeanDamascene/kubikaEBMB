@@ -4246,6 +4246,7 @@ model PurchaseOrderLine {
   taxAmount       Decimal       @default(0) @map("tax_amount") @db.Decimal(19, 2)
   lineTotal       Decimal       @default(0) @map("line_total") @db.Decimal(19, 2)
   budgetRefs      Json          @default("{}") @map("budget_refs")
+  unitSnapshot    Json          @default("{}") @map("unit_snapshot")
   product         Product       @relation(fields: [productId], references: [id])
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
 
@@ -4419,6 +4420,7 @@ model PurchaseReturnLine {
   qtyReturned      Decimal        @map("qty_returned") @db.Decimal(19, 4)
   unitCost         Decimal        @default(0) @map("unit_cost") @db.Decimal(19, 6)
   serialNumbers    Json           @default("[]") @map("serial_numbers")
+  unitSnapshot     Json           @default("{}") @map("unit_snapshot")
   product          Product        @relation(fields: [productId], references: [id])
   purchaseReturn   PurchaseReturn @relation(fields: [purchaseReturnId], references: [id], onDelete: Cascade)
 

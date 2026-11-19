@@ -93,6 +93,33 @@ describe('product barcode image generation', () => {
     expect(bwipjs.toBuffer).not.toHaveBeenCalled();
   });
 
+  it('returns a validation response for an EAN-13 with an incorrect check digit', async () => {
+    Product.findOne.mockResolvedValue({
+      _id: 'product-1',
+      company: 'company-1',
+      barcode: '6001234000113',
+      barcodeType: 'EAN13',
+      sku: 'RICE-01',
+    });
+    const res = createResponse();
+    const next = jest.fn();
+
+    await getProductBarcode({
+      user: { company: 'company-1' },
+      params: { id: 'product-1' },
+      query: {},
+      get: () => 'https://example.test',
+    }, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      success: false,
+      message: 'EAN-13 barcode check digit is invalid; the final digit should be 2.',
+    });
+    expect(bwipjs.toBuffer).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
   it('generates a clean product deep link without redundant mutable query values', async () => {
     const previousFrontendBase = process.env.FRONTEND_BASE_URL;
     process.env.FRONTEND_BASE_URL = 'https://app.kubika.test/';

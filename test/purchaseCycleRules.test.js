@@ -8,6 +8,13 @@ const {
 const {
   normalizeGRNLinesFromPurchaseOrder,
 } = require('../utils/purchaseReceiptRules');
+const {
+  getPurchaseUnitSnapshot,
+  normalizePurchaseUnitDefinitions,
+  resolvePurchaseUnit,
+  toBaseQuantity,
+  toBaseUnitCost,
+} = require('../utils/purchaseUnitRules');
 
 describe('purchase return rules', () => {
   const grn = {
@@ -39,6 +46,7 @@ describe('purchase return rules', () => {
       product: 'product-1',
       qtyReturned: 4,
       unitCost: 25,
+      purchaseUnitSnapshot: { code: 'base', label: 'unit', baseQuantity: 1 },
       serialNumbers: [],
     }]);
     expect(calculateReturnTotals(grn, lines)).toEqual({
@@ -109,6 +117,7 @@ describe('direct purchase return rules', () => {
       product: 'product-1',
       qtyReturned: 3,
       unitCost: 12.5,
+      purchaseUnitSnapshot: { code: 'base', label: 'unit', baseQuantity: 1 },
       serialNumbers: [],
     }]);
     expect(calculatePurchaseReturnTotals(purchase, lines)).toEqual({
@@ -154,6 +163,7 @@ describe('GRN receipt rules', () => {
       unitCost: 25,
       landedUnitCost: null,
       taxRate: 18,
+      purchaseUnitSnapshot: { code: 'base', label: 'unit', baseQuantity: 1 },
       batchNo: undefined,
       serialNumbers: [],
       manufactureDate: null,
@@ -173,5 +183,82 @@ describe('GRN receipt rules', () => {
       ...validLine,
       qtyReceived: 7,
     }])).toThrow(/exceeds remaining/);
+  });
+});
+
+describe('purchase unit conversion rules', () => {
+  const product = {
+    name: 'Soda',
+    unit: 'bottle',
+    customFields: {
+      purchaseUnits: [{ code: 'case', label: 'Case', baseQuantity: 12 }],
+    },
+  };
+
+  test('normalizes configured purchase units and resolves the base unit separately', () => {
+    expect(normalizePurchaseUnitDefinitions(product)).toEqual([
+      { code: 'case', label: 'Case', baseQuantity: 12 },
+    ]);
+    expect(resolvePurchaseUnit(product, 'case')).toEqual({
+      code: 'case',
+      label: 'Case',
+      baseQuantity: 12,
+    });
+    expect(resolvePurchaseUnit(product)).toEqual({
+      code: 'base',
+      label: 'bottle',
+      baseQuantity: 1,
+    });
+    expect(getPurchaseUnitSnapshot({ unitSnapshot: {} }, product)).toEqual({
+      code: 'base',
+      label: 'bottle',
+      baseQuantity: 1,
+    });
+  });
+
+  test('converts purchase quantity and cost without changing the line value', () => {
+    const snapshot = resolvePurchaseUnit(product, 'case');
+    const baseQuantity = toBaseQuantity(2.5, snapshot);
+    const baseUnitCost = toBaseUnitCost(1800, snapshot);
+
+    expect(baseQuantity).toBe(30);
+    expect(baseUnitCost).toBe(150);
+    expect(baseQuantity * baseUnitCost).toBe(4500);
+    expect(getPurchaseUnitSnapshot({ purchaseUnitSnapshot: snapshot }, product)).toEqual(snapshot);
+  });
+
+  test('keeps return limits in purchase units while converting returned inventory quantities', () => {
+    const packedPurchase = {
+      items: [{
+        _id: 'purchase-line-pack',
+        product: 'product-1',
+        quantity: 3,
+        unitCost: 240,
+        taxRate: 0,
+        purchaseUnitSnapshot: { code: 'case', label: 'Case', baseQuantity: 12 },
+      }],
+    };
+    const lines = buildPurchaseReturnLines(packedPurchase, [{
+      purchaseLine: 'purchase-line-pack',
+      qtyReturned: 1.5,
+    }]);
+
+    expect(lines[0].qtyReturned).toBe(1.5);
+    expect(toBaseQuantity(lines[0].qtyReturned, getPurchaseUnitSnapshot(packedPurchase.items[0]))).toBe(18);
+    expect(calculatePurchaseReturnTotals(packedPurchase, lines)).toEqual({
+      subtotal: 360,
+      taxAmount: 0,
+      totalAmount: 360,
+    });
+  });
+
+  test('rejects invalid configurations, unknown units, and conversions beyond stock precision', () => {
+    expect(() => normalizePurchaseUnitDefinitions({
+      ...product,
+      customFields: { purchaseUnits: [{ code: 'case', label: 'Case', baseQuantity: 12 }, { code: 'case', label: 'Box', baseQuantity: 24 }] },
+    })).toThrow(/unique/);
+    expect(() => resolvePurchaseUnit(product, 'box')).toThrow(/not configured/);
+    expect(() => toBaseQuantity(0.0001, { code: 'case', label: 'Case', baseQuantity: 1.5 })).toThrow(/four decimal places/);
+    expect(() => toBaseQuantity(-1, { code: 'base', label: 'bottle', baseQuantity: 1 })).toThrow(/positive/);
   });
 });

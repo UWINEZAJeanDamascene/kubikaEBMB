@@ -1,3 +1,8 @@
+const {
+  getPurchaseUnitSnapshot,
+  toBaseQuantity,
+} = require('./purchaseUnitRules');
+
 function idOf(value) {
   if (value && typeof value === 'object') {
     return String(value._id || value.id || '');
@@ -49,6 +54,7 @@ function buildReturnLines(grn, requestedLines, confirmedReturns = [], excludeRet
     if (!Number.isFinite(quantity) || quantity <= 0) {
       throw httpError('Return quantities must be greater than zero');
     }
+    toBaseQuantity(quantity, getPurchaseUnitSnapshot(sourceLine));
 
     const alreadyReturned = returnedByLine.get(grnLineId) || 0;
     const availableQuantity = Number(sourceLine.qtyReceived || 0) - alreadyReturned;
@@ -64,6 +70,7 @@ function buildReturnLines(grn, requestedLines, confirmedReturns = [], excludeRet
       product: sourceProductId,
       qtyReturned: quantity,
       unitCost: Number(sourceLine.unitCost) || 0,
+      purchaseUnitSnapshot: getPurchaseUnitSnapshot(sourceLine),
       serialNumbers: normalizeSerialNumbers(requestedLine.serialNumbers),
     };
   });
@@ -85,7 +92,8 @@ function normalizeSerialNumbers(value) {
 
 function validateReturnSerialNumbers(sourceLine, quantity, value) {
   const serialNumbers = normalizeSerialNumbers(value);
-  if (!Number.isInteger(Number(quantity)) || serialNumbers.length !== Number(quantity)) {
+  const baseQuantity = toBaseQuantity(quantity, getPurchaseUnitSnapshot(sourceLine));
+  if (!Number.isInteger(baseQuantity) || serialNumbers.length !== baseQuantity) {
     throw httpError('Select exactly one available serial number for each returned unit', 409);
   }
 
@@ -159,6 +167,7 @@ function buildPurchaseReturnLines(purchase, requestedLines, confirmedReturns = [
     if (!Number.isFinite(quantity) || quantity <= 0) {
       throw httpError('Return quantities must be greater than zero');
     }
+    toBaseQuantity(quantity, getPurchaseUnitSnapshot(sourceLine));
 
     const alreadyReturned = returnedByLine.get(purchaseLineId) || 0;
     const availableQuantity = Number(sourceLine.quantity ?? sourceLine.qty ?? 0) - alreadyReturned;
@@ -174,6 +183,7 @@ function buildPurchaseReturnLines(purchase, requestedLines, confirmedReturns = [
       product: sourceProductId,
       qtyReturned: quantity,
       unitCost: Number(sourceLine.unitCost) || 0,
+      purchaseUnitSnapshot: getPurchaseUnitSnapshot(sourceLine),
       serialNumbers: normalizeSerialNumbers(requestedLine.serialNumbers),
     };
   });

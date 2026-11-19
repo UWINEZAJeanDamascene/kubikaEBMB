@@ -5,8 +5,42 @@ const { parsePagination, paginationMeta } = require('../utils/pagination');
 const emailService = require('../services/emailService');
 const Company = require('../models/Company');
 const Supplier = require('../models/Supplier');
+const Product = require('../models/Product');
 const { emitDataChanged } = require('../lib/realtimeEvents');
 const { runInTransaction } = require('../services/transactionService');
+const {
+  normalizePurchaseUnitSnapshot,
+  resolvePurchaseUnit,
+} = require('../utils/purchaseUnitRules');
+
+async function snapshotPurchaseOrderLines(lines, companyId, existingLines = []) {
+  if (!Array.isArray(lines)) {
+    throw Object.assign(new Error('Purchase order lines must be a list'), { status: 400 });
+  }
+  const productIds = [...new Set(lines.map((line) => String(line.product?._id || line.product || '')).filter(Boolean))];
+  const products = productIds.length
+    ? await Product.find({ _id: { $in: productIds }, company: companyId })
+    : [];
+  const productsById = new Map(products.map((product) => [String(product._id), product]));
+
+  return lines.map((line, index) => {
+    const productId = String(line.product?._id || line.product || '');
+    const product = productsById.get(productId);
+    if (!product) {
+      throw Object.assign(new Error(`Line ${index + 1}: select a product available in this company`), { status: 400 });
+    }
+
+    const existing = line._id
+      ? existingLines.find((candidate) => String(candidate._id || candidate.id) === String(line._id))
+      : null;
+    const existingSnapshot = existing?.purchaseUnitSnapshot || existing?.unitSnapshot;
+    const code = String(line.purchaseUnitCode || line.purchaseUnitSnapshot?.code || existingSnapshot?.code || 'base').toLowerCase();
+    const snapshot = existingSnapshot && existingSnapshot.code === code
+      ? normalizePurchaseUnitSnapshot(existingSnapshot, product.unit || 'unit')
+      : resolvePurchaseUnit(product, code);
+    return { ...line, purchaseUnitSnapshot: snapshot };
+  });
+}
 
 const sendPOEmail = async (po, action, companyId) => {
   try {
@@ -36,6 +70,7 @@ exports.createPurchaseOrder = async (req, res, next) => {
     const payload = req.body;
     payload.company = companyId;
     payload.createdBy = req.user.id;
+    payload.lines = await snapshotPurchaseOrderLines(payload.lines || payload.items || [], companyId);
     // Orders must enter the approval workflow as drafts; accepting an incoming
     // status here would allow callers to bypass approval and commitment checks.
     payload.status = 'draft';
@@ -62,6 +97,9 @@ exports.updatePurchaseOrder = async (req, res, next) => {
     const po = await PurchaseOrder.findOne({ _id: req.params.id, company: companyId });
     if (!po) return res.status(404).json({ success: false, message: 'PO not found' });
     if (po.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft POs can be edited' });
+    if (req.body.lines !== undefined) {
+      req.body.lines = await snapshotPurchaseOrderLines(req.body.lines, companyId, po.lines || []);
+    }
 
     // Update fields individually to ensure Mongoose tracks changes properly
     const allowedFields = ['supplier', 'warehouse', 'orderDate', 'expectedDeliveryDate', 'currencyCode', 'exchangeRate', 'notes', 'lines', 'freight'];
@@ -83,9 +121,6 @@ exports.approvePurchaseOrder = async (req, res, next) => {
     const po = await PurchaseOrder.findOne({ _id: req.params.id, company: companyId });
     if (!po) return res.status(404).json({ success: false, message: 'PO not found' });
     if (po.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft POs can be approved' });
-    if (po.createdBy && String(po.createdBy) === String(userId)) {
-      return res.status(403).json({ success: false, message: 'The purchase order creator cannot approve the same order. Ask another user with purchase order approval permission.' });
-    }
 
     const BudgetLine = require('../models/BudgetLine');
     const resolvedLines = [];

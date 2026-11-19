@@ -16,6 +16,8 @@ const cacheService = require('../services/cacheService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
 const slowQueryMonitor = require('../utils/slowQueryMonitor');
 const moduleEntitlementService = require('../services/moduleEntitlementService');
+const { normalizePurchaseUnitDefinitions } = require('../utils/purchaseUnitRules');
+const { validateGs1Barcode } = require('../utils/barcodeRules');
 const {
   slimProductForHistory,
   buildProductHistoryChanges,
@@ -281,7 +283,7 @@ exports.getProducts = async (req, res, next) => {
       '_id', 'company', 'name', 'sku', 'barcode', 'imageUrl', 'imageUrls', 'unit', 'currentStock',
       'isActive', 'isArchived', 'trackingType', 'trackBatch',
       'trackSerialNumbers', 'defaultWarehouse', 'sellingPrice', 'costPrice',
-      'preferredSupplier', 'averageCost', 'taxCode', 'taxRate', 'createdAt', 'updatedAt'
+      'preferredSupplier', 'averageCost', 'taxCode', 'taxRate', 'customFields', 'createdAt', 'updatedAt'
     ] : isStockLevels ? [
       '_id', 'company', 'name', 'sku', 'category', 'unit', 'currentStock',
       'reservedQuantity', 'averageCost', 'costPrice', 'lowStockThreshold',
@@ -426,6 +428,14 @@ exports.getProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.createProduct = async (req, res, next) => {
   try {
+    const barcodeError = validateGs1Barcode(req.body.barcode, req.body.barcodeType);
+    if (barcodeError) return res.status(422).json({ success: false, errors: { barcode: barcodeError } });
+
+    try {
+      normalizePurchaseUnitDefinitions({ ...req.body, customFields: req.body.customFields || {} });
+    } catch (error) {
+      return res.status(error.status || 422).json({ success: false, errors: { purchaseUnits: error.message } });
+    }
     const imageUrlError = validateProductImageUrl(req.body.imageUrl);
     if (imageUrlError) return res.status(422).json({ success: false, errors: { imageUrl: imageUrlError } });
     if (typeof req.body.imageUrl === 'string') req.body.imageUrl = req.body.imageUrl.trim();
@@ -530,6 +540,13 @@ exports.createProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.updateProduct = async (req, res, next) => {
   try {
+    if (req.body.customFields && Object.prototype.hasOwnProperty.call(req.body.customFields, 'purchaseUnits')) {
+      try {
+        normalizePurchaseUnitDefinitions({ ...req.body, customFields: req.body.customFields });
+      } catch (error) {
+        return res.status(error.status || 422).json({ success: false, errors: { purchaseUnits: error.message } });
+      }
+    }
     if (Object.prototype.hasOwnProperty.call(req.body, 'imageUrl')) {
       const imageUrlError = validateProductImageUrl(req.body.imageUrl);
       if (imageUrlError) return res.status(422).json({ success: false, errors: { imageUrl: imageUrlError } });
@@ -550,6 +567,15 @@ exports.updateProduct = async (req, res, next) => {
         success: false, 
         message: 'Product not found' 
       });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, 'barcode')
+      || Object.prototype.hasOwnProperty.call(req.body, 'barcodeType')) {
+      const barcodeError = validateGs1Barcode(
+        Object.prototype.hasOwnProperty.call(req.body, 'barcode') ? req.body.barcode : product.barcode,
+        Object.prototype.hasOwnProperty.call(req.body, 'barcodeType') ? req.body.barcodeType : product.barcodeType,
+      );
+      if (barcodeError) return res.status(422).json({ success: false, errors: { barcode: barcodeError } });
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body, 'barcode')) {
@@ -1155,6 +1181,8 @@ exports.getProductBarcode = async (req, res, next) => {
     if (bcid === 'itf14' && !/^\d{14}$/.test(codeText)) {
       return res.status(400).json({ success: false, message: 'ITF-14 barcode must be exactly 14 digits' });
     }
+    const barcodeError = validateGs1Barcode(codeText, requestedType);
+    if (barcodeError) return res.status(400).json({ success: false, message: barcodeError });
     if (bcid === 'code39') {
       codeText = codeText.toUpperCase();
       if (!/^[0-9A-Z .$/+%-]+$/.test(codeText)) {
