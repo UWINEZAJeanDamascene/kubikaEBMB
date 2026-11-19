@@ -42,6 +42,20 @@ exports.createProforma = async (req, res, next) => {
   }
 };
 
+async function createInformationalDocument(req, res, next, kind, label) {
+  try {
+    const { companyId, registerId, userId } = context(req);
+    const document = await posNonPostingDocumentService.createDocument({ companyId, registerId, userId, kind, input: req.body || {} });
+    return res.status(201).json({ success: true, data: document, message: `${label} saved. It did not record a sale or move stock.` });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ success: false, code: error.code, message: error.message });
+    return next(error);
+  }
+}
+
+exports.createQuote = (req, res, next) => createInformationalDocument(req, res, next, 'QUOTE', 'Quote');
+exports.createDeliveryNote = (req, res, next) => createInformationalDocument(req, res, next, 'DELIVERY_NOTE', 'Draft delivery note');
+
 exports.convertProforma = async (req, res, next) => {
   try {
     const { companyId, registerId } = context(req);

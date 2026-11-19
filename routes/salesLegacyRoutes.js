@@ -225,5 +225,7 @@ router.get('/non-posting-documents', canReadSale, requireOnlinePosSession, posNo
 router.post('/training-documents', canCreateSale, requireOnlinePosSession, idem(posNonPostingDocumentController.createTraining));
 router.post('/proformas', canCreateSale, requireOnlinePosSession, idem(posNonPostingDocumentController.createProforma));
 router.post('/proformas/:documentId/convert', canCreateSale, requireOnlinePosSession, idem(posNonPostingDocumentController.convertProforma));
+router.post('/quotes', canCreateSale, requireOnlinePosSession, idem(posNonPostingDocumentController.createQuote));
+router.post('/delivery-notes/draft', canCreateSale, requireOnlinePosSession, idem(posNonPostingDocumentController.createDeliveryNote));
 
 module.exports = router;

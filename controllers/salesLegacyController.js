@@ -175,6 +175,11 @@ exports.createDirectSale = async (req, res, next) => {
   let proformaDocument = null;
   try {
     companyId = req.user.company._id;
+    let purchaseOrderNumber = String(req.body?.purchaseOrderNumber || '').trim();
+    if (purchaseOrderNumber.length > 80) {
+      return res.status(400).json({ success: false, code: 'POS_PURCHASE_ORDER_NUMBER_INVALID', message: 'Purchase order number must be 80 characters or fewer.' });
+    }
+    req.body = { ...req.body, purchaseOrderNumber: purchaseOrderNumber || undefined };
     // Mock mode is intentionally manual so development/test checkouts never
     // acquire fabricated fiscal receipts. Sandbox and production POS sales
     // are submitted after the sale transaction commits.
@@ -220,7 +225,9 @@ exports.createDirectSale = async (req, res, next) => {
         warehouseId: savedDocument.warehouseId,
         clientId: savedDocument.clientId || undefined,
         clientInfo: savedDocument.clientInfo || undefined,
+        purchaseOrderNumber: savedDocument.purchaseOrderNumber || undefined,
       };
+      purchaseOrderNumber = String(req.body.purchaseOrderNumber || '').trim();
     }
     // Legacy checkout, pending V2 creation, and online/offline V2 completion
     // all reserve this company-scoped request row inside the sale transaction.
@@ -1914,6 +1921,7 @@ exports.createDirectSale = async (req, res, next) => {
                 ...(item.unitPrice != null ? { unitPrice: Number(item.unitPrice) } : {}),
                 ...(item.catalogUnitPrice != null ? { catalogUnitPrice: Number(item.catalogUnitPrice) } : {}),
               })),
+              ...(purchaseOrderNumber ? { purchaseOrderNumber } : {}),
             },
           ...(isV2Pending ? {
             tillSessionId: String(activeTill._id),
@@ -3279,6 +3287,7 @@ exports.getPosProducts = async (req, res, next) => {
         onHandStock,
         reservedStock,
         quarantinedStock,
+        isStockable: p.isStockable !== false,
         averageCost: toNumber(p.averageCost),
         // Till filters need a human-readable category. Product.find() selects
         // only the category foreign key unless the relation is populated.

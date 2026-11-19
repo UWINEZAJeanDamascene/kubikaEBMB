@@ -51,6 +51,7 @@ function pendingCheckoutPayload(body) {
     warehouseId: String(body.warehouseId),
     ...(body.displayTotal != null ? { displayTotal: Number(body.displayTotal) } : {}),
     ...(body.notes != null ? { notes: String(body.notes) } : {}),
+    ...(body.purchaseOrderNumber != null ? { purchaseOrderNumber: String(body.purchaseOrderNumber).trim().slice(0, 80) } : {}),
     ...(body.terms != null ? { terms: String(body.terms) } : {}),
     ...(body.dueDate != null ? { dueDate: body.dueDate } : {}),
     ...(clientInfo ? {

@@ -16,12 +16,24 @@ function fail(statusCode, code, message) {
 
 async function createDocument({ companyId, registerId, userId, kind, input }) {
   const type = String(kind || '').toUpperCase();
-  if (!['TRAINING', 'PROFORMA'].includes(type)) throw fail(400, 'POS_DOCUMENT_TYPE_INVALID', 'Choose a training or proforma document.');
+  if (!['TRAINING', 'PROFORMA', 'QUOTE', 'DELIVERY_NOTE'].includes(type)) throw fail(400, 'POS_DOCUMENT_TYPE_INVALID', 'Choose a training, proforma, quote, or delivery note.');
   const register = await prisma.posRegister.findFirst({ where: { id: String(registerId), companyId: String(companyId), isActive: true } });
   if (!register) throw fail(403, 'POS_DOCUMENT_REGISTER_INVALID', 'This register is not available in the current company.');
   if (type === 'TRAINING' && !register.trainingMode) throw fail(409, 'POS_TRAINING_MODE_DISABLED', 'Training mode is not enabled for this register.');
   const rows = Array.isArray(input?.items) ? input.items : [];
   if (!rows.length || rows.length > 500) throw fail(400, 'POS_DOCUMENT_ITEMS_INVALID', 'Add between one and 500 items.');
+  const purchaseOrderNumber = String(input.purchaseOrderNumber || '').trim();
+  if (purchaseOrderNumber.length > 80) throw fail(400, 'POS_PURCHASE_ORDER_NUMBER_INVALID', 'Purchase order number must be 80 characters or fewer.');
+  if (type === 'DELIVERY_NOTE' && (!input.clientId || !input.warehouseId)) {
+    throw fail(422, 'POS_DELIVERY_NOTE_CUSTOMER_WAREHOUSE_REQUIRED', 'Select a named customer and warehouse before creating a delivery note.');
+  }
+  if (type === 'DELIVERY_NOTE') {
+    const warehouse = await dbClient().warehouse.findFirst({
+      where: { id: String(input.warehouseId), companyId: String(companyId), isActive: true },
+      select: { id: true },
+    });
+    if (!warehouse) throw fail(422, 'POS_DELIVERY_NOTE_WAREHOUSE_INVALID', 'The selected warehouse is unavailable. Refresh the till and try again.');
+  }
   const normalized = rows.map((row) => ({
     productId: String(row.productId || row._id || ''),
     quantity: Number(row.quantity ?? row.cartQuantity),
@@ -125,7 +137,8 @@ async function createDocument({ companyId, registerId, userId, kind, input }) {
   const taxAmount = items.reduce((sum, item) => sum + item.taxAmount, 0);
   const totalAmount = Math.round((subtotal - discountAmount + taxAmount) * 100) / 100;
   const id = generateObjectId();
-  const documentNumber = `${type === 'TRAINING' ? 'TRN' : 'PRO'}-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}-${id.slice(-5).toUpperCase()}`;
+  const prefix = { TRAINING: 'TRN', PROFORMA: 'PRO', QUOTE: 'QUO', DELIVERY_NOTE: 'DLV' }[type];
+  const documentNumber = `${prefix}-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}-${id.slice(-5).toUpperCase()}`;
   const now = new Date();
   const conversionKey = type === 'PROFORMA' ? `PROFORMA_${id}` : null;
   const created = await prisma.posNonPostingDocument.create({ data: {
@@ -133,9 +146,11 @@ async function createDocument({ companyId, registerId, userId, kind, input }) {
     documentNumber, documentType: type, status: 'open', totalAmount, conversionKey,
     documentData: {
       items, clientId: input.clientId || null, clientInfo, warehouseId: input.warehouseId || null,
+      purchaseOrderNumber: purchaseOrderNumber || null,
       cartDiscountPct, cartDiscountReason,
       subtotal, discountAmount, taxAmount, totalAmount, createdAt: now.toISOString(),
-      informationalOnly: type === 'PROFORMA', trainingOnly: type === 'TRAINING',
+      informationalOnly: ['PROFORMA', 'QUOTE', 'DELIVERY_NOTE'].includes(type), trainingOnly: type === 'TRAINING',
+      stockMovementPosted: false,
     },
   } });
   return created;
