@@ -67,6 +67,7 @@ const POS_AUDIT_EVENTS = new Set([
   'PAYMENT_CANCELLED',
   'POS_SALE_COMPLETED',
   'POS_SALE_PAYMENT_PENDING',
+  'POS_WHOLESALE_STOCK_RESERVED',
   'POS_REFUND_COMPLETED',
   'POS_REFUND_PAYOUT_RECORDED',
   'POS_REFUND_DRAFT_CREATED',
@@ -247,6 +248,7 @@ const OBSERVATION_EVENTS = new Set([
 function inferAuditEntity(metadata = {}) {
   const candidates = [
     ['submissionId', 'EBM_SUBMISSION'], ['creditNoteId', 'CREDIT_NOTE'],
+    ['reservationId', 'STOCK_RESERVATION'],
     ['reprintId', 'RECEIPT_REPRINT'], ['receiptId', 'RECEIPT'], ['invoiceId', 'INVOICE'],
     ['saleId', 'SALE'], ['voucherId', 'VOUCHER'], ['batchId', 'VOUCHER_BATCH'],
     ['customerId', 'CUSTOMER'], ['clientId', 'CUSTOMER'], ['registerId', 'REGISTER'],

@@ -1,13 +1,15 @@
 'use strict';
 
 const mockTx = { warehouse: {}, client: {}, posShift: {}, product: {}, $queryRawUnsafe: jest.fn(), $executeRawUnsafe: jest.fn() };
-const mockDb = { $transaction: jest.fn() };
+const mockDb = {};
+const mockPrisma = { $transaction: jest.fn() };
 const mockAudit = jest.fn();
 
-jest.mock('../lib/prisma', () => ({ dbClient: () => mockDb }));
+jest.mock('../lib/prisma', () => ({ dbClient: () => mockDb, prisma: mockPrisma }));
 jest.mock('../services/posAuditService', () => ({ writePosAuditLog: (...args) => mockAudit(...args) }));
 
 const controller = require('../controllers/posStockReservationController');
+const { runWithTx } = require('../lib/txContext');
 
 const makeResponse = () => ({
   status: jest.fn(function status(code) { this.statusCode = code; return this; }),
@@ -29,7 +31,7 @@ const request = {
 describe('POS wholesale stock reservations', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockDb.$transaction.mockImplementation((callback) => callback(mockTx));
+    mockPrisma.$transaction.mockImplementation((callback) => callback(mockTx));
     mockTx.warehouse.findFirst = jest.fn().mockResolvedValue({ id: request.body.warehouseId, name: 'Main Store' });
     mockTx.client.findFirst = jest.fn().mockResolvedValue({ id: request.body.clientId, name: 'Wholesale Customer', code: 'C-1', phoneNormalized: '+250700000000' });
     mockTx.posShift.findFirst = jest.fn().mockResolvedValue({ id: '111111111111111111111111' });
@@ -56,6 +58,14 @@ describe('POS wholesale stock reservations', () => {
       backorderLines: [{ productName: 'Beans', remainingBaseQuantity: 12 }],
     });
     expect(mockTx.$queryRawUnsafe).toHaveBeenCalledWith(expect.stringContaining('qty_reserved = sl.qty_reserved + LEAST'), expect.any(String), request.body.items[0].productId, request.body.warehouseId, 24);
+  });
+
+  test('joins the active idempotency transaction instead of nesting a Prisma transaction', async () => {
+    const res = makeResponse();
+    await runWithTx(mockTx, () => controller.create(request, res, (error) => { throw error; }));
+
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   });
 
   test('requires a named wholesale customer before reserving', async () => {

@@ -70,6 +70,26 @@ describe('POS audit logging', () => {
     expect(saved.hash).toBe(hashAuditRow(saved));
   });
 
+  test('writes wholesale stock reservation events against the reservation entity', async () => {
+    prisma.posAuditLog.create.mockImplementation(async ({ data }) => data);
+
+    await writePosAuditLog({
+      companyId: 'company',
+      registerId: 'register',
+      event: 'POS_WHOLESALE_STOCK_RESERVED',
+      metadata: { reservationId: 'reservation-1', referenceNo: 'RSV-1', status: 'backorder', lineCount: 1 },
+    });
+
+    expect(prisma.posAuditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        event: 'POS_WHOLESALE_STOCK_RESERVED',
+        entityType: 'STOCK_RESERVATION',
+        entityId: 'reservation-1',
+        outcome: 'COMMITTED',
+      }),
+    });
+  });
+
   test('samples repeated denials while retaining exact rolling-window counts in emitted events', async () => {
     prisma.posAuditLog.create.mockImplementation(async ({ data }) => data);
     expect([1, 2, 3, 4, 5, 6, 7, 8].filter(shouldSampleDenial)).toEqual([1, 2, 3, 4, 5, 8]);

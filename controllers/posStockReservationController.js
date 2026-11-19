@@ -2,6 +2,7 @@
 
 const { randomBytes } = require('crypto');
 const { dbClient } = require('../lib/prisma');
+const { runInPrismaTransaction } = require('../services/transactionService');
 const { normalizeWholesaleConfig } = require('../utils/posWholesalePricing');
 const { writePosAuditLog } = require('../services/posAuditService');
 
@@ -61,7 +62,7 @@ exports.create = async (req, res, next) => {
     }
     const id = randomBytes(12).toString('hex');
     const referenceNo = `RSV-${Date.now().toString(36).toUpperCase()}-${id.slice(-6).toUpperCase()}`;
-    const result = await dbClient().$transaction(async (tx) => {
+    const result = await runInPrismaTransaction(async (tx) => {
       const [warehouse, client, shift] = await Promise.all([
         tx.warehouse.findFirst({ where: { id: warehouseId, companyId, isActive: true }, select: { id: true, name: true } }),
         tx.client.findFirst({ where: { id: clientId, companyId, isActive: true }, select: { id: true, name: true, code: true, phoneNormalized: true } }),
@@ -134,7 +135,7 @@ exports.allocateBackorder = async (req, res, next) => {
   const reservationId = String(req.params.reservationId || '');
   if (!objectId(reservationId)) return res.status(400).json({ success: false, code: 'POS_RESERVATION_ID_INVALID', message: 'Reservation id is invalid.' });
   try {
-    const result = await dbClient().$transaction(async (tx) => {
+    const result = await runInPrismaTransaction(async (tx) => {
       const rows = await tx.$queryRawUnsafe(`SELECT id, warehouse_id AS "warehouseId", lines, backorder_lines AS "backorderLines" FROM pos_stock_reservations WHERE id=$1 AND company_id=$2 AND register_id=$3 AND status IN ('partial','backorder') FOR UPDATE`, reservationId, companyId, registerId);
       const reservation = rows[0];
       if (!reservation) throw Object.assign(new Error('No open backorder reservation was found for this register.'), { statusCode: 404, code: 'POS_RESERVATION_NOT_FOUND' });
@@ -169,7 +170,7 @@ exports.cancel = async (req, res, next) => {
   const reservationId = String(req.params.reservationId || '');
   if (!objectId(reservationId)) return res.status(400).json({ success: false, code: 'POS_RESERVATION_ID_INVALID', message: 'Reservation id is invalid.' });
   try {
-    await dbClient().$transaction(async (tx) => {
+    await runInPrismaTransaction(async (tx) => {
       const rows = await tx.$queryRawUnsafe(`SELECT id, warehouse_id AS "warehouseId", lines FROM pos_stock_reservations WHERE id=$1 AND company_id=$2 AND register_id=$3 AND status IN ('reserved','partial','backorder') FOR UPDATE`, reservationId, companyId, registerId);
       const reservation = rows[0];
       if (!reservation) throw Object.assign(new Error('Open reservation not found for this register.'), { statusCode: 404, code: 'POS_RESERVATION_NOT_FOUND' });
