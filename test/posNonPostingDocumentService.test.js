@@ -7,6 +7,7 @@ const mockPrisma = {
 const mockDatabase = {
   systemSettings: { findUnique: jest.fn() },
   category: { findMany: jest.fn() },
+  warehouse: { findFirst: jest.fn() },
 };
 const mockProducts = { find: jest.fn() };
 const mockClient = { findOne: jest.fn() };
@@ -28,30 +29,32 @@ const regularProductId = 'dddddddddddddddddddddd01';
 const restrictedProductId = 'dddddddddddddddddddddd02';
 
 function configureProducts() {
-  mockProducts.find.mockReturnValue({
+  const products = [
+    {
+      _id: regularProductId,
+      name: 'Tea',
+      sku: 'TEA',
+      sellingPrice: 100,
+      taxRate: 0,
+      category: 'regular-category',
+      isNoDiscount: false,
+    },
+    {
+      _id: restrictedProductId,
+      name: 'Rice',
+      sku: 'RICE',
+      sellingPrice: 50,
+      taxRate: 0,
+      category: 'restricted-category',
+      isNoDiscount: false,
+    },
+  ];
+
+  mockProducts.find.mockImplementation((query) => ({
     select: jest.fn().mockReturnValue({
-      lean: jest.fn().mockResolvedValue([
-        {
-          _id: regularProductId,
-          name: 'Tea',
-          sku: 'TEA',
-          sellingPrice: 100,
-          taxRate: 0,
-          category: 'regular-category',
-          isNoDiscount: false,
-        },
-        {
-          _id: restrictedProductId,
-          name: 'Rice',
-          sku: 'RICE',
-          sellingPrice: 50,
-          taxRate: 0,
-          category: 'restricted-category',
-          isNoDiscount: false,
-        },
-      ]),
+      lean: jest.fn().mockResolvedValue(products.filter((product) => query._id.$in.includes(product._id))),
     }),
-  });
+  }));
 }
 
 describe('POS non-posting document service', () => {
@@ -69,6 +72,7 @@ describe('POS non-posting document service', () => {
       },
     });
     mockDatabase.category.findMany.mockResolvedValue([{ id: 'restricted-category' }]);
+    mockDatabase.warehouse.findFirst.mockResolvedValue({ id: 'ffffffffffffffffffffffff' });
     configureProducts();
   });
 
@@ -117,5 +121,38 @@ describe('POS non-posting document service', () => {
     })).rejects.toMatchObject({ code: 'POS_DISCOUNT_REASON_REQUIRED' });
 
     expect(mockPrisma.posNonPostingDocument.create).not.toHaveBeenCalled();
+  });
+
+  test('saves draft delivery notes as informational documents without conversion state', async () => {
+    mockClient.findOne.mockReturnValue({
+      select: jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue({ name: 'Wholesale Customer', contact: {}, address: null }),
+      }),
+    });
+
+    await createDocument({
+      companyId,
+      registerId,
+      userId,
+      kind: 'DELIVERY_NOTE',
+      input: {
+        clientId: 'ffffffffffffffffffffff01',
+        warehouseId: 'ffffffffffffffffffffffff',
+        items: [{ productId: regularProductId, quantity: 1, unitPrice: 100 }],
+      },
+    });
+
+    expect(mockPrisma.posNonPostingDocument.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        documentType: 'DELIVERY_NOTE',
+        status: 'open',
+        conversionKey: null,
+        documentData: expect.objectContaining({
+          informationalOnly: true,
+          stockMovementPosted: false,
+          warehouseId: 'ffffffffffffffffffffffff',
+        }),
+      }),
+    });
   });
 });

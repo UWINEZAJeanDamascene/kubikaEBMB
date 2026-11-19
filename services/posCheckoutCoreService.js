@@ -52,6 +52,9 @@ function pendingCheckoutPayload(body) {
     ...(body.displayTotal != null ? { displayTotal: Number(body.displayTotal) } : {}),
     ...(body.notes != null ? { notes: String(body.notes) } : {}),
     ...(body.purchaseOrderNumber != null ? { purchaseOrderNumber: String(body.purchaseOrderNumber).trim().slice(0, 80) } : {}),
+    ...(body.buyerTin != null ? { buyerTin: String(body.buyerTin).trim().slice(0, 9) } : {}),
+    ...(body.salespersonId != null ? { salespersonId: String(body.salespersonId).trim() } : {}),
+    ...(body.salespersonName != null ? { salespersonName: String(body.salespersonName).trim().slice(0, 160) } : {}),
     ...(body.terms != null ? { terms: String(body.terms) } : {}),
     ...(body.dueDate != null ? { dueDate: body.dueDate } : {}),
     ...(clientInfo ? {

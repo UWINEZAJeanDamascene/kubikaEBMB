@@ -98,7 +98,7 @@ function makeCustomerData(input, { quick = false } = {}) {
   const phoneInput = input?.phone ?? input?.contact?.phone;
   const phoneNormalized = normalizeRwandaPhone(phoneInput);
   const email = quick ? null : normalizeEmail(input?.email ?? input?.contact?.email);
-  const tin = quick ? null : normalizeTin(input?.tin ?? input?.taxId);
+  const tin = normalizeTin(input?.tin ?? input?.taxId);
   const type = quick ? 'individual' : String(input?.type || 'individual').toLowerCase();
   if (!CUSTOMER_TYPES.has(type)) throw customerError('CUSTOMER_TYPE_INVALID', 'Choose individual or business.');
   const existingContact = input?.contact && typeof input.contact === 'object' && !Array.isArray(input.contact)

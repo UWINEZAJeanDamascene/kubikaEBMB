@@ -34,6 +34,7 @@ const posDiscountApplicationController = require('../controllers/posDiscountAppl
 const posVoucherController = require('../controllers/posVoucherController');
 const posScannerSettingsController = require('../controllers/posScannerSettingsController');
 const posStockReservationController = require('../controllers/posStockReservationController');
+const posTillCustomerController = require('../controllers/posTillCustomerController');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 
 const requirePosSessionAuth = requirePosSession();
@@ -139,6 +140,9 @@ router.route('/held-sales')
   .get(canManageHeldSales, heldSaleController.listHeldSales)
   .post(canManageHeldSales, idem(heldSaleController.createHeldSale));
 router.delete('/held-sales/:heldSaleId', canManageHeldSales, idem(heldSaleController.deleteHeldSale));
+router.get('/salespeople', canReadSale, requirePosSessionAuth, posTillCustomerController.salespeople);
+router.get('/customers/:clientId/repeat-order', canReadSale, requirePosSessionAuth, posTillCustomerController.repeatLastOrder);
+router.get('/customers/:clientId/statement', canReadSale, requirePosSessionAuth, posTillCustomerController.customerStatement);
 router.get('/promotions', canReadPosCatalog, posPromotionController.list);
 router.get('/promotions/manage', canManagePromotions, posPromotionController.list);
 router.post('/promotions', canManagePromotions, idem(posPromotionController.create));

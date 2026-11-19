@@ -226,9 +226,27 @@ exports.createDirectSale = async (req, res, next) => {
         clientId: savedDocument.clientId || undefined,
         clientInfo: savedDocument.clientInfo || undefined,
         purchaseOrderNumber: savedDocument.purchaseOrderNumber || undefined,
+        buyerTin: savedDocument.buyerTin || undefined,
+        salespersonId: savedDocument.salespersonId || undefined,
+        salespersonName: savedDocument.salespersonName || undefined,
       };
       purchaseOrderNumber = String(req.body.purchaseOrderNumber || '').trim();
     }
+    const buyerTin = String(req.body?.buyerTin || '').trim();
+    if (buyerTin && !/^\d{9}$/.test(buyerTin)) {
+      return res.status(422).json({ success: false, code: 'POS_BUYER_TIN_INVALID', message: 'Buyer TIN must contain exactly 9 digits.' });
+    }
+    const salespersonId = String(req.body?.salespersonId || req.posAuthContext?.session?.userId || req.user?.id || req.user?._id || '').trim();
+    let salesperson = null;
+    if (salespersonId) {
+      if (!/^[a-f\d]{24}$/i.test(salespersonId)) return res.status(422).json({ success: false, code: 'POS_SALESPERSON_INVALID', message: 'Choose an active salesperson from this company.' });
+      salesperson = await dbClient().user.findFirst({
+        where: { id: salespersonId, isActive: true, OR: [{ companyId: String(companyId) }, { companyUsers: { some: { companyId: String(companyId), status: 'active' } } }] },
+        select: { id: true, name: true },
+      });
+      if (!salesperson) return res.status(422).json({ success: false, code: 'POS_SALESPERSON_INVALID', message: 'The selected salesperson is not active in this company.' });
+    }
+    req.body = { ...req.body, salespersonId: salesperson?.id || undefined, salespersonName: salesperson?.name || undefined };
     // Legacy checkout, pending V2 creation, and online/offline V2 completion
     // all reserve this company-scoped request row inside the sale transaction.
     // The invoice completion key remains as a domain-level recovery check.
@@ -1908,7 +1926,7 @@ exports.createDirectSale = async (req, res, next) => {
           ...(offlineContext ? { referenceNo: offlineContext.receiptNumber } : {}),
           client: client._id,
           customerName: client.name,
-          customerTin: client.taxId,
+          customerTin: buyerTin || client.taxId,
           customerAddress: client.contact?.address || client.address,
           lines: invoiceLines,
           status: paymentStatus,
@@ -1922,6 +1940,8 @@ exports.createDirectSale = async (req, res, next) => {
                 ...(item.catalogUnitPrice != null ? { catalogUnitPrice: Number(item.catalogUnitPrice) } : {}),
               })),
               ...(purchaseOrderNumber ? { purchaseOrderNumber } : {}),
+              ...(salesperson ? { salespersonId: salesperson.id, salespersonName: salesperson.name } : {}),
+              ...(buyerTin ? { buyerTin } : {}),
             },
           ...(isV2Pending ? {
             tillSessionId: String(activeTill._id),

@@ -147,6 +147,9 @@ async function createDocument({ companyId, registerId, userId, kind, input }) {
     documentData: {
       items, clientId: input.clientId || null, clientInfo, warehouseId: input.warehouseId || null,
       purchaseOrderNumber: purchaseOrderNumber || null,
+      buyerTin: String(input.buyerTin || '').trim() || null,
+      salespersonId: String(input.salespersonId || '').trim() || null,
+      salespersonName: String(input.salespersonName || '').trim().slice(0, 160) || null,
       cartDiscountPct, cartDiscountReason,
       subtotal, discountAmount, taxAmount, totalAmount, createdAt: now.toISOString(),
       informationalOnly: ['PROFORMA', 'QUOTE', 'DELIVERY_NOTE'].includes(type), trainingOnly: type === 'TRAINING',
