@@ -1,3 +1,9 @@
+CREATE UNIQUE INDEX IF NOT EXISTS "invoices_company_id_id_key"
+  ON "invoices"("company_id", "id");
+
+CREATE UNIQUE INDEX IF NOT EXISTS "pos_payments_company_id_id_key"
+  ON "pos_payments"("company_id", "id");
+
 CREATE TABLE IF NOT EXISTS restaurant_menu_categories (
   id CHAR(24) PRIMARY KEY,
   company_id CHAR(24) NOT NULL,

@@ -2228,6 +2228,7 @@ model PosPayment {
   storedValueLedger    PosStoredValueLedger[]
   cheque               PosCheque?
 
+  @@unique([companyId, id])
   @@unique([companyId, idempotencyKey])
   @@unique([companyId, externalRef])
   @@unique([companyId, method, normalizedReference])
@@ -3977,6 +3978,7 @@ model Invoice {
   posCheques               PosCheque[]
   posPaymentRefunds        PosPaymentRefund[]
 
+  @@unique([companyId, id])
   @@unique([companyId, referenceNo])
   @@unique([companyId, posCompletionKey])
   @@unique([companyId, posCancellationKey])
