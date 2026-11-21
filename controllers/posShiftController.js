@@ -5,6 +5,7 @@ const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const { findTillSessionForShift } = require('../services/posShiftLinkService');
 const { buildReport } = require('./tillZReportController');
 const { getBankDepositClearingBalances } = require('../services/posBankDepositClearingService');
+const restaurantOrderService = require('../services/posRestaurantOrderService');
 const {
   openTillSessionForShift,
 } = require('../services/posShiftLinkService');
@@ -156,6 +157,11 @@ exports.current = async (req, res, next) => {
         },
       },
     });
+    const restaurantOpenOrders = await restaurantOrderService.listShiftHandoverOrders(
+      prisma,
+      companyId,
+      registerId,
+    );
 
     if (!shift) {
       const depositClearingBalances = await getBankDepositClearingBalances(companyId);
@@ -167,6 +173,7 @@ exports.current = async (req, res, next) => {
           bankDepositClearingBalance: depositClearingBalances.get(registerId) || 0,
           totals: null,
           settings: publicSettings,
+          restaurantOpenOrders,
         },
       });
     }
@@ -229,6 +236,7 @@ exports.current = async (req, res, next) => {
         totals,
         report,
         settings: publicSettings,
+        restaurantOpenOrders,
       },
     });
   } catch (error) {

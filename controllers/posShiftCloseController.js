@@ -10,6 +10,7 @@ const { getPosZReportHighWaterMark } = require('../services/posZReportSequence')
 const { releaseInvoiceReservations } = require('../services/posVoucherService');
 const { retireUnusedReceiptNumbersForShift } = require('../services/posOfflineReceiptNumberService');
 const { buildReport } = require('./tillZReportController');
+const restaurantOrderService = require('../services/posRestaurantOrderService');
 const {
   findRegisterForShift,
   findTillSessionForShift,
@@ -392,6 +393,17 @@ exports.close = async (req, res, next) => {
         },
       });
       if (!shift) return { code: 'POS_SHIFT_NOT_OPEN' };
+      const restaurantOpenOrders = await restaurantOrderService.listShiftHandoverOrders(
+        tx,
+        companyId,
+        registerId,
+      );
+      const ordersRequiringHandover = restaurantOpenOrders.filter((order) => (
+        order.status === 'billed' || !order.waiterId || order.waiterId === userId
+      ));
+      if (ordersRequiringHandover.length) {
+        return { code: 'POS_SHIFT_RESTAURANT_OPEN_ORDERS', restaurantOpenOrders: ordersRequiringHandover };
+      }
       const unprintedReceiptCount = await tx.posPrintJob.count({
         where: {
           companyId,
@@ -847,6 +859,15 @@ exports.close = async (req, res, next) => {
     }
     if (result.code === 'POS_SHIFT_NOT_OPEN') {
       return invalidRequest(res, 409, result.code, 'The shift is not open on this register.');
+    }
+    if (result.code === 'POS_SHIFT_RESTAURANT_OPEN_ORDERS') {
+      return invalidRequest(
+        res,
+        409,
+        result.code,
+        'Hand over or settle all open Restaurant tables and tabs before closing this shift.',
+        { restaurantOpenOrders: result.restaurantOpenOrders },
+      );
     }
     if (result.code === 'POS_REGISTER_NOT_FOUND') {
       return invalidRequest(res, 404, result.code, 'Active POS register not found.');

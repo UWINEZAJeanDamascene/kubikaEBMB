@@ -1598,6 +1598,9 @@ exports.completeSale = async (req, res, next) => {
         storedValuePaymentIds: [...storedValuePayments.keys()],
       } : {}),
     };
+    if (invoice.posCheckoutPayload.restaurantCheckoutSnapshot) {
+      req.posRestaurantCheckout = invoice.posCheckoutPayload.restaurantCheckoutSnapshot;
+    }
     return createDirectSale(req, res, next);
   } catch (error) {
     if (error?.code === 'POS_PAYMENT_FLOW_DISABLED') {

@@ -262,9 +262,15 @@ async function resolvePosSession(req, allowedStatuses = ['active']) {
         return changed;
       });
       if (locked.count === 1) {
-        return { error: responseError(423, 'POS_SESSION_LOCKED', 'POS session was locked after being idle. Enter a PIN to continue.') };
+        if (allowedStatuses.includes('locked')) {
+          session.status = 'locked';
+          session.lockedAt = now;
+        } else {
+          return { error: responseError(423, 'POS_SESSION_LOCKED', 'POS session was locked after being idle. Enter a PIN to continue.') };
+        }
+      } else {
+        return { error: responseError(401, 'POS_SESSION_INACTIVE', 'POS session is no longer active.') };
       }
-      return { error: responseError(401, 'POS_SESSION_INACTIVE', 'POS session is no longer active.') };
     }
 
     await prisma.posSession.updateMany({

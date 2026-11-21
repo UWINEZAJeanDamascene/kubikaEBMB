@@ -275,6 +275,18 @@ describe('POS session authorization middleware', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
+  test('returns the newly locked session to auth routes so the PIN screen can render', async () => {
+    session.lastActivityAt = new Date(Date.now() - 6 * 60 * 1000);
+    const req = request();
+    const res = response();
+    const next = jest.fn();
+
+    await requirePosSession({ allowedStatuses: ['active', 'locked'] })(req, res, next);
+
+    expect(next).toHaveBeenCalledWith();
+    expect(req.posSession).toMatchObject({ status: 'locked', lockedAt: expect.any(Date) });
+  });
+
   test('checks backend permissions against the configured role matrix', async () => {
     const req = request({ posAuthContext: { user, company, settings } });
     const res = response();

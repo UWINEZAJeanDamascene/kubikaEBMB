@@ -8,6 +8,7 @@ const { requestIp, writePosAuditLog } = require('../services/posAuditService');
 const { getPosZReportHighWaterMark } = require('../services/posZReportSequence');
 const shiftCloseController = require('./posShiftCloseController');
 const { retireUnusedReceiptNumbersForShift } = require('../services/posOfflineReceiptNumberService');
+const restaurantOrderService = require('../services/posRestaurantOrderService');
 const {
   findRegisterForShift,
   lockRegisterForZNumber,
@@ -430,7 +431,7 @@ exports.handover = async (req, res, next) => {
         where: { id: shiftId, companyId, registerId, status: 'open' },
         include: {
           invoices: {
-            where: { status: { not: 'cancelled' } },
+            where: { status: { notIn: ['cancelled', 'PENDING_PAYMENT'] } },
             select: { subtotal: true, totalDiscount: true, taxAmount: true, totalAmount: true, payments: true },
           },
           cashMovements: { select: { type: true, amount: true } },
@@ -512,6 +513,15 @@ exports.handover = async (req, res, next) => {
         return { code: 'POS_REGISTER_NOT_FOUND' };
       }
       const zNumber = (await getPosZReportHighWaterMark(tx, companyId, registerId)) + 1;
+      const restaurantHandover = await restaurantOrderService.carryOpenOrdersForShiftHandover(tx, {
+        companyId,
+        registerId,
+        fromUserId: userId,
+        toUserId,
+        shiftId,
+      });
+      if (restaurantHandover.code) return restaurantHandover;
+      const carriedRestaurantOrders = restaurantHandover.orders;
       const now = new Date();
       const journalEntryId = await postShiftVariance({
         tx,
@@ -626,10 +636,11 @@ exports.handover = async (req, res, next) => {
           toUserId,
           countedCash: counted.countedCash,
           zReportId: zReport.id,
+          restaurantOrdersCarried: carriedRestaurantOrders.length,
         },
         ip: requestIp(req),
       }, tx);
-      return { newShift, closedShift, zReport, replayed: false };
+      return { newShift, closedShift, zReport, carriedRestaurantOrders, replayed: false };
     });
 
     if (result.code === 'POS_REGISTER_NOT_FOUND') return invalidRequest(res, 404, result.code, 'Active POS register not found.');
@@ -641,11 +652,23 @@ exports.handover = async (req, res, next) => {
     if (result.code === 'POS_SHIFT_NOT_OPEN') return invalidRequest(res, 409, result.code, 'Only the current open shift can be handed over.');
     if (result.code === 'POS_SHIFT_HANDOVER_CASHIER_MISMATCH') return invalidRequest(res, 403, result.code, 'Only the cashier who opened this shift can hand it over.');
     if (result.code === 'POS_SHIFT_HELD_SALES_BLOCKED') return invalidRequest(res, 409, result.code, 'Recall, complete, or remove held sales before handing over this shift.');
+    if (result.code === 'RESTAURANT_OPEN_BILLED_ORDERS_BLOCKED') {
+      return invalidRequest(
+        res,
+        409,
+        'POS_SHIFT_RESTAURANT_BILLS_UNPAID',
+        'Settle issued Restaurant bills before handing over. They are tied to the current cashier; unpaid orders cannot be counted as cash.',
+        { restaurantOpenOrders: result.blockedOrders },
+      );
+    }
     if (result.code === 'POS_SHIFT_CASH_RECONCILIATION_INVALID') return invalidRequest(res, 409, result.code, 'Expected cash exceeds the supported integer amount range.');
     if (result.code === 'POS_SHIFT_VARIANCE_REASON_REQUIRED') return invalidRequest(res, 400, result.code, 'Explain the cash variance with at least 10 characters before handover.', result);
     if (result.code === 'POS_SHIFT_VARIANCE_APPROVAL_REQUIRED') return invalidRequest(res, 403, result.code, 'A manager approval is required for this cash variance.', result);
     if (result.code === 'POS_SHIFT_VARIANCE_APPROVAL_INVALID') return invalidRequest(res, 403, result.code, 'The manager approval is invalid, expired, used, or does not match this reconciliation.');
 
+    if (!result.replayed) {
+      restaurantOrderService.notifyHandoverOrders(companyId, result.carriedRestaurantOrders || []);
+    }
     return res.status(result.replayed ? 200 : 201).json({
       success: true,
       replayed: result.replayed,

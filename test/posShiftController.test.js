@@ -14,6 +14,9 @@ jest.mock('../services/posAuditService', () => ({
   requestIp: jest.fn((req) => req?.ip || null),
   writePosAuditLog: jest.fn().mockResolvedValue(undefined),
 }));
+jest.mock('../services/posRestaurantOrderService', () => ({
+  listShiftHandoverOrders: jest.fn().mockResolvedValue([]),
+}));
 
 const { prisma } = require('../lib/prisma');
 const { writePosAuditLog } = require('../services/posAuditService');

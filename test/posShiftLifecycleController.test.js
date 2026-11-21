@@ -12,10 +12,15 @@ jest.mock('../services/posShiftAccountingService', () => ({
 jest.mock('../services/transactionService', () => ({
   runInTransaction: jest.fn(),
 }));
+jest.mock('../services/posRestaurantOrderService', () => ({
+  carryOpenOrdersForShiftHandover: jest.fn().mockResolvedValue({ orders: [] }),
+  notifyHandoverOrders: jest.fn(),
+}));
 
 const { prisma } = require('../lib/prisma');
 const { postShiftVariance, reverseJournalEntry } = require('../services/posShiftAccountingService');
 const { runInTransaction } = require('../services/transactionService');
+const restaurantOrderService = require('../services/posRestaurantOrderService');
 const { handover, reopen } = require('../controllers/posShiftLifecycleController');
 
 const COMPANY_ID = '507f1f77bcf86cd799439011';
@@ -300,6 +305,14 @@ describe('POS shift reopen and cashier handover', () => {
       shift: expect.objectContaining({ id: SHIFT_ID }),
       variance: 0,
     }));
+    expect(restaurantOrderService.carryOpenOrdersForShiftHandover).toHaveBeenCalledWith(tx, expect.objectContaining({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      fromUserId: USER_ID,
+      toUserId: NEXT_USER_ID,
+      shiftId: SHIFT_ID,
+    }));
+    expect(restaurantOrderService.notifyHandoverOrders).toHaveBeenCalledWith(COMPANY_ID, []);
     const closeAudit = tx.posAuditLog.create.mock.calls.filter(([entry]) => entry.data.event === 'SHIFT_CLOSED');
     const handoverAudit = tx.posAuditLog.create.mock.calls.filter(([entry]) => entry.data.event === 'SHIFT_HANDED_OVER');
     expect(closeAudit).toHaveLength(1);

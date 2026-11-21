@@ -474,7 +474,6 @@ exports.refreshSessionToken = async (req, res, next) => {
         data: {
           refreshTokenHash: tokens.refreshTokenHash,
           refreshExpiresAt: tokens.refreshExpiresAt,
-          lastActivityAt: now,
         },
       });
       if (changed.count !== 1) return null;

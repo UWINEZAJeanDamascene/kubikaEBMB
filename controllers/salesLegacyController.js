@@ -878,11 +878,39 @@ exports.createDirectSale = async (req, res, next) => {
     const quarantinedByProduct = new Map(quarantinedRows.map((row) => [String(row.productId), Number(row._sum?.qtyOnHand || 0)]));
     let requiresManagerApproval = false;
 
+    if (req.posRestaurantCheckout
+      && (!Array.isArray(req.posRestaurantCheckout.lines)
+        || req.posRestaurantCheckout.lines.length !== items.length)) {
+      return res.status(409).json({
+        success: false,
+        code: 'RESTAURANT_CHECKOUT_SNAPSHOT_INVALID',
+        message: 'The saved Restaurant order no longer matches this checkout. Review the bill before retrying.',
+      });
+    }
+
     for (const [itemIndex, item] of items.entries()) {
       const product = productsMap.get(String(item.productId));
       if (!product) {
         missingProducts.push(item.productId);
         continue;
+      }
+
+      const restaurantLine = req.posRestaurantCheckout?.lines?.[itemIndex];
+      if (req.posRestaurantCheckout && (
+        !restaurantLine
+        || String(item.productId) !== String(restaurantLine.productId)
+        || Number(item.quantity) !== Number(restaurantLine.quantity)
+        || Number(item.unitPrice) !== Number(restaurantLine.unitPrice)
+        || String(item.taxCode || '') !== String(restaurantLine.taxCode || '')
+        || Number(item.taxRate) !== Number(restaurantLine.taxRate)
+        || String(item.description || '') !== String(restaurantLine.description || '')
+        || Number(item.discountPct || 0) !== 0
+      )) {
+        return res.status(409).json({
+          success: false,
+          code: 'RESTAURANT_CHECKOUT_SNAPSHOT_INVALID',
+          message: 'The saved Restaurant order no longer matches this checkout. Review the bill before retrying.',
+        });
       }
 
       const snapshotProduct = offlineContext?.snapshotData.products?.[String(item.productId)];
@@ -891,7 +919,7 @@ exports.createDirectSale = async (req, res, next) => {
       }
       const saleQuantity = Number(item.quantity);
       const productPrice = effectivePrice(String(product._id), product.sellingPrice, priceListPricing.priceByProduct);
-      const wholesaleLine = offlineContext
+      const wholesaleLine = offlineContext || restaurantLine
         ? { multiplier: 1, baseQuantity: saleQuantity, unitPrice: productPrice, salesUnitPrice: productPrice, unitLabel: product.unit }
         : resolveWholesaleLine({
           product, quantity: saleQuantity, salesUnitCode: item.salesUnitCode, basePrice: productPrice,
@@ -909,7 +937,9 @@ exports.createDirectSale = async (req, res, next) => {
       if (offlineContext && Math.abs(Number(snapshotProduct.price) - productPrice) > 0.000001) {
         return res.status(403).json({ success: false, code: 'POS_OFFLINE_PRICE_SNAPSHOT_MISMATCH', message: `${snapshotProduct.name} price no longer matches the signed offline catalog.` });
       }
-      const requestedUnitPrice = item.unitPrice == null ? expectedSalesPrice : Number(item.unitPrice);
+      const requestedUnitPrice = restaurantLine
+        ? Number(restaurantLine.unitPrice)
+        : item.unitPrice == null ? expectedSalesPrice : Number(item.unitPrice);
       const requestedDiscountPct = item.discountPct == null ? 0 : Number(item.discountPct);
       const isOpenPriceItem = item.openPrice === true;
       const isRestrictedProduct = !isOpenPriceItem && isDiscountRestricted(product);
@@ -926,13 +956,15 @@ exports.createDirectSale = async (req, res, next) => {
           });
         }
       }
-      const appliedCartDiscountPct = isRestrictedProduct ? 0 : cartDiscountPct;
-      const discountPct = promotion
+      const appliedCartDiscountPct = restaurantLine || isRestrictedProduct ? 0 : cartDiscountPct;
+      const discountPct = restaurantLine
+        ? 0
+        : promotion
         ? Number(promotionDiscountPctByIndex.get(itemIndex) || 0)
         : appliedCartDiscountPct > 0 ? appliedCartDiscountPct : requestedDiscountPct;
       const discountReason = appliedCartDiscountPct > 0
         ? String(cartDiscountReason || '').trim()
-        : typeof item.discountReason === 'string' ? item.discountReason.trim() : '';
+        : restaurantLine ? '' : typeof item.discountReason === 'string' ? item.discountReason.trim() : '';
       if (offlineContext && (
         item.catalogUnitPrice == null
         || Math.abs(Number(item.catalogUnitPrice) - expectedSalesPrice) > 0.000001
@@ -963,7 +995,7 @@ exports.createDirectSale = async (req, res, next) => {
           message: `Price or discount is invalid for ${product.name}`,
         });
       }
-      if (isRestrictedProduct
+      if (!restaurantLine && isRestrictedProduct
         && (requestedDiscountPct > 0 || requestedUnitPrice < expectedSalesPrice - 0.000001 || discountPct > 0)) {
         return res.status(403).json({
           success: false,
@@ -971,7 +1003,7 @@ exports.createDirectSale = async (req, res, next) => {
           message: `${product.name} or its category is marked as no-discount.`,
         });
       }
-      if (!appliedCartDiscountPct && requestedDiscountPct > 0 && !discountSettings.discountReasons.some(
+      if (!restaurantLine && !appliedCartDiscountPct && requestedDiscountPct > 0 && !discountSettings.discountReasons.some(
         (reason) => reason.toLocaleLowerCase() === discountReason.toLocaleLowerCase(),
       )) {
         return res.status(400).json({
@@ -982,7 +1014,7 @@ exports.createDirectSale = async (req, res, next) => {
       }
 
       const unitPrice = requestedUnitPrice;
-      const hasPriceOverride = Math.abs(requestedUnitPrice - expectedSalesPrice) > 0.000001;
+      const hasPriceOverride = !restaurantLine && Math.abs(requestedUnitPrice - expectedSalesPrice) > 0.000001;
       if (!tillFeatures.manualDiscounts && (requestedDiscountPct > 0 || (hasPriceOverride && !isOpenPriceItem))) {
         return res.status(403).json({
           success: false,
@@ -1161,7 +1193,9 @@ exports.createDirectSale = async (req, res, next) => {
         }
       }
 
-      const taxRate = offlineContext ? Number(snapshotProduct.taxRate) : resolveProductTaxRate(product);
+      const taxRate = offlineContext
+        ? Number(snapshotProduct.taxRate)
+        : restaurantLine ? Number(restaurantLine.taxRate) : resolveProductTaxRate(product);
       if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
         return res.status(422).json({
           success: false,
@@ -1169,7 +1203,9 @@ exports.createDirectSale = async (req, res, next) => {
           message: `The configured tax rate for ${product.name} is invalid`,
         });
       }
-      const taxCode = offlineContext ? snapshotProduct.taxCode : (product.taxCode || (taxRate > 0 ? 'B' : 'A'));
+      const taxCode = offlineContext
+        ? snapshotProduct.taxCode
+        : restaurantLine ? String(restaurantLine.taxCode) : (product.taxCode || (taxRate > 0 ? 'B' : 'A'));
       if (offlineContext && Number(item.taxRate) !== taxRate) offlineTaxPayloadMismatch = true;
       const baseUnitPrice = requestedUnitPrice / Number(wholesaleLine.multiplier || 1);
       const { subtotal, discountAmount, netAmount, taxAmount, lineTotal } = calculatePosLineAmounts({
@@ -1188,7 +1224,9 @@ exports.createDirectSale = async (req, res, next) => {
         product: product._id,
         productCode: offlineContext ? snapshotProduct.sku : (product.sku || ''),
         productName: offlineContext ? snapshotProduct.name : product.name,
-        description: offlineContext
+        description: restaurantLine
+          ? String(restaurantLine.description)
+          : offlineContext
           ? snapshotProduct.name
           : item.openPrice === true
             ? String(item.description).normalize('NFKC').trim()
@@ -1933,7 +1971,12 @@ exports.createDirectSale = async (req, res, next) => {
           posOrigin: true,
           posPostingStatus: isV2Pending ? 'not_required' : 'pending',
           posCheckoutPayload: isV2Pending
-            ? pendingCheckoutPayload(req.body)
+            ? {
+              ...pendingCheckoutPayload(req.body),
+              ...(req.posRestaurantCheckout
+                ? { restaurantCheckoutSnapshot: req.posRestaurantCheckout }
+                : {}),
+            }
             : {
               items: (Array.isArray(req.body.items) ? req.body.items : []).map((item) => ({
                 ...(item.unitPrice != null ? { unitPrice: Number(item.unitPrice) } : {}),

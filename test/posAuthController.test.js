@@ -286,6 +286,7 @@ describe('POS authentication endpoints', () => {
     expect(firstResponse.statusCode).toBe(200);
     expect(firstResponse.body.data.refreshToken).not.toBe(initial.refreshToken);
     expect(session.refreshTokenHash).not.toBe(initial.refreshTokenHash);
+    expect(tx.posSession.updateMany.mock.calls[0][0].data).not.toHaveProperty('lastActivityAt');
     expect(auditRows(tx, 'SESSION_TOKEN_REFRESHED')).toHaveLength(1);
 
     const replayResponse = createResponse();

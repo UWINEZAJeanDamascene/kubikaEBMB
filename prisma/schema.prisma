@@ -2508,6 +2508,233 @@ model Category {
   @@map("categories")
 }
 
+model RestaurantMenuCategory {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  categoryId  String   @map("category_id") @db.Char(24)
+  isEnabled   Boolean  @default(true) @map("is_enabled")
+  displayOrder Int     @default(0) @map("display_order")
+  gridColumns Int     @default(4) @map("grid_columns")
+  buttonColor String?  @map("button_color") @db.VarChar(24)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, id], map: "restaurant_menu_categories_company_id_id_key")
+  @@unique([companyId, categoryId], map: "restaurant_menu_categories_company_category_key")
+  @@index([companyId, isEnabled, displayOrder], map: "restaurant_menu_categories_company_enabled_order_idx")
+  @@map("restaurant_menu_categories")
+}
+
+model RestaurantMenuItem {
+  id               String   @id @db.Char(24)
+  companyId        String   @map("company_id") @db.Char(24)
+  productId        String   @unique(map: "restaurant_menu_items_product_id_key") @map("product_id") @db.Char(24)
+  menuName         String?  @map("menu_name") @db.VarChar(180)
+  menuDescription  String?  @map("menu_description")
+  station          String   @default("kitchen") @db.VarChar(16)
+  stockMode        String   @default("none") @map("stock_mode") @db.VarChar(16)
+  isAvailable      Boolean  @default(true) @map("is_available")
+  displayOrder     Int      @default(0) @map("display_order")
+  measureName      String?  @map("measure_name") @db.VarChar(32)
+  measuresPerBottle Decimal? @map("measures_per_bottle") @db.Decimal(10, 4)
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, id], map: "restaurant_menu_items_company_id_id_key")
+  @@unique([companyId, productId], map: "restaurant_menu_items_company_product_id_key")
+  @@index([companyId, isAvailable, displayOrder], map: "restaurant_menu_items_company_available_order_idx")
+  @@map("restaurant_menu_items")
+}
+
+model RestaurantModifierGroup {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  name           String   @db.VarChar(120)
+  selectionMode  String   @default("single") @map("selection_mode") @db.VarChar(16)
+  isRequired     Boolean  @default(false) @map("is_required")
+  minSelections  Int      @default(0) @map("min_selections")
+  maxSelections  Int      @default(1) @map("max_selections")
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, id], map: "restaurant_modifier_groups_company_id_id_key")
+  @@unique([companyId, name], map: "restaurant_modifier_groups_company_name_key")
+  @@index([companyId, isActive, name], map: "restaurant_modifier_groups_company_active_name_idx")
+  @@map("restaurant_modifier_groups")
+}
+
+model RestaurantModifierOption {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  groupId         String   @map("group_id") @db.Char(24)
+  name            String   @db.VarChar(120)
+  priceAdjustment Decimal  @default(0) @map("price_adjustment") @db.Decimal(19, 2)
+  isAvailable     Boolean  @default(true) @map("is_available")
+  displayOrder    Int      @default(0) @map("display_order")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, id], map: "restaurant_modifier_options_company_id_id_key")
+  @@unique([companyId, groupId, name], map: "restaurant_modifier_options_company_group_name_key")
+  @@index([companyId, groupId, isAvailable, displayOrder], map: "restaurant_modifier_options_company_group_available_order_idx")
+  @@map("restaurant_modifier_options")
+}
+
+model RestaurantMenuItemModifierGroup {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  menuItemId      String   @map("menu_item_id") @db.Char(24)
+  modifierGroupId String   @map("modifier_group_id") @db.Char(24)
+  displayOrder    Int      @default(0) @map("display_order")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, menuItemId, modifierGroupId], map: "restaurant_menu_item_modifier_groups_company_item_group_key")
+  @@index([companyId, menuItemId, displayOrder], map: "restaurant_menu_item_modifier_groups_company_item_order_idx")
+  @@map("restaurant_menu_item_modifier_groups")
+}
+
+model RestaurantFloorArea {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  name        String   @db.VarChar(80)
+  displayOrder Int     @default(0) @map("display_order")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, id], map: "restaurant_floor_areas_company_id_id_key")
+  @@unique([companyId, name], map: "restaurant_floor_areas_company_name_key")
+  @@index([companyId, isActive, displayOrder], map: "restaurant_floor_areas_company_active_order_idx")
+  @@map("restaurant_floor_areas")
+}
+
+model RestaurantTable {
+  id               String   @id @db.Char(24)
+  companyId        String   @map("company_id") @db.Char(24)
+  areaId           String   @map("area_id") @db.Char(24)
+  name             String   @db.VarChar(40)
+  capacity         Int      @default(4)
+  displayOrder     Int      @default(0) @map("display_order")
+  color            String?  @db.VarChar(24)
+  state            String   @default("free") @db.VarChar(24)
+  guestCount       Int      @default(0) @map("guest_count")
+  version          Int      @default(1)
+  mergedIntoTableId String? @map("merged_into_table_id") @db.Char(24)
+  lastChangedById  String? @map("last_changed_by_id") @db.Char(24)
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, id], map: "restaurant_tables_company_id_id_key")
+  @@unique([companyId, areaId, name], map: "restaurant_tables_company_area_name_key")
+  @@index([companyId, areaId, state, displayOrder], map: "restaurant_tables_company_area_state_order_idx")
+  @@index([companyId, mergedIntoTableId], map: "restaurant_tables_company_merged_into_idx")
+  @@map("restaurant_tables")
+}
+
+model RestaurantOrder {
+  id         String    @id @db.Char(24)
+  companyId  String    @map("company_id") @db.Char(24)
+  registerId String    @map("register_id") @db.Char(24)
+  tableId    String?   @map("table_id") @db.Char(24)
+  status     String    @default("open") @db.VarChar(20)
+  version    Int       @default(1)
+  guestCount Int       @default(1) @map("guest_count")
+  openedById String    @map("opened_by_id") @db.Char(24)
+  waiterId   String?   @map("waiter_id") @db.Char(24)
+  openedAt   DateTime  @default(now()) @map("opened_at") @db.Timestamptz(3)
+  updatedAt  DateTime  @map("updated_at") @db.Timestamptz(3)
+  orderKind  String    @default("dining") @map("order_kind") @db.VarChar(16)
+  tabName    String?   @map("tab_name") @db.VarChar(120)
+
+  @@unique([companyId, id])
+  @@index([companyId, orderKind, status, openedAt], map: "restaurant_orders_company_kind_status_opened_idx")
+  @@index([companyId, status, updatedAt], map: "restaurant_orders_company_status_updated_idx")
+  @@index([companyId, tableId, status], map: "restaurant_orders_company_table_status_idx")
+  @@map("restaurant_orders")
+}
+
+model RestaurantOrderEvent {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  orderId        String   @map("order_id") @db.Char(24)
+  version        Int
+  idempotencyKey String   @map("idempotency_key") @db.VarChar(160)
+  eventType      String   @map("event_type") @db.VarChar(32)
+  payloadJson    Json     @map("payload_json")
+  actorId        String   @map("actor_id") @db.Char(24)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, idempotencyKey], map: "restaurant_order_events_idempotency_key")
+  @@unique([companyId, orderId, version], map: "restaurant_order_events_order_version_key")
+  @@index([companyId, orderId, createdAt], map: "restaurant_order_events_order_created_idx")
+  @@map("restaurant_order_events")
+}
+
+model RestaurantBill {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  orderId         String   @map("order_id") @db.Char(24)
+  invoiceId       String?  @map("invoice_id") @db.Char(24)
+  version         Int      @default(1)
+  status          String   @default("issued") @db.VarChar(24)
+  splitType       String   @map("split_type") @db.VarChar(16)
+  subtotal        Decimal  @db.Decimal(19, 2)
+  taxAmount       Decimal  @map("tax_amount") @db.Decimal(19, 2)
+  totalAmount     Decimal  @map("total_amount") @db.Decimal(19, 2)
+  lineSnapshot    Json     @map("line_snapshot")
+  payerAllocations Json   @map("payer_allocations")
+  createdById     String   @map("created_by_id") @db.Char(24)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, id])
+  @@unique([companyId, orderId])
+  @@unique([companyId, invoiceId])
+  @@unique([invoiceId])
+  @@map("restaurant_bills")
+}
+
+model RestaurantBillPayment {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  billId      String   @map("bill_id") @db.Char(24)
+  paymentId   String   @map("payment_id") @db.Char(24)
+  payerNumber Int      @map("payer_number")
+  amount      Int
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, paymentId])
+  @@unique([paymentId])
+  @@unique([companyId, billId, payerNumber, paymentId])
+  @@map("restaurant_bill_payments")
+}
+
+model RestaurantKitchenTicket {
+  id                String    @id @db.Char(24)
+  companyId         String    @map("company_id") @db.Char(24)
+  orderId           String    @map("order_id") @db.Char(24)
+  roundNumber       Int       @map("round_number")
+  station           String    @db.VarChar(16)
+  status            String    @default("queued") @db.VarChar(20)
+  idempotencyKey    String    @map("idempotency_key") @db.VarChar(160)
+  printJobId        String?   @unique @map("print_job_id") @db.Char(24)
+  payloadJson       Json      @map("payload_json")
+  reprintCount      Int       @default(0) @map("reprint_count")
+  retryCount        Int       @default(0) @map("retry_count")
+  lastError         String?   @map("last_error") @db.VarChar(500)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime  @map("updated_at") @db.Timestamptz(3)
+  fallbackAgentId   String?   @map("fallback_agent_id") @db.Char(24)
+  fallbackPrinterId String?   @map("fallback_printer_id") @db.Char(24)
+  fallbackAttempted Boolean   @default(false) @map("fallback_attempted")
+
+  @@unique([companyId, idempotencyKey], map: "restaurant_kitchen_tickets_idempotency_key")
+  @@unique([companyId, orderId, roundNumber, station], map: "restaurant_kitchen_tickets_round_station_key")
+  @@index([companyId, status, createdAt], map: "restaurant_kitchen_tickets_status_created_idx")
+  @@map("restaurant_kitchen_tickets")
+}
+
 model Warehouse {
   id                      String                @id @db.Char(24)
   companyId               String                @map("company_id") @db.Char(24)

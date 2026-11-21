@@ -18,10 +18,14 @@ jest.mock('../services/posShiftAccountingService', () => ({
 jest.mock('../services/transactionService', () => ({
   runInTransaction: jest.fn(),
 }));
+jest.mock('../services/posRestaurantOrderService', () => ({
+  listShiftHandoverOrders: jest.fn().mockResolvedValue([]),
+}));
 
 const { prisma } = require('../lib/prisma');
 const { postShiftVariance } = require('../services/posShiftAccountingService');
 const { runInTransaction } = require('../services/transactionService');
+const restaurantOrderService = require('../services/posRestaurantOrderService');
 const { close, zReport, movementTotals } = require('../controllers/posShiftCloseController');
 const { calculateExpectedCash } = require('../services/posShiftService');
 
@@ -212,6 +216,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   prisma.systemSettings.findUnique.mockResolvedValue(null);
   prisma.posPayment.findMany.mockResolvedValue([]);
+  restaurantOrderService.listShiftHandoverOrders.mockResolvedValue([]);
   postShiftVariance.mockResolvedValue({ journalEntryId: null, postingStatus: 'not_required' });
   runInTransaction.mockImplementation((callback) => callback(createTransaction()));
 });
@@ -239,6 +244,25 @@ describe('POS shift close and Z report', () => {
     expect(res.statusCode).toBe(400);
     expect(res.body.code).toBe('POS_IDEMPOTENCY_KEY_INVALID');
     expect(prisma.systemSettings.findUnique).not.toHaveBeenCalled();
+  });
+
+  test('blocks close while an open Restaurant order is still assigned to the closing cashier', async () => {
+    const tx = createTransaction();
+    restaurantOrderService.listShiftHandoverOrders.mockResolvedValue([{
+      id: 'restaurant-order-id',
+      status: 'open',
+      waiterId: USER_ID,
+      tableName: 'Table 4',
+    }]);
+    runInTransaction.mockImplementation((callback) => callback(tx));
+    const res = createResponse();
+
+    await close(createRequest(), res, jest.fn());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('POS_SHIFT_RESTAURANT_OPEN_ORDERS');
+    expect(res.body.restaurantOpenOrders).toMatchObject([{ id: 'restaurant-order-id', tableName: 'Table 4' }]);
+    expect(tx.posShift.update).not.toHaveBeenCalled();
   });
 
   test('reconciles cash, closes atomically, and stores the final Z report', async () => {
