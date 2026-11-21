@@ -15,7 +15,7 @@ const RETRY_BASE_MS = 1000; // exponential: 1s → 2s → 4s
 const getSender = () => {
   // Gmail must send from the authenticated mailbox; using another address here
   // makes the message look spoofed and increases spam placement.
-  const address = emailConfig.provider === 'gmail'
+  const address = ['gmail', 'gmail-api'].includes(emailConfig.provider)
     ? emailConfig.gmailUser
     : (emailConfig.fromAddress || emailConfig.smtpUser || emailConfig.gmailUser);
   return `${emailConfig.fromName} <${address}>`;

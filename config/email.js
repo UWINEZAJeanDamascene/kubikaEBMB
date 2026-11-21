@@ -16,6 +16,11 @@ const validateConfig = () => {
   if (provider === 'gmail') {
     if (!emailConfig.gmailUser) missing.push('GMAIL_USER');
     if (!emailConfig.gmailAppPassword) missing.push('GMAIL_APP_PASSWORD');
+  } else if (provider === 'gmail-api') {
+    if (!emailConfig.gmailUser) missing.push('GMAIL_USER');
+    if (!emailConfig.gmailApiClientId) missing.push('GMAIL_API_CLIENT_ID');
+    if (!emailConfig.gmailApiClientSecret) missing.push('GMAIL_API_CLIENT_SECRET');
+    if (!emailConfig.gmailApiRefreshToken) missing.push('GMAIL_API_REFRESH_TOKEN');
   } else if (provider === 'resend') {
     if (!emailConfig.resendApiKey) missing.push('RESEND_API_KEY');
   } else {
@@ -119,6 +124,51 @@ const createTransporter = () => {
           rejected: [],
           messageId: result.id,
           response: 'Resend API accepted the email.',
+        };
+      },
+    };
+  }
+
+  if (provider === 'gmail-api') {
+    const { google } = require('googleapis');
+    const MailComposer = require('nodemailer/lib/mail-composer');
+    const oauthClient = new google.auth.OAuth2(
+      emailConfig.gmailApiClientId,
+      emailConfig.gmailApiClientSecret,
+    );
+    oauthClient.setCredentials({ refresh_token: emailConfig.gmailApiRefreshToken });
+    const gmail = google.gmail({ version: 'v1', auth: oauthClient });
+
+    return {
+      verify: async () => {
+        const token = await oauthClient.getAccessToken();
+        if (!token?.token) throw new Error('Gmail API OAuth did not return an access token.');
+        return true;
+      },
+      sendMail: async (mail) => {
+        const mimeMessage = await new Promise((resolve, reject) => {
+          new MailComposer(mail).compile().build((error, message) => {
+            if (error) return reject(error);
+            return resolve(message);
+          });
+        });
+        const raw = mimeMessage.toString('base64')
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/, '');
+        const result = await gmail.users.messages.send({
+          userId: 'me',
+          requestBody: { raw },
+        });
+        const accepted = Array.isArray(mail.to)
+          ? mail.to
+          : String(mail.to || '').split(',').map((address) => address.trim()).filter(Boolean);
+
+        return {
+          accepted,
+          rejected: [],
+          messageId: result.data.id,
+          response: 'Gmail API accepted the email.',
         };
       },
     };

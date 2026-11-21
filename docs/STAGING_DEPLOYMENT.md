@@ -42,6 +42,8 @@ Required changes:
 - `JWT_SECRET` - Generate a strong key: `openssl rand -hex 32`
 - `FRONTEND_URL` - Your staging frontend URL
 
+The backend derives its CORS origin from `FRONTEND_URL` (scheme and host); set it to the origin users open in their browser. Add any additional trusted browser origins to `CORS_ORIGINS` and redeploy the backend after changing these values.
+
 ---
 
 ## Step 3: Build Docker Image

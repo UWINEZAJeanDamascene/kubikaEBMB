@@ -36,4 +36,30 @@ describe('production CORS origins', () => {
     expect(config.server.frontendUrl).toBe('https://kubika-ebmf.vercel.app');
     expect(config.server.corsOrigins).toEqual(['https://kubika-ebmf.vercel.app']);
   });
+
+  test('allows the configured frontend origin in production after removing its path', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.FRONTEND_URL = 'https://app.example.com/workspace';
+    delete process.env.ALLOWED_ORIGINS;
+    delete process.env.CORS_ORIGINS;
+    jest.resetModules();
+
+    const config = require('../src/config/environment');
+
+    expect(config.server.allowedOrigins).toContain('https://app.example.com');
+    expect(config.server.corsOrigins).toContain('https://app.example.com');
+    expect(config.server.corsOrigins).not.toContain('https://app.example.com/workspace');
+  });
+
+  test('does not add a loopback frontend origin to production CORS', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.FRONTEND_URL = 'http://localhost:5173';
+    delete process.env.ALLOWED_ORIGINS;
+    delete process.env.CORS_ORIGINS;
+    jest.resetModules();
+
+    const config = require('../src/config/environment');
+
+    expect(config.server.corsOrigins).not.toContain('http://localhost:5173');
+  });
 });

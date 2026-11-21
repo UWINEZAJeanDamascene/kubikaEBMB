@@ -110,11 +110,29 @@ function array(value, defaultVal = []) {
   return String(value).split(',').map(s => s.trim()).filter(Boolean);
 }
 
+function uniqueOrigins(origins, nodeEnv) {
+  const loopbackOrigin = /^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i;
+  return [...new Set(origins)]
+    .filter((origin) => nodeEnv !== 'production' || !loopbackOrigin.test(origin));
+}
+
 /**
  * Build the frozen config object
  */
 function buildConfig() {
   const nodeEnv = normalizeNodeEnv();
+  const frontendUrl = process.env.FRONTEND_URL || (
+    nodeEnv === 'production' ? PRODUCTION_FRONTEND_ORIGIN : 'http://localhost:5173'
+  );
+  const frontendOrigin = new URL(frontendUrl).origin;
+  const configuredOrigins = array(
+    process.env.ALLOWED_ORIGINS,
+    nodeEnv === 'production' ? [PRODUCTION_FRONTEND_ORIGIN] : ['http://localhost:3000', 'http://localhost:5173'],
+  );
+  const configuredCorsOrigins = array(
+    process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS,
+    nodeEnv === 'production' ? [PRODUCTION_FRONTEND_ORIGIN] : ['http://localhost:3000', 'http://localhost:5173'],
+  );
   
   const config = {
     // =====================
@@ -134,16 +152,9 @@ function buildConfig() {
     server: {
       env: nodeEnv,
       port: number(process.env.PORT, 3000),
-      frontendUrl: process.env.FRONTEND_URL || (
-        nodeEnv === 'production' ? PRODUCTION_FRONTEND_ORIGIN : 'http://localhost:5173'
-      ),
-      allowedOrigins: array(
-        process.env.ALLOWED_ORIGINS,
-        nodeEnv === 'production' ? [PRODUCTION_FRONTEND_ORIGIN] : ['http://localhost:3000', 'http://localhost:5173'],
-      ).filter((origin) => nodeEnv !== 'production' || !/^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(origin)),
-      corsOrigins: array(process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS,
-        nodeEnv === 'production' ? [PRODUCTION_FRONTEND_ORIGIN] : ['http://localhost:3000', 'http://localhost:5173'])
-        .filter((origin) => nodeEnv !== 'production' || !/^https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(origin)),
+      frontendUrl,
+      allowedOrigins: uniqueOrigins([...configuredOrigins, frontendOrigin], nodeEnv),
+      corsOrigins: uniqueOrigins([...configuredCorsOrigins, frontendOrigin], nodeEnv),
     },
     
     // =====================
@@ -218,6 +229,9 @@ function buildConfig() {
       provider: (process.env.EMAIL_PROVIDER || 'gmail').toLowerCase(),
       gmailUser: process.env.GMAIL_USER || null,
       gmailAppPassword: process.env.GMAIL_APP_PASSWORD || null,
+      gmailApiClientId: process.env.GMAIL_API_CLIENT_ID || null,
+      gmailApiClientSecret: process.env.GMAIL_API_CLIENT_SECRET || null,
+      gmailApiRefreshToken: process.env.GMAIL_API_REFRESH_TOKEN || null,
       resendApiKey: process.env.RESEND_API_KEY || null,
       smtpHost: process.env.SMTP_HOST || 'smtp.gmail.com',
       smtpPort: number(process.env.SMTP_PORT, 587),
