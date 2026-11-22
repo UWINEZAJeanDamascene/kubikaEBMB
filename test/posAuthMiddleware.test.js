@@ -28,6 +28,7 @@ const { verifyPosSessionToken } = require('../services/posSessionTokenService');
 const {
   requireDevice,
   requirePosSession,
+  requirePosSystemTillType,
   requirePermission,
   requireCashMovementPermission,
   requireApproval,
@@ -162,6 +163,26 @@ describe('POS session authorization middleware', () => {
       where: { id: SESSION_ID, companyId: COMPANY_ID, status: 'active' },
       data: expect.objectContaining({ lastActivityAt: expect.any(Date) }),
     }));
+  });
+
+  test('restricts Restaurant POS routes to Restaurant registers', () => {
+    const guard = requirePosSystemTillType('restaurant');
+    const next = jest.fn();
+    const retailResponse = response();
+
+    guard({ posAuthContext: { register: { systemTillType: 'retail' } } }, retailResponse, next);
+
+    expect(retailResponse.statusCode).toBe(403);
+    expect(retailResponse.body).toMatchObject({
+      success: false,
+      code: 'POS_SYSTEM_TILL_TYPE_INVALID',
+    });
+    expect(next).not.toHaveBeenCalled();
+
+    const restaurantResponse = response();
+    guard({ posAuthContext: { register: { systemTillType: 'restaurant' } } }, restaurantResponse, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(restaurantResponse.body).toBeNull();
   });
 
   test('cashier defaults stay least-privilege while supervisors and store managers get review rights', async () => {

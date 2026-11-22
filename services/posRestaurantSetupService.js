@@ -2,6 +2,8 @@
 
 const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
+const { resolvePurchaseUnit, toBaseQuantity } = require('../utils/purchaseUnitRules');
+const { activePromotion, normalizePromotion } = require('./posRestaurantPromotionRules');
 const { requestIp, writePosAuditLog } = require('./posAuditService');
 
 const DEFAULT_STATIONS = Object.freeze([
@@ -63,6 +65,141 @@ function normalizeStation(value, fallback = 'none') {
     throw setupError('RESTAURANT_SETUP_INVALID', 'Choose Kitchen, Bar, or no preparation station.');
   }
   return station;
+}
+
+function normalizeStockMode(value, fallback = 'none') {
+  const mode = value === undefined ? fallback : String(value).trim().toLowerCase();
+  if (!['none', 'recipe', 'goods'].includes(mode)) {
+    throw setupError('RESTAURANT_SETUP_INVALID', 'Choose recipe stock, packaged goods, or no direct stock mode.');
+  }
+  return mode;
+}
+
+function normalizeRecipeIngredients(value) {
+  if (!Array.isArray(value) || value.length > 50) {
+    throw setupError('RESTAURANT_SETUP_INVALID', 'A recipe can contain up to 50 ingredients.');
+  }
+  const seen = new Set();
+  return value.map((ingredient) => {
+    const productId = normalizeId(ingredient?.productId, 'recipe ingredient');
+    const quantity = Number(ingredient?.quantity);
+    const unitCode = String(ingredient?.unitCode || 'base').trim().toLowerCase();
+    if (seen.has(productId)) {
+      throw setupError('RESTAURANT_SETUP_INVALID', 'Each stock product can appear only once in a recipe.');
+    }
+    if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 1000000
+      || !/^[a-z0-9_-]{1,24}$/.test(unitCode)) {
+      throw setupError('RESTAURANT_SETUP_INVALID', 'Recipe quantities and units must be valid and greater than zero.');
+    }
+    seen.add(productId);
+    return { productId, quantity, unitCode };
+  });
+}
+
+async function normalizeBarMeasure(tx, companyId, value) {
+  if (value == null || value.enabled === false) {
+    return {
+      barStockProductId: null,
+      barPurchaseUnitCode: null,
+      barServingVolume: null,
+      barServingUnit: null,
+    };
+  }
+  const stockProductId = normalizeId(value.stockProductId, 'bar stock product');
+  const purchaseUnitCode = String(value.purchaseUnitCode || '').trim().toLowerCase();
+  const servingVolume = Number(value.servingVolume);
+  const measureName = normalizeName(value.measureName, 'Measure name', 32);
+  if (!purchaseUnitCode || !Number.isFinite(servingVolume) || servingVolume <= 0) {
+    throw setupError('RESTAURANT_SETUP_INVALID', 'Choose a bottle purchase unit and enter a serving volume greater than zero.');
+  }
+  const stockProduct = await tx.product.findFirst({
+    where: { id: stockProductId, companyId, isActive: true, isArchived: false, isStockable: true },
+    select: { id: true, unit: true, customFields: true },
+  });
+  if (!stockProduct) {
+    throw setupError('RESTAURANT_STOCK_PRODUCT_NOT_FOUND', 'Choose an active stock product from this company for the bar measure.', 404);
+  }
+  if (String(value.servingUnit || '').trim().toLowerCase() !== String(stockProduct.unit || '').trim().toLowerCase()) {
+    throw setupError('RESTAURANT_BAR_MEASURE_UNIT_MISMATCH', `The serving unit must match the stock product unit (${stockProduct.unit}).`);
+  }
+  let bottleUnit;
+  try {
+    bottleUnit = resolvePurchaseUnit(stockProduct, purchaseUnitCode);
+  } catch (error) {
+    throw setupError('RESTAURANT_BAR_PURCHASE_UNIT_INVALID', error.message);
+  }
+  if (bottleUnit.code === 'base' || servingVolume > bottleUnit.baseQuantity) {
+    throw setupError('RESTAURANT_BAR_MEASURE_VOLUME_INVALID', 'A serving must be smaller than or equal to the selected bottle volume.');
+  }
+  const measuresPerBottle = Number((bottleUnit.baseQuantity / servingVolume).toFixed(4));
+  if (!Number.isFinite(measuresPerBottle) || measuresPerBottle <= 0) {
+    throw setupError('RESTAURANT_BAR_MEASURE_VOLUME_INVALID', 'The selected bottle cannot produce a valid serving count.');
+  }
+  return {
+    barStockProductId: stockProduct.id,
+    barPurchaseUnitCode,
+    barServingVolume: String(servingVolume),
+    barServingUnit: stockProduct.unit,
+    measureName,
+    measuresPerBottle: String(measuresPerBottle),
+  };
+}
+
+async function saveRecipeIngredients(tx, companyId, menuItemId, ingredients) {
+  const normalized = normalizeRecipeIngredients(ingredients);
+  if (normalized.length) {
+    const products = await tx.product.findMany({
+      where: {
+        companyId,
+        id: { in: normalized.map((ingredient) => ingredient.productId) },
+        isActive: true,
+        isArchived: false,
+        isStockable: true,
+      },
+      select: { id: true, unit: true, customFields: true },
+    });
+    const productById = new Map(products.map((product) => [product.id, product]));
+    for (const ingredient of normalized) {
+      const product = productById.get(ingredient.productId);
+      if (!product) {
+        throw setupError('RESTAURANT_RECIPE_PRODUCT_NOT_FOUND', 'Every recipe ingredient must be an active stock product in this company.', 404);
+      }
+      try {
+        const unit = resolvePurchaseUnit(product, ingredient.unitCode);
+        toBaseQuantity(ingredient.quantity, unit);
+      } catch (error) {
+        throw setupError('RESTAURANT_RECIPE_UNIT_INVALID', error.message);
+      }
+    }
+  }
+  await tx.restaurantRecipeIngredient.deleteMany({ where: { companyId, menuItemId } });
+  for (const ingredient of normalized) {
+    await tx.restaurantRecipeIngredient.create({
+      data: {
+        id: generateObjectId(),
+        companyId,
+        menuItemId,
+        productId: ingredient.productId,
+        quantity: String(ingredient.quantity),
+        unitCode: ingredient.unitCode,
+      },
+    });
+  }
+}
+
+async function saveMenuPromotions(tx, companyId, menuItemId, promotions) {
+  if (!Array.isArray(promotions) || promotions.length > 20) {
+    throw setupError('RESTAURANT_SETUP_INVALID', 'A menu item can have up to 20 scheduled promotions.');
+  }
+  const normalized = promotions.map((promotion) => normalizePromotion(promotion));
+  await tx.restaurantHappyHourPromotion.deleteMany({ where: { companyId, menuItemId } });
+  for (const promotion of normalized) {
+    const data = { ...promotion };
+    delete data.id;
+    await tx.restaurantHappyHourPromotion.create({
+      data: { id: generateObjectId(), companyId, menuItemId, ...data },
+    });
+  }
 }
 
 function normalizePriceAdjustment(value) {
@@ -130,6 +267,15 @@ function toProduct(product, categoryNames) {
     sellingPrice: String(product.sellingPrice),
     taxCode: product.taxCode || '',
     taxRate: String(product.taxRate ?? '0'),
+    unit: product.unit || 'unit',
+    isStockable: product.isStockable !== false,
+    purchaseUnits: Array.isArray(product.customFields?.purchaseUnits)
+      ? product.customFields.purchaseUnits.map((unit) => ({
+        code: String(unit.code || ''),
+        label: String(unit.label || ''),
+        baseQuantity: Number(unit.baseQuantity),
+      }))
+      : [],
   };
 }
 
@@ -298,7 +444,10 @@ async function getSetup(companyId, productSearch = '') {
             ],
           } : {}),
         },
-        select: { id: true, name: true, sku: true, categoryId: true, sellingPrice: true, taxCode: true, taxRate: true },
+        select: {
+          id: true, name: true, sku: true, categoryId: true, sellingPrice: true, taxCode: true,
+          taxRate: true, unit: true, customFields: true, isStockable: true,
+        },
         orderBy: { name: 'asc' },
         take: 100,
       }),
@@ -329,13 +478,41 @@ async function getSetup(companyId, productSearch = '') {
       }),
     ]);
 
-    const menuProductIds = [...new Set(menuItems.map((item) => item.productId))];
     const menuItemIds = menuItems.map((item) => item.id);
+    const [recipeIngredients, promotions, company, inventorySettings, warehouses] = await Promise.all([
+      menuItemIds.length
+        ? tx.restaurantRecipeIngredient.findMany({
+          where: { companyId: scopedCompanyId, menuItemId: { in: menuItemIds } },
+          orderBy: [{ menuItemId: 'asc' }, { productId: 'asc' }],
+        })
+        : [],
+      menuItemIds.length
+        ? tx.restaurantHappyHourPromotion.findMany({
+          where: { companyId: scopedCompanyId, menuItemId: { in: menuItemIds } },
+          orderBy: [{ menuItemId: 'asc' }, { startMinute: 'asc' }, { id: 'asc' }],
+        })
+        : [],
+      tx.company.findUnique({ where: { id: scopedCompanyId }, select: { timezone: true } }),
+      tx.restaurantInventorySettings.findUnique({ where: { companyId: scopedCompanyId } }),
+      tx.warehouse.findMany({
+        where: { companyId: scopedCompanyId, isActive: true },
+        select: { id: true, code: true, name: true, isDefault: true },
+        orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
+      }),
+    ]);
+    const stockProductIds = [...new Set([
+      ...menuItems.map((item) => item.barStockProductId).filter(Boolean),
+      ...recipeIngredients.map((ingredient) => ingredient.productId),
+    ])];
+    const menuProductIds = [...new Set([...menuItems.map((item) => item.productId), ...stockProductIds])];
     const [menuProducts, assignments, tables] = await Promise.all([
       menuProductIds.length
         ? tx.product.findMany({
           where: { companyId: scopedCompanyId, id: { in: menuProductIds } },
-          select: { id: true, name: true, sku: true, categoryId: true, sellingPrice: true, taxCode: true, taxRate: true },
+          select: {
+            id: true, name: true, sku: true, categoryId: true, sellingPrice: true, taxCode: true,
+            taxRate: true, unit: true, customFields: true, isStockable: true,
+          },
         })
         : [],
       menuItemIds.length
@@ -364,6 +541,43 @@ async function getSetup(companyId, productSearch = '') {
       };
     });
     const productsById = new Map(menuProducts.map((product) => [product.id, product]));
+    const recipesByMenuItemId = new Map();
+    for (const ingredient of recipeIngredients) {
+      const current = recipesByMenuItemId.get(ingredient.menuItemId) || [];
+      const product = productsById.get(ingredient.productId);
+      if (!product) {
+        throw setupError('RESTAURANT_SETUP_DATA_INCONSISTENT', 'A recipe ingredient refers to a product that is unavailable in this company.', 409);
+      }
+      current.push({
+        productId: ingredient.productId,
+        productName: product.name,
+        productSku: product.sku,
+        quantity: String(ingredient.quantity),
+        unitCode: ingredient.unitCode,
+        unit: ingredient.unitCode === 'base' ? product.unit : (
+          product.customFields?.purchaseUnits?.find((unit) => unit.code === ingredient.unitCode)?.label || ingredient.unitCode
+        ),
+      });
+      recipesByMenuItemId.set(ingredient.menuItemId, current);
+    }
+    const promotionsByMenuItemId = new Map();
+    for (const promotion of promotions) {
+      const current = promotionsByMenuItemId.get(promotion.menuItemId) || [];
+      current.push({
+        id: promotion.id,
+        name: promotion.name,
+        kind: promotion.kind,
+        value: Number(promotion.value),
+        weekdays: promotion.weekdays,
+        startMinute: promotion.startMinute,
+        endMinute: promotion.endMinute,
+        startsAt: promotion.startsAt,
+        endsAt: promotion.endsAt,
+        isEnabled: promotion.isEnabled,
+      });
+      promotionsByMenuItemId.set(promotion.menuItemId, current);
+    }
+    const stockProductById = productsById;
     const groupsById = new Map(modifierGroups.map((group) => [
       group.id,
       toModifierGroup(group, modifierOptions),
@@ -406,6 +620,26 @@ async function getSetup(companyId, productSearch = '') {
       }
       const categoryName = categoryNames.get(product.categoryId);
       const station = DEFAULT_STATIONS.find((entry) => entry.id === item.station) || null;
+      const stockProduct = item.barStockProductId ? stockProductById.get(item.barStockProductId) : null;
+      let barServingVolume = item.barServingVolume == null ? null : Number(item.barServingVolume);
+      let barServingUnit = item.barServingUnit || stockProduct?.unit || null;
+      let bottleVolume = null;
+      if (stockProduct && item.barPurchaseUnitCode) {
+        try {
+          bottleVolume = resolvePurchaseUnit(stockProduct, item.barPurchaseUnitCode).baseQuantity;
+        } catch (error) {
+          bottleVolume = null;
+        }
+      }
+      if (barServingVolume == null && bottleVolume && Number(item.measuresPerBottle) > 0) {
+        barServingVolume = bottleVolume / Number(item.measuresPerBottle);
+      }
+      const activePrice = activePromotion(
+        promotionsByMenuItemId.get(item.id) || [],
+        Number(product.sellingPrice),
+        new Date(),
+        company?.timezone || 'Africa/Kigali',
+      );
       return {
         id: item.id,
         productId: item.productId,
@@ -413,8 +647,37 @@ async function getSetup(companyId, productSearch = '') {
         stationId: item.station === 'none' ? null : item.station,
         sortOrder: item.displayOrder,
         isAvailable: item.isAvailable,
+        serviceChargeExempt: item.serviceChargeExempt === true,
         isActive: true,
         menuName: item.menuName,
+        stockMode: item.stockMode || 'none',
+        barMeasure: item.barStockProductId ? {
+          stockProductId: item.barStockProductId,
+          stockProductName: stockProduct?.name || '',
+          purchaseUnitCode: item.barPurchaseUnitCode,
+          servingVolume: barServingVolume,
+          servingUnit: barServingUnit,
+          bottleVolume,
+          poursPerBottle: barServingVolume && bottleVolume
+            ? Number((bottleVolume / barServingVolume).toFixed(4))
+            : Number(item.measuresPerBottle) || null,
+          measureName: item.measureName,
+          needsSetup: !barServingVolume || !bottleVolume,
+        } : (item.measureName || item.measuresPerBottle != null ? {
+          stockProductId: null,
+          stockProductName: '',
+          purchaseUnitCode: null,
+          servingVolume: null,
+          servingUnit: null,
+          bottleVolume: null,
+          poursPerBottle: Number(item.measuresPerBottle) || null,
+          measureName: item.measureName,
+          needsSetup: true,
+        } : null),
+        recipeIngredients: recipesByMenuItemId.get(item.id) || [],
+        promotions: promotionsByMenuItemId.get(item.id) || [],
+        currentPrice: activePrice.unitPrice,
+        activePromotion: activePrice.promotion,
         product: toProduct(product, categoryNames),
         category: { id: product.categoryId, name: categoryName || '' },
         station,
@@ -424,9 +687,15 @@ async function getSetup(companyId, productSearch = '') {
 
     return {
       products: products.map((product) => toProduct(product, categoryNames)),
+      companyTimeZone: company?.timezone || 'Africa/Kigali',
       categories,
       menuItems: menuItemDtos,
       modifierGroups: modifierGroups.map((group) => groupsById.get(group.id)),
+      inventorySettings: {
+        recipeShortageMode: inventorySettings?.recipeShortageMode || 'warn',
+        stationWarehouseOverrides: inventorySettings?.stationWarehouseOverrides || {},
+      },
+      warehouses,
       areas: areas.map((area) => ({
         id: area.id,
         name: area.name,
@@ -498,21 +767,40 @@ async function createMenuItem(companyId, body, actor) {
   const productId = normalizeId(body?.productId, 'product');
   const station = normalizeStation(body?.stationId ?? body?.station);
   const displayOrder = normalizeSortOrder(body?.sortOrder ?? body?.displayOrder);
+  const serviceChargeExempt = normalizeBoolean(body?.serviceChargeExempt, 'Service-charge exemption', false);
+  const stockMode = normalizeStockMode(body?.stockMode);
   const assignments = body?.modifierGroups ?? [];
+  const recipeIngredients = Object.prototype.hasOwnProperty.call(body || {}, 'recipeIngredients')
+    ? normalizeRecipeIngredients(body.recipeIngredients)
+    : [];
+  if ((stockMode === 'recipe') !== (recipeIngredients.length > 0)) {
+    throw setupError('RESTAURANT_RECIPE_CONFIGURATION_REQUIRED', 'Recipe stock mode requires at least one recipe ingredient, and recipe ingredients require recipe stock mode.');
+  }
   return auditedTransaction(scopedCompanyId, actor, 'menu_item.created', 'restaurant_menu_item', null, async (tx) => {
     await validateProduct(tx, scopedCompanyId, productId);
+    const barMeasure = Object.prototype.hasOwnProperty.call(body || {}, 'barMeasure')
+      ? await normalizeBarMeasure(tx, scopedCompanyId, body.barMeasure)
+      : {};
     const menuItem = await tx.restaurantMenuItem.create({
       data: {
         id: generateObjectId(),
         companyId: scopedCompanyId,
         productId,
         station,
-        stockMode: 'none',
+        stockMode,
         isAvailable: true,
         displayOrder,
+        serviceChargeExempt,
+        ...barMeasure,
       },
     });
     await replaceModifierAssignments(tx, scopedCompanyId, menuItem.id, assignments);
+    if (Object.prototype.hasOwnProperty.call(body || {}, 'recipeIngredients')) {
+      await saveRecipeIngredients(tx, scopedCompanyId, menuItem.id, body.recipeIngredients);
+    }
+    if (Object.prototype.hasOwnProperty.call(body || {}, 'promotions')) {
+      await saveMenuPromotions(tx, scopedCompanyId, menuItem.id, body.promotions);
+    }
     return menuItem;
   });
 }
@@ -531,6 +819,12 @@ async function updateMenuItem(companyId, menuItemId, body, actor) {
   if (Object.prototype.hasOwnProperty.call(source, 'isAvailable')) {
     data.isAvailable = normalizeBoolean(source.isAvailable, 'Menu item availability');
   }
+  if (Object.prototype.hasOwnProperty.call(source, 'serviceChargeExempt')) {
+    data.serviceChargeExempt = normalizeBoolean(source.serviceChargeExempt, 'Service-charge exemption');
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'stockMode')) {
+    data.stockMode = normalizeStockMode(source.stockMode);
+  }
   if (Object.prototype.hasOwnProperty.call(source, 'menuName')) {
     const name = source.menuName === null || source.menuName === '' ? null : normalizeName(source.menuName, 'Menu name', 180);
     data.menuName = name;
@@ -541,11 +835,24 @@ async function updateMenuItem(companyId, menuItemId, body, actor) {
       : String(source.menuDescription).normalize('NFKC').trim();
   }
   const hasModifierGroups = Object.prototype.hasOwnProperty.call(source, 'modifierGroups');
-  if (!Object.keys(data).length && !hasModifierGroups) {
+  const hasBarMeasure = Object.prototype.hasOwnProperty.call(source, 'barMeasure');
+  const hasRecipeIngredients = Object.prototype.hasOwnProperty.call(source, 'recipeIngredients');
+  const hasPromotions = Object.prototype.hasOwnProperty.call(source, 'promotions');
+  if (!Object.keys(data).length && !hasModifierGroups && !hasBarMeasure && !hasRecipeIngredients && !hasPromotions) {
     throw setupError('RESTAURANT_SETUP_INVALID', 'Provide at least one menu item change.');
   }
   return auditedTransaction(scopedCompanyId, actor, 'menu_item.updated', 'restaurant_menu_item', id, async (tx) => {
     const current = await findOwned(tx, 'restaurantMenuItem', scopedCompanyId, id, 'Menu item');
+    const targetStockMode = data.stockMode || current.stockMode || 'none';
+    const recipeCount = hasRecipeIngredients
+      ? normalizeRecipeIngredients(source.recipeIngredients).length
+      : await tx.restaurantRecipeIngredient.count({
+        where: { companyId: scopedCompanyId, menuItemId: id },
+      });
+    if ((targetStockMode === 'recipe') !== (recipeCount > 0)) {
+      throw setupError('RESTAURANT_RECIPE_CONFIGURATION_REQUIRED', 'Recipe stock mode requires at least one recipe ingredient, and recipe ingredients require recipe stock mode.');
+    }
+    if (hasBarMeasure) Object.assign(data, await normalizeBarMeasure(tx, scopedCompanyId, source.barMeasure));
     const updated = Object.keys(data).length
       ? await tx.restaurantMenuItem.update({
         where: { companyId_id: { companyId: scopedCompanyId, id } },
@@ -553,8 +860,75 @@ async function updateMenuItem(companyId, menuItemId, body, actor) {
       })
       : current;
     if (hasModifierGroups) await replaceModifierAssignments(tx, scopedCompanyId, id, source.modifierGroups);
+    if (hasRecipeIngredients) await saveRecipeIngredients(tx, scopedCompanyId, id, source.recipeIngredients);
+    if (hasPromotions) await saveMenuPromotions(tx, scopedCompanyId, id, source.promotions);
     return updated;
   });
+}
+
+async function updateInventorySettings(companyId, body, actor) {
+  const scopedCompanyId = requireCompany(companyId);
+  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  const mode = source.recipeShortageMode === undefined
+    ? undefined
+    : String(source.recipeShortageMode).trim().toLowerCase();
+  if (mode !== undefined && !['warn', 'require_manager', 'block'].includes(mode)) {
+    throw setupError('RESTAURANT_INVENTORY_SETTINGS_INVALID', 'Choose warn, manager approval, or block for recipe stock shortages.');
+  }
+  const hasOverrides = Object.prototype.hasOwnProperty.call(source, 'stationWarehouseOverrides');
+  let overrides;
+  if (hasOverrides) {
+    const raw = source.stationWarehouseOverrides;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+      || Object.keys(raw).some((station) => !['kitchen', 'bar'].includes(station))) {
+      throw setupError('RESTAURANT_INVENTORY_SETTINGS_INVALID', 'Warehouse overrides may be set only for Kitchen and Bar.');
+    }
+    overrides = {};
+    for (const [station, value] of Object.entries(raw)) {
+      if (value == null || value === '') continue;
+      overrides[station] = normalizeId(value, `${station} warehouse`);
+    }
+  }
+  if (mode === undefined && !hasOverrides) {
+    throw setupError('RESTAURANT_INVENTORY_SETTINGS_INVALID', 'Provide a shortage mode or station warehouse override.');
+  }
+  return auditedTransaction(
+    scopedCompanyId,
+    actor,
+    'inventory_settings.updated',
+    'restaurant_inventory_settings',
+    scopedCompanyId,
+    async (tx) => {
+      if (overrides && Object.keys(overrides).length) {
+        const found = await tx.warehouse.findMany({
+          where: { companyId: scopedCompanyId, id: { in: Object.values(overrides) }, isActive: true },
+          select: { id: true },
+        });
+        if (found.length !== new Set(Object.values(overrides)).size) {
+          throw setupError('RESTAURANT_INVENTORY_WAREHOUSE_INVALID', 'Choose active warehouses belonging to this company.', 404);
+        }
+      }
+      const current = await tx.restaurantInventorySettings.findUnique({ where: { companyId: scopedCompanyId } });
+      return tx.restaurantInventorySettings.upsert({
+        where: { companyId: scopedCompanyId },
+        create: {
+          companyId: scopedCompanyId,
+          recipeShortageMode: mode || 'warn',
+          stationWarehouseOverrides: overrides || {},
+          updatedById: actor?.userId || null,
+        },
+        update: {
+          ...(mode !== undefined ? { recipeShortageMode: mode } : {}),
+          ...(overrides ? { stationWarehouseOverrides: overrides } : {}),
+          updatedById: actor?.userId || null,
+        },
+      }).then((updated) => ({
+        ...updated,
+        recipeShortageMode: mode ?? current?.recipeShortageMode ?? updated.recipeShortageMode,
+        stationWarehouseOverrides: overrides ?? current?.stationWarehouseOverrides ?? updated.stationWarehouseOverrides,
+      }));
+    },
+  );
 }
 
 async function createModifierGroup(companyId, body, actor) {
@@ -782,5 +1156,6 @@ module.exports = {
   updateMenuCategory,
   updateMenuItem,
   updateModifierGroup,
+  updateInventorySettings,
   updateTable,
 };

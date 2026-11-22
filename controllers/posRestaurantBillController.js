@@ -39,6 +39,14 @@ exports.issueOrderBill = action(201, (req, companyId) => (
   billService.issueBill(companyId, req.params.orderId, req)
 ));
 
+exports.moveItemsBetweenChecks = action(200, (req, companyId) => (
+  billService.moveItemsBetweenChecks(companyId, req.params.orderId, req)
+));
+
 exports.settleBill = action(200, (req, companyId) => (
   billService.settleBill(companyId, req.params.billId, req)
+));
+
+exports.releaseFailedPaymentLock = action(200, (req, companyId) => (
+  billService.releaseFailedPaymentLock(companyId, req.params.billId, req.params.paymentId, req)
 ));

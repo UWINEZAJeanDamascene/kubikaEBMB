@@ -24,6 +24,9 @@ const ACCOUNT_FIELDS = Object.freeze([
   { key: 'salesRevenue', label: 'Sales revenue', allowedTypes: ['revenue'], required: true },
   { key: 'vatOutput', label: 'VAT output', allowedTypes: ['liability'], required: true },
   { key: 'costOfGoodsSold', label: 'Cost of goods sold', allowedTypes: ['cogs', 'expense'], required: true },
+  { key: 'tipsPayable', label: 'Tips payable', allowedTypes: ['liability'] },
+  { key: 'serviceChargeIncome', label: 'Service charge income', allowedTypes: ['revenue'] },
+  { key: 'serviceChargePayable', label: 'Service charge payable', allowedTypes: ['liability'] },
 ]);
 const FIELD_BY_KEY = new Map(ACCOUNT_FIELDS.map((field) => [field.key, field]));
 
@@ -259,6 +262,30 @@ function resolveAccount(profile, key, { tillType, registerId } = {}) {
   return profile.companyDefaults?.[key] || null;
 }
 
+function assertAccountMappings(profile, keys, scope = {}) {
+  const resolved = {};
+  for (const key of keys) {
+    const definition = FIELD_BY_KEY.get(key);
+    if (!definition) throw new TypeError(`Unknown POS accounting mapping: ${key}.`);
+    const accountCode = resolveAccount(profile, key, scope);
+    if (!accountCode) {
+      throw Object.assign(new TypeError(
+        `Configure an account for ${definition.label} in the POS accounting profile before enabling Restaurant billing features.`,
+      ), { code: 'POS_ACCOUNT_MAPPING_REQUIRED', key });
+    }
+    const invalid = (profile.validationErrors || []).find((error) => (
+      error.key === key && String(error.accountCode) === String(accountCode)
+    ));
+    if (invalid) {
+      throw Object.assign(new TypeError(
+        `The ${definition.label} account is invalid: ${invalid.message}`,
+      ), { code: 'POS_ACCOUNT_MAPPING_INVALID', key, accountCode });
+    }
+    resolved[key] = accountCode;
+  }
+  return resolved;
+}
+
 function mappingForTender(tender) {
   const method = String(tender.paymentMethod || tender.method || '').toLowerCase();
   if (method === 'cash') return { method, key: 'posRegisterCash' };
@@ -355,5 +382,6 @@ module.exports = {
   getProfile,
   saveProfile,
   resolveAccount,
+  assertAccountMappings,
   assertTenderMappings,
 };

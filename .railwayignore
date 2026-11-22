@@ -1,0 +1,17 @@
+node_modules/
+**/node_modules/
+.git/
+
+packages/kubika-print-agent/staging/
+packages/kubika-print-agent/release/
+
+downloads/print-agent/*
+!downloads/print-agent/manifest.json
+!downloads/print-agent/release-notes.md
+!downloads/print-agent/KubikaPrintAgent-0.1.4-setup.exe
+!downloads/print-agent/KubikaPrintAgent-0.1.4-portable.zip
+
+backups/
+tmp/
+coverage/
+*.log

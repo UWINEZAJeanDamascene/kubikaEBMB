@@ -586,6 +586,25 @@ async function updateSourceStatus(tx, posting, status, ids, now) {
         String(posting.company_id),
       );
     }
+    return;
+  }
+  const restaurantTipTables = {
+    restaurant_tip: 'restaurant_tips',
+    restaurant_tip_payout: 'restaurant_tip_payouts',
+    restaurant_tip_reversal: 'restaurant_tip_reversals',
+  };
+  const restaurantTipTable = restaurantTipTables[posting.source_type];
+  if (restaurantTipTable) {
+    await tx.$executeRawUnsafe(
+      `UPDATE "${restaurantTipTable}"
+       SET "journal_entry_id" = COALESCE($1, "journal_entry_id"),
+           "posting_status" = $2
+       WHERE "id" = $3 AND "company_id" = $4`,
+      journalEntryId,
+      status,
+      String(posting.source_id),
+      String(posting.company_id),
+    );
   }
 }
 

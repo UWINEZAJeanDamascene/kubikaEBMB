@@ -9,7 +9,7 @@ const DEFAULT_DRAWER_SETTINGS = Object.freeze({
   shiftClose: false,
   noSale: true,
 });
-const PRINTER_ROLES = Object.freeze(['receipt', 'report', 'a4']);
+const PRINTER_ROLES = Object.freeze(['receipt', 'report', 'a4', 'kitchen', 'bar']);
 const PRINT_PATHS = Object.freeze(['agent', 'serial', 'browser']);
 const DEFAULT_PRINT_ROUTING = Object.freeze({
   order: Object.freeze(['agent', 'serial', 'browser']),
@@ -75,7 +75,7 @@ function validatePrinterRoles(values) {
   const result = {};
   for (const [role, printerId] of Object.entries(values)) {
     const isPrinterId = typeof printerId === 'string' && /^[a-f\d]{24}$/i.test(printerId);
-    const isRoleSelector = typeof printerId === 'string' && /^role:(receipt|report|a4)$/.test(printerId);
+    const isRoleSelector = typeof printerId === 'string' && /^role:(receipt|report|a4|kitchen|bar)$/.test(printerId);
     if (!PRINTER_ROLES.includes(role) || (printerId !== null && !isPrinterId && !isRoleSelector)) {
       return null;
     }

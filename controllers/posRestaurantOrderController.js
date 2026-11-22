@@ -23,6 +23,7 @@ function actorFor(req) {
     registerId: String(context?.register?.id || context?.session?.registerId || ''),
     name: String(context?.user?.name || ''),
     trainingMode: Boolean(context?.register?.trainingMode),
+    permissions: Array.isArray(req.posPermissions) ? req.posPermissions : [],
   };
 }
 
@@ -55,12 +56,12 @@ function action(statusCode, operation) {
   };
 }
 
-exports.getOverview = action(200, (req, companyId) => (
-  orderService.getOverview(companyId)
+exports.getOverview = action(200, (req, companyId, actor) => (
+  orderService.getOverview(companyId, actor)
 ));
 
-exports.getOrder = action(200, (req, companyId) => (
-  orderService.getOrder(companyId, req.params.orderId)
+exports.getOrder = action(200, (req, companyId, actor) => (
+  orderService.getOrder(companyId, req.params.orderId, actor)
 ));
 
 exports.getReport = action(200, (req, companyId, actor) => (

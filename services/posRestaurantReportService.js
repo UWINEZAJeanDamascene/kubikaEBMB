@@ -3,7 +3,20 @@
 const { prisma } = require('../lib/prisma');
 const { listShiftHandoverOrders } = require('./posRestaurantOrderService');
 
-const REPORT_TYPES = new Set(['sales-by-item', 'open-orders', 'voids', 'shifts']);
+const REPORT_TYPES = new Set([
+  'sales-by-item',
+  'open-orders',
+  'service-charges',
+  'tips',
+  'voids',
+  'shifts',
+  'sales-by-hour',
+  'waiter-performance',
+  'promotion-effectiveness',
+  'recipe-consumption',
+  'bar-measures',
+  'item-margin',
+]);
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ID_PATTERN = /^[a-f0-9]{24}$/i;
 
@@ -75,6 +88,125 @@ async function addOrderBillingSummary(companyId, orders) {
       balanceDue: Math.max(0, billTotal - amountReceived),
     };
   });
+}
+
+async function loadRestaurantAdvancedData(companyId, registerId, dateFilter) {
+  const [orders, company] = await Promise.all([
+    prisma.restaurantOrder.findMany({
+      where: { companyId, registerId, updatedAt: dateFilter },
+      select: { id: true, waiterId: true, status: true, updatedAt: true },
+    }),
+    prisma.company.findUnique({ where: { id: companyId }, select: { timezone: true } }),
+  ]);
+  const orderIds = orders.map((order) => order.id);
+  const bills = orderIds.length
+    ? await prisma.restaurantBill.findMany({
+      where: { companyId, orderId: { in: orderIds }, status: 'paid' },
+      select: {
+        id: true,
+        orderId: true,
+        invoiceId: true,
+        totalAmount: true,
+        lineSnapshot: true,
+        createdAt: true,
+      },
+    })
+    : [];
+  const invoiceIds = [...new Set(bills.map((bill) => bill.invoiceId).filter(Boolean))];
+  const invoices = invoiceIds.length
+    ? await prisma.invoice.findMany({
+      where: {
+        companyId,
+        id: { in: invoiceIds },
+        registerId,
+        posOrigin: true,
+        status: 'fully_paid',
+        invoiceDate: dateFilter,
+      },
+      select: {
+        id: true,
+        totalAmount: true,
+        invoiceDate: true,
+        lines: {
+          select: {
+            productId: true,
+            productName: true,
+            qty: true,
+            unitPrice: true,
+            lineSubtotal: true,
+            discountPct: true,
+            lineTax: true,
+            lineTotal: true,
+            cogsAmount: true,
+            isServiceLine: true,
+          },
+        },
+      },
+    })
+    : [];
+  return {
+    orders,
+    bills: bills.filter((bill) => invoiceIds.includes(bill.invoiceId)),
+    invoices,
+    orderById: new Map(orders.map((order) => [order.id, order])),
+    invoiceById: new Map(invoices.map((invoice) => [invoice.id, invoice])),
+    billByInvoiceId: new Map(bills.filter((bill) => bill.invoiceId).map((bill) => [bill.invoiceId, bill])),
+    timeZone: company?.timezone || 'Africa/Kigali',
+  };
+}
+
+function localHour(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(date));
+  return Number(parts.find((part) => part.type === 'hour')?.value);
+}
+
+function snapshotItems(bill) {
+  const snapshot = payloadObject(bill?.lineSnapshot);
+  return Array.isArray(snapshot.items) ? snapshot.items : [];
+}
+
+async function getStockCommitmentReportData(companyId, orderIds, dateFilter) {
+  if (!orderIds.length) return { rows: [], productNames: new Map() };
+  const rows = await prisma.restaurantStockCommitment.findMany({
+    where: {
+      companyId,
+      orderId: { in: orderIds },
+      status: { in: ['deducted', 'waste'] },
+      OR: [
+        { closedAt: dateFilter },
+        { voidedAt: dateFilter },
+      ],
+    },
+    select: {
+      orderId: true,
+      orderItemId: true,
+      productId: true,
+      quantity: true,
+      sourceType: true,
+      servingCount: true,
+      purchaseUnitCode: true,
+      purchaseUnitVolume: true,
+      status: true,
+      totalCost: true,
+      closedAt: true,
+      voidedAt: true,
+    },
+  });
+  const productIds = [...new Set(rows.map((row) => row.productId))];
+  const products = productIds.length
+    ? await prisma.product.findMany({
+      where: { companyId, id: { in: productIds } },
+      select: { id: true, name: true, unit: true },
+    })
+    : [];
+  return {
+    rows,
+    productNames: new Map(products.map((product) => [product.id, { name: product.name, unit: product.unit }])),
+  };
 }
 
 async function listRestaurantReportRegisters(companyIdValue) {
@@ -225,6 +357,406 @@ async function getRestaurantReport({ companyId: companyIdValue, registerId: regi
       billsIssued: issuedBills.length,
       billedTotal: issuedBills.reduce((total, bill) => total + Number(bill.totalAmount || 0), 0),
       items: [...items.values()].sort((left, right) => right.sales - left.sales),
+    };
+  }
+
+  if ([
+    'sales-by-hour',
+    'waiter-performance',
+    'promotion-effectiveness',
+    'recipe-consumption',
+    'bar-measures',
+    'item-margin',
+  ].includes(type)) {
+    const data = await loadRestaurantAdvancedData(companyId, register.id, dateFilter);
+    const paidOrders = data.invoices.map((invoice) => ({
+      invoice,
+      bill: data.billByInvoiceId.get(invoice.id),
+      order: data.orderById.get(data.billByInvoiceId.get(invoice.id)?.orderId),
+    })).filter((entry) => entry.bill && entry.order);
+
+    if (type === 'sales-by-hour') {
+      const hours = Array.from({ length: 24 }, (_, hour) => ({
+        hour,
+        invoiceCount: 0,
+        sales: 0,
+      }));
+      for (const { invoice } of paidOrders) {
+        const bucket = hours[localHour(invoice.invoiceDate, data.timeZone)];
+        bucket.invoiceCount += 1;
+        bucket.sales += Number(invoice.totalAmount || 0);
+      }
+      return {
+        type,
+        from: range.from.toISOString(),
+        to: range.to.toISOString(),
+        timeZone: data.timeZone,
+        invoiceCount: paidOrders.length,
+        totalSales: paidOrders.reduce((total, entry) => total + Number(entry.invoice.totalAmount || 0), 0),
+        hours,
+      };
+    }
+
+    if (type === 'waiter-performance') {
+      const waiters = new Map();
+      for (const { invoice, order } of paidOrders) {
+        const key = order.waiterId || 'unassigned';
+        const waiter = waiters.get(key) || {
+          waiterId: order.waiterId,
+          name: order.waiterId ? null : 'Unassigned',
+          invoiceCount: 0,
+          sales: 0,
+        };
+        waiter.invoiceCount += 1;
+        waiter.sales += Number(invoice.totalAmount || 0);
+        waiters.set(key, waiter);
+      }
+      const waiterIds = [...waiters.keys()].filter((id) => id !== 'unassigned');
+      const users = waiterIds.length
+        ? await prisma.user.findMany({
+          where: { companyId, id: { in: waiterIds } },
+          select: { id: true, name: true },
+        })
+        : [];
+      const nameById = new Map(users.map((user) => [user.id, user.name]));
+      const rows = [...waiters.values()].map((waiter) => ({
+        ...waiter,
+        name: waiter.waiterId ? nameById.get(waiter.waiterId) || 'Staff member' : waiter.name,
+        averageSale: waiter.invoiceCount ? waiter.sales / waiter.invoiceCount : 0,
+      })).sort((left, right) => right.sales - left.sales);
+      return {
+        type,
+        from: range.from.toISOString(),
+        to: range.to.toISOString(),
+        invoiceCount: paidOrders.length,
+        totalSales: rows.reduce((total, row) => total + row.sales, 0),
+        rows,
+      };
+    }
+
+    if (type === 'promotion-effectiveness') {
+      const promotions = new Map();
+      for (const { invoice } of paidOrders) {
+        const bill = data.billByInvoiceId.get(invoice.id);
+        for (const item of snapshotItems(bill)) {
+          const promotion = payloadObject(item.promotionSnapshot);
+          if (!promotion.id) continue;
+          const key = String(promotion.id);
+          const row = promotions.get(key) || {
+            promotionId: key,
+            name: String(promotion.name || 'Promotion'),
+            itemCount: 0,
+            quantity: 0,
+            discount: 0,
+            sales: 0,
+          };
+          row.itemCount += 1;
+          row.quantity += Number(item.quantity || 0);
+          row.discount += Number(item.discountAmount || 0);
+          row.sales += Number(item.total || 0);
+          promotions.set(key, row);
+        }
+      }
+      return {
+        type,
+        from: range.from.toISOString(),
+        to: range.to.toISOString(),
+        rows: [...promotions.values()].sort((left, right) => right.sales - left.sales),
+      };
+    }
+
+    const commitments = await getStockCommitmentReportData(
+      companyId,
+      data.orders.map((order) => order.id),
+      dateFilter,
+    );
+    if (type === 'recipe-consumption') {
+      const consumption = new Map();
+      for (const row of commitments.rows) {
+        if (row.sourceType !== 'recipe') continue;
+        const product = commitments.productNames.get(row.productId);
+        const key = `${row.productId}:${row.status}`;
+        const item = consumption.get(key) || {
+          productId: row.productId,
+          productName: product?.name || 'Stock item',
+          unit: product?.unit || '',
+          status: row.status,
+          quantity: 0,
+          cost: 0,
+        };
+        item.quantity += Number(row.quantity || 0);
+        item.cost += Number(row.totalCost || 0);
+        consumption.set(key, item);
+      }
+      const rows = [...consumption.values()].sort((left, right) => right.cost - left.cost);
+      return {
+        type,
+        from: range.from.toISOString(),
+        to: range.to.toISOString(),
+        quantity: rows.reduce((total, row) => total + row.quantity, 0),
+        cost: rows.reduce((total, row) => total + row.cost, 0),
+        rows,
+      };
+    }
+    if (type === 'bar-measures') {
+      const measures = new Map();
+      for (const row of commitments.rows) {
+        if (row.sourceType !== 'bar_measure') continue;
+        const product = commitments.productNames.get(row.productId);
+        const key = `${row.productId}:${row.purchaseUnitCode || ''}:${row.purchaseUnitVolume || ''}`;
+        const item = measures.get(key) || {
+          productId: row.productId,
+          productName: product?.name || 'Bar stock item',
+          unit: product?.unit || '',
+          purchaseUnitCode: row.purchaseUnitCode,
+          bottleVolume: Number(row.purchaseUnitVolume || 0),
+          servings: 0,
+          stockUsed: 0,
+          bottleEquivalent: 0,
+          cost: 0,
+        };
+        item.servings += Number(row.servingCount || 0);
+        item.stockUsed += Number(row.quantity || 0);
+        item.bottleEquivalent += item.bottleVolume > 0
+          ? Number(row.quantity || 0) / item.bottleVolume
+          : 0;
+        item.cost += Number(row.totalCost || 0);
+        measures.set(key, item);
+      }
+      const rows = [...measures.values()].sort((left, right) => right.stockUsed - left.stockUsed);
+      return {
+        type,
+        from: range.from.toISOString(),
+        to: range.to.toISOString(),
+        servings: rows.reduce((total, row) => total + row.servings, 0),
+        stockUsed: rows.reduce((total, row) => total + row.stockUsed, 0),
+        cost: rows.reduce((total, row) => total + row.cost, 0),
+        rows,
+      };
+    }
+
+    const costByOrderItemId = new Map();
+    for (const row of commitments.rows) {
+      if (row.status !== 'deducted' || !row.orderItemId) continue;
+      costByOrderItemId.set(
+        row.orderItemId,
+        (costByOrderItemId.get(row.orderItemId) || 0) + Number(row.totalCost || 0),
+      );
+    }
+    const margins = new Map();
+    for (const { invoice } of paidOrders) {
+      const bill = data.billByInvoiceId.get(invoice.id);
+      for (const item of snapshotItems(bill)) {
+        const line = invoice.lines.find((candidate) => (
+          !candidate.isServiceLine
+          && candidate.productId === item.productId
+          && Number(candidate.qty) === Number(item.quantity)
+          && (candidate.description || '') === (item.description || '')
+        ));
+        const key = `${item.productId}:${item.name}`;
+        const row = margins.get(key) || {
+          productId: item.productId,
+          name: item.name || 'Restaurant item',
+          quantity: 0,
+          netSales: 0,
+          cost: 0,
+        };
+        row.quantity += Number(item.quantity || 0);
+        row.netSales += Number(item.total || 0) - Number(item.taxAmount || 0);
+        row.cost += costByOrderItemId.get(item.itemId) ?? Number(line?.cogsAmount || 0);
+        margins.set(key, row);
+      }
+    }
+    const rows = [...margins.values()].map((row) => ({
+      ...row,
+      margin: row.netSales - row.cost,
+      marginPct: row.netSales > 0 ? ((row.netSales - row.cost) / row.netSales) * 100 : null,
+    })).sort((left, right) => right.margin - left.margin);
+    return {
+      type,
+      from: range.from.toISOString(),
+      to: range.to.toISOString(),
+      netSales: rows.reduce((total, row) => total + row.netSales, 0),
+      cost: rows.reduce((total, row) => total + row.cost, 0),
+      margin: rows.reduce((total, row) => total + row.margin, 0),
+      rows,
+    };
+  }
+
+  if (type === 'service-charges') {
+    const orders = await prisma.restaurantOrder.findMany({
+      where: { companyId, registerId },
+      select: { id: true },
+    });
+    const bills = orders.length
+      ? await prisma.restaurantBill.findMany({
+        where: {
+          companyId,
+          orderId: { in: orders.map((order) => order.id) },
+          createdAt: dateFilter,
+          status: { in: ['issued', 'pending_payment', 'paid'] },
+        },
+        select: {
+          id: true,
+          orderId: true,
+          checkNumber: true,
+          serviceChargeAmount: true,
+          serviceChargeTaxAmount: true,
+          serviceChargeRatePct: true,
+          serviceChargeMode: true,
+          serviceChargeOverrideReason: true,
+          serviceChargeOverriddenById: true,
+          createdAt: true,
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      })
+      : [];
+    const overrides = bills.filter((bill) => bill.serviceChargeOverrideReason);
+    const managerIds = [...new Set(overrides.map((bill) => bill.serviceChargeOverriddenById).filter(Boolean))];
+    const managers = managerIds.length
+      ? await prisma.user.findMany({
+        where: { companyId, id: { in: managerIds } },
+        select: { id: true, name: true },
+      })
+      : [];
+    const managerNames = new Map(managers.map((manager) => [manager.id, manager.name]));
+    return {
+      type,
+      from: range.from.toISOString(),
+      to: range.to.toISOString(),
+      count: bills.filter((bill) => Number(bill.serviceChargeAmount || 0) > 0).length,
+      totalServiceCharge: bills.reduce((total, bill) => total + Number(bill.serviceChargeAmount || 0), 0),
+      totalServiceChargeTax: bills.reduce((total, bill) => total + Number(bill.serviceChargeTaxAmount || 0), 0),
+      overrideCount: overrides.length,
+      overrides: overrides.map((bill) => ({
+        id: bill.id,
+        orderId: bill.orderId,
+        checkNumber: bill.checkNumber,
+        amount: Number(bill.serviceChargeAmount || 0),
+        ratePct: bill.serviceChargeRatePct == null ? null : Number(bill.serviceChargeRatePct),
+        mode: bill.serviceChargeMode,
+        reason: bill.serviceChargeOverrideReason,
+        managerId: bill.serviceChargeOverriddenById,
+        managerName: managerNames.get(bill.serviceChargeOverriddenById) || null,
+        createdAt: bill.createdAt,
+      })),
+    };
+  }
+
+  if (type === 'tips') {
+    const [tips, payouts, reversals] = await Promise.all([
+      prisma.restaurantTip.findMany({
+        where: { companyId, registerId, createdAt: dateFilter },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      }),
+      prisma.restaurantTipPayout.findMany({
+        where: { companyId, registerId, createdAt: dateFilter },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      }),
+      prisma.restaurantTipReversal.findMany({
+        where: { companyId, registerId, createdAt: dateFilter },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      }),
+    ]);
+    const [allTips, allPayouts, allReversals] = await Promise.all([
+      prisma.restaurantTip.findMany({ where: { companyId } }),
+      prisma.restaurantTipPayout.findMany({ where: { companyId } }),
+      prisma.restaurantTipReversal.findMany({ where: { companyId } }),
+    ]);
+    const waiterIds = [...new Set([
+      ...tips.map((tip) => String(tip.waiterId)),
+      ...payouts.map((payout) => String(payout.waiterId)),
+      ...allTips.map((tip) => String(tip.waiterId)),
+    ])];
+    const users = waiterIds.length
+      ? await prisma.user.findMany({
+        where: { companyId, id: { in: waiterIds } },
+        select: { id: true, name: true },
+      })
+      : [];
+    const waiterNames = new Map(users.map((user) => [String(user.id), user.name]));
+    const tipsById = new Map(allTips.map((tip) => [String(tip.id), tip]));
+    const totalTips = tips.reduce((sum, tip) => sum + Number(tip.amount || 0), 0);
+    const totalPayouts = payouts.reduce((sum, payout) => sum + Number(payout.amount || 0), 0);
+    const totalReversals = reversals.reduce((sum, reversal) => sum + Number(reversal.amount || 0), 0);
+    const balanceWaiterIds = [...new Set(allTips.map((tip) => String(tip.waiterId)))];
+    const waiters = balanceWaiterIds.map((waiterId) => {
+      const waiterTips = allTips.filter((tip) => String(tip.waiterId) === waiterId);
+      const tipIds = new Set(waiterTips.map((tip) => String(tip.id)));
+      const waiterReversals = allReversals.filter((reversal) => tipIds.has(String(reversal.tipId)));
+      const waiterPayouts = allPayouts.filter((payout) => String(payout.waiterId) === waiterId);
+      return {
+        waiterId,
+        name: waiterNames.get(waiterId) || waiterId,
+        collected: waiterTips.reduce((sum, tip) => sum + Number(tip.amount || 0), 0),
+        reversed: waiterReversals.reduce((sum, reversal) => sum + Number(reversal.amount || 0), 0),
+        paidOut: waiterPayouts.reduce((sum, payout) => sum + Number(payout.amount || 0), 0),
+        available: waiterTips.reduce((sum, tip) => sum + Number(tip.amount || 0), 0)
+          - waiterReversals.reduce((sum, reversal) => sum + Number(reversal.amount || 0), 0)
+          - waiterPayouts.reduce((sum, payout) => sum + Number(payout.amount || 0), 0),
+        postingPending: [...waiterTips, ...waiterReversals, ...waiterPayouts]
+          .some((row) => row.postingStatus !== 'posted'),
+      };
+    }).sort((left, right) => left.name.localeCompare(right.name));
+    const availableByWaiter = new Map(waiters.map((waiter) => [waiter.waiterId, waiter.available]));
+    const staffIds = [...new Set([
+      ...reversals.map((reversal) => String(reversal.approvedById)),
+      ...payouts.map((payout) => String(payout.approvedById)),
+    ])];
+    const staff = staffIds.length
+      ? await prisma.user.findMany({
+        where: { companyId, id: { in: staffIds } },
+        select: { id: true, name: true },
+      })
+      : [];
+    const staffNames = new Map(staff.map((user) => [String(user.id), user.name]));
+    return {
+      type,
+      from: range.from.toISOString(),
+      to: range.to.toISOString(),
+      totalTips,
+      totalPayouts,
+      totalReversals,
+      netCashEffect: totalTips - totalPayouts - totalReversals,
+      waiters,
+      tips: tips.map((tip) => ({
+        id: tip.id,
+        billId: tip.billId,
+        waiterId: tip.waiterId,
+        waiterName: waiterNames.get(String(tip.waiterId)) || null,
+        amount: Number(tip.amount),
+        availableToReverse: Math.max(0, Math.min(
+          Number(tip.amount) - allReversals
+            .filter((reversal) => String(reversal.tipId) === String(tip.id))
+            .reduce((sum, reversal) => sum + Number(reversal.amount || 0), 0),
+          availableByWaiter.get(String(tip.waiterId)) || 0,
+        )),
+        captureMode: tip.captureMode,
+        postingStatus: tip.postingStatus,
+        createdAt: tip.createdAt,
+      })),
+      payouts: payouts.map((payout) => ({
+        id: payout.id,
+        waiterId: payout.waiterId,
+        waiterName: waiterNames.get(String(payout.waiterId)) || null,
+        amount: Number(payout.amount),
+        reason: payout.reason,
+        approvedById: payout.approvedById,
+        approvedByName: staffNames.get(String(payout.approvedById)) || null,
+        postingStatus: payout.postingStatus,
+        createdAt: payout.createdAt,
+      })),
+      reversals: reversals.map((reversal) => ({
+        id: reversal.id,
+        tipId: reversal.tipId,
+        waiterId: tipsById.get(String(reversal.tipId))?.waiterId || null,
+        amount: Number(reversal.amount),
+        reason: reversal.reason,
+        approvedById: reversal.approvedById,
+        approvedByName: staffNames.get(String(reversal.approvedById)) || null,
+        postingStatus: reversal.postingStatus,
+        createdAt: reversal.createdAt,
+      })),
     };
   }
 

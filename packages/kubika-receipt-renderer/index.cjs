@@ -421,6 +421,7 @@ function renderThermalDocument(payload, options = {}) {
         'cash-movement-slip': 'CASH MOVEMENT',
         'test-print': 'PRINTER TEST',
         'report-pdf': 'REPORT',
+        'restaurant-ticket': 'RESTAURANT TICKET',
     };
     const title = String(firstValue(data.title, data.documentTitle, titleByType[jobType], data.receiptNumber && 'RECEIPT', 'POS DOCUMENT'));
     const chunks = [];

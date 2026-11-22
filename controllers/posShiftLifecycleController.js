@@ -446,6 +446,19 @@ exports.handover = async (req, res, next) => {
       const refundRows = await shiftCloseController.findCashRefunds(tx, companyId, shiftId);
       const cashRefunds = shiftCloseController.centsOrWholeAmount(refundRows[0]?.amount);
       const movements = shiftCloseController.movementTotals(shift.cashMovements);
+      const tipRows = await tx.$queryRawUnsafe(
+        `SELECT
+           COALESCE((SELECT SUM("amount") FROM "restaurant_tips" WHERE "company_id" = $1 AND "shift_id" = $2), 0)::numeric AS "cashCollected",
+           COALESCE((SELECT SUM("amount") FROM "restaurant_tip_payouts" WHERE "company_id" = $1 AND "shift_id" = $2), 0)::numeric AS "cashPaidOut",
+           COALESCE((SELECT SUM("amount") FROM "restaurant_tip_reversals" WHERE "company_id" = $1 AND "shift_id" = $2), 0)::numeric AS "cashReversed"`,
+        companyId,
+        shiftId,
+      );
+      const restaurantTipTotals = {
+        cashCollected: shiftCloseController.centsOrWholeAmount(tipRows[0]?.cashCollected),
+        cashPaidOut: shiftCloseController.centsOrWholeAmount(tipRows[0]?.cashPaidOut),
+        cashReversed: shiftCloseController.centsOrWholeAmount(tipRows[0]?.cashReversed),
+      };
       const heldSalesCount = await shiftCloseController.findHeldSalesCount(tx, companyId);
       if (settings.heldSalesOnClose === 'BLOCK' && heldSalesCount > 0) {
         return { code: 'POS_SHIFT_HELD_SALES_BLOCKED', heldSalesCount };
@@ -455,8 +468,8 @@ exports.handover = async (req, res, next) => {
         openingFloat: shift.openingFloat,
         cashSales: sales.cashSales,
         cashRefunds,
-        cashIn: movements.cashIn,
-        cashOut: movements.cashOut,
+        cashIn: movements.cashIn + restaurantTipTotals.cashCollected,
+        cashOut: movements.cashOut + restaurantTipTotals.cashPaidOut + restaurantTipTotals.cashReversed,
         safeDrops: movements.safeDrops,
       });
       if (expectedCash > MAX_DATABASE_INT) return { code: 'POS_SHIFT_CASH_RECONCILIATION_INVALID' };
@@ -513,15 +526,6 @@ exports.handover = async (req, res, next) => {
         return { code: 'POS_REGISTER_NOT_FOUND' };
       }
       const zNumber = (await getPosZReportHighWaterMark(tx, companyId, registerId)) + 1;
-      const restaurantHandover = await restaurantOrderService.carryOpenOrdersForShiftHandover(tx, {
-        companyId,
-        registerId,
-        fromUserId: userId,
-        toUserId,
-        shiftId,
-      });
-      if (restaurantHandover.code) return restaurantHandover;
-      const carriedRestaurantOrders = restaurantHandover.orders;
       const now = new Date();
       const journalEntryId = await postShiftVariance({
         tx,
@@ -572,6 +576,7 @@ exports.handover = async (req, res, next) => {
         approvedById,
         closedById: userId,
         heldSalesCount,
+        restaurantTipTotals,
         heldSalesPolicy: settings.heldSalesOnClose,
         journalEntryId,
       });
@@ -617,6 +622,16 @@ exports.handover = async (req, res, next) => {
         openingFloat: counted.countedCash,
         openingCount: counted.count,
       });
+      const restaurantHandover = await restaurantOrderService.carryOpenOrdersForShiftHandover(tx, {
+        companyId,
+        registerId,
+        fromUserId: userId,
+        toUserId,
+        shiftId,
+        toShiftId: newShift.id,
+      });
+      if (restaurantHandover.code) return restaurantHandover;
+      const carriedRestaurantOrders = restaurantHandover.orders;
       await writePosAuditLog({
         companyId,
         registerId,

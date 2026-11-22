@@ -236,6 +236,18 @@ exports.createDirectSale = async (req, res, next) => {
     if (buyerTin && !/^\d{9}$/.test(buyerTin)) {
       return res.status(422).json({ success: false, code: 'POS_BUYER_TIN_INVALID', message: 'Buyer TIN must contain exactly 9 digits.' });
     }
+    requestKey = req.posV2Completion
+      ? String(req.posV2Completion.offlineOperationId || req.posV2Completion.completionKey || '').trim()
+      : String(proformaDocument?.conversionKey || req.get('Idempotency-Key') || '').trim();
+    if (requestKey && !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,99}$/.test(requestKey)) {
+      return res.status(400).json({ success: false, code: 'POS_INVALID_IDEMPOTENCY_KEY', message: 'Checkout idempotency key is invalid.' });
+    }
+    const hasOfflineOperation = Boolean(
+      req.body.offlineSnapshotCapability || req.body.offlineSaleId
+      || req.body.offlineCreatedAt || req.body.offlineOperationId,
+    );
+    payloadHash = hashPosSalePayload(req.body);
+    if (requestKey && !hasOfflineOperation && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
     const salespersonId = String(req.body?.salespersonId || req.posAuthContext?.session?.userId || req.user?.id || req.user?._id || '').trim();
     let salesperson = null;
     if (salespersonId) {
@@ -250,17 +262,7 @@ exports.createDirectSale = async (req, res, next) => {
     // Legacy checkout, pending V2 creation, and online/offline V2 completion
     // all reserve this company-scoped request row inside the sale transaction.
     // The invoice completion key remains as a domain-level recovery check.
-    requestKey = req.posV2Completion
-      ? String(req.posV2Completion.offlineOperationId || req.posV2Completion.completionKey || '').trim()
-      : String(proformaDocument?.conversionKey || req.get('Idempotency-Key') || '').trim();
-    if (requestKey && !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,99}$/.test(requestKey)) {
-      return res.status(400).json({ success: false, code: 'POS_INVALID_IDEMPOTENCY_KEY', message: 'Checkout idempotency key is invalid.' });
-    }
     const requestedRegisterId = String(req.body.registerId || '');
-    const hasOfflineOperation = Boolean(
-      req.body.offlineSnapshotCapability || req.body.offlineSaleId
-      || req.body.offlineCreatedAt || req.body.offlineOperationId,
-    );
     const claimedRegister = await findClaimedRegister(companyId, requestedRegisterId, req.body.deviceId);
     if (!claimedRegister) throw registerClaimRequiredError();
     if (claimedRegister.trainingMode) {
@@ -297,7 +299,6 @@ exports.createDirectSale = async (req, res, next) => {
       });
     }
     const isV2Pending = req.posPaymentFlow === 'PAYMENTS_V2' && !req.posV2Completion;
-    payloadHash = hashPosSalePayload(req.body);
     if (isV2Pending && !requestKey) {
       return res.status(400).json({
         success: false,
@@ -305,7 +306,6 @@ exports.createDirectSale = async (req, res, next) => {
         message: 'Provide an Idempotency-Key before creating a pending POS sale.',
       });
     }
-    if (requestKey && !hasOfflineOperation && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
     if (hasOfflineOperation) {
       const claims = verifyPosOfflineCapability(req.body.offlineSnapshotCapability);
       const offlineSaleId = String(req.body.offlineSaleId || '').trim();
@@ -904,7 +904,7 @@ exports.createDirectSale = async (req, res, next) => {
         || String(item.taxCode || '') !== String(restaurantLine.taxCode || '')
         || Number(item.taxRate) !== Number(restaurantLine.taxRate)
         || String(item.description || '') !== String(restaurantLine.description || '')
-        || Number(item.discountPct || 0) !== 0
+        || Number(item.discountPct || 0) !== Number(restaurantLine.discountPct || 0)
       )) {
         return res.status(409).json({
           success: false,
@@ -1173,7 +1173,11 @@ exports.createDirectSale = async (req, res, next) => {
       } else if (serialNumbers.length) {
         return res.status(400).json({ success: false, code: 'POS_SERIALS_NOT_ALLOWED', message: `${product.name} is not configured for serial tracking.` });
       }
-      if (isStockable) {
+      const restaurantUsesRecipeStock = Boolean(
+        restaurantLine
+        && (restaurantLine.stockMode === 'recipe' || restaurantLine.barStockProductId),
+      );
+      if (isStockable && !restaurantUsesRecipeStock) {
         const stockLevel = stockLevelByProduct.get(String(product._id));
         const availableStock = stockLevel
           ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - Number(stockLevel.qty_reserved || 0) - (quarantinedByProduct.get(String(product._id)) || 0))
@@ -1246,11 +1250,12 @@ exports.createDirectSale = async (req, res, next) => {
         taxAmount: taxAmount,
         lineSubtotal: subtotal,
         lineTotal: lineTotal,
+        serviceChargeExempt: restaurantLine?.serviceChargeExempt === true,
         warehouse: warehouseId,
         serialNumbers,
       });
 
-      if (isStockable) {
+      if (isStockable && !restaurantUsesRecipeStock) {
         stockUpdates.push({
           product,
           quantity,
@@ -1350,12 +1355,38 @@ exports.createDirectSale = async (req, res, next) => {
     }
 
     // Calculate totals
-    const subtotal = roundMoney(invoiceLines.reduce((sum, line) => sum + line.lineSubtotal, 0));
+    const serviceCharge = req.posRestaurantCheckout?.serviceCharge || null;
+    const serviceChargeAmount = Number(serviceCharge?.amountRwf || 0);
+    const serviceChargeTaxAmount = Number(serviceCharge?.taxAmountRwf || 0);
+    if (serviceCharge && (
+      !['off', 'income', 'pass-through'].includes(serviceCharge.mode)
+      || !Number.isFinite(serviceChargeAmount)
+      || serviceChargeAmount < 0
+      || !Number.isFinite(serviceChargeTaxAmount)
+      || serviceChargeTaxAmount < 0
+      || (serviceCharge.mode === 'off' && (serviceChargeAmount > 0 || serviceChargeTaxAmount > 0))
+      || (serviceCharge.taxable !== true && serviceChargeTaxAmount !== 0)
+      || (serviceChargeAmount > 0 && !Number.isFinite(Number(serviceCharge.ratePct)))
+    )) {
+      return res.status(409).json({
+        success: false,
+        code: 'RESTAURANT_SERVICE_CHARGE_SNAPSHOT_INVALID',
+        message: 'The saved Restaurant service-charge details are invalid. Review the bill before retrying.',
+      });
+    }
+    const itemSubtotal = roundMoney(invoiceLines.reduce((sum, line) => sum + line.lineSubtotal, 0));
+    const subtotal = roundMoney(itemSubtotal + serviceChargeAmount);
     const voucherDiscountRwf = Number(voucherQuote?.pricing.totals.voucherDiscountRwf || 0);
     const totalDiscount = roundMoney(discountBeforeVouchers + voucherDiscountRwf);
     const netSales = roundMoney(subtotal - totalDiscount);
-    const totalTax = roundMoney(invoiceLines.reduce((sum, line) => sum + line.taxAmount, 0));
-    const grandTotal = roundMoney(invoiceLines.reduce((sum, line) => sum + line.lineTotal, 0));
+    const totalTax = roundMoney(
+      invoiceLines.reduce((sum, line) => sum + line.taxAmount, 0) + serviceChargeTaxAmount,
+    );
+    const grandTotal = roundMoney(
+      invoiceLines.reduce((sum, line) => sum + line.lineTotal, 0)
+        + serviceChargeAmount
+        + serviceChargeTaxAmount,
+    );
     if (offlineContext) {
       const savedDisplayTotal = Number(req.body.displayTotal);
       if (Number.isFinite(savedDisplayTotal) && Math.abs(savedDisplayTotal - grandTotal) > 0.009) {
@@ -1933,8 +1964,18 @@ exports.createDirectSale = async (req, res, next) => {
           where: { companyId: String(companyId), invoiceId: String(invoice._id) },
           orderBy: { lineOrder: 'asc' },
         });
-        if (savedLines.length !== invoiceLines.length
-          || savedLines.some((line, index) => !lineValuesMatch(line, invoiceLines[index]))) {
+        const savedItemLines = savedLines.filter((line) => line.isServiceLine !== true);
+        const savedServiceLines = savedLines.filter((line) => line.isServiceLine === true);
+        const serviceLineMatches = serviceChargeAmount > 0
+          ? savedServiceLines.length === 1
+            && Math.abs(Number(savedServiceLines[0].lineSubtotal) - serviceChargeAmount) <= 0.005
+            && Math.abs(Number(savedServiceLines[0].lineTax) - serviceChargeTaxAmount) <= 0.005
+            && Math.abs(Number(savedServiceLines[0].lineTotal) - serviceChargeAmount - serviceChargeTaxAmount) <= 0.005
+            && savedServiceLines[0].serviceChargeExempt === true
+          : savedServiceLines.length === 0;
+        if (savedItemLines.length !== invoiceLines.length
+          || savedItemLines.some((line, index) => !lineValuesMatch(line, invoiceLines[index]))
+          || !serviceLineMatches) {
           throw Object.assign(new Error('The pending sale lines changed. Review or cancel the pending sale before retrying.'), {
             code: 'POS_PENDING_SALE_LINES_CHANGED',
           });
@@ -2526,6 +2567,74 @@ exports.createDirectSale = async (req, res, next) => {
       }
       if (stockMovementCreates.length > 0) {
         await StockMovement.insertMany(stockMovementCreates, { session });
+      }
+      const restaurantManagedLines = Array.isArray(req.posRestaurantCheckout?.lines)
+        ? req.posRestaurantCheckout.lines.filter((line) => (
+          line.stockMode === 'recipe' || Boolean(line.barStockProductId)
+        ))
+        : [];
+      if (restaurantManagedLines.length) {
+        const orderItemIds = restaurantManagedLines.map((line) => String(line.itemId || ''));
+        if (orderItemIds.some((id) => !isObjectIdString(id))) {
+          throw Object.assign(new Error('The Restaurant checkout is missing valid order item references for stock costing.'), {
+            code: 'RESTAURANT_STOCK_COST_REFERENCE_INVALID',
+          });
+        }
+        const commitments = await postingClient.restaurantStockCommitment.findMany({
+          where: {
+            companyId: String(companyId),
+            orderItemId: { in: orderItemIds },
+            status: 'committed',
+          },
+          select: { orderItemId: true, totalCost: true },
+        });
+        const costsByItemId = new Map();
+        for (const commitment of commitments) {
+          costsByItemId.set(
+            commitment.orderItemId,
+            (costsByItemId.get(commitment.orderItemId) || 0) + Number(commitment.totalCost || 0),
+          );
+        }
+        for (const restaurantLine of restaurantManagedLines) {
+          const itemId = String(restaurantLine.itemId);
+          if (!costsByItemId.has(itemId)) {
+            throw Object.assign(new Error('Restaurant recipe or bar stock costs are missing. Review stock commitments before completing payment.'), {
+              code: 'RESTAURANT_STOCK_COST_MISSING',
+            });
+          }
+          const lineOrder = req.posRestaurantCheckout.lines.indexOf(restaurantLine);
+          const invoiceLine = storedLinesForPosting[lineOrder];
+          if (!invoiceLine || String(invoiceLine.productId || invoiceLine.product || '') !== String(restaurantLine.productId)) {
+            throw Object.assign(new Error('The Restaurant invoice line could not be matched to its stock commitment.'), {
+              code: 'RESTAURANT_STOCK_COST_LINE_MISMATCH',
+            });
+          }
+          const quantity = Number(restaurantLine.quantity);
+          const cogsAmount = Number(costsByItemId.get(itemId).toFixed(2));
+          if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(cogsAmount) || cogsAmount < 0) {
+            throw Object.assign(new Error('The saved Restaurant stock cost is invalid.'), {
+              code: 'RESTAURANT_STOCK_COST_INVALID',
+            });
+          }
+          const unitCost = Number((cogsAmount / quantity).toFixed(6));
+          invoiceLine.unitCost = unitCost;
+          invoiceLine.cogsAmount = cogsAmount;
+          const costUpdate = await postingClient.invoiceLine.updateMany({
+            where: {
+              invoiceId: String(invoice._id),
+              companyId: String(companyId),
+              lineOrder,
+              productId: String(restaurantLine.productId),
+            },
+            data: { unitCost, cogsAmount },
+          });
+          if (costUpdate.count !== 1) {
+            throw Object.assign(new Error('The Restaurant stock cost could not be saved to its invoice line.'), {
+              code: 'RESTAURANT_STOCK_COST_SAVE_FAILED',
+            });
+          }
+          totalCOGS += cogsAmount;
+        }
       }
       if (offlineContext) {
         await dbClient().$executeRawUnsafe(

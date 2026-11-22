@@ -70,6 +70,8 @@ async function buildPosSaleJournalEntries({
     tillType: String(register.systemTillType || 'retail').toLowerCase(),
     registerId: String(register.id || register._id),
   };
+  const serviceCharge = invoice.posCheckoutPayload?.restaurantCheckoutSnapshot?.serviceCharge || null;
+  const serviceChargeAmount = Number(serviceCharge?.amountRwf || 0);
   const mappedAccount = async (profileKey, moduleName, mappingKey, fallback) => {
     try {
       return posAccountingProfileService.resolveAccount(accountingProfile, profileKey, scope)
@@ -100,6 +102,22 @@ async function buildPosSaleJournalEntries({
       vatOutput: await mappedAccount('vatOutput', 'tax', 'vatOutput', DEFAULT_ACCOUNTS.vatOutput),
       costOfGoodsSold: await mappedAccount('costOfGoodsSold', 'inventory', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold),
     };
+    if (serviceChargeAmount > 0) {
+      const serviceChargeAccount = serviceCharge.mode === 'income'
+        ? 'serviceChargeIncome'
+        : serviceCharge.mode === 'pass-through'
+          ? 'serviceChargePayable'
+          : null;
+      if (!serviceChargeAccount) {
+        throw Object.assign(new TypeError('Restaurant service-charge mode is invalid for accounting.'), {
+          code: 'RESTAURANT_SERVICE_CHARGE_ACCOUNTING_INVALID',
+        });
+      }
+      Object.assign(
+        accounts,
+        posAccountingProfileService.assertAccountMappings(accountingProfile, [serviceChargeAccount], scope),
+      );
+    }
   } catch (error) {
     error.accountingPostingFailure = true;
     throw error;
@@ -107,6 +125,7 @@ async function buildPosSaleJournalEntries({
   const postingInvoice = {
     id: String(invoice._id || invoice.id),
     referenceNo: invoice.referenceNo,
+    posCheckoutPayload: invoice.posCheckoutPayload,
     ebm: { ...(invoice.ebm || {}), ...(paymentFlow === 'PAYMENTS_V2' ? { paymentFlow } : {}) },
     totalAmount,
     subtotal,

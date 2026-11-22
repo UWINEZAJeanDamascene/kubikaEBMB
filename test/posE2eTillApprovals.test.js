@@ -14,6 +14,7 @@ jest.mock('../lib/prisma', () => ({
     user: { findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn() },
     tillSession: { findFirst: jest.fn(), findMany: jest.fn() },
     posRegister: { findFirst: jest.fn() },
+    posDevice: { findFirst: jest.fn() },
     posManagerApproval: { create: jest.fn(), findMany: jest.fn() },
     posApprovalPolicy: { findUnique: jest.fn().mockResolvedValue(null) },
     product: { findMany: jest.fn() },
@@ -82,7 +83,14 @@ describe('POS E2E — till open / close / variance', () => {
     prisma.posApprovalPolicy.findUnique.mockResolvedValue(null);
     resolveUserRoles.mockResolvedValue([{ name: 'sales', is_system_role: true }]);
     PermissionService.check.mockReturnValue(false);
-    prisma.posRegister.findFirst.mockResolvedValue({ name: 'Front counter' });
+    const claimedRegister = { id: '888888888888888888888888', code: IDS.registerId, name: 'Front counter', isActive: true };
+    prisma.posRegister.findFirst.mockResolvedValue(claimedRegister);
+    prisma.posDevice.findFirst.mockResolvedValue({
+      id: '777777777777777777777777',
+      deviceId: IDS.deviceId,
+      status: 'active',
+      register: claimedRegister,
+    });
   });
 
   test('opens a till with opening float for a free register', async () => {

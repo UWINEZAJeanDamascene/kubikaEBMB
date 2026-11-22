@@ -1055,6 +1055,10 @@ model Company {
   posChequeDeposits           PosChequeDeposit[]
   posCheques                  PosCheque[]
   posPaymentSettings          PosPaymentSettings?
+  restaurantBillingSettings  RestaurantBillingSettings?
+  restaurantTips             RestaurantTip[]
+  restaurantTipPayouts        RestaurantTipPayout[]
+  restaurantTipReversals      RestaurantTipReversal[]
   posManagerApprovals         PosManagerApproval[]
   posApprovalRequests         PosApprovalRequest[]
   posHeldSales                PosHeldSale[]
@@ -1158,6 +1162,7 @@ model User {
   confirmedPosPayments        PosPayment[]               @relation("PosPaymentConfirmedBy")
   reconciledPosPayments       PosPayment[]               @relation("PosPaymentReconciledBy")
   approvedPosPaymentRefunds   PosPaymentRefund[]         @relation("PosPaymentRefundApprovedBy")
+  releasedRestaurantBillPaymentLocks RestaurantBillPayment[] @relation("RestaurantBillPaymentLockReleasedBy")
   createdPosHeldSales         PosHeldSale[]
   roles                       UserRole[]
   sessions                    UserSession[]
@@ -2420,6 +2425,24 @@ model PosPaymentSettings {
   @@map("pos_payment_settings")
 }
 
+model RestaurantBillingSettings {
+  companyId                 String   @id @map("company_id") @db.Char(24)
+  tipsEnabled               Boolean  @default(false) @map("tips_enabled")
+  tipAttribution            String   @default("closing_waiter") @map("tip_attribution") @db.VarChar(24)
+  largeTipConfirmationPct   Decimal  @default(100) @map("large_tip_confirmation_pct") @db.Decimal(7, 4)
+  serviceChargeMode         String   @default("off") @map("service_charge_mode") @db.VarChar(16)
+  serviceChargeRatePct      Decimal? @map("service_charge_rate_pct") @db.Decimal(7, 4)
+  serviceChargeRateByTillType Json   @default("{}") @map("service_charge_rate_by_till_type")
+  serviceChargeRateByRegister Json  @default("{}") @map("service_charge_rate_by_register")
+  serviceChargeTaxable      Boolean? @map("service_charge_taxable")
+  serviceChargeTaxRateId    String?  @map("service_charge_tax_rate_id") @db.Char(24)
+  updatedById               String?  @map("updated_by_id") @db.Char(24)
+  updatedAt                 DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company                   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@map("restaurant_billing_settings")
+}
+
 /// Customer prepayments recognised as revenue over time. `recognitions` holds the
 /// schedule rows ({ _id, amount, date, description, status, journalEntryId }).
 model DeferredRevenue {
@@ -2538,6 +2561,11 @@ model RestaurantMenuItem {
   displayOrder     Int      @default(0) @map("display_order")
   measureName      String?  @map("measure_name") @db.VarChar(32)
   measuresPerBottle Decimal? @map("measures_per_bottle") @db.Decimal(10, 4)
+  barStockProductId String? @map("bar_stock_product_id") @db.Char(24)
+  barPurchaseUnitCode String? @map("bar_purchase_unit_code") @db.VarChar(24)
+  barServingVolume Decimal? @map("bar_serving_volume") @db.Decimal(19, 6)
+  barServingUnit   String?  @map("bar_serving_unit") @db.VarChar(32)
+  serviceChargeExempt Boolean @default(false) @map("service_charge_exempt")
   createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
@@ -2545,6 +2573,77 @@ model RestaurantMenuItem {
   @@unique([companyId, productId], map: "restaurant_menu_items_company_product_id_key")
   @@index([companyId, isAvailable, displayOrder], map: "restaurant_menu_items_company_available_order_idx")
   @@map("restaurant_menu_items")
+}
+
+model RestaurantRecipeIngredient {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  menuItemId      String   @map("menu_item_id") @db.Char(24)
+  productId       String   @map("product_id") @db.Char(24)
+  quantity        Decimal  @db.Decimal(19, 6)
+  unitCode        String   @map("unit_code") @db.VarChar(24)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, menuItemId, productId], map: "restaurant_recipe_ingredients_company_item_product_key")
+  @@index([companyId, productId], map: "restaurant_recipe_ingredients_company_product_idx")
+  @@map("restaurant_recipe_ingredients")
+}
+
+model RestaurantHappyHourPromotion {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  menuItemId  String   @map("menu_item_id") @db.Char(24)
+  name        String   @db.VarChar(120)
+  kind        String   @db.VarChar(16)
+  value       Decimal  @db.Decimal(19, 4)
+  weekdays    Int[]    @default([])
+  startMinute Int      @map("start_minute")
+  endMinute   Int      @map("end_minute")
+  startsAt    DateTime? @map("starts_at") @db.Timestamptz(3)
+  endsAt      DateTime? @map("ends_at") @db.Timestamptz(3)
+  isEnabled   Boolean  @default(true) @map("is_enabled")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([companyId, menuItemId, isEnabled], map: "restaurant_happy_hour_company_item_enabled_idx")
+  @@map("restaurant_happy_hour_promotions")
+}
+
+model RestaurantInventorySettings {
+  companyId               String   @id @map("company_id") @db.Char(24)
+  recipeShortageMode      String   @default("warn") @map("recipe_shortage_mode") @db.VarChar(16)
+  stationWarehouseOverrides Json   @default("{}") @map("station_warehouse_overrides")
+  updatedById             String?  @map("updated_by_id") @db.Char(24)
+  updatedAt               DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("restaurant_inventory_settings")
+}
+
+model RestaurantStockCommitment {
+  id            String    @id @db.Char(24)
+  companyId     String    @map("company_id") @db.Char(24)
+  orderId       String    @map("order_id") @db.Char(24)
+  orderItemId   String    @map("order_item_id") @db.Char(24)
+  productId     String    @map("product_id") @db.Char(24)
+  warehouseId   String    @map("warehouse_id") @db.Char(24)
+  quantity      Decimal   @db.Decimal(19, 6)
+  sourceType    String   @default("recipe") @map("source_type") @db.VarChar(16)
+  servingCount  Int      @default(0) @map("serving_count")
+  purchaseUnitCode String? @map("purchase_unit_code") @db.VarChar(24)
+  purchaseUnitVolume Decimal? @map("purchase_unit_volume") @db.Decimal(19, 6)
+  status        String    @default("committed") @db.VarChar(16)
+  unitCost      Decimal?  @map("unit_cost") @db.Decimal(19, 6)
+  totalCost     Decimal?  @map("total_cost") @db.Decimal(19, 4)
+  committedAt   DateTime  @default(now()) @map("committed_at") @db.Timestamptz(3)
+  closedAt      DateTime? @map("closed_at") @db.Timestamptz(3)
+  voidedAt      DateTime? @map("voided_at") @db.Timestamptz(3)
+  voidDecision  String?   @map("void_decision") @db.VarChar(16)
+
+  @@unique([companyId, orderItemId, productId, warehouseId], map: "restaurant_stock_commitments_company_item_product_warehouse_key")
+  @@index([companyId, productId, warehouseId, status], map: "restaurant_stock_commitments_available_idx")
+  @@index([companyId, orderId, status], map: "restaurant_stock_commitments_order_status_idx")
+  @@map("restaurant_stock_commitments")
 }
 
 model RestaurantModifierGroup {
@@ -2676,6 +2775,9 @@ model RestaurantBill {
   id              String   @id @db.Char(24)
   companyId       String   @map("company_id") @db.Char(24)
   orderId         String   @map("order_id") @db.Char(24)
+  checkNumber     Int      @default(1) @map("check_number")
+  guestNumber     Int?     @map("guest_number")
+  reallocationKey String?  @map("reallocation_key") @db.VarChar(100)
   invoiceId       String?  @map("invoice_id") @db.Char(24)
   version         Int      @default(1)
   status          String   @default("issued") @db.VarChar(24)
@@ -2683,6 +2785,15 @@ model RestaurantBill {
   subtotal        Decimal  @db.Decimal(19, 2)
   taxAmount       Decimal  @map("tax_amount") @db.Decimal(19, 2)
   totalAmount     Decimal  @map("total_amount") @db.Decimal(19, 2)
+  serviceChargeAmount Decimal @default(0) @map("service_charge_amount") @db.Decimal(19, 2)
+  serviceChargeTaxAmount Decimal @default(0) @map("service_charge_tax_amount") @db.Decimal(19, 2)
+  serviceChargeRatePct Decimal? @map("service_charge_rate_pct") @db.Decimal(7, 4)
+  serviceChargeMode String @default("off") @map("service_charge_mode") @db.VarChar(16)
+  serviceChargeTaxable Boolean @default(false) @map("service_charge_taxable")
+  serviceChargeTaxRateId String? @map("service_charge_tax_rate_id") @db.Char(24)
+  serviceChargeOverrideReason String? @map("service_charge_override_reason") @db.VarChar(500)
+  serviceChargeOverriddenById String? @map("service_charge_overridden_by_id") @db.Char(24)
+  serviceChargeOverriddenAt DateTime? @map("service_charge_overridden_at") @db.Timestamptz(3)
   lineSnapshot    Json     @map("line_snapshot")
   payerAllocations Json   @map("payer_allocations")
   createdById     String   @map("created_by_id") @db.Char(24)
@@ -2690,25 +2801,103 @@ model RestaurantBill {
   updatedAt       DateTime @map("updated_at") @db.Timestamptz(3)
 
   @@unique([companyId, id])
-  @@unique([companyId, orderId])
+  @@unique([companyId, orderId, checkNumber], map: "restaurant_bills_company_order_check_key")
   @@unique([companyId, invoiceId])
   @@unique([invoiceId])
+  @@index([companyId, orderId, status], map: "restaurant_bills_company_order_status_idx")
   @@map("restaurant_bills")
 }
 
 model RestaurantBillPayment {
-  id          String   @id @db.Char(24)
-  companyId   String   @map("company_id") @db.Char(24)
-  billId      String   @map("bill_id") @db.Char(24)
-  paymentId   String   @map("payment_id") @db.Char(24)
-  payerNumber Int      @map("payer_number")
-  amount      Int
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  id                 String    @id @db.Char(24)
+  companyId          String    @map("company_id") @db.Char(24)
+  billId             String    @map("bill_id") @db.Char(24)
+  paymentId          String    @map("payment_id") @db.Char(24)
+  payerNumber        Int       @map("payer_number")
+  amount             Int
+  lockReleasedAt     DateTime? @map("lock_released_at") @db.Timestamptz(3)
+  lockReleaseReason  String?   @map("lock_release_reason") @db.VarChar(500)
+  lockReleasedById   String?   @map("lock_released_by_id") @db.Char(24)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  lockReleasedBy     User?     @relation("RestaurantBillPaymentLockReleasedBy", fields: [lockReleasedById], references: [id], onDelete: SetNull)
 
   @@unique([companyId, paymentId])
   @@unique([paymentId])
   @@unique([companyId, billId, payerNumber, paymentId])
   @@map("restaurant_bill_payments")
+}
+
+model RestaurantTip {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  billId          String   @map("bill_id") @db.Char(24)
+  orderId         String   @map("order_id") @db.Char(24)
+  waiterId        String   @map("waiter_id") @db.Char(24)
+  registerId      String   @map("register_id") @db.Char(24)
+  shiftId         String?  @map("shift_id") @db.Char(24)
+  cashierId       String   @map("cashier_id") @db.Char(24)
+  amount          Int
+  paymentMethod   String   @map("payment_method") @db.VarChar(32)
+  provider        String?  @db.VarChar(32)
+  reference       String?  @db.VarChar(160)
+  idempotencyKey  String   @map("idempotency_key") @db.VarChar(160)
+  captureMode     String   @default("cash_tip") @map("capture_mode") @db.VarChar(20)
+  tenderedAmount  Int?     @map("tendered_amount")
+  postingStatus   String   @default("pending") @map("posting_status") @db.VarChar(20)
+  journalEntryId  String?  @map("journal_entry_id") @db.Char(24)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  reversals       RestaurantTipReversal[]
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId, waiterId, createdAt])
+  @@index([companyId, billId, createdAt])
+  @@map("restaurant_tips")
+}
+
+model RestaurantTipPayout {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  waiterId        String   @map("waiter_id") @db.Char(24)
+  registerId      String   @map("register_id") @db.Char(24)
+  shiftId         String?  @map("shift_id") @db.Char(24)
+  amount          Int
+  paymentMethod   String   @map("payment_method") @db.VarChar(16)
+  accountCode     String   @map("account_code") @db.VarChar(64)
+  reference       String?  @db.VarChar(160)
+  reason          String   @db.VarChar(500)
+  approvedById    String   @map("approved_by_id") @db.Char(24)
+  idempotencyKey  String   @map("idempotency_key") @db.VarChar(160)
+  postingStatus   String   @default("pending") @map("posting_status") @db.VarChar(20)
+  journalEntryId  String?  @map("journal_entry_id") @db.Char(24)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId, waiterId, createdAt])
+  @@map("restaurant_tip_payouts")
+}
+
+model RestaurantTipReversal {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  tipId           String   @map("tip_id") @db.Char(24)
+  registerId      String   @map("register_id") @db.Char(24)
+  shiftId         String?  @map("shift_id") @db.Char(24)
+  amount          Int
+  reason          String   @db.VarChar(500)
+  approvedById    String   @map("approved_by_id") @db.Char(24)
+  idempotencyKey  String   @map("idempotency_key") @db.VarChar(160)
+  postingStatus   String   @default("pending") @map("posting_status") @db.VarChar(20)
+  journalEntryId  String?  @map("journal_entry_id") @db.Char(24)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  tip             RestaurantTip @relation(fields: [tipId], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId, tipId, createdAt])
+  @@index([companyId, shiftId, createdAt])
+  @@map("restaurant_tip_reversals")
 }
 
 model RestaurantKitchenTicket {
@@ -4023,6 +4212,8 @@ model InvoiceLine {
   invoiceId      String     @map("invoice_id") @db.Char(24)
   lineOrder      Int        @default(0) @map("line_order")
   lineId         String?    @map("line_id") @db.Char(24)
+  isServiceLine  Boolean    @default(false) @map("is_service_line")
+  serviceChargeExempt Boolean @default(false) @map("service_charge_exempt")
   productId      String     @map("product_id") @db.Char(24)
   productName    String?    @map("product_name")
   productCode    String?    @map("product_code")
@@ -7413,6 +7604,7 @@ enum StockMovementType {
 enum StockMovementReason {
   purchase
   sale
+  restaurant_recipe
   return
   damage
   loss

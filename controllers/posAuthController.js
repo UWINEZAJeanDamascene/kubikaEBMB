@@ -109,6 +109,7 @@ async function publicRegister(register) {
     location: register.location || '',
     branchId: register.branchId || null,
     branchName: branch?.name || '',
+    systemTillType: register.systemTillType || 'retail',
   };
 }
 

@@ -138,6 +138,8 @@ function invoiceLineToApi(row) {
       lineSubtotal: qtyNum(row.lineSubtotal),
       lineTax: qtyNum(row.lineTax),
       lineTotal: qtyNum(row.lineTotal),
+      isServiceLine: row.isServiceLine === true,
+      serviceChargeExempt: row.serviceChargeExempt === true,
       unitCost: moneyStr(row.unitCost),
       cogsAmount: moneyStr(row.cogsAmount),
       warehouse: row.warehouseId ?? null,
@@ -314,6 +316,8 @@ async function invoiceTranslateCreate(data) {
       projectId: line.projectId || line.project_id ? toIdString(line.projectId || line.project_id) : null,
       qtyCredited: line.qtyCredited ?? 0,
       qtyDelivered: line.qtyDelivered ?? 0,
+      isServiceLine: line.isServiceLine === true,
+      serviceChargeExempt: line.serviceChargeExempt === true,
       serialNumbers: Array.isArray(line.serialNumbers) ? line.serialNumbers : [],
     };
   });

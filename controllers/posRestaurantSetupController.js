@@ -62,6 +62,10 @@ exports.updateMenuItem = action(200, (req, companyId, actor) => (
   setupService.updateMenuItem(companyId, req.params.menuItemId, req.body, actor)
 ));
 
+exports.updateInventorySettings = action(200, (req, companyId, actor) => (
+  setupService.updateInventorySettings(companyId, req.body, actor)
+));
+
 exports.createModifierGroup = action(201, (req, companyId, actor) => (
   setupService.createModifierGroup(companyId, req.body, actor)
 ));

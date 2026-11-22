@@ -144,6 +144,7 @@ function emptyCheckoutDb() {
   return {
     stockBatch: { groupBy: jest.fn().mockResolvedValue([]) },
     systemSettings: { findUnique: jest.fn().mockResolvedValue(null) },
+    user: { findFirst: jest.fn().mockResolvedValue({ id: IDS.cashier, name: 'Cashier' }) },
     userRole: { findMany: jest.fn().mockResolvedValue([]) },
     $queryRawUnsafe: checkoutQueryMock(),
     $executeRawUnsafe: jest.fn().mockResolvedValue(1),
@@ -230,11 +231,13 @@ function stubHappyPathDeps({ stockMatchedCount = 1, momoBank = null } = {}) {
   const db = {
     stockBatch: { groupBy: jest.fn().mockResolvedValue([]) },
     category: { findMany: jest.fn().mockResolvedValue([]) },
+    user: { findFirst: jest.fn().mockResolvedValue({ id: IDS.cashier, name: 'Cashier' }) },
     userRole: { findMany: jest.fn().mockResolvedValue([]) },
     invoiceLine: {
       findMany: jest.fn().mockResolvedValue([]),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
+    restaurantStockCommitment: { findMany: jest.fn().mockResolvedValue([]) },
     posCustomerCreditLedger: { create: jest.fn().mockResolvedValue({ id: 'credit-ledger-1' }) },
     systemSettings: { findUnique: jest.fn().mockResolvedValue({ posDiscountSettings: discountTestSettings }) },
     // SELECT replay → empty; INSERT reservation → claimed row.
@@ -261,6 +264,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'on', version: 1 });
     dbClient.mockReturnValue({
       systemSettings: { findUnique: jest.fn().mockResolvedValue(null) },
+      user: { findFirst: jest.fn().mockResolvedValue({ id: IDS.cashier, name: 'Cashier' }) },
       userRole: { findMany: jest.fn().mockResolvedValue([]) },
     });
     posAccountingProfileService.getProfile.mockResolvedValue({
@@ -470,6 +474,8 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(res.body.changeDue).toBe(0);
     expect(Invoice.create.mock.calls[0][0][0].posCheckoutPayload).toEqual({
       items: [{ unitPrice: 1000, catalogUnitPrice: 1000 }],
+      salespersonId: IDS.cashier,
+      salespersonName: 'Cashier',
     });
     expect(db.$queryRawUnsafe).toHaveBeenCalledWith(
       expect.stringContaining('"opened_by" AS "openedById"'),
@@ -528,6 +534,61 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       IDS.till,
       IDS.cashier,
     );
+  });
+
+  test('Restaurant recipe checkout uses committed ingredient cost without deducting the menu product twice', async () => {
+    const { db } = stubHappyPathDeps();
+    const orderItemId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const shiftId = '777777777777777777777778';
+    db.restaurantStockCommitment.findMany.mockResolvedValue([
+      { orderItemId, totalCost: 30 },
+      { orderItemId, totalCost: 5.25 },
+    ]);
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      if (String(sql).includes('FROM "pos_shifts"')) return [{ id: shiftId, openedById: IDS.cashier }];
+      if (String(sql).includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      return [];
+    });
+    const request = makeReq({
+      body: checkoutBody({ items: [saleLine({ taxCode: 'B', taxRate: 18 })] }),
+      headers: { 'Idempotency-Key': 'restaurant-recipe-cogs-0001' },
+    });
+    request.posRestaurantCheckout = {
+      lines: [{
+        itemId: orderItemId,
+        productId: IDS.product,
+        quantity: 1,
+        unitPrice: 1000,
+        taxCode: 'B',
+        taxRate: 18,
+        description: 'POS Widget',
+        discountPct: 0,
+        stockMode: 'recipe',
+        barStockProductId: null,
+      }],
+    };
+
+    const res = mockRes();
+    await createDirectSale(request, res, (err) => { throw err; });
+
+    expect(res.statusCode).toBe(201);
+    expect(inventoryService.consume).not.toHaveBeenCalled();
+    expect(StockLevel.updateMany).not.toHaveBeenCalled();
+    expect(Product.bulkWrite).not.toHaveBeenCalled();
+    expect(StockMovement.insertMany).not.toHaveBeenCalled();
+    expect(db.restaurantStockCommitment.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        companyId: IDS.company,
+        orderItemId: { in: [orderItemId] },
+        status: 'committed',
+      }),
+    }));
+    expect(db.invoiceLine.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ invoiceId: IDS.invoice, lineOrder: 0, productId: IDS.product }),
+      data: { unitCost: 35.25, cogsAmount: 35.25 },
+    }));
+    const journalLines = JournalService.createEntriesAtomic.mock.calls[0][2].flatMap((entry) => entry.lines);
+    expect(journalLines).toEqual(expect.arrayContaining([expect.objectContaining({ debit: 35.25 })]));
   });
 
   test('completes an approved discounted sale without updating the protected walk-in customer', async () => {
@@ -1934,6 +1995,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
       client: IDS.client,
     });
     dbClient.mockReturnValue({
+      user: { findFirst: jest.fn().mockResolvedValue({ id: IDS.cashier, name: 'Cashier' }) },
       $queryRawUnsafe: jest.fn().mockResolvedValue([{
         requestKey: 'retry-key-abcdefghij',
         createdById: IDS.cashier,
@@ -2007,6 +2069,7 @@ describe('POS E2E — checkout (sales-legacy)', () => {
   test('idempotency key conflict rejects a different payload on the same key', async () => {
     CurrencyService.getCompanyBase.mockResolvedValue('RWF');
     dbClient.mockReturnValue({
+      user: { findFirst: jest.fn().mockResolvedValue({ id: IDS.cashier, name: 'Cashier' }) },
       $queryRawUnsafe: jest.fn().mockResolvedValue([{
         requestKey: 'conflict-key-abcdef',
         createdById: IDS.cashier,

@@ -226,6 +226,7 @@ async function buildShiftReportSnapshot({
   approvedById,
   closedById,
   heldSalesCount,
+  restaurantTipTotals,
   heldSalesPolicy,
   journalEntryId,
   postingStatus,
@@ -250,6 +251,14 @@ async function buildShiftReportSnapshot({
   snapshot.cash.journalEntryId = journalEntryId;
   snapshot.cash.postingStatus = postingStatus;
   snapshot.heldSales = { count: heldSalesCount, policy: heldSalesPolicy };
+  snapshot.restaurantTips = {
+    cashCollected: Number(restaurantTipTotals?.cashCollected || 0),
+    cashPaidOut: Number(restaurantTipTotals?.cashPaidOut || 0),
+    cashReversed: Number(restaurantTipTotals?.cashReversed || 0),
+    netCashEffect: Number(restaurantTipTotals?.cashCollected || 0)
+      - Number(restaurantTipTotals?.cashPaidOut || 0)
+      - Number(restaurantTipTotals?.cashReversed || 0),
+  };
   snapshot.fiscalReceipts.policy = fiscalClosePolicy;
   snapshot.fiscalReceipts.closeApproval = fiscalApprovedById
     ? { approved: true, approvedById: fiscalApprovedById }

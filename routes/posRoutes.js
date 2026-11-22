@@ -40,6 +40,8 @@ const posPinController = require('../controllers/posPinController');
 const {
   requireDevice,
   requirePosSession,
+  requirePosSystemTillType,
+  requirePosTrainingModeDisabled,
   requirePermission,
   requireCashMovementPermission,
 } = require('../middleware/posAuthMiddleware');
@@ -65,10 +67,14 @@ const posSecurityController = require('../controllers/posSecurityController');
 const posPaymentsV2Controller = require('../controllers/posPaymentsV2Controller');
 const posRestaurantOrderController = require('../controllers/posRestaurantOrderController');
 const posRestaurantBillController = require('../controllers/posRestaurantBillController');
+const posRestaurantTipController = require('../controllers/posRestaurantTipController');
 const posGiftCardController = require('../controllers/posGiftCardController');
 const posCreditAccountController = require('../controllers/posCreditAccountController');
 const posChequeController = require('../controllers/posChequeController');
 const posRestaurantSetupController = require('../controllers/posRestaurantSetupController');
+const posRestaurantBillingSettingsController = require('../controllers/posRestaurantBillingSettingsController');
+const requireRestaurantRegister = requirePosSystemTillType('restaurant');
+const requireProductionRestaurantRegister = requirePosTrainingModeDisabled();
 const canManagePosRegisters = requirePermissionOrRoles('pos.admin', 'registers', ['admin', 'manager', 'store_manager']);
 const canReadRestaurantReports = requirePosPermissions({ resource: 'pos.report', action: 'x' });
 const posPrintAgentRoutes = require('./posPrintAgentRoutes');
@@ -88,6 +94,7 @@ router.put('/register-settings', protect, canManagePosSettings, idem(posTillSett
 router.get('/restaurant/setup', protect, canManagePosSettings, posRestaurantSetupController.getSetup);
 router.post('/restaurant/setup/categories', protect, canManagePosSettings, idem(posRestaurantSetupController.createMenuCategory));
 router.patch('/restaurant/setup/categories/:categoryId', protect, canManagePosSettings, idem(posRestaurantSetupController.updateMenuCategory));
+router.put('/restaurant/setup/inventory-settings', protect, canManagePosSettings, idem(posRestaurantSetupController.updateInventorySettings));
 router.post('/restaurant/setup/menu-items', protect, canManagePosSettings, idem(posRestaurantSetupController.createMenuItem));
 router.patch('/restaurant/setup/menu-items/:menuItemId', protect, canManagePosSettings, idem(posRestaurantSetupController.updateMenuItem));
 router.post('/restaurant/setup/modifier-groups', protect, canManagePosSettings, idem(posRestaurantSetupController.createModifierGroup));
@@ -96,24 +103,33 @@ router.post('/restaurant/setup/areas', protect, canManagePosSettings, idem(posRe
 router.patch('/restaurant/setup/areas/:areaId', protect, canManagePosSettings, idem(posRestaurantSetupController.updateFloorArea));
 router.post('/restaurant/setup/areas/:areaId/tables', protect, canManagePosSettings, idem(posRestaurantSetupController.createTable));
 router.patch('/restaurant/setup/tables/:tableId', protect, canManagePosSettings, idem(posRestaurantSetupController.updateTable));
-router.get('/restaurant/orders/overview', requirePosSession(), requirePermission('pos.till.sell'), posRestaurantOrderController.getOverview);
+router.get('/restaurant/orders/overview', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), posRestaurantOrderController.getOverview);
 router.get('/restaurant/report-registers', protect, canReadRestaurantReports, posRestaurantOrderController.listReportRegisters);
 router.get('/restaurant/reports', protect, canReadRestaurantReports, posRestaurantOrderController.getReport);
-router.post('/restaurant/orders/handover', requirePosSession(), requirePermission('pos.shift.close'), idem(posRestaurantOrderController.handoverOpenOrders));
-router.get('/restaurant/orders/:orderId', requirePosSession(), requirePermission('pos.till.sell'), posRestaurantOrderController.getOrder);
-router.get('/restaurant/orders/:orderId/bill', requirePosSession(), requirePermission('pos.till.sell'), posRestaurantBillController.getOrderBill);
-router.post('/restaurant/orders/:orderId/bill', requirePosSession(), requirePermission('pos.till.sell'), idem(posRestaurantBillController.issueOrderBill));
-router.post('/restaurant/bills/:billId/payments', requirePosSession(), requirePermission('pos.payment.take'), idem(posRestaurantBillController.settleBill));
-router.post('/restaurant/orders', requirePosSession(), requirePermission('pos.till.sell'), idem(posRestaurantOrderController.openOrder));
-router.patch('/restaurant/orders/:orderId/items', requirePosSession(), requirePermission('pos.till.sell'), idem(posRestaurantOrderController.updateUnsentItems));
-router.post('/restaurant/orders/:orderId/send', requirePosSession(), requirePermission('pos.till.sell'), idem(posRestaurantOrderController.sendRound));
-router.post('/restaurant/orders/:orderId/items/:itemId/void', requirePosSession(), requirePermission('pos.till.void'), idem(posRestaurantOrderController.voidSentItem));
-router.get('/restaurant/stations/:station/tickets', requirePosSession(), requirePermission('pos.till.sell'), posRestaurantOrderController.listStationTickets);
-router.patch('/restaurant/tickets/:ticketId/status', requirePosSession(), requirePermission('pos.till.sell'), idem(posRestaurantOrderController.updateTicketStatus));
-router.post('/restaurant/tickets/:ticketId/retry', requirePosSession(), requirePermission('pos.till.sell'), idem(posRestaurantOrderController.retryTicket));
+router.post('/restaurant/orders/handover', requirePosSession(), requireRestaurantRegister, requireProductionRestaurantRegister, requirePermission('pos.shift.close'), idem(posRestaurantOrderController.handoverOpenOrders));
+router.get('/restaurant/orders/:orderId', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), posRestaurantOrderController.getOrder);
+router.get('/restaurant/orders/:orderId/bill', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), posRestaurantBillController.getOrderBill);
+router.post('/restaurant/orders/:orderId/bill', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantBillController.issueOrderBill));
+router.patch('/restaurant/orders/:orderId/bill/checks', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantBillController.moveItemsBetweenChecks));
+router.post('/restaurant/bills/:billId/payments', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.take'), idem(posRestaurantBillController.settleBill));
+router.post('/restaurant/bills/:billId/tips', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.take'), idem(posRestaurantTipController.captureCashTip));
+router.get('/restaurant/tips/settings', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), posRestaurantTipController.getCaptureSettings);
+router.get('/restaurant/tips/waiters', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.reconcile'), posRestaurantTipController.listWaiterTipBalances);
+router.post('/restaurant/tips/payouts', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.reconcile'), idem(posRestaurantTipController.payWaiterTips));
+router.post('/restaurant/tips/:tipId/reversal', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.reconcile'), idem(posRestaurantTipController.reverseCashTip));
+router.post('/restaurant/bills/:billId/payments/:paymentId/release', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.reconcile'), idem(posRestaurantBillController.releaseFailedPaymentLock));
+router.post('/restaurant/orders', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantOrderController.openOrder));
+router.patch('/restaurant/orders/:orderId/items', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantOrderController.updateUnsentItems));
+router.post('/restaurant/orders/:orderId/send', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantOrderController.sendRound));
+router.post('/restaurant/orders/:orderId/items/:itemId/void', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.void'), idem(posRestaurantOrderController.voidSentItem));
+router.get('/restaurant/stations/:station/tickets', requirePosSession(), requireRestaurantRegister, requireProductionRestaurantRegister, requirePermission('pos.till.sell'), posRestaurantOrderController.listStationTickets);
+router.patch('/restaurant/tickets/:ticketId/status', requirePosSession(), requireRestaurantRegister, requireProductionRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantOrderController.updateTicketStatus));
+router.post('/restaurant/tickets/:ticketId/retry', requirePosSession(), requireRestaurantRegister, requireProductionRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantOrderController.retryTicket));
 router.get('/admin/discount-settings', protect, canManagePosSettings, posDiscountSettingsController.getSettings);
 router.get('/admin/accounting-profile', protect, canManagePosSettings, posAccountingProfileController.getProfile);
 router.put('/admin/accounting-profile', protect, canManagePosSettings, idem(posAccountingProfileController.updateProfile));
+router.get('/admin/restaurant-billing-settings', protect, canManagePosSettings, posRestaurantBillingSettingsController.getSettings);
+router.put('/admin/restaurant-billing-settings', protect, canManagePosSettings, idem(posRestaurantBillingSettingsController.updateSettings));
 router.get('/admin/discount-settings/roles', protect, canManagePosSettings, posDiscountSettingsController.getRoles);
 router.put('/admin/discount-settings', protect, canManagePosSettings, idem(posDiscountSettingsController.updateSettings));
 router.patch('/admin/registers/:registerId/discount-settings', protect, canManagePosRegisters, idem(posDiscountSettingsController.updateRegisterSettings));

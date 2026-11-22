@@ -63,6 +63,12 @@ function bindPosUser(req, auth) {
   };
 }
 
+function posDeviceId(auth, register) {
+  const deviceId = String(auth?.posDevice?.deviceId || register?.claimedDeviceId || '').trim().toLowerCase();
+  if (!/^[a-f0-9-]{36}$/.test(deviceId)) return null;
+  return deviceId;
+}
+
 function invalid(res, status, code, message) {
   return res.status(status).json({ success: false, code, message });
 }
@@ -212,11 +218,13 @@ async function assertInvoiceContext(req, invoice) {
 exports.createPendingSale = (req, res, next) => {
   const auth = req.posAuthContext;
   if (!auth) return invalid(res, 401, 'POS_SESSION_INVALID', 'A valid POS session is required.');
+  const deviceId = posDeviceId(auth, auth.register);
+  if (!deviceId) return invalid(res, 403, 'POS_REGISTER_CLAIM_REQUIRED', 'This POS session is not bound to a claimed device.');
   bindPosUser(req, auth);
   req.body = {
     ...req.body,
     registerId: auth.register.code,
-    deviceId: auth.posDevice.deviceId,
+    deviceId,
   };
   req.posPaymentFlow = 'PAYMENTS_V2';
   return createDirectSale(req, res, next);
@@ -1522,12 +1530,14 @@ exports.completeSale = async (req, res, next) => {
     }
 
     bindPosUser(req, auth);
+    const deviceId = posDeviceId(auth, register);
+    if (!deviceId) return invalid(res, 403, 'POS_REGISTER_CLAIM_REQUIRED', 'This POS session is not bound to a claimed device.');
     req.body = {
       ...invoice.posCheckoutPayload,
       displayTotal: invoice.posCheckoutPayload.displayTotal ?? total,
       clientId: invoice.clientId,
       registerId: register.code,
-      deviceId: auth.posDevice.deviceId,
+      deviceId,
       tillSession: { id: invoice.tillSessionId },
       payments: payments.flatMap((payment) => {
         if (payment.method === 'CREDIT') {

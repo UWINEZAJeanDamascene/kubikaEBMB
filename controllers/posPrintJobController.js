@@ -36,6 +36,7 @@ function redactCustomerFields(value) {
 
 function ttlFor(jobType) {
   if (jobType === 'drawer-open') return 10;
+  if (jobType === 'restaurant-ticket') return 24 * 60 * 60;
   if (['receipt', 'refund-receipt', 'gift-card-slip'].includes(jobType)) return 120;
   if (jobType === 'test-print') return 30;
   if (['x-report', 'z-report', 'cash-movement-slip', 'report-pdf'].includes(jobType)) return 10 * 60;
@@ -45,6 +46,7 @@ function ttlFor(jobType) {
 
 function maxAttemptsFor(jobType) {
   if (jobType === 'drawer-open') return 2;
+  if (jobType === 'restaurant-ticket') return 12;
   if (['receipt', 'refund-receipt', 'gift-card-slip'].includes(jobType)) return 9;
   if (jobType === 'test-print') return 3;
   if (['x-report', 'z-report', 'cash-movement-slip', 'report-pdf'].includes(jobType)) return 8;
@@ -72,7 +74,7 @@ exports.createJob = async (req, res, next) => {
     const allowedTypes = [
       'receipt', 'refund-receipt', 'gift-card-slip', 'x-report', 'z-report',
       'cash-movement-slip', 'drawer-open', 'invoice-pdf', 'statement-pdf',
-      'report-pdf', 'test-print',
+      'report-pdf', 'test-print', 'restaurant-ticket',
     ];
     if (!/^[a-f\d]{24}$/i.test(registerId) || !allowedTypes.includes(jobType) || !idempotencyKey || !payload) {
       return res.status(400).json({ success: false, code: 'PRINT_JOB_INVALID', message: 'Invalid print job request.' });
@@ -660,7 +662,7 @@ exports.configurePrinter = async (req, res, next) => {
     const selectedCodePage = Number(codePage ?? 16);
     const copyCount = Number(copies ?? 1);
     const trayName = tray == null ? null : String(tray).trim() || null;
-    if (!['receipt', 'report', 'a4'].includes(printerRole)
+    if (!['receipt', 'report', 'a4', 'kitchen', 'bar'].includes(printerRole)
       || !['thermal', 'a4'].includes(size)
       || (printerRole === 'a4' && size !== 'a4')
       || (size === 'thermal' && ![58, 80].includes(width))
@@ -874,6 +876,27 @@ exports.acknowledge = async (req, res, next) => {
         leasedUntil: null,
       },
     });
+    if (job.jobType === 'restaurant-ticket') {
+      await prisma.restaurantKitchenTicket.updateMany({
+        where: { companyId: agent.companyId, printJobId: job.id },
+        data: {
+          lastError: terminal
+            ? `Printer fallback failed: ${errorMessage}`
+            : `Printer fallback retry queued: ${errorMessage}`,
+          retryCount: { increment: 1 },
+          updatedAt: now,
+        },
+      });
+    }
+    if (job.jobType === 'restaurant-ticket') {
+      await prisma.restaurantKitchenTicket.updateMany({
+        where: { companyId: agent.companyId, printJobId: job.id },
+        data: {
+          lastError: outcome === 'confirmed' ? null : 'Printer ticket was transmitted. Waiting for confirmation.',
+          updatedAt: now,
+        },
+      });
+    }
     await writePosAuditLog({
       companyId: agent.companyId, registerId: agent.registerId,
       event: outcome === 'confirmed' ? 'PRINT_JOB_CONFIRMED' : 'PRINT_JOB_TRANSMITTED',
@@ -942,6 +965,15 @@ exports.uncertain = async (req, res, next) => {
         leasedUntil: null,
       },
     });
+    if (job.jobType === 'restaurant-ticket') {
+      await prisma.restaurantKitchenTicket.updateMany({
+        where: { companyId: agent.companyId, printJobId: job.id },
+        data: {
+          lastError: `Printer outcome uncertain: ${errorMessage}`,
+          updatedAt: new Date(),
+        },
+      });
+    }
     await writePosAuditLog({
       companyId: agent.companyId,
       registerId: agent.registerId,

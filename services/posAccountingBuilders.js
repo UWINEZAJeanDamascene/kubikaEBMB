@@ -102,8 +102,29 @@ function buildSaleJournalEntries({ invoice, tenders, accounts }) {
   if (storedNetSales !== netSales) {
     throw new TypeError('Stored subtotal less discounts does not match invoice total less VAT.');
   }
+  const serviceCharge = invoice.posCheckoutPayload?.restaurantCheckoutSnapshot?.serviceCharge || null;
+  const serviceChargeAmount = serviceCharge
+    ? toCents(serviceCharge.amountRwf || 0, 'serviceCharge.amountRwf')
+    : 0;
+  const serviceChargeMode = serviceCharge?.mode || 'off';
+  if (!['off', 'income', 'pass-through'].includes(serviceChargeMode)
+    || (serviceChargeMode === 'off' && serviceChargeAmount > 0)
+    || serviceChargeAmount > netSales) {
+    throw new TypeError('Stored Restaurant service-charge details do not reconcile with invoice revenue.');
+  }
+  const itemRevenue = netSales - serviceChargeAmount;
   // POS discounts, including voucher allocations, reduce revenue; do not post a second discount journal line.
-  if (netSales > 0) addLine(revenueLines, requiredAccount(accounts, 'salesRevenue'), 0, fromCents(netSales), `Sales revenue - ${reference}`);
+  if (itemRevenue > 0) addLine(revenueLines, requiredAccount(accounts, 'salesRevenue'), 0, fromCents(itemRevenue), `Sales revenue - ${reference}`);
+  if (serviceChargeAmount > 0) {
+    const accountKey = serviceChargeMode === 'income' ? 'serviceChargeIncome' : 'serviceChargePayable';
+    addLine(
+      revenueLines,
+      requiredAccount(accounts, accountKey),
+      0,
+      fromCents(serviceChargeAmount),
+      `Restaurant service charge - ${reference}`,
+    );
+  }
   if (tax > 0) addLine(revenueLines, requiredAccount(accounts, 'vatOutput'), 0, fromCents(tax), `VAT output - ${reference}`);
 
   const sourceLines = Array.isArray(invoice.lines) ? invoice.lines : [];

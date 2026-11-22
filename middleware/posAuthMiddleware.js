@@ -416,6 +416,36 @@ function requirePosSession({ allowedStatuses = ['active'] } = {}) {
   };
 }
 
+function requirePosSystemTillType(systemTillType) {
+  const requiredType = String(systemTillType || '').trim().toLowerCase();
+  return (req, res, next) => {
+    const actualType = String(req.posAuthContext?.register?.systemTillType || 'retail')
+      .trim()
+      .toLowerCase();
+    if (!requiredType || actualType !== requiredType) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_SYSTEM_TILL_TYPE_INVALID',
+        message: 'This POS register is not configured for this service.',
+      });
+    }
+    return next();
+  };
+}
+
+function requirePosTrainingModeDisabled() {
+  return (req, res, next) => {
+    if (req.posAuthContext?.register?.trainingMode) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_TRAINING_MODE_RESTRICTED',
+        message: 'This action is unavailable on a training register.',
+      });
+    }
+    return next();
+  };
+}
+
 function requirePermission(permission) {
   const requiredPermission = String(permission || '').trim();
   return async (req, res, next) => {
@@ -578,6 +608,8 @@ module.exports = {
   requireDevice,
   requirePosDeviceContact,
   requirePosSession,
+  requirePosSystemTillType,
+  requirePosTrainingModeDisabled,
   requirePermission,
   requireCashMovementPermission,
   requireApproval,

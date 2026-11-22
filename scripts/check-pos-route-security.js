@@ -41,6 +41,7 @@ const SPECIAL_AUTH = new Map([
   ['POST /api/pos/print-agent/agent/jobs/:jobId/fail', 'Print-agent bearer credential and job ownership/state are validated.'],
   ['POST /api/pos/print-agent/agent/jobs/:jobId/uncertain', 'Print-agent bearer credential and job ownership/state are validated.'],
   ['POST /api/pos/print-agent/agent/drawer-authorizations/consume', 'Print-agent bearer credential, register binding, expiry, and single-use authorization are validated.'],
+  ['GET /api/pos/print-agent/documents/:documentId', 'Short-lived signed URL capability is verified against the stored document company and register.'],
   ['POST /api/pos/print-agent/drawer-authorizations', 'Active cashier session, payment permission, register binding, and one-time drawer capability are validated.'],
   ['POST /api/pos/print-agent/drawer-authorizations/consume', 'Active cashier session, register binding, expiry, and single-use capability are validated.'],
   ['GET /api/public/pos/receipts/:token', 'Hashed, expiring public receipt capability token is checked by the receipt controller.'],
@@ -83,8 +84,17 @@ const NATIVE_IDEMPOTENCY = new Map([
   ['POST /api/pos/print-agent/agent/jobs/:jobId/acknowledge', 'Print job ID and state transition are the native job boundary.'],
   ['POST /api/pos/print-agent/agent/jobs/:jobId/fail', 'Print job ID and state transition are the native job boundary.'],
   ['POST /api/pos/print-agent/agent/jobs/:jobId/uncertain', 'Print job ID, active lease token, and one-way uncertain state are the native job boundary.'],
+  ['POST /api/pos/print-agent/agent/status', 'Agent-bound printer status updates replace the current status for each registered printer.'],
+  ['POST /api/pos/print-agent/agent/drawer-authorizations/:authorizationId/outcome', 'Drawer authorization ID and conditional one-way outcome transition prevent replay.'],
+  ['POST /api/pos/print-agent/agent/results', 'Stable print idempotency keys and conditional job-state transitions deduplicate result sync.'],
   ['POST /api/pos/print-agent/cashier/receipt-attempts', 'Stable document/copy/type key and conditional job-state transition prevent duplicate cashier attempts.'],
   ['POST /api/pos/print-agent/cashier/receipt-attempts/:jobId/outcome', 'Conditional one-way print outcome transition prevents replaying cashier decisions.'],
+  ['POST /api/pos/print-agent/drawer-authorizations/:authorizationId/outcome', 'Drawer authorization ID and conditional one-way outcome transition prevent replay.'],
+  ['POST /api/pos/print-agent/cashier/document-jobs/gift-card', 'Stable caller idempotency key and unique company-scoped print-job identity prevent duplicate jobs.'],
+  ['POST /api/pos/print-agent/cashier/document-jobs/cash-movement/:movementId', 'Stable caller idempotency key and unique company-scoped print-job identity prevent duplicate jobs.'],
+  ['POST /api/pos/print-agent/cashier/document-jobs/x-report/:shiftId', 'Shift/report idempotency key and unique company-scoped print-job identity prevent duplicate jobs.'],
+  ['POST /api/pos/print-agent/cashier/document-jobs/z-report/:shiftId', 'Stable caller idempotency key and unique company-scoped print-job identity prevent duplicate jobs.'],
+  ['POST /api/pos/print-agent/cashier/documents/invoice/:invoiceId', 'Register-scoped document type/source/version identity reuses unchanged stored documents.'],
   ['POST /api/pos/print-agent/agent/drawer-authorizations/consume', 'Drawer authorization row is atomically consumed once per register.'],
   ['POST /api/pos/print-agent/drawer-authorizations', 'Action identity and shared idempotency prevent duplicate authorization issuance on replay.'],
   ['POST /api/pos/print-agent/drawer-authorizations/consume', 'Drawer authorization row is atomically consumed once per cashier session.'],
@@ -206,15 +216,15 @@ function makeRoute(method, routePath, args, offset, file, mount, inherited) {
   const fullPath = `${mount}${routePath === '/' ? '' : routePath}`;
   const key = `${method} ${fullPath}`;
   const hasPosSession = /requirePosSession|posSession(?:Read)?\s*\(|requireSamePosCashier|offlineSyncDeviceAccess|requireOnlinePosSession/.test(middleware);
-  const hasDeviceAuth = /requireDevice\s*\(|requirePosDeviceContact\s*\(|requireDevice(?:\s|\(|,)/.test(middleware) || SPECIAL_AUTH.has(key);
+  const hasDeviceAuth = /requireDevice\s*\(|requirePosDeviceContact\s*\(|requireDevice(?:\s|\(|,)|requirePrintAgent\b/.test(middleware) || SPECIAL_AUTH.has(key);
   const hasErpAuth = /(?:^|[\s,(])protect(?:\s|,|\)|$)/.test(middleware);
   const authenticated = hasPosSession || hasDeviceAuth || hasErpAuth;
-  const permission = /requirePermission|requireAnyPosPermission|requireAssignedPermissions|requirePermissionOrRoles|can[A-Z]\w*|authorizeCreditNote|Permission|posSession(?:Read)?\s*\(|requireCashMovementPermission/.test(middleware);
+  const permission = /requirePermission|requireAnyPosPermission|requireAssignedPermissions|requirePermissionOrRoles|can[A-Z]\w*|authorizeCreditNote|Permission|posSession(?:Read)?\s*\(|requireCashMovementPermission|requirePrintAgent\b/.test(middleware);
   const idem = /idempotentHandler|idem\w*\s*\(|idempotent/i.test(middleware) || /posSession\(/.test(middleware);
   const specialAuth = SPECIAL_AUTH.get(key) || SESSION_ACTION_AUTH.get(key) || null;
   const nativeIdempotency = NATIVE_IDEMPOTENCY.get(key) || null;
   const posSessionBound = /requirePosSession|posSession(?:Read)?\s*\(|requireSamePosCashier|offlineSyncDeviceAccess|requireOnlinePosSession/.test(middleware);
-  const deviceBound = /requireDevice\s*\(|requirePosDeviceContact\s*\(|offlineSyncDeviceAccess/.test(middleware)
+  const deviceBound = /requireDevice\s*\(|requirePosDeviceContact\s*\(|requirePrintAgent\b|offlineSyncDeviceAccess/.test(middleware)
     || Boolean(specialAuth && /device|agent|provider|pairing/i.test(specialAuth));
   const routeRateLimited = /rateLimit|rateLimiter|publicReceiptLimit|limiter\s*\(/i.test(middleware);
   const rateLimit = /posCredentialRateLimit/i.test(middleware)

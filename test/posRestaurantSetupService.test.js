@@ -46,6 +46,23 @@ function createTransactionClient() {
       findMany: jest.fn(),
       upsert: jest.fn(),
     },
+    restaurantRecipeIngredient: {
+      count: jest.fn().mockResolvedValue(0),
+      create: jest.fn(),
+      deleteMany: jest.fn(),
+      findMany: jest.fn(),
+    },
+    restaurantHappyHourPromotion: {
+      create: jest.fn(),
+      deleteMany: jest.fn(),
+      findMany: jest.fn(),
+    },
+    restaurantInventorySettings: {
+      findUnique: jest.fn().mockResolvedValue(null),
+      upsert: jest.fn(),
+    },
+    company: { findUnique: jest.fn().mockResolvedValue({ timezone: 'Africa/Kigali' }) },
+    warehouse: { findMany: jest.fn().mockResolvedValue([]), findFirst: jest.fn() },
     restaurantModifierGroup: {
       create: jest.fn(),
       findFirst: jest.fn(),
@@ -87,6 +104,18 @@ describe('Restaurant setup service', () => {
     await expect(setupService.getSetup('not-a-company')).rejects.toMatchObject({
       code: 'RESTAURANT_COMPANY_REQUIRED',
       statusCode: 400,
+    });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  test('requires recipe ingredients when a menu item is configured for recipe stock', async () => {
+    await expect(setupService.createMenuItem(COMPANY_ID, {
+      productId: PRODUCT_ID,
+      stationId: 'kitchen',
+      stockMode: 'recipe',
+      modifierGroups: [],
+    }, { userId: '9'.repeat(24) })).rejects.toMatchObject({
+      code: 'RESTAURANT_RECIPE_CONFIGURATION_REQUIRED',
     });
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
@@ -142,6 +171,8 @@ describe('Restaurant setup service', () => {
     tx.restaurantModifierGroup.findMany.mockResolvedValue([]);
     tx.restaurantModifierOption.findMany.mockResolvedValue([]);
     tx.restaurantMenuItemModifierGroup.findMany.mockResolvedValue([]);
+    tx.restaurantRecipeIngredient.findMany.mockResolvedValue([]);
+    tx.restaurantHappyHourPromotion.findMany.mockResolvedValue([]);
     tx.restaurantFloorArea.findMany.mockResolvedValue([]);
     tx.restaurantTable.findMany.mockResolvedValue([]);
 

@@ -60,7 +60,7 @@ function createRequest({ body = {}, key = 'lifecycle-key-0001' } = {}) {
   };
 }
 
-function makeTransaction({ shift, priorCorrection = null, newerShift = null } = {}) {
+function makeTransaction({ shift, priorCorrection = null, newerShift = null, tipTotals = null } = {}) {
   const activeShift = shift || {
     id: SHIFT_ID,
     companyId: COMPANY_ID,
@@ -87,6 +87,9 @@ function makeTransaction({ shift, priorCorrection = null, newerShift = null } = 
       if (String(query).includes('pos_registers')) return [{ id: REGISTER_ID }];
       if (String(query).includes('pos_shifts')) return [{ id: SHIFT_ID }];
       if (String(query).includes('FROM credit_notes')) return [{ amount: '0', count: 0 }];
+      if (String(query).includes('FROM "restaurant_tips"')) {
+        return [tipTotals || { cashCollected: '0', cashPaidOut: '0', cashReversed: '0' }];
+      }
       if (String(query).includes('pos_held_sales')) return [{ count: 0 }];
       return [];
     }),
@@ -265,7 +268,10 @@ describe('POS shift reopen and cashier handover', () => {
       invoices: [],
       cashMovements: [],
     };
-    const tx = makeTransaction({ shift });
+    const tx = makeTransaction({
+      shift,
+      tipTotals: { cashCollected: '250', cashPaidOut: '75', cashReversed: '25' },
+    });
     tx.posShift.findFirst
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(shift)
@@ -276,8 +282,8 @@ describe('POS shift reopen and cashier handover', () => {
     await handover(createRequest({
       body: {
         toUserId: NEXT_USER_ID,
-        closingCount: { 5000: 2, 2000: 1, 1000: 1, 500: 1, 100: 1, 50: 0, other: 200 },
-        countedCash: 13800,
+        closingCount: { 5000: 2, 2000: 1, 1000: 1, 500: 1, 100: 1, 50: 0, other: 350 },
+        countedCash: 13950,
       },
     }), res, jest.fn());
 
@@ -286,10 +292,26 @@ describe('POS shift reopen and cashier handover', () => {
     expect(res.body.data.newShift).toMatchObject({
       status: 'open',
       openedById: NEXT_USER_ID,
-      openingFloat: 13800,
+      openingFloat: 13950,
       handoverFromShiftId: SHIFT_ID,
     });
     expect(tx.posZReport.create).toHaveBeenCalledTimes(1);
+    expect(tx.posZReport.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        snapshot: expect.objectContaining({
+          restaurantTips: {
+            cashCollected: 250,
+            cashPaidOut: 75,
+            cashReversed: 25,
+            netCashEffect: 150,
+          },
+        }),
+      }),
+    }));
+    expect(tx.posShift.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: SHIFT_ID },
+      data: expect.objectContaining({ expectedCash: 13950, difference: 0 }),
+    }));
     expect(tx.tillSession.update).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'till-id' },
       data: expect.objectContaining({ status: 'closed', closingCount: 13800 }),
@@ -311,6 +333,7 @@ describe('POS shift reopen and cashier handover', () => {
       fromUserId: USER_ID,
       toUserId: NEXT_USER_ID,
       shiftId: SHIFT_ID,
+      toShiftId: expect.any(String),
     }));
     expect(restaurantOrderService.notifyHandoverOrders).toHaveBeenCalledWith(COMPANY_ID, []);
     const closeAudit = tx.posAuditLog.create.mock.calls.filter(([entry]) => entry.data.event === 'SHIFT_CLOSED');

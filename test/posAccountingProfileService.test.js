@@ -275,6 +275,8 @@ describe('pure POS accounting builders', () => {
     loyaltyPointsLiability: '2870',
     inventory: '1400',
     salesRevenue: '4000',
+    serviceChargeIncome: '4100',
+    serviceChargePayable: '2200',
     vatOutput: '2220',
     costOfGoodsSold: '5000',
   };
@@ -515,6 +517,7 @@ describe('pure POS accounting builders', () => {
       ],
       accounts,
     });
+
     const lines = entries[0].lines;
     const accountTotal = (accountCode, side) => lines
       .filter((line) => line.accountCode === accountCode)
@@ -530,6 +533,40 @@ describe('pure POS accounting builders', () => {
     expect(accountTotal('1400', 'credit')).toBe(420);
     expect(lines.reduce((sum, line) => sum + line.debit, 0)).toBe(1482);
     expect(lines.reduce((sum, line) => sum + line.credit, 0)).toBe(1482);
+  });
+
+  test.each([
+    ['income', '4100'],
+    ['pass-through', '2200'],
+  ])('posts Restaurant service charges to the %s account', (mode, accountCode) => {
+    const entries = builders.buildSaleJournalEntries({
+      invoice: {
+        id: `invoice-service-charge-${mode}`,
+        totalAmount: 1298,
+        subtotal: 1100,
+        totalDiscount: 0,
+        taxAmount: 198,
+        amountPaid: 1298,
+        amountOutstanding: 0,
+        posCheckoutPayload: {
+          restaurantCheckoutSnapshot: {
+            serviceCharge: { mode, amountRwf: 100, taxAmountRwf: 18 },
+          },
+        },
+        lines: [
+          { lineSubtotal: 1000, lineTax: 180, lineTotal: 1180, cogsAmount: 0 },
+          { lineSubtotal: 100, lineTax: 18, lineTotal: 118, cogsAmount: 0, isServiceLine: true },
+        ],
+      },
+      tenders: [{ paymentMethod: 'cash', amountRwf: 1298 }],
+      accounts,
+    });
+
+    expect(entries[0].lines).toContainEqual(expect.objectContaining({ accountCode, credit: 100 }));
+    expect(entries[0].lines).toContainEqual(expect.objectContaining({ accountCode: '4000', credit: 1000 }));
+    expect(entries[0].lines).toContainEqual(expect.objectContaining({ accountCode: '2220', credit: 198 }));
+    expect(entries[0].lines.reduce((sum, line) => sum + line.debit, 0)).toBe(1298);
+    expect(entries[0].lines.reduce((sum, line) => sum + line.credit, 0)).toBe(1298);
   });
 
   test('rejects line totals that do not reconcile with the stored invoice header', () => {

@@ -26,6 +26,38 @@ describe('POS route security inventory', () => {
     expect(uncovered).toEqual([]);
   });
 
+  test('Restaurant POS-session routes require a Restaurant register', () => {
+    const restaurantSessionRoutes = routes.filter((route) => (
+      route.path.includes('/restaurant/')
+      && route.authentication === 'POS_SESSION'
+    ));
+
+    expect(restaurantSessionRoutes.length).toBeGreaterThan(5);
+    expect(restaurantSessionRoutes.filter((route) => (
+      !route.middleware.includes('requireRestaurantRegister')
+    ))).toEqual([]);
+  });
+
+  test('print-agent routes use agent authentication or signed-document capabilities', () => {
+    for (const key of [
+      'POST /api/pos/print-agent/agent/status',
+      'GET /api/pos/print-agent/agent/documents/:documentId/versions/:version',
+      'POST /api/pos/print-agent/agent/drawer-authorizations/:authorizationId/outcome',
+      'POST /api/pos/print-agent/agent/results',
+    ]) {
+      expect(routes.find((route) => route.key === key)).toMatchObject({
+        authentication: 'DEVICE_OR_PROTOCOL',
+        authorization: 'ROUTE_PERMISSION',
+      });
+    }
+
+    expect(routes.find((route) => route.key === 'GET /api/pos/print-agent/documents/:documentId'))
+      .toMatchObject({
+        authentication: 'DEVICE_OR_PROTOCOL',
+        authorization: 'ACTION_GATED',
+      });
+  });
+
   test('POS audit and security endpoints use distinct least-privilege capabilities', () => {
     const expected = {
       'GET /api/pos/admin/audit': 'canReadPosAudit',

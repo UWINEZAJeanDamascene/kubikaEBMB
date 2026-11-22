@@ -4,7 +4,11 @@ const crypto = require('crypto');
 const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const restaurantSetupService = require('./posRestaurantSetupService');
+const restaurantInventoryService = require('./posRestaurantInventoryService');
+const { activePromotion } = require('./posRestaurantPromotionRules');
 const socketService = require('./socketService');
+const { writePosAuditLog } = require('./posAuditService');
+const { resolveHardwareSettings } = require('./posDrawerPolicyService');
 
 const ID_PATTERN = /^[a-f0-9]{24}$/i;
 const STATIONS = new Set(['kitchen', 'bar']);
@@ -74,6 +78,9 @@ function readSnapshot(event) {
     items: Array.isArray(snapshot.items) ? snapshot.items : [],
     rounds: Array.isArray(snapshot.rounds) ? snapshot.rounds : [],
     trainingMode: Boolean(snapshot.trainingMode),
+    ...(typeof snapshot.trainingTableId === 'string' && ID_PATTERN.test(snapshot.trainingTableId)
+      ? { trainingTableId: snapshot.trainingTableId }
+      : {}),
   };
 }
 
@@ -97,7 +104,7 @@ function orderView(order, snapshot) {
     id: order.id,
     companyId: order.companyId,
     registerId: order.registerId,
-    tableId: order.tableId,
+    tableId: order.tableId || snapshot.trainingTableId || null,
     orderKind: order.orderKind,
     status: order.status,
     version: order.version,
@@ -135,7 +142,7 @@ async function listShiftHandoverOrders(client, companyId, registerId) {
   }
   const tableNames = new Map(tables.map((table) => [table.id, table.name]));
 
-  return orders.map((order) => {
+  return orders.filter((order) => !(snapshots.get(order.id) || emptySnapshot()).trainingMode).map((order) => {
     const snapshot = snapshots.get(order.id) || emptySnapshot();
     return {
       id: order.id,
@@ -158,23 +165,60 @@ async function carryOpenOrdersForShiftHandover(tx, {
   fromUserId,
   toUserId,
   shiftId,
+  toShiftId,
 }) {
   const openOrders = await tx.restaurantOrder.findMany({
     where: { companyId, registerId, status: { in: ACTIVE_ORDER_STATUSES } },
     orderBy: [{ openedAt: 'asc' }, { id: 'asc' }],
   });
-  const billedOrders = openOrders.filter((order) => order.status === 'billed');
-  if (billedOrders.length) {
-    return {
-      code: 'RESTAURANT_OPEN_BILLED_ORDERS_BLOCKED',
-      blockedOrders: await listShiftHandoverOrders(tx, companyId, registerId),
-    };
+  const activeOrders = [];
+  for (const order of openOrders) {
+    const snapshot = await findSnapshot(tx, companyId, order);
+    if (!snapshot.trainingMode) activeOrders.push({ order, snapshot });
+  }
+  const transferredChecks = [];
+  for (const { order } of activeOrders.filter(({ order: activeOrder }) => activeOrder.status === 'billed')) {
+    const bills = await tx.restaurantBill.findMany({
+      where: { companyId, orderId: order.id, status: 'pending_payment', invoiceId: { not: null } },
+      select: { id: true, invoiceId: true },
+    });
+    for (const bill of bills) {
+      const invoice = await tx.invoice.findFirst({
+        where: { id: bill.invoiceId, companyId, posOrigin: true },
+        select: { id: true, status: true, cashierId: true, shiftId: true, referenceNo: true },
+      });
+      if (!invoice || invoice.status !== 'PENDING_PAYMENT') {
+        throw fail('RESTAURANT_BILL_HANDOVER_STATE_INVALID', 'A billed check is not in a transferable unpaid state. Resolve it before cashier handover.', 409);
+      }
+      await tx.invoice.update({
+        where: { id: invoice.id },
+        data: {
+          cashierId: toUserId,
+          ...(toShiftId ? { shiftId: toShiftId } : {}),
+        },
+      });
+      transferredChecks.push({ billId: bill.id, invoiceId: invoice.id, referenceNo: invoice.referenceNo });
+    }
+  }
+  if (transferredChecks.length) {
+    await writePosAuditLog({
+      companyId,
+      registerId,
+      userId: fromUserId,
+      event: 'RESTAURANT_BILLS_HANDED_OVER',
+      metadata: {
+        fromUserId,
+        toUserId,
+        fromShiftId: shiftId,
+        toShiftId: toShiftId || shiftId,
+        checks: transferredChecks,
+      },
+    }, tx);
   }
 
   const carriedOrders = [];
-  for (const order of openOrders) {
+  for (const { order, snapshot } of activeOrders) {
     if (order.waiterId === toUserId) continue;
-    const snapshot = await findSnapshot(tx, companyId, order);
     const updated = await writeOrderVersion(
       tx,
       order,
@@ -265,7 +309,7 @@ async function writeOrderVersion(
   return { ...order, ...extraData, version: nextVersion, updatedAt: now };
 }
 
-async function getOverview(companyIdValue) {
+async function getOverview(companyIdValue, actor = {}) {
   const companyId = requireCompany(companyIdValue);
   const setup = await restaurantSetupService.getSetup(companyId);
   const orders = await prisma.restaurantOrder.findMany({
@@ -289,6 +333,13 @@ async function getOverview(companyIdValue) {
   for (const event of events) {
     if (!snapshots.has(event.orderId)) snapshots.set(event.orderId, readSnapshot(event));
   }
+  const visibleOrders = orders.filter((order) => {
+    const trainingMode = snapshots.get(order.id)?.trainingMode === true;
+    return trainingMode
+      ? actor.trainingMode === true && String(order.registerId) === String(actor.registerId || '')
+      : actor.trainingMode !== true;
+  });
+  const visibleOrderIds = new Set(visibleOrders.map((order) => order.id));
   const enabledCategoryIds = new Set(
     setup.categories.filter((category) => category.isEnabled && category.categoryActive)
       .map((category) => category.categoryId),
@@ -299,8 +350,10 @@ async function getOverview(companyIdValue) {
     categories: setup.categories.filter((category) => category.isEnabled && category.categoryActive),
     menuItems,
     areas: setup.areas.filter((area) => area.isActive),
-    orders: orders.map((order) => orderView(order, snapshots.get(order.id) || emptySnapshot())),
-    readyTickets,
+    orders: visibleOrders.map((order) => orderView(order, snapshots.get(order.id) || emptySnapshot())),
+    readyTickets: actor.trainingMode === true
+      ? []
+      : readyTickets.filter((ticket) => visibleOrderIds.has(ticket.orderId)),
     displays: {
       kitchen: socketService.hasRestaurantDisplay(companyId, 'kitchen'),
       bar: socketService.hasRestaurantDisplay(companyId, 'bar'),
@@ -308,12 +361,14 @@ async function getOverview(companyIdValue) {
   };
 }
 
-async function getOrder(companyIdValue, orderIdValue) {
+async function getOrder(companyIdValue, orderIdValue, actorValue) {
   const companyId = requireCompany(companyIdValue);
   const orderId = normalizeId(orderIdValue, 'order');
+  const actor = requireActor(actorValue);
   return prisma.$transaction(async (tx) => {
     const order = await findOrder(tx, companyId, orderId);
     const snapshot = await findSnapshot(tx, companyId, order);
+    assertTrainingMode(actor, snapshot, order);
     const tickets = await tx.restaurantKitchenTicket.findMany({
       where: { companyId, orderId },
       orderBy: [{ roundNumber: 'asc' }, { station: 'asc' }],
@@ -393,6 +448,11 @@ async function markBillPaid(tx, companyIdValue, orderIdValue, actorValue, idempo
     throw fail('RESTAURANT_ORDER_BILL_REQUIRED', 'Issue a bill before completing payment.', 409);
   }
 
+  await restaurantInventoryService.closeOrderCommitments(tx, {
+    companyId,
+    orderId,
+    actorId: actor.userId,
+  });
   const paidOrder = await writeOrderVersion(
     tx,
     order,
@@ -451,19 +511,22 @@ async function openOrder(companyIdValue, body, actorValue, idempotencyKeyValue) 
       if (!table) throw fail('RESTAURANT_TABLE_NOT_FOUND', 'This table is not available in this company.', 404);
       if (table.state !== 'free') throw fail('RESTAURANT_TABLE_IN_USE', 'This table is not free. Refresh the floor and try again.', 409);
       if (guestCount > table.capacity) throw fail('RESTAURANT_ORDER_INVALID', 'Guest count cannot exceed the table capacity.');
-      const claimed = await tx.restaurantTable.updateMany({
-        where: { id: tableId, companyId, state: 'free' },
-        data: { state: 'occupied', guestCount, version: { increment: 1 } },
-      });
-      if (claimed.count !== 1) throw fail('RESTAURANT_TABLE_IN_USE', 'Another staff member opened this table. Refresh the floor.', 409);
+      if (!actor.trainingMode) {
+        const claimed = await tx.restaurantTable.updateMany({
+          where: { id: tableId, companyId, state: 'free' },
+          data: { state: 'occupied', guestCount, version: { increment: 1 } },
+        });
+        if (claimed.count !== 1) throw fail('RESTAURANT_TABLE_IN_USE', 'Another staff member opened this table. Refresh the floor.', 409);
+      }
     }
 
+    const storedTableId = actor.trainingMode ? null : tableId;
     const order = await tx.restaurantOrder.create({
       data: {
         id: generateObjectId(),
         companyId,
         registerId: actor.registerId,
-        tableId,
+        tableId: storedTableId,
         status: OPEN_ORDER_STATUS,
         version: 1,
         guestCount,
@@ -475,7 +538,10 @@ async function openOrder(companyIdValue, body, actorValue, idempotencyKeyValue) 
         tabName,
       },
     });
-    const snapshot = emptySnapshot(actor.trainingMode);
+    const snapshot = {
+      ...emptySnapshot(actor.trainingMode),
+      ...(actor.trainingMode && tableId ? { trainingTableId: tableId } : {}),
+    };
     await tx.restaurantOrderEvent.create({
       data: {
         id: generateObjectId(),
@@ -491,11 +557,13 @@ async function openOrder(companyIdValue, body, actorValue, idempotencyKeyValue) 
     });
     return orderView(order, snapshot);
   });
-  socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
-    orderId: result.id,
-    version: result.version,
-    change: 'opened',
-  });
+  if (!result.trainingMode) {
+    socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
+      orderId: result.id,
+      version: result.version,
+      change: 'opened',
+    });
+  }
   return result;
 }
 
@@ -568,6 +636,21 @@ async function buildLines(tx, companyId, inputItems) {
     assignmentsByMenuItem.set(assignment.menuItemId, current);
   }
 
+  const [promotions, company] = await Promise.all([
+    menuItemIds.length
+      ? tx.restaurantHappyHourPromotion.findMany({
+        where: { companyId, menuItemId: { in: menuItemIds }, isEnabled: true },
+      })
+      : [],
+    tx.company.findUnique({ where: { id: companyId }, select: { timezone: true } }),
+  ]);
+  const promotionsByMenuItem = new Map();
+  for (const promotion of promotions) {
+    const current = promotionsByMenuItem.get(promotion.menuItemId) || [];
+    current.push(promotion);
+    promotionsByMenuItem.set(promotion.menuItemId, current);
+  }
+
   return prepared.map((input) => {
     const menuItem = menuByProductId.get(input.productId);
     const product = productById.get(input.productId);
@@ -590,6 +673,12 @@ async function buildLines(tx, companyId, inputItems) {
       name: option.name,
       priceAdjustment: decimalText(option.priceAdjustment),
     }));
+    const pricing = activePromotion(
+      promotionsByMenuItem.get(menuItem.id) || [],
+      Number(product.sellingPrice),
+      new Date(),
+      company?.timezone || 'Africa/Kigali',
+    );
     return {
       id: generateObjectId(),
       productId: product.id,
@@ -597,8 +686,12 @@ async function buildLines(tx, companyId, inputItems) {
       sku: product.sku,
       quantity: input.quantity,
       unitPrice: decimalText(product.sellingPrice),
+      promotionSnapshot: pricing.promotion,
       taxCode: product.taxCode,
       taxRate: decimalText(product.taxRate),
+      serviceChargeExempt: menuItem.serviceChargeExempt === true,
+      stockMode: menuItem.stockMode || 'none',
+      barStockProductId: menuItem.barStockProductId || null,
       station: STATIONS.has(menuItem.station) ? menuItem.station : 'none',
       modifiers,
       note: input.note,
@@ -619,6 +712,7 @@ async function updateUnsentItems(companyIdValue, orderIdValue, body, actorValue,
     if (order.status !== OPEN_ORDER_STATUS) throw fail('RESTAURANT_ORDER_CLOSED', 'This order is no longer open.', 409);
     if (order.version !== expectedVersion) throw fail('RESTAURANT_ORDER_VERSION_CONFLICT', 'Another staff member changed this order. Refresh and try again.', 409);
     const snapshot = await findSnapshot(tx, companyId, order);
+    assertTrainingMode(actor, snapshot, order);
     const newLines = await buildLines(tx, companyId, body?.items);
     const sentLines = snapshot.items.filter((item) => item.status !== 'unsent');
     const nextSnapshot = {
@@ -628,11 +722,13 @@ async function updateUnsentItems(companyIdValue, orderIdValue, body, actorValue,
     const savedOrder = await writeOrderVersion(tx, order, nextSnapshot, 'ITEMS_UPDATED', {}, actor, key);
     return orderView(savedOrder, nextSnapshot);
   });
-  socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
-    orderId,
-    version: updated.version,
-    change: 'items',
-  });
+  if (!updated.trainingMode) {
+    socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
+      orderId,
+      version: updated.version,
+      change: 'items',
+    });
+  }
   return updated;
 }
 
@@ -664,6 +760,99 @@ function ticketKey(companyId, orderId, roundNumber, station, requestKey) {
     .digest('hex');
 }
 
+function assertTrainingMode(actor, snapshot, order) {
+  if (Boolean(actor.trainingMode) !== Boolean(snapshot.trainingMode)) {
+    throw fail('RESTAURANT_TRAINING_MODE_MISMATCH', 'This order belongs to a different register mode.', 403);
+  }
+  if (snapshot.trainingMode && String(actor.registerId) !== String(order?.registerId || '')) {
+    throw fail('RESTAURANT_TRAINING_MODE_MISMATCH', 'This training order belongs to a different register.', 403);
+  }
+}
+
+async function createTicketFallbackJob(tx, companyId, registerId, ticket, displayOnline) {
+  if (displayOnline) return ticket;
+  const register = await tx.posRegister.findFirst({
+    where: { id: registerId, companyId, isActive: true },
+    select: { id: true, systemTillType: true },
+  });
+  if (!register) return ticket;
+  const settings = tx.systemSettings?.findUnique
+    ? await tx.systemSettings.findUnique({
+      where: { companyId },
+      select: { posHardwareSettings: true },
+    })
+    : null;
+  const hardware = resolveHardwareSettings(
+    settings?.posHardwareSettings,
+    register.systemTillType,
+    register.id,
+  );
+  const selector = hardware.printerRoles?.[ticket.station];
+  const printer = selector && tx.posPrintPrinter?.findFirst
+    ? await tx.posPrintPrinter.findFirst({
+      where: {
+        companyId,
+        status: 'active',
+        agent: { status: 'active', revokedAt: null, registerId: register.id },
+        ...( /^[a-f\d]{24}$/i.test(selector)
+          ? { id: selector }
+          : { role: selector.replace(/^role:/, '') }),
+      },
+      select: { id: true, agentId: true, role: true, name: true },
+    })
+    : null;
+  if (!printer) return ticket;
+
+  const payload = ticket.payloadJson || {};
+  const payloadJson = {
+    title: `${ticket.station === 'kitchen' ? 'KITCHEN' : 'BAR'} TICKET`,
+    shopName: payload.shopName || 'KUBIKA',
+    tableName: payload.tableName,
+    waiterName: payload.waiterName,
+    lines: (payload.items || []).map((item) => ({
+      name: item.name,
+      quantity: item.quantity,
+      description: [
+        item.modifiers?.length ? item.modifiers.join(', ') : null,
+        item.note || null,
+      ].filter(Boolean).join(' - ') || undefined,
+    })),
+  };
+  const payloadText = JSON.stringify(payloadJson);
+  const now = new Date();
+  const jobIdempotencyKey = `${ticket.idempotencyKey}:restaurant-ticket`;
+  const printJob = await tx.posPrintJob.create({
+    data: {
+      id: generateObjectId(),
+      companyId,
+      registerId: register.id,
+      agentId: printer.agentId,
+      printerId: printer.id,
+      jobType: 'restaurant-ticket',
+      status: 'queued',
+      idempotencyKey: jobIdempotencyKey,
+      payloadJson,
+      payloadHash: crypto.createHash('sha256').update(payloadText).digest('hex'),
+      maxAttempts: 12,
+      expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+      createdAt: now,
+      updatedAt: now,
+    },
+  });
+  const updated = await tx.restaurantKitchenTicket.update({
+    where: { id: ticket.id },
+    data: {
+      printJobId: printJob.id,
+      fallbackAgentId: printer.agentId,
+      fallbackPrinterId: printer.id,
+      fallbackAttempted: true,
+      lastError: `${ticket.station === 'kitchen' ? 'Kitchen' : 'Bar'} display is offline. A printer ticket was queued on ${printer.name}.`,
+      updatedAt: now,
+    },
+  });
+  return { ...ticket, ...(updated || {}) };
+}
+
 async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempotencyKeyValue) {
   const companyId = requireCompany(companyIdValue);
   const orderId = normalizeId(orderIdValue, 'order');
@@ -675,15 +864,26 @@ async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempot
     if (order.status !== OPEN_ORDER_STATUS) throw fail('RESTAURANT_ORDER_CLOSED', 'This order is no longer open.', 409);
     if (order.version !== expectedVersion) throw fail('RESTAURANT_ORDER_VERSION_CONFLICT', 'Another staff member changed this order. Refresh and try again.', 409);
     const snapshot = await findSnapshot(tx, companyId, order);
+    assertTrainingMode(actor, snapshot, order);
+    const trainingMode = snapshot.trainingMode;
     const unsent = snapshot.items.filter((item) => item.status === 'unsent');
     if (!unsent.length) throw fail('RESTAURANT_ORDER_NO_UNSENT_ITEMS', 'Add items before sending a new round.');
     const roundNumber = snapshot.rounds.reduce((max, round) => Math.max(max, Number(round.roundNumber) || 0), 0) + 1;
     const now = new Date();
+    const stockCommitment = trainingMode
+      ? { warnings: [], commitments: [], approval: null }
+      : await restaurantInventoryService.prepareRoundCommitments(tx, {
+        companyId,
+        order,
+        items: unsent,
+        actor,
+        stockApprovalReason: body?.stockApprovalReason,
+      });
     const nextItems = snapshot.items.map((item) => item.status === 'unsent'
       ? { ...item, status: 'sent', roundNumber, sentAt: now.toISOString() }
       : item);
     const tickets = [];
-    const stations = actor.trainingMode ? [] : [...STATIONS].filter((station) => unsent.some((item) => item.station === station));
+    const stations = trainingMode ? [] : [...STATIONS].filter((station) => unsent.some((item) => item.station === station));
     const table = order.tableId
       ? await tx.restaurantTable.findFirst({ where: { id: order.tableId, companyId }, select: { name: true } })
       : null;
@@ -717,7 +917,8 @@ async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempot
           fallbackAttempted: false,
         },
       });
-      tickets.push({ ...ticket, displayOnline });
+      const fallbackTicket = await createTicketFallbackJob(tx, companyId, actor.registerId, ticket, displayOnline);
+      tickets.push({ ...fallbackTicket, displayOnline });
     }
     const nextSnapshot = {
       ...snapshot,
@@ -727,10 +928,16 @@ async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempot
     const savedOrder = await writeOrderVersion(tx, order, nextSnapshot, 'ROUND_SENT', {
       roundNumber,
       ticketIds: tickets.map((ticket) => ticket.id),
-      trainingMode: actor.trainingMode,
+      trainingMode,
+      stockWarnings: stockCommitment.warnings,
+      stockApproval: stockCommitment.approval,
     }, actor, key);
     return {
-      order: orderView(savedOrder, nextSnapshot),
+      order: {
+        ...orderView(savedOrder, nextSnapshot),
+        stockWarnings: stockCommitment.warnings,
+      },
+      stockWarnings: stockCommitment.warnings,
       tickets,
       stationDelivery: Object.fromEntries([...STATIONS].map((station) => [
         station,
@@ -738,11 +945,13 @@ async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempot
       ])),
     };
   });
-  socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
-    orderId,
-    version: result.order.version,
-    change: 'round_sent',
-  });
+  if (!result.order.trainingMode) {
+    socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
+      orderId,
+      version: result.order.version,
+      change: 'round_sent',
+    });
+  }
   for (const ticket of result.tickets) {
     socketService.emitToRestaurantStation(companyId, ticket.station, 'restaurant:ticket-new', {
       ticketId: ticket.id,
@@ -875,6 +1084,7 @@ async function voidSentItem(companyIdValue, orderIdValue, itemIdValue, body, act
     const order = await findOrder(tx, companyId, orderId);
     if (order.status !== OPEN_ORDER_STATUS) throw fail('RESTAURANT_ORDER_CLOSED', 'This order is no longer open.', 409);
     const snapshot = await findSnapshot(tx, companyId, order);
+    assertTrainingMode(actor, snapshot, order);
     const item = snapshot.items.find((line) => line.id === itemId);
     if (!item || item.status !== 'sent') throw fail('RESTAURANT_ORDER_ITEM_NOT_VOIDABLE', 'Only a sent, active item can be voided.', 409);
     const nextItem = { ...item, status: 'voided', voidReason: reason, voidDecision: decision, voidedById: actor.userId, voidedAt: new Date().toISOString() };
@@ -882,6 +1092,33 @@ async function voidSentItem(companyIdValue, orderIdValue, itemIdValue, body, act
     const tickets = await tx.restaurantKitchenTicket.findMany({
       where: { companyId, orderId },
     });
+    const itemTickets = tickets.filter((ticket) => {
+      const payload = ticket.payloadJson && typeof ticket.payloadJson === 'object' ? ticket.payloadJson : {};
+      return Array.isArray(payload.items) && payload.items.some((line) => line.id === itemId);
+    });
+    const prepared = itemTickets.some((ticket) => ticket.status !== 'queued');
+    if (decision === 'return' && !actor.permissions?.includes('pos.till.void')) {
+      throw fail('RESTAURANT_VOID_RETURN_MANAGER_REQUIRED', 'A manager must approve returning an unprepared item to stock.', 403);
+    }
+    const stockChanges = await restaurantInventoryService.voidItemCommitments(tx, {
+      companyId,
+      itemId,
+      actorId: actor.userId,
+      reason,
+      decision,
+      prepared,
+    });
+    if (decision === 'return') {
+      await writePosAuditLog({
+        companyId,
+        registerId: actor.registerId,
+        userId: actor.userId,
+        event: 'RESTAURANT_UNPREPARED_STOCK_RETURN_APPROVED',
+        entityType: 'restaurant_order_item',
+        entityId: itemId,
+        metadata: { orderId, reason, stockChanges },
+      }, tx);
+    }
     for (const ticket of tickets) {
       const payload = ticket.payloadJson && typeof ticket.payloadJson === 'object' ? ticket.payloadJson : {};
       if (!Array.isArray(payload.items) || !payload.items.some((line) => line.id === itemId)) continue;
@@ -902,14 +1139,19 @@ async function voidSentItem(companyIdValue, orderIdValue, itemIdValue, body, act
       itemId,
       reason,
       decision,
+      prepared,
+      approvedById: decision === 'return' ? actor.userId : null,
+      stockChanges,
     }, actor, key);
     return { order: orderView(savedOrder, nextSnapshot), tickets };
   });
-  socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
-    orderId,
-    version: result.order.version,
-    change: 'item_voided',
-  });
+  if (!result.order.trainingMode) {
+    socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
+      orderId,
+      version: result.order.version,
+      change: 'item_voided',
+    });
+  }
   for (const ticket of result.tickets) {
     if (ticket.station === 'kitchen' || ticket.station === 'bar') {
       socketService.emitToRestaurantStation(companyId, ticket.station, 'restaurant:ticket-updated', {

@@ -8,6 +8,7 @@ jest.mock('../services/socketService', () => ({
   emitToRestaurantStation: jest.fn(),
   hasRestaurantDisplay: jest.fn(() => false),
 }));
+jest.mock('../services/posAuditService', () => ({ writePosAuditLog: jest.fn() }));
 
 const { prisma } = require('../lib/prisma');
 const socketService = require('../services/socketService');
@@ -48,8 +49,33 @@ function createTransactionClient() {
       findMany: jest.fn(),
       updateMany: jest.fn(),
     },
-    restaurantMenuItem: { findMany: jest.fn() },
-    product: { findMany: jest.fn() },
+    restaurantBill: { findMany: jest.fn() },
+    invoice: { findFirst: jest.fn(), update: jest.fn() },
+    restaurantMenuItem: { findMany: jest.fn().mockResolvedValue([]) },
+    restaurantRecipeIngredient: { findMany: jest.fn().mockResolvedValue([]) },
+    restaurantHappyHourPromotion: { findMany: jest.fn().mockResolvedValue([]) },
+    restaurantInventorySettings: { findUnique: jest.fn().mockResolvedValue(null) },
+    restaurantStockCommitment: {
+      create: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
+      update: jest.fn(),
+    },
+    stockLevel: {
+      upsert: jest.fn(),
+      findUnique: jest.fn(),
+      update: jest.fn(),
+    },
+    stockMovement: { create: jest.fn() },
+    company: { findUnique: jest.fn().mockResolvedValue({ timezone: 'Africa/Kigali', ebmEnabled: false }) },
+    posRegister: { findFirst: jest.fn().mockResolvedValue({ id: REGISTER_ID, systemTillType: 'restaurant', branchId: REGISTER_ID }) },
+    systemSettings: { findUnique: jest.fn().mockResolvedValue(null) },
+    posPrintPrinter: { findFirst: jest.fn().mockResolvedValue(null) },
+    posPrintJob: { create: jest.fn() },
+    product: {
+      findMany: jest.fn().mockResolvedValue([]),
+      findFirst: jest.fn(),
+      update: jest.fn(),
+    },
     restaurantMenuCategory: { findMany: jest.fn() },
     restaurantMenuItemModifierGroup: { findMany: jest.fn() },
     restaurantModifierGroup: { findMany: jest.fn() },
@@ -65,6 +91,12 @@ describe('Restaurant order service', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     tx = createTransactionClient();
+    tx.stockLevel.findUnique.mockResolvedValue({
+      qtyOnHand: 0,
+      qtyReserved: 0,
+      avgCost: 0,
+    });
+    tx.$queryRawUnsafe = jest.fn().mockResolvedValue([]);
     prisma.$transaction = jest.fn((callback) => callback(tx));
   });
 
@@ -94,6 +126,34 @@ describe('Restaurant order service', () => {
     }));
   });
 
+  test('keeps a training dining order off the real table state', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue(null);
+    tx.restaurantTable.findFirst.mockResolvedValue({ id: TABLE_ID, state: 'free', capacity: 4 });
+    tx.restaurantOrder.create.mockImplementation(({ data }) => Promise.resolve(data));
+
+    const trainingActor = { ...actor, trainingMode: true };
+    const order = await orderService.openOrder(COMPANY_ID, {
+      orderKind: 'dining',
+      tableId: TABLE_ID,
+      guestCount: 2,
+    }, trainingActor, 'restaurant-training-open-0001');
+
+    expect(tx.restaurantTable.updateMany).not.toHaveBeenCalled();
+    expect(tx.restaurantOrder.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ tableId: null }),
+    }));
+    expect(order.tableId).toBe(TABLE_ID);
+    expect(order.trainingMode).toBe(true);
+    expect(tx.restaurantOrderEvent.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        payloadJson: expect.objectContaining({
+          snapshot: expect.objectContaining({ trainingMode: true, trainingTableId: TABLE_ID }),
+        }),
+      }),
+    }));
+    expect(socketService.emitToRestaurantPos).not.toHaveBeenCalled();
+  });
+
   test('persists counter orders using the database quick-sale kind', async () => {
     tx.restaurantOrder.create.mockImplementation(({ data }) => Promise.resolve(data));
 
@@ -105,6 +165,61 @@ describe('Restaurant order service', () => {
       data: expect.objectContaining({ orderKind: 'quick_sale', tableId: null }),
     }));
     expect(order.orderKind).toBe('quick_sale');
+  });
+
+  test('keeps training orders and tickets out of production overviews', async () => {
+    const trainingOrderId = '6'.repeat(24);
+    const productionOrderId = '7'.repeat(24);
+    const trainingRegisterId = '8'.repeat(24);
+    setupService.getSetup.mockResolvedValue({ categories: [], menuItems: [], areas: [] });
+    prisma.restaurantOrder = {
+      findMany: jest.fn().mockResolvedValue([
+        { id: trainingOrderId, registerId: trainingRegisterId, version: 1 },
+        { id: productionOrderId, registerId: REGISTER_ID, version: 1 },
+      ]),
+    };
+    prisma.restaurantOrderEvent = {
+      findMany: jest.fn().mockResolvedValue([
+        { orderId: trainingOrderId, payloadJson: { snapshot: { items: [], rounds: [], trainingMode: true } } },
+        { orderId: productionOrderId, payloadJson: { snapshot: { items: [], rounds: [], trainingMode: false } } },
+      ]),
+    };
+    prisma.restaurantKitchenTicket = {
+      findMany: jest.fn().mockResolvedValue([
+        { id: '9'.repeat(24), orderId: trainingOrderId },
+        { id: 'a'.repeat(24), orderId: productionOrderId },
+      ]),
+    };
+
+    const productionOverview = await orderService.getOverview(COMPANY_ID, actor);
+    expect(productionOverview.orders.map((order) => order.id)).toEqual([productionOrderId]);
+    expect(productionOverview.readyTickets.map((ticket) => ticket.orderId)).toEqual([productionOrderId]);
+
+    const trainingOverview = await orderService.getOverview(COMPANY_ID, {
+      ...actor,
+      registerId: trainingRegisterId,
+      trainingMode: true,
+    });
+    expect(trainingOverview.orders.map((order) => order.id)).toEqual([trainingOrderId]);
+    expect(trainingOverview.readyTickets).toEqual([]);
+  });
+
+  test.each([
+    ['a production register', actor],
+    ['another training register', { ...actor, trainingMode: true, registerId: '9'.repeat(24) }],
+  ])('blocks direct access to a training order from %s', async (_label, requestActor) => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: { snapshot: { items: [], rounds: [], trainingMode: true } },
+    });
+
+    await expect(orderService.getOrder(COMPANY_ID, ORDER_ID, requestActor))
+      .rejects.toMatchObject({ code: 'RESTAURANT_TRAINING_MODE_MISMATCH', statusCode: 403 });
+    expect(tx.restaurantKitchenTicket.findMany).not.toHaveBeenCalled();
   });
 
   test('rejects stale order versions before validating or writing lines', async () => {
@@ -155,7 +270,25 @@ describe('Restaurant order service', () => {
         },
       },
     });
+    tx.restaurantMenuItem.findMany.mockResolvedValue([
+      { id: '6'.repeat(24), productId: PRODUCT_ID, station: 'kitchen', isAvailable: true, stockMode: 'none' },
+      { id: '7'.repeat(24), productId: '5'.repeat(24), station: 'bar', isAvailable: true, stockMode: 'none' },
+    ]);
     tx.restaurantKitchenTicket.create.mockImplementation(({ data }) => Promise.resolve(data));
+    tx.systemSettings.findUnique.mockResolvedValue({
+      posHardwareSettings: {
+        companyDefaults: {
+          printerRoles: { kitchen: 'role:kitchen', bar: 'role:bar' },
+        },
+      },
+    });
+    tx.posPrintPrinter.findFirst.mockImplementation(({ where }) => Promise.resolve(
+      where.role
+        ? { id: where.role === 'kitchen' ? '8'.repeat(24) : '9'.repeat(24), agentId: '7'.repeat(24), role: where.role, name: `${where.role} printer` }
+        : null
+    ));
+    tx.posPrintJob.create.mockImplementation(({ data }) => Promise.resolve({ ...data }));
+    tx.restaurantKitchenTicket.update.mockImplementation(({ data }) => Promise.resolve(data));
     tx.restaurantOrder.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await orderService.sendRound(COMPANY_ID, ORDER_ID, { expectedVersion: 1 }, actor, 'restaurant-round-send-0001');
@@ -168,7 +301,130 @@ describe('Restaurant order service', () => {
       expect(ticket.lastError).toContain('display is offline');
     }
     expect(tx.restaurantKitchenTicket.create).toHaveBeenCalledTimes(2);
+    expect(tx.posPrintJob.create).toHaveBeenCalledTimes(2);
     expect(socketService.emitToRestaurantStation).toHaveBeenCalledTimes(2);
+  });
+
+  test('does not deliver a training round to production stations', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      tableId: null,
+      status: 'open',
+      version: 1,
+      guestCount: 1,
+      openedById: USER_ID,
+      waiterId: USER_ID,
+      openedAt: new Date('2026-11-21T00:00:00.000Z'),
+      updatedAt: new Date('2026-11-21T00:00:00.000Z'),
+      orderKind: 'quick_sale',
+      tabName: null,
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: {
+        snapshot: {
+          trainingMode: true,
+          rounds: [],
+          items: [{
+            id: '3'.repeat(24),
+            productId: PRODUCT_ID,
+            name: 'Soup',
+            quantity: 1,
+            unitPrice: '5.00',
+            station: 'kitchen',
+            modifiers: [],
+            note: '',
+            status: 'unsent',
+            roundNumber: null,
+          }],
+        },
+      },
+    });
+    tx.restaurantOrder.updateMany.mockResolvedValue({ count: 1 });
+
+    const result = await orderService.sendRound(
+      COMPANY_ID,
+      ORDER_ID,
+      { expectedVersion: 1 },
+      { ...actor, trainingMode: true },
+      'restaurant-training-round-0001',
+    );
+
+    expect(result.tickets).toEqual([]);
+    expect(result.stationDelivery.kitchen.ticketCreated).toBe(false);
+    expect(tx.restaurantKitchenTicket.create).not.toHaveBeenCalled();
+    expect(socketService.emitToRestaurantStation).not.toHaveBeenCalled();
+    expect(tx.restaurantOrderEvent.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        eventType: 'ROUND_SENT',
+        payloadJson: expect.objectContaining({ trainingMode: true }),
+      }),
+    }));
+  });
+
+  test('rejects sending an order through a register in the wrong mode', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      status: 'open',
+      version: 1,
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: { snapshot: { items: [], rounds: [], trainingMode: true } },
+    });
+
+    await expect(orderService.sendRound(
+      COMPANY_ID,
+      ORDER_ID,
+      { expectedVersion: 1 },
+      actor,
+      'restaurant-training-mismatch-0001',
+    )).rejects.toMatchObject({ code: 'RESTAURANT_TRAINING_MODE_MISMATCH', statusCode: 403 });
+    expect(tx.restaurantOrder.updateMany).not.toHaveBeenCalled();
+    expect(tx.restaurantKitchenTicket.create).not.toHaveBeenCalled();
+  });
+
+  test('requires manager permission before returning an unprepared void item to stock', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      status: 'open',
+      version: 2,
+      orderKind: 'quick_sale',
+      openedAt: new Date('2026-11-21T00:00:00.000Z'),
+      updatedAt: new Date('2026-11-21T00:00:00.000Z'),
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: {
+        snapshot: {
+          trainingMode: false,
+          rounds: [],
+          items: [{
+            id: '3'.repeat(24),
+            productId: PRODUCT_ID,
+            name: 'Soda',
+            quantity: 1,
+            status: 'sent',
+          }],
+        },
+      },
+    });
+    tx.restaurantKitchenTicket.findMany.mockResolvedValue([]);
+
+    await expect(orderService.voidSentItem(
+      COMPANY_ID,
+      ORDER_ID,
+      '3'.repeat(24),
+      { decision: 'return', reason: 'Wrong item' },
+      actor,
+      'restaurant-return-unapproved-0001',
+    )).rejects.toMatchObject({ code: 'RESTAURANT_VOID_RETURN_MANAGER_REQUIRED', statusCode: 403 });
+
+    expect(tx.restaurantStockCommitment.findMany).not.toHaveBeenCalled();
+    expect(tx.restaurantOrder.updateMany).not.toHaveBeenCalled();
   });
 
   test('marks a station ticket ready independently and accepts waiter pickup acknowledgement', async () => {
@@ -337,7 +593,37 @@ describe('Restaurant order service', () => {
     }));
   });
 
-  test('blocks carrying an issued unpaid bill to a different cashier', async () => {
+  test('excludes training orders from shift handover', async () => {
+    tx.restaurantOrder.findMany.mockResolvedValue([{
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      tableId: null,
+      status: 'open',
+      version: 1,
+      waiterId: USER_ID,
+      openedAt: new Date('2026-11-21T00:00:00.000Z'),
+      orderKind: 'quick_sale',
+      tabName: null,
+    }]);
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: { snapshot: { items: [], rounds: [], trainingMode: true } },
+    });
+
+    const result = await orderService.carryOpenOrdersForShiftHandover(tx, {
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      fromUserId: USER_ID,
+      toUserId: '4'.repeat(24),
+      shiftId: '5'.repeat(24),
+    });
+
+    expect(result).toEqual({ orders: [] });
+    expect(tx.restaurantOrder.updateMany).not.toHaveBeenCalled();
+    expect(tx.restaurantOrderEvent.create).not.toHaveBeenCalled();
+  });
+
+  test('transfers issued unpaid bill ownership to the incoming cashier and shift', async () => {
     tx.restaurantOrder.findMany.mockResolvedValue([{
       id: ORDER_ID,
       companyId: COMPANY_ID,
@@ -354,6 +640,19 @@ describe('Restaurant order service', () => {
     }]);
     tx.restaurantOrderEvent.findMany.mockResolvedValue([]);
     tx.restaurantTable.findMany.mockResolvedValue([]);
+    tx.restaurantBill.findMany.mockResolvedValue([{ id: '6'.repeat(24), invoiceId: '7'.repeat(24) }]);
+    tx.invoice.findFirst.mockResolvedValue({
+      id: '7'.repeat(24),
+      status: 'PENDING_PAYMENT',
+      cashierId: USER_ID,
+      shiftId: '5'.repeat(24),
+      referenceNo: 'INV-REST-01',
+    });
+    tx.invoice.update.mockResolvedValue({});
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: { snapshot: { trainingMode: false, items: [], rounds: [] } },
+    });
+    tx.restaurantOrder.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await orderService.carryOpenOrdersForShiftHandover(tx, {
       companyId: COMPANY_ID,
@@ -361,11 +660,14 @@ describe('Restaurant order service', () => {
       fromUserId: USER_ID,
       toUserId: '4'.repeat(24),
       shiftId: '5'.repeat(24),
+      toShiftId: '8'.repeat(24),
     });
 
-    expect(result.code).toBe('RESTAURANT_OPEN_BILLED_ORDERS_BLOCKED');
-    expect(result.blockedOrders).toMatchObject([{ id: ORDER_ID, status: 'billed' }]);
-    expect(tx.restaurantOrder.updateMany).not.toHaveBeenCalled();
-    expect(tx.restaurantOrderEvent.create).not.toHaveBeenCalled();
+    expect(result.orders).toHaveLength(1);
+    expect(tx.invoice.update).toHaveBeenCalledWith({
+      where: { id: '7'.repeat(24) },
+      data: { cashierId: '4'.repeat(24), shiftId: '8'.repeat(24) },
+    });
+    expect(tx.restaurantOrder.updateMany).toHaveBeenCalled();
   });
 });
