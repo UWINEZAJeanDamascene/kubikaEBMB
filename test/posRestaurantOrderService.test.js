@@ -91,6 +91,7 @@ describe('Restaurant order service', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     tx = createTransactionClient();
+    prisma.product = { findMany: jest.fn().mockResolvedValue([]) };
     tx.stockLevel.findUnique.mockResolvedValue({
       qtyOnHand: 0,
       qtyReserved: 0,
@@ -241,6 +242,143 @@ describe('Restaurant order service', () => {
     expect(tx.restaurantOrder.updateMany).not.toHaveBeenCalled();
   });
 
+  test('saves a custom Kitchen request without requiring a menu product', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      status: 'open',
+      version: 1,
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: { snapshot: { items: [], rounds: [], trainingMode: false } },
+    });
+    tx.restaurantMenuCategory.findMany.mockResolvedValue([]);
+    tx.restaurantMenuItemModifierGroup.findMany.mockResolvedValue([]);
+    tx.restaurantModifierGroup.findMany.mockResolvedValue([]);
+    tx.restaurantModifierOption.findMany.mockResolvedValue([]);
+    tx.restaurantOrder.updateMany.mockResolvedValue({ count: 1 });
+
+    const order = await orderService.updateUnsentItems(COMPANY_ID, ORDER_ID, {
+      expectedVersion: 1,
+      items: [{
+        type: 'custom',
+        name: 'Vegetable curry, no coconut',
+        station: 'kitchen',
+        quantity: 2,
+        note: 'Customer request',
+      }],
+    }, actor, 'restaurant-custom-item-0001');
+
+    expect(order.items).toEqual([expect.objectContaining({
+      isCustom: true,
+      customPricingStatus: 'pending',
+      productId: null,
+      name: 'Vegetable curry, no coconut',
+      station: 'kitchen',
+      quantity: 2,
+      status: 'unsent',
+    })]);
+    expect(tx.product.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ id: { in: [] } }) }));
+  });
+
+  test('requires a manager to map and price a custom request before billing', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      status: 'open',
+      version: 2,
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: {
+        snapshot: {
+          trainingMode: false,
+          rounds: [],
+          items: [{
+            id: '3'.repeat(24),
+            isCustom: true,
+            customPricingStatus: 'pending',
+            productId: null,
+            name: 'Vegetable curry',
+            quantity: 1,
+            station: 'kitchen',
+            modifiers: [],
+            note: '',
+            status: 'sent',
+            roundNumber: 1,
+          }],
+        },
+      },
+    });
+    tx.product.findFirst.mockResolvedValue({
+      id: PRODUCT_ID,
+      name: 'Restaurant custom sale',
+      sku: 'CUSTOM',
+      taxCode: 'B',
+      taxRate: 18,
+    });
+    tx.restaurantOrder.updateMany.mockResolvedValue({ count: 1 });
+
+    const result = await orderService.approveCustomItemPricing(
+      COMPANY_ID,
+      ORDER_ID,
+      '3'.repeat(24),
+      { expectedVersion: 2, productId: PRODUCT_ID, unitPrice: 7500 },
+      { ...actor, permissions: ['pos.payment.reconcile'] },
+      'restaurant-custom-pricing-0001',
+    );
+
+    expect(result.items[0]).toMatchObject({
+      isCustom: true,
+      customPricingStatus: 'approved',
+      productId: PRODUCT_ID,
+      unitPrice: '7500',
+      taxCode: 'B',
+      taxRate: '18',
+      customPricing: expect.objectContaining({ approvedById: USER_ID }),
+    });
+    expect(tx.restaurantOrderEvent.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ eventType: 'CUSTOM_ITEM_PRICED' }),
+    }));
+  });
+
+  test('prevents non-managers from searching catalog products for custom pricing', async () => {
+    await expect(orderService.searchCustomItemProducts(COMPANY_ID, 'custom', actor))
+      .rejects.toMatchObject({ code: 'RESTAURANT_CUSTOM_ITEM_MANAGER_REQUIRED', statusCode: 403 });
+    expect(prisma.product.findMany).not.toHaveBeenCalled();
+  });
+
+  test('blocks bill claim while a custom item still needs manager review', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      status: 'open',
+      version: 1,
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: {
+        snapshot: {
+          trainingMode: false,
+          rounds: [],
+          items: [{
+            id: '3'.repeat(24),
+            isCustom: true,
+            customPricingStatus: 'pending',
+            productId: null,
+            name: 'Vegetable curry',
+            quantity: 1,
+            status: 'sent',
+          }],
+        },
+      },
+    });
+
+    await expect(orderService.claimBill(COMPANY_ID, ORDER_ID, actor, 'restaurant-custom-bill-0001'))
+      .rejects.toMatchObject({ code: 'RESTAURANT_CUSTOM_ITEM_REVIEW_REQUIRED', statusCode: 409 });
+    expect(tx.restaurantOrder.updateMany).not.toHaveBeenCalled();
+  });
+
   test('routes a mixed round into separate price-free Kitchen and Bar tickets', async () => {
     const order = {
       id: ORDER_ID,
@@ -298,11 +436,60 @@ describe('Restaurant order service', () => {
     expect(result.tickets.find((ticket) => ticket.station === 'bar').payloadJson.items.map((item) => item.name)).toEqual(['Juice']);
     for (const ticket of result.tickets) {
       expect(ticket.payloadJson.items[0]).not.toHaveProperty('unitPrice');
-      expect(ticket.lastError).toContain('display is offline');
+      expect(ticket.lastError).toContain('printer ticket was queued');
     }
     expect(tx.restaurantKitchenTicket.create).toHaveBeenCalledTimes(2);
     expect(tx.posPrintJob.create).toHaveBeenCalledTimes(2);
     expect(socketService.emitToRestaurantStation).toHaveBeenCalledTimes(2);
+  });
+
+  test('does not save a transient offline warning on a ticket without printer fallback', async () => {
+    const order = {
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      tableId: null,
+      status: 'open',
+      version: 1,
+      guestCount: 1,
+      openedById: USER_ID,
+      waiterId: USER_ID,
+      openedAt: new Date('2026-11-21T00:00:00.000Z'),
+      updatedAt: new Date('2026-11-21T00:00:00.000Z'),
+      orderKind: 'quick_sale',
+      tabName: null,
+    };
+    tx.restaurantOrder.findFirst.mockResolvedValue(order);
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: {
+        snapshot: {
+          trainingMode: false,
+          rounds: [],
+          items: [
+            { id: '3'.repeat(24), productId: PRODUCT_ID, name: 'Soup', quantity: 1, unitPrice: '5.00', station: 'kitchen', modifiers: [], note: '', status: 'unsent', roundNumber: null },
+          ],
+        },
+      },
+    });
+    tx.restaurantMenuItem.findMany.mockResolvedValue([
+      { id: MENU_ITEM_ID, productId: PRODUCT_ID, station: 'kitchen', isAvailable: true, stockMode: 'none' },
+    ]);
+    tx.restaurantKitchenTicket.create.mockImplementation(({ data }) => Promise.resolve(data));
+    tx.restaurantOrder.updateMany.mockResolvedValue({ count: 1 });
+
+    const result = await orderService.sendRound(
+      COMPANY_ID,
+      ORDER_ID,
+      { expectedVersion: 1 },
+      actor,
+      'restaurant-round-offline-display-0001',
+    );
+
+    expect(result.stationDelivery.kitchen.online).toBe(false);
+    expect(result.tickets[0].lastError).toBeNull();
+    expect(tx.restaurantKitchenTicket.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ lastError: null }),
+    }));
   });
 
   test('does not deliver a training round to production stations', async () => {

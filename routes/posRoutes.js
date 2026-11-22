@@ -104,6 +104,7 @@ router.patch('/restaurant/setup/areas/:areaId', protect, canManagePosSettings, i
 router.post('/restaurant/setup/areas/:areaId/tables', protect, canManagePosSettings, idem(posRestaurantSetupController.createTable));
 router.patch('/restaurant/setup/tables/:tableId', protect, canManagePosSettings, idem(posRestaurantSetupController.updateTable));
 router.get('/restaurant/orders/overview', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), posRestaurantOrderController.getOverview);
+router.get('/restaurant/custom-item-products', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.reconcile'), posRestaurantOrderController.searchCustomItemProducts);
 router.get('/restaurant/report-registers', protect, canReadRestaurantReports, posRestaurantOrderController.listReportRegisters);
 router.get('/restaurant/reports', protect, canReadRestaurantReports, posRestaurantOrderController.getReport);
 router.post('/restaurant/orders/handover', requirePosSession(), requireRestaurantRegister, requireProductionRestaurantRegister, requirePermission('pos.shift.close'), idem(posRestaurantOrderController.handoverOpenOrders));
@@ -120,6 +121,7 @@ router.post('/restaurant/tips/:tipId/reversal', requirePosSession(), requireRest
 router.post('/restaurant/bills/:billId/payments/:paymentId/release', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.reconcile'), idem(posRestaurantBillController.releaseFailedPaymentLock));
 router.post('/restaurant/orders', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantOrderController.openOrder));
 router.patch('/restaurant/orders/:orderId/items', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantOrderController.updateUnsentItems));
+router.patch('/restaurant/orders/:orderId/items/:itemId/custom-pricing', requirePosSession(), requireRestaurantRegister, requirePermission('pos.payment.reconcile'), idem(posRestaurantOrderController.approveCustomItemPricing));
 router.post('/restaurant/orders/:orderId/send', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.sell'), idem(posRestaurantOrderController.sendRound));
 router.post('/restaurant/orders/:orderId/items/:itemId/void', requirePosSession(), requireRestaurantRegister, requirePermission('pos.till.void'), idem(posRestaurantOrderController.voidSentItem));
 router.get('/restaurant/stations/:station/tickets', requirePosSession(), requireRestaurantRegister, requireProductionRestaurantRegister, requirePermission('pos.till.sell'), posRestaurantOrderController.listStationTickets);

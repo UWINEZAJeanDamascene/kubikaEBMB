@@ -184,6 +184,10 @@ function buildCheckoutLines(order) {
   const sentItems = order.items.filter((item) => item.status === 'sent');
   if (!sentItems.length) throw fail('RESTAURANT_ORDER_EMPTY', 'Add and send at least one item before issuing the bill.', 409);
   return sentItems.map((item) => {
+    if (item.isCustom === true
+      && (item.customPricingStatus !== 'approved' || !ID_PATTERN.test(String(item.productId || '')))) {
+      throw fail('RESTAURANT_CUSTOM_ITEM_REVIEW_REQUIRED', 'A manager must assign a catalog product, price, and tax category to every custom item before billing.', 409);
+    }
     const basePrice = Number(item.unitPrice);
     const taxRate = Number(item.taxRate || 0);
     const modifiers = Array.isArray(item.modifiers) ? item.modifiers : [];

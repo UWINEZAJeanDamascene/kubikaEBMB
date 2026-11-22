@@ -201,6 +201,21 @@ exports.updateUnsentItems = action(200, (req, companyId, actor) => (
   )
 ));
 
+exports.searchCustomItemProducts = action(200, (req, companyId, actor) => (
+  orderService.searchCustomItemProducts(companyId, req.query?.q, actor)
+));
+
+exports.approveCustomItemPricing = action(200, (req, companyId, actor) => (
+  orderService.approveCustomItemPricing(
+    companyId,
+    req.params.orderId,
+    req.params.itemId,
+    req.body,
+    actor,
+    idempotencyKeyFor(req),
+  )
+));
+
 exports.sendRound = action(200, (req, companyId, actor) => (
   orderService.sendRound(
     companyId,

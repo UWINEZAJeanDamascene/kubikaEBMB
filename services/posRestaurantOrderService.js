@@ -23,6 +23,17 @@ function fail(code, message, statusCode = 400) {
   return error;
 }
 
+function normalizeCustomItemPrice(value) {
+  if (value == null || String(value).trim() === '') {
+    throw fail('RESTAURANT_CUSTOM_ITEM_PRICE_INVALID', 'Enter a valid custom-item price.');
+  }
+  const price = Number(value);
+  if (!Number.isSafeInteger(price) || price < 0 || price > 1000000000) {
+    throw fail('RESTAURANT_CUSTOM_ITEM_PRICE_INVALID', 'Enter a valid custom-item price.');
+  }
+  return String(price);
+}
+
 function requireCompany(value) {
   const companyId = String(value || '').trim();
   if (!ID_PATTERN.test(companyId)) {
@@ -41,6 +52,12 @@ function requireActor(actor) {
     throw fail('RESTAURANT_REGISTER_REQUIRED', 'A valid POS register is required.', 401);
   }
   return { ...actor, userId, registerId };
+}
+
+function requireCustomItemManager(actor) {
+  if (!Array.isArray(actor.permissions) || !actor.permissions.includes('pos.payment.reconcile')) {
+    throw fail('RESTAURANT_CUSTOM_ITEM_MANAGER_REQUIRED', 'A manager must review custom items before billing.', 403);
+  }
 }
 
 function normalizeId(value, label) {
@@ -401,6 +418,11 @@ async function claimBill(companyIdValue, orderIdValue, actorValue, idempotencyKe
     if (!snapshot.items.some((item) => item.status === 'sent')) {
       throw fail('RESTAURANT_ORDER_EMPTY', 'Add and send at least one item before issuing the bill.', 409);
     }
+    if (snapshot.items.some((item) => item.status !== 'voided'
+      && item.isCustom === true
+      && (item.customPricingStatus !== 'approved' || !ID_PATTERN.test(String(item.productId || ''))))) {
+      throw fail('RESTAURANT_CUSTOM_ITEM_REVIEW_REQUIRED', 'A manager must assign a catalog product, price, and tax category to every custom item before billing.', 409);
+    }
 
     const billedOrder = await writeOrderVersion(
       tx,
@@ -575,6 +597,19 @@ async function buildLines(tx, companyId, inputItems) {
 
   const prepared = inputItems.map((item) => {
     const source = item && typeof item === 'object' && !Array.isArray(item) ? item : {};
+    if (source.type === 'custom') {
+      const station = String(source.station || '').trim().toLowerCase();
+      if (!STATIONS.has(station)) {
+        throw fail('RESTAURANT_ORDER_INVALID', 'Choose Kitchen or Bar for a custom item.');
+      }
+      return {
+        isCustom: true,
+        name: normalizeText(source.name, 'Custom item description', 120, { required: true }),
+        station,
+        quantity: normalizeQuantity(source.quantity),
+        note: normalizeText(source.note, 'Item note', 240),
+      };
+    }
     return {
       productId: normalizeId(source.productId, 'menu item'),
       quantity: normalizeQuantity(source.quantity),
@@ -584,7 +619,8 @@ async function buildLines(tx, companyId, inputItems) {
         : [],
     };
   });
-  const productIds = [...new Set(prepared.map((item) => item.productId))];
+  const menuLines = prepared.filter((item) => !item.isCustom);
+  const productIds = [...new Set(menuLines.map((item) => item.productId))];
   const [menuItems, products] = await Promise.all([
     tx.restaurantMenuItem.findMany({
       where: { companyId, productId: { in: productIds }, isAvailable: true },
@@ -652,6 +688,28 @@ async function buildLines(tx, companyId, inputItems) {
   }
 
   return prepared.map((input) => {
+    if (input.isCustom) {
+      return {
+        id: generateObjectId(),
+        isCustom: true,
+        customPricingStatus: 'pending',
+        productId: null,
+        name: input.name,
+        sku: '',
+        quantity: input.quantity,
+        unitPrice: null,
+        taxCode: null,
+        taxRate: null,
+        serviceChargeExempt: false,
+        stockMode: 'none',
+        barStockProductId: null,
+        station: input.station,
+        modifiers: [],
+        note: input.note,
+        status: 'unsent',
+        roundNumber: null,
+      };
+    }
     const menuItem = menuByProductId.get(input.productId);
     const product = productById.get(input.productId);
     const assignedGroups = new Set(assignmentsByMenuItem.get(menuItem.id) || []);
@@ -727,6 +785,107 @@ async function updateUnsentItems(companyIdValue, orderIdValue, body, actorValue,
       orderId,
       version: updated.version,
       change: 'items',
+    });
+  }
+  return updated;
+}
+
+async function searchCustomItemProducts(companyIdValue, queryValue, actorValue) {
+  const companyId = requireCompany(companyIdValue);
+  const actor = requireActor(actorValue);
+  requireCustomItemManager(actor);
+  const query = normalizeText(queryValue, 'Search', 80).trim();
+  if (query.length < 2) return [];
+  const products = await prisma.product.findMany({
+    where: {
+      companyId,
+      isActive: true,
+      isArchived: false,
+      OR: [
+        { name: { contains: query, mode: 'insensitive' } },
+        { sku: { contains: query, mode: 'insensitive' } },
+      ],
+    },
+    select: { id: true, name: true, sku: true, sellingPrice: true, taxCode: true, taxRate: true },
+    orderBy: { name: 'asc' },
+    take: 20,
+  });
+  return products.map((product) => ({
+    id: product.id,
+    name: product.name,
+    sku: product.sku,
+    sellingPrice: decimalText(product.sellingPrice),
+    taxCode: String(product.taxCode || 'A'),
+    taxRate: decimalText(product.taxRate),
+  }));
+}
+
+async function approveCustomItemPricing(companyIdValue, orderIdValue, itemIdValue, body, actorValue, idempotencyKeyValue) {
+  const companyId = requireCompany(companyIdValue);
+  const orderId = normalizeId(orderIdValue, 'order');
+  const itemId = normalizeId(itemIdValue, 'order item');
+  const actor = requireActor(actorValue);
+  requireCustomItemManager(actor);
+  const key = eventKey(idempotencyKeyValue);
+  const expectedVersion = normalizeExpectedVersion(body?.expectedVersion);
+  const productId = normalizeId(body?.productId, 'catalog product');
+  const unitPrice = normalizeCustomItemPrice(body?.unitPrice);
+  const updated = await prisma.$transaction(async (tx) => {
+    const order = await findOrder(tx, companyId, orderId);
+    if (order.status !== OPEN_ORDER_STATUS) {
+      throw fail('RESTAURANT_ORDER_CLOSED', 'This order is no longer open for custom-item review.', 409);
+    }
+    if (order.version !== expectedVersion) {
+      throw fail('RESTAURANT_ORDER_VERSION_CONFLICT', 'Another staff member changed this order. Refresh and try again.', 409);
+    }
+    const snapshot = await findSnapshot(tx, companyId, order);
+    assertTrainingMode(actor, snapshot, order);
+    const item = snapshot.items.find((candidate) => candidate.id === itemId);
+    if (!item || item.isCustom !== true || item.status !== 'sent') {
+      throw fail('RESTAURANT_CUSTOM_ITEM_NOT_REVIEWABLE', 'Only a sent custom item can be reviewed.', 409);
+    }
+    const product = await tx.product.findFirst({
+      where: { id: productId, companyId, isActive: true, isArchived: false },
+      select: { id: true, name: true, sku: true, taxCode: true, taxRate: true },
+    });
+    if (!product) {
+      throw fail('RESTAURANT_CUSTOM_ITEM_PRODUCT_UNAVAILABLE', 'Choose an active catalog product for this custom item.', 409);
+    }
+    const now = new Date();
+    const pricedItem = {
+      ...item,
+      productId: product.id,
+      sku: product.sku,
+      unitPrice,
+      taxCode: String(product.taxCode || 'A'),
+      taxRate: decimalText(product.taxRate),
+      customPricingStatus: 'approved',
+      customPricing: {
+        productName: product.name,
+        approvedById: actor.userId,
+        approvedAt: now.toISOString(),
+      },
+    };
+    const nextSnapshot = {
+      ...snapshot,
+      items: snapshot.items.map((candidate) => candidate.id === itemId ? pricedItem : candidate),
+    };
+    const savedOrder = await writeOrderVersion(
+      tx,
+      order,
+      nextSnapshot,
+      'CUSTOM_ITEM_PRICED',
+      { itemId, productId: product.id, unitPrice, taxCode: pricedItem.taxCode, taxRate: pricedItem.taxRate },
+      actor,
+      key,
+    );
+    return orderView(savedOrder, nextSnapshot);
+  });
+  if (!updated.trainingMode) {
+    socketService.emitToRestaurantPos(companyId, 'restaurant:order-updated', {
+      orderId,
+      version: updated.version,
+      change: 'custom-item-priced',
     });
   }
   return updated;
@@ -870,12 +1029,13 @@ async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempot
     if (!unsent.length) throw fail('RESTAURANT_ORDER_NO_UNSENT_ITEMS', 'Add items before sending a new round.');
     const roundNumber = snapshot.rounds.reduce((max, round) => Math.max(max, Number(round.roundNumber) || 0), 0) + 1;
     const now = new Date();
+    const stockItems = unsent.filter((item) => item.isCustom !== true);
     const stockCommitment = trainingMode
       ? { warnings: [], commitments: [], approval: null }
       : await restaurantInventoryService.prepareRoundCommitments(tx, {
         companyId,
         order,
-        items: unsent,
+        items: stockItems,
         actor,
         stockApprovalReason: body?.stockApprovalReason,
       });
@@ -911,7 +1071,7 @@ async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempot
           payloadJson,
           reprintCount: 0,
           retryCount: 0,
-          lastError: displayOnline ? null : `${station === 'kitchen' ? 'Kitchen' : 'Bar'} display is offline. The ticket is saved and will appear when the display reconnects.`,
+          lastError: null,
           createdAt: now,
           updatedAt: now,
           fallbackAttempted: false,
@@ -1047,7 +1207,7 @@ async function retryTicket(companyIdValue, ticketIdValue, actorValue) {
     where: { id: ticket.id },
     data: {
       retryCount: { increment: 1 },
-      lastError: displayOnline ? null : `${ticket.station === 'kitchen' ? 'Kitchen' : 'Bar'} display is offline. The ticket remains saved.`,
+      lastError: null,
       updatedAt: new Date(),
     },
   });
@@ -1166,6 +1326,7 @@ async function voidSentItem(companyIdValue, orderIdValue, itemIdValue, body, act
 }
 
 module.exports = {
+  approveCustomItemPricing,
   carryOpenOrdersForShiftHandover,
   claimBill,
   getOrder,
@@ -1176,6 +1337,7 @@ module.exports = {
   notifyHandoverOrders,
   openOrder,
   retryTicket,
+  searchCustomItemProducts,
   sendRound,
   updateTicketStatus,
   updateUnsentItems,
