@@ -566,14 +566,14 @@ exports.forceLogoutUser = async (req, res, next) => {
 /**
  * Check if platform admin setup is needed
  * GET /api/auth/platform-admin-status
- * Public - returns whether a platform admin exists
+ * Public - setup is available only before the first user is created
  */
 exports.checkPlatformAdminStatus = async (req, res, next) => {
   try {
-    const existingAdmin = await prisma.user.findFirst({ where: { role: 'platform_admin' } });
+    const userCount = await prisma.user.count();
     res.json({
       success: true,
-      needsSetup: !existingAdmin
+      needsSetup: userCount === 0
     });
   } catch (error) {
     next(error);
@@ -584,7 +584,7 @@ exports.checkPlatformAdminStatus = async (req, res, next) => {
  * Setup the first platform admin
  * POST /api/auth/setup-platform-admin
  * Public - requires PLATFORM_ADMIN_SETUP_KEY env var
- * Can only be used once when no platform admin exists
+ * Can only be used once before the first user exists
  */
 exports.setupPlatformAdmin = async (req, res, next) => {
   try {
@@ -626,13 +626,22 @@ exports.setupPlatformAdmin = async (req, res, next) => {
     }
     if (passwordError) return res.status(400).json({ success: false, message: passwordError.message, code: passwordError.code });
 
-    // Check if any platform admin already exists
+    // Keep platform-admin conflicts distinct from other users blocking bootstrap.
     const existingAdmin = await prisma.user.findFirst({ where: { role: 'platform_admin' } });
     if (existingAdmin) {
       return res.status(409).json({
         success: false,
         message: 'A platform administrator already exists. Setup can only be performed once.',
         code: 'PLATFORM_ADMIN_ALREADY_EXISTS'
+      });
+    }
+
+    const existingUserCount = await prisma.user.count();
+    if (existingUserCount > 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'Platform setup is only available before the first user is created.',
+        code: 'PLATFORM_SETUP_NOT_AVAILABLE'
       });
     }
 
