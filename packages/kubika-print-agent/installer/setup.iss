@@ -1,5 +1,7 @@
 #define AppName "Kubika Print Agent"
-#define AppVersion "0.1.5"
+#ifndef AppVersion
+  #define AppVersion "0.0.0"
+#endif
 #define AppPublisher "Kubika"
 #define AppExeName "service.exe"
 

@@ -58,6 +58,7 @@ logs/*
 README.md
 docs/
 *.md
+!downloads/print-agent/release-notes.md
 
 # Git
 .git/

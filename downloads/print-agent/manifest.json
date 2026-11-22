@@ -1,17 +1,21 @@
 ﻿{
-    "version":  "0.1.4",
-    "releaseDateUtc":  "2026-11-14T11:45:18.4847949Z",
+    "winswSha256":  "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da",
+    "setupSigned":  false,
+    "setup":  "KubikaPrintAgent-0.1.5-setup.exe",
+    "releaseDateUtc":  "2026-11-16T16:33:26.3259431Z",
+    "signingDecision":  "Unsigned: no production signing certificate was configured.",
+    "package":  "KubikaPrintAgent-0.1.5-portable.zip",
+    "version":  "0.1.5",
+    "setupSha256":  "479fa112c2b3337f3b58da660da6c7ebc31ed37825fd9cf38abf8ffae5ee6499",
+    "releaseNotes":  "release-notes.md",
+    "packageSha256":  "4a3bae04c063f23edb3868e3ed4802a3b1bbb52d71a7e7b2aa23049d2f4eb5aa",
+    "sha256":  "4a3bae04c063f23edb3868e3ed4802a3b1bbb52d71a7e7b2aa23049d2f4eb5aa",
+    "signed":  false,
     "hardwareValidation":  {
                                "productionCertificate":  "not-provided",
                                "windowsSdk":  "available",
                                "simulatedTcp9100":  "passed",
                                "physicalDrawers":  "pending",
                                "physicalPrinters":  "pending"
-                           },
-    "sha256":  "0d4ff7934bca8ab7d00b6831e47612044823e4f6881e855ea30fc5c8251b96ce",
-    "setup":  "KubikaPrintAgent-0.1.4-setup.exe",
-    "signed":  false,
-    "package":  "KubikaPrintAgent-0.1.4-portable.zip",
-    "setupSha256":  "5ec5fb5ae6f560dfb0ca9fe6498178c9e8262cee5b08a91e79b26c79f284f232",
-    "winswSha256":  "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
+                           }
 }

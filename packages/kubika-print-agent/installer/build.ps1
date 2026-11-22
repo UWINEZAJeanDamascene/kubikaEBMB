@@ -1,7 +1,8 @@
 $ErrorActionPreference = 'Stop'
 
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
-$version = '0.1.5'
+$package = Get-Content (Join-Path $root 'package.json') -Raw | ConvertFrom-Json
+$version = [string]$package.version
 $staging = Join-Path $root 'staging'
 $release = Join-Path $root 'release'
 $runtimeDir = Join-Path $staging 'runtime'
@@ -70,7 +71,7 @@ if ($signThumbprint -and $signTool) {
 Compress-Archive -Path "$staging\*" -DestinationPath $zip -Force
 if (Test-Path $inno) {
   Write-Host 'Building Inno Setup installer...'
-  & $inno '/Q' $installerScript
+  & $inno '/Q' "/DAppVersion=$version" $installerScript
   if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 } else {
   Write-Warning "Inno Setup is not installed at $inno. Portable ZIP and manifest were created; the Setup EXE must be built on a release machine with Inno Setup 6."
@@ -110,5 +111,19 @@ Copy-Item (Join-Path $root 'installer\verify-release.ps1') (Join-Path $release '
 @("# Kubika Print Agent $version", '', '- Adds redacted rotating JSON logs and a protected diagnostics export.', '- Reports Windows printer status and surfaces backend agent, printer, failure, and queue alerts.', '- Installer upgrade stops the service before replacing files; uninstall prompts to keep or remove shop data.', '- Includes the LocalSystem printer visibility comparison script and release SHA-256 verifier.', '', "Signing: $($manifest.signingDecision)", 'Physical Windows 10/11 printer validation remains pending.') | Set-Content $releaseNotes -Encoding UTF8
 $manifest.releaseNotes = Split-Path -Leaf $releaseNotes
 $manifest | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $release 'manifest.json') -Encoding UTF8
+
+# Publish complete releases into the tracked directory used by both local and
+# deployed backends. Keep portable-only builds in the ignored release directory.
+if (Test-Path $setupExe) {
+  $downloadDir = Join-Path $root '..\..\downloads\print-agent'
+  New-Item -ItemType Directory -Force $downloadDir | Out-Null
+  Copy-Item $zip $downloadDir -Force
+  Copy-Item $setupExe $downloadDir -Force
+  Copy-Item $releaseNotes $downloadDir -Force
+  Copy-Item (Join-Path $release 'manifest.json') $downloadDir -Force
+  Write-Host "Published $version to tracked release directory $downloadDir. Review and commit these release artifacts."
+} else {
+  Write-Warning 'Setup EXE was not built; the tracked release was not changed.'
+}
 
 Write-Host "Release artifacts are in $release"
