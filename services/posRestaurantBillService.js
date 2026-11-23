@@ -990,6 +990,8 @@ async function issueBill(companyIdValue, orderIdValue, req) {
         taxCode: line.taxCode,
         taxRate: line.taxRate,
         serviceChargeExempt: line.serviceChargeExempt === true,
+        promotionSnapshot: line.promotionSnapshot,
+        discountPct: line.discountPct,
         description: line.description,
       })),
     };
@@ -1334,7 +1336,7 @@ async function settleBill(companyIdValue, billIdValue, req) {
       throw fail('RESTAURANT_BILL_PAYER_INVALID', 'Choose a guest with an amount assigned to this bill.', 400);
     }
     const payerPaidRows = await dbClient().$queryRawUnsafe(
-      'SELECT COALESCE(SUM(p.amount), 0)::text AS amount FROM restaurant_bill_payments bp JOIN pos_payments p ON p.company_id = bp.company_id AND p.id = bp.payment_id WHERE bp.company_id = $1 AND bp.bill_id = $2 AND bp.payer_number = $3 AND p.status = $4',
+      'SELECT COALESCE(SUM(p.amount), 0)::text AS amount FROM restaurant_bill_payments bp JOIN pos_payments p ON p.company_id = bp.company_id AND p.id = bp.payment_id WHERE bp.company_id = $1 AND bp.bill_id = $2 AND bp.payer_number = $3 AND p.status = $4::"PosPaymentStatus"',
       companyId,
       bill.id,
       payerNumber,

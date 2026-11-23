@@ -591,6 +591,50 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     expect(journalLines).toEqual(expect.arrayContaining([expect.objectContaining({ debit: 35.25 })]));
   });
 
+  test('applies a saved Restaurant promotion discount without requiring manual discount approval', async () => {
+    stubHappyPathDeps();
+    Invoice.create.mockResolvedValue([buildInvoiceDoc({ grandTotal: 800, totalAmount: 800 })]);
+    const orderItemId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const request = makeReq({
+      body: checkoutBody({
+        items: [saleLine({
+          unitPrice: 1000,
+          discountPct: 20,
+          discountReason: '',
+          taxCode: 'A',
+          taxRate: 0,
+        })],
+        paymentAmount: 800,
+      }),
+    });
+    request.posRestaurantCheckout = {
+      lines: [{
+        itemId: orderItemId,
+        productId: IDS.product,
+        quantity: 1,
+        unitPrice: 1000,
+        taxCode: 'A',
+        taxRate: 0,
+        description: 'POS Widget',
+        discountPct: 20,
+        promotionSnapshot: { unitPrice: 800 },
+      }],
+    };
+
+    const res = mockRes();
+    await createDirectSale(request, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(201);
+    expect(Invoice.create.mock.calls[0][0][0].lines[0]).toMatchObject({
+      unitPrice: 1000,
+      discountPct: 20,
+      lineSubtotal: 1000,
+      taxRate: 0,
+      taxAmount: 0,
+      lineTotal: 800,
+    });
+  });
+
   test('completes an approved discounted sale without updating the protected walk-in customer', async () => {
     const { db } = stubHappyPathDeps();
     const walkInCustomer = {

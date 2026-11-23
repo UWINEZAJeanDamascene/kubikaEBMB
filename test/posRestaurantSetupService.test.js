@@ -250,6 +250,34 @@ describe('Restaurant setup service', () => {
     }), tx);
   });
 
+  test('adds a packaged-goods menu item with direct stock deduction', async () => {
+    tx.product.findFirst.mockResolvedValue({ id: PRODUCT_ID, categoryId: CATEGORY_ID });
+    tx.category.findFirst.mockResolvedValue({ id: CATEGORY_ID });
+    tx.restaurantMenuCategory.findFirst.mockResolvedValue({ id: CATEGORY_ID });
+    tx.restaurantMenuItem.findFirst.mockResolvedValue(null);
+    tx.restaurantMenuItem.create.mockResolvedValue({ id: MENU_ITEM_ID, productId: PRODUCT_ID, stockMode: 'goods' });
+    tx.restaurantMenuItemModifierGroup.deleteMany.mockResolvedValue({ count: 0 });
+
+    await expect(setupService.createMenuItem(COMPANY_ID, {
+      productId: PRODUCT_ID,
+      stationId: 'kitchen',
+      stockMode: 'goods',
+      modifierGroups: [],
+    }, { userId: '9'.repeat(24) })).resolves.toMatchObject({
+      id: MENU_ITEM_ID,
+      productId: PRODUCT_ID,
+      stockMode: 'goods',
+    });
+
+    expect(tx.restaurantMenuItem.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        companyId: COMPANY_ID,
+        productId: PRODUCT_ID,
+        stockMode: 'goods',
+      }),
+    }));
+  });
+
   test('rejects modifier prices with more precision than the existing database supports', async () => {
     await expect(setupService.createModifierGroup(COMPANY_ID, {
       name: 'Size',

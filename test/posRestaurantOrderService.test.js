@@ -127,6 +127,36 @@ describe('Restaurant order service', () => {
     }));
   });
 
+  test('reuses an empty open order and releases its stale table claim', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      tableId: TABLE_ID,
+      status: 'open',
+      version: 1,
+      guestCount: 2,
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: { snapshot: { items: [], rounds: [], trainingMode: false } },
+    });
+    tx.restaurantTable.findFirst.mockResolvedValue({ id: TABLE_ID, state: 'occupied' });
+    tx.restaurantTable.updateMany.mockResolvedValue({ count: 1 });
+
+    const order = await orderService.openOrder(COMPANY_ID, {
+      orderKind: 'dining',
+      tableId: TABLE_ID,
+      guestCount: 2,
+    }, actor, 'restaurant-reuse-empty-order-0001');
+
+    expect(order.id).toBe(ORDER_ID);
+    expect(tx.restaurantOrder.create).not.toHaveBeenCalled();
+    expect(tx.restaurantTable.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: TABLE_ID, companyId: COMPANY_ID, state: 'occupied' },
+      data: expect.objectContaining({ state: 'free', guestCount: 0 }),
+    }));
+  });
+
   test('keeps a training dining order off the real table state', async () => {
     tx.restaurantOrder.findFirst.mockResolvedValue(null);
     tx.restaurantTable.findFirst.mockResolvedValue({ id: TABLE_ID, state: 'free', capacity: 4 });
@@ -281,6 +311,47 @@ describe('Restaurant order service', () => {
     expect(tx.product.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ id: { in: [] } }) }));
   });
 
+  test('releases the table when the last unsent line is removed', async () => {
+    tx.restaurantOrder.findFirst.mockResolvedValue({
+      id: ORDER_ID,
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      tableId: TABLE_ID,
+      status: 'open',
+      version: 1,
+      guestCount: 2,
+    });
+    tx.restaurantOrderEvent.findFirst.mockResolvedValue({
+      payloadJson: {
+        snapshot: {
+          items: [{
+            id: '3'.repeat(24),
+            productId: PRODUCT_ID,
+            quantity: 1,
+            status: 'unsent',
+            roundNumber: null,
+          }],
+          rounds: [],
+          trainingMode: false,
+        },
+      },
+    });
+    tx.restaurantTable.findFirst.mockResolvedValue({ id: TABLE_ID, state: 'occupied' });
+    tx.restaurantTable.updateMany.mockResolvedValue({ count: 1 });
+    tx.restaurantOrder.updateMany.mockResolvedValue({ count: 1 });
+
+    const order = await orderService.updateUnsentItems(COMPANY_ID, ORDER_ID, {
+      expectedVersion: 1,
+      items: [],
+    }, actor, 'restaurant-clear-empty-order-0001');
+
+    expect(order.items).toEqual([]);
+    expect(tx.restaurantTable.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: TABLE_ID, companyId: COMPANY_ID, state: 'occupied' },
+      data: expect.objectContaining({ state: 'free', guestCount: 0 }),
+    }));
+  });
+
   test('requires a manager to map and price a custom request before billing', async () => {
     tx.restaurantOrder.findFirst.mockResolvedValue({
       id: ORDER_ID,
@@ -412,6 +483,12 @@ describe('Restaurant order service', () => {
       { id: '6'.repeat(24), productId: PRODUCT_ID, station: 'kitchen', isAvailable: true, stockMode: 'none' },
       { id: '7'.repeat(24), productId: '5'.repeat(24), station: 'bar', isAvailable: true, stockMode: 'none' },
     ]);
+    tx.restaurantRecipeIngredient.findMany.mockResolvedValue([
+      { menuItemId: '6'.repeat(24), productId: '8'.repeat(24), quantity: '0.25', unitCode: 'base' },
+    ]);
+    tx.product.findMany.mockResolvedValue([
+      { id: '8'.repeat(24), name: 'Tomatoes', unit: 'kg', customFields: {} },
+    ]);
     tx.restaurantKitchenTicket.create.mockImplementation(({ data }) => Promise.resolve(data));
     tx.systemSettings.findUnique.mockResolvedValue({
       posHardwareSettings: {
@@ -434,6 +511,9 @@ describe('Restaurant order service', () => {
     expect(result.tickets.map((ticket) => ticket.station).sort()).toEqual(['bar', 'kitchen']);
     expect(result.tickets.find((ticket) => ticket.station === 'kitchen').payloadJson.items.map((item) => item.name)).toEqual(['Soup']);
     expect(result.tickets.find((ticket) => ticket.station === 'bar').payloadJson.items.map((item) => item.name)).toEqual(['Juice']);
+    expect(result.tickets.find((ticket) => ticket.station === 'kitchen').payloadJson.items[0].recipe).toEqual([
+      expect.objectContaining({ name: 'Tomatoes', quantity: '0.25', unit: 'kg' }),
+    ]);
     for (const ticket of result.tickets) {
       expect(ticket.payloadJson.items[0]).not.toHaveProperty('unitPrice');
       expect(ticket.lastError).toContain('printer ticket was queued');

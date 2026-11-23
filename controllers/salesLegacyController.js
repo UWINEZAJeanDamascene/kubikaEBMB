@@ -896,6 +896,7 @@ exports.createDirectSale = async (req, res, next) => {
       }
 
       const restaurantLine = req.posRestaurantCheckout?.lines?.[itemIndex];
+      const isSavedRestaurantPromotion = Boolean(restaurantLine?.promotionSnapshot);
       if (req.posRestaurantCheckout && (
         !restaurantLine
         || String(item.productId) !== String(restaurantLine.productId)
@@ -958,7 +959,7 @@ exports.createDirectSale = async (req, res, next) => {
       }
       const appliedCartDiscountPct = restaurantLine || isRestrictedProduct ? 0 : cartDiscountPct;
       const discountPct = restaurantLine
-        ? 0
+        ? Number(restaurantLine.discountPct || 0)
         : promotion
         ? Number(promotionDiscountPctByIndex.get(itemIndex) || 0)
         : appliedCartDiscountPct > 0 ? appliedCartDiscountPct : requestedDiscountPct;
@@ -1015,7 +1016,8 @@ exports.createDirectSale = async (req, res, next) => {
 
       const unitPrice = requestedUnitPrice;
       const hasPriceOverride = !restaurantLine && Math.abs(requestedUnitPrice - expectedSalesPrice) > 0.000001;
-      if (!tillFeatures.manualDiscounts && (requestedDiscountPct > 0 || (hasPriceOverride && !isOpenPriceItem))) {
+      if (!tillFeatures.manualDiscounts && !isSavedRestaurantPromotion
+        && (requestedDiscountPct > 0 || (hasPriceOverride && !isOpenPriceItem))) {
         return res.status(403).json({
           success: false,
           code: 'POS_TILL_FEATURE_DISABLED',
@@ -1244,7 +1246,7 @@ exports.createDirectSale = async (req, res, next) => {
         discountReason,
         discountCapPercent: promotion
           ? Number(promotionDiscountPctByIndex.get(itemIndex) || 0)
-          : appliedCartDiscountPct > 0 ? 0 : requestedDiscountPct,
+          : (appliedCartDiscountPct > 0 || isSavedRestaurantPromotion) ? 0 : requestedDiscountPct,
         taxCode: taxCode,
         taxRate: taxRate,
         taxAmount: taxAmount,

@@ -271,6 +271,58 @@ function decimalText(value) {
   return value == null ? '0' : String(value);
 }
 
+async function ticketRecipeMap(tx, companyId, items) {
+  const productIds = [...new Set(items.map((item) => String(item.productId || '')).filter(Boolean))];
+  if (!productIds.length) return new Map();
+  const menuItems = await tx.restaurantMenuItem.findMany({
+    where: { companyId, productId: { in: productIds }, isAvailable: true },
+  });
+  const menuItemIds = menuItems.map((item) => item.id);
+  const ingredients = menuItemIds.length
+    ? await tx.restaurantRecipeIngredient.findMany({
+      where: { companyId, menuItemId: { in: menuItemIds } },
+    })
+    : [];
+  const stockProductIds = [...new Set([
+    ...menuItems.map((item) => item.barStockProductId).filter(Boolean),
+    ...ingredients.map((ingredient) => ingredient.productId),
+  ])];
+  const products = stockProductIds.length
+    ? await tx.product.findMany({
+      where: { companyId, id: { in: stockProductIds } },
+      select: { id: true, name: true, unit: true, customFields: true },
+    })
+    : [];
+  const menuByProductId = new Map(menuItems.map((item) => [item.productId, item]));
+  const ingredientsByMenuItemId = new Map();
+  for (const ingredient of ingredients) {
+    const list = ingredientsByMenuItemId.get(ingredient.menuItemId) || [];
+    list.push(ingredient);
+    ingredientsByMenuItemId.set(ingredient.menuItemId, list);
+  }
+  const productById = new Map(products.map((product) => [product.id, product]));
+  const recipeByProductId = new Map();
+  for (const item of items) {
+    const menuItem = menuByProductId.get(item.productId);
+    if (!menuItem) continue;
+    const recipe = (ingredientsByMenuItemId.get(menuItem.id) || []).map((ingredient) => {
+      const product = productById.get(ingredient.productId);
+      const unit = ingredient.unitCode === 'base'
+        ? product?.unit || ingredient.unitCode
+        : product?.customFields?.purchaseUnits?.find((entry) => entry.code === ingredient.unitCode)?.label
+          || ingredient.unitCode;
+      return {
+        productId: ingredient.productId,
+        name: product?.name || 'Stock item',
+        quantity: String(ingredient.quantity),
+        unit,
+      };
+    });
+    recipeByProductId.set(item.productId, recipe);
+  }
+  return recipeByProductId;
+}
+
 function normalizeQuantity(value) {
   const quantity = Number(value);
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 99) {
@@ -525,7 +577,31 @@ async function openOrder(companyIdValue, body, actorValue, idempotencyKeyValue) 
       const active = await tx.restaurantOrder.findFirst({
         where: { companyId, tableId, status: { in: ACTIVE_ORDER_STATUSES } },
       });
-      if (active) throw fail('RESTAURANT_TABLE_IN_USE', 'This table already has an open order. Open that order instead.', 409);
+      if (active) {
+        const snapshot = await findSnapshot(tx, companyId, active);
+        if (active.status === OPEN_ORDER_STATUS && snapshot.items.length === 0 && snapshot.rounds.length === 0) {
+          if (!actor.trainingMode) {
+            const table = await tx.restaurantTable.findFirst({
+              where: { id: tableId, companyId },
+              select: { id: true, state: true },
+            });
+            if (!table) throw fail('RESTAURANT_TABLE_NOT_FOUND', 'This order table is no longer available.', 404);
+            if (table.state === 'occupied') {
+              const released = await tx.restaurantTable.updateMany({
+                where: { id: tableId, companyId, state: 'occupied' },
+                data: { state: 'free', guestCount: 0, version: { increment: 1 } },
+              });
+              if (released.count !== 1) {
+                throw fail('RESTAURANT_TABLE_STATE_CONFLICT', 'Refresh the floor before reopening this table.', 409);
+              }
+            } else if (table.state !== 'free') {
+              throw fail('RESTAURANT_TABLE_STATE_CONFLICT', 'This table is not available for an empty order. Refresh the floor.', 409);
+            }
+          }
+          return orderView(active, snapshot);
+        }
+        throw fail('RESTAURANT_TABLE_IN_USE', 'This table already has an open order. Open that order instead.', 409);
+      }
       const table = await tx.restaurantTable.findFirst({
         where: { id: tableId, companyId },
         select: { id: true, state: true, capacity: true },
@@ -777,6 +853,34 @@ async function updateUnsentItems(companyIdValue, orderIdValue, body, actorValue,
       ...snapshot,
       items: [...sentLines, ...newLines],
     };
+    if (order.tableId && !actor.trainingMode) {
+      const table = await tx.restaurantTable.findFirst({
+        where: { id: order.tableId, companyId },
+        select: { id: true, state: true },
+      });
+      if (!table) throw fail('RESTAURANT_TABLE_NOT_FOUND', 'This order table is no longer available.', 404);
+      if (nextSnapshot.items.length === 0) {
+        if (table.state === 'occupied') {
+          const released = await tx.restaurantTable.updateMany({
+            where: { id: order.tableId, companyId, state: 'occupied' },
+            data: { state: 'free', guestCount: 0, version: { increment: 1 } },
+          });
+          if (released.count !== 1) {
+            throw fail('RESTAURANT_TABLE_STATE_CONFLICT', 'Refresh the floor before removing the last item.', 409);
+          }
+        }
+      } else if (table.state === 'free') {
+        const claimed = await tx.restaurantTable.updateMany({
+          where: { id: order.tableId, companyId, state: 'free' },
+          data: { state: 'occupied', guestCount: order.guestCount, version: { increment: 1 } },
+        });
+        if (claimed.count !== 1) {
+          throw fail('RESTAURANT_TABLE_IN_USE', 'Another staff member opened this table. Refresh the floor.', 409);
+        }
+      } else if (table.state !== 'occupied') {
+        throw fail('RESTAURANT_TABLE_STATE_CONFLICT', 'This table is not available for an open order. Refresh the floor.', 409);
+      }
+    }
     const savedOrder = await writeOrderVersion(tx, order, nextSnapshot, 'ITEMS_UPDATED', {}, actor, key);
     return orderView(savedOrder, nextSnapshot);
   });
@@ -891,7 +995,7 @@ async function approveCustomItemPricing(companyIdValue, orderIdValue, itemIdValu
   return updated;
 }
 
-function ticketPayload(order, roundNumber, station, items, tableName, waiterName, createdAt) {
+function ticketPayload(order, roundNumber, station, items, tableName, waiterName, createdAt, recipeByProductId = new Map()) {
   return {
     orderId: order.id,
     orderKind: order.orderKind,
@@ -904,11 +1008,13 @@ function ticketPayload(order, roundNumber, station, items, tableName, waiterName
     sentAt: createdAt.toISOString(),
     items: items.map((item) => ({
       id: item.id,
+      productId: item.productId || null,
       name: item.name,
       quantity: item.quantity,
       modifiers: item.modifiers,
       note: item.note,
       status: item.status,
+      recipe: recipeByProductId.get(item.productId) || [],
     })),
   };
 }
@@ -1042,6 +1148,9 @@ async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempot
     const nextItems = snapshot.items.map((item) => item.status === 'unsent'
       ? { ...item, status: 'sent', roundNumber, sentAt: now.toISOString() }
       : item);
+    const recipeByProductId = trainingMode
+      ? new Map()
+      : await ticketRecipeMap(tx, companyId, unsent);
     const tickets = [];
     const stations = trainingMode ? [] : [...STATIONS].filter((station) => unsent.some((item) => item.station === station));
     const table = order.tableId
@@ -1057,6 +1166,7 @@ async function sendRound(companyIdValue, orderIdValue, body, actorValue, idempot
         table?.name || null,
         actor.name || 'Staff',
         now,
+        recipeByProductId,
       );
       const displayOnline = socketService.hasRestaurantDisplay(companyId, station);
       const ticket = await tx.restaurantKitchenTicket.create({
@@ -1131,10 +1241,43 @@ async function listStationTickets(companyIdValue, stationValue) {
     where: { companyId, station, status: { in: ACTIVE_TICKET_STATUSES } },
     orderBy: [{ createdAt: 'asc' }, { roundNumber: 'asc' }],
   });
+  let setup;
+  try {
+    setup = await restaurantSetupService.getSetup(companyId);
+  } catch (_error) {
+    setup = null;
+  }
+  const recipeByProductId = new Map();
+  const menuByName = new Map();
+  for (const menuItem of setup?.menuItems || []) {
+    const recipe = (menuItem.recipeIngredients || []).map((ingredient) => ({
+      productId: ingredient.productId,
+      name: ingredient.productName || 'Stock item',
+      quantity: String(ingredient.quantity),
+      unit: ingredient.unit || ingredient.unitCode || '',
+    }));
+    recipeByProductId.set(menuItem.productId, recipe);
+    menuByName.set(String(menuItem.menuName || menuItem.product?.name || '').trim().toLowerCase(), menuItem.productId);
+  }
+  const enrichedTickets = tickets.map((ticket) => {
+    const payload = ticket.payloadJson && typeof ticket.payloadJson === 'object' ? ticket.payloadJson : {};
+    if (!Array.isArray(payload.items)) return ticket;
+    return {
+      ...ticket,
+      payloadJson: {
+        ...payload,
+        items: payload.items.map((item) => {
+          if (Array.isArray(item.recipe)) return item;
+          const productId = item.productId || menuByName.get(String(item.name || '').trim().toLowerCase());
+          return { ...item, productId: productId || null, recipe: recipeByProductId.get(productId) || [] };
+        }),
+      },
+    };
+  });
   return {
     station,
     displayOnline: socketService.hasRestaurantDisplay(companyId, station),
-    tickets,
+    tickets: enrichedTickets,
   };
 }
 

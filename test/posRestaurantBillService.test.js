@@ -413,6 +413,8 @@ describe('Restaurant bill service', () => {
       statusCode: 400,
     });
 
+    const payerPaidQuery = database.$queryRawUnsafe.mock.calls.find(([query]) => query.includes('SUM(p.amount)'));
+    expect(payerPaidQuery[0]).toContain('p.status = $4::"PosPaymentStatus"');
     expect(paymentsController.recordCashPayment).not.toHaveBeenCalled();
   });
 
@@ -629,6 +631,45 @@ describe('Restaurant bill service', () => {
       itemId: itemOneId,
       stockMode: 'recipe',
       barStockProductId: null,
+    });
+  });
+
+  test('includes a saved promotion in the Restaurant checkout snapshot', async () => {
+    const itemId = '2'.repeat(24);
+    const productId = '4'.repeat(24);
+    billRows = [];
+    orderService.claimBill.mockResolvedValue({
+      id: ORDER_ID,
+      version: 3,
+      items: [{
+        id: itemId,
+        status: 'sent',
+        productId,
+        name: 'Mozzarella Cheese 1kg',
+        sku: 'MOZZARELLA',
+        quantity: 1,
+        unitPrice: 1000,
+        taxRate: 0,
+        taxCode: 'A',
+        modifiers: [],
+        promotionSnapshot: { unitPrice: 800 },
+      }],
+    });
+    paymentsController.createPendingSale.mockImplementation(async () => {
+      throw Object.assign(new Error('Stop after capturing the checkout request.'), {
+        code: 'TEST_CHECKOUT_CAPTURED',
+        statusCode: 409,
+      });
+    });
+
+    await expect(billService.issueBill(COMPANY_ID, ORDER_ID, makeRequest({ splitType: 'single' })))
+      .rejects.toMatchObject({ code: 'TEST_CHECKOUT_CAPTURED' });
+
+    const checkoutRequest = paymentsController.createPendingSale.mock.calls[0][0];
+    expect(checkoutRequest.posRestaurantCheckout.lines[0]).toMatchObject({
+      itemId,
+      discountPct: 20,
+      promotionSnapshot: { unitPrice: 800 },
     });
   });
 
