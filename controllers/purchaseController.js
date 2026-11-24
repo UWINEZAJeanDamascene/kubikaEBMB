@@ -167,6 +167,12 @@ async function receivePaidPurchaseStock(purchase, req, supplier) {
       const manufactureDate = parseOptionalDate(item.manufactureDate);
       const expiryDate = parseOptionalDate(item.expiryDate);
       const lotNo = item.lotNo ? String(item.lotNo).trim().toUpperCase() : null;
+      if (manufactureDate && expiryDate && expiryDate <= manufactureDate) {
+        throw Object.assign(new Error(`Expiry date must be after manufacture date for batch ${batchNo || product.name}.`), {
+          status: 422,
+          code: 'BATCH_EXPIRY_INVALID',
+        });
+      }
 
       await inventoryService.createLayer(
         companyId,
@@ -240,6 +246,7 @@ async function receivePaidPurchaseStock(purchase, req, supplier) {
             unitCost: baseUnitCost,
             manufactureDate,
             expiryDate,
+            lotNumber: lotNo,
           });
         } else {
           const oldQty = Number(stockBatch.qtyOnHand) || 0;

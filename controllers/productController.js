@@ -23,6 +23,17 @@ const {
   buildProductHistoryChanges,
   enrichProductHistory,
 } = require('../utils/productHistoryHelpers');
+const { normalizeMedicine, validateMedicine, medicineIdentity } =
+  require('../services/pharmacyMedicineCatalogService');
+
+function applyPharmacyMedicineValidation(body) {
+  if (!body.customFields || typeof body.customFields !== 'object') return null;
+  if (!Object.prototype.hasOwnProperty.call(body.customFields, 'pharmacy')) return null;
+  const medicine = normalizeMedicine(body.customFields.pharmacy);
+  const errors = validateMedicine(medicine);
+  body.customFields = { ...body.customFields, pharmacy: medicine };
+  return Object.keys(errors).length ? errors : null;
+}
 
 function stripEbmProductFields(body) {
   for (const key of Object.keys(body)) {
@@ -211,9 +222,26 @@ async function findBarcodeConflict(barcode, companyId, excludeProductId = null) 
   if (!normalizedBarcode) return null;
   const matches = await Product.find({
     company: companyId,
-    barcode: { $regex: `^${escapeRegex(normalizedBarcode)}$`, $options: 'i' },
+    $or: [
+      { barcode: { $regex: `^${escapeRegex(normalizedBarcode)}$`, $options: 'i' } },
+      { alternateBarcodes: { $in: [normalizedBarcode] } },
+    ],
   }).limit(2).lean();
   return matches.find((match) => String(match._id) !== String(excludeProductId || '')) || null;
+}
+
+async function findMedicineIdentityConflict(customFields, companyId, excludeProductId = null) {
+  const pharmacy = customFields?.pharmacy;
+  if (!pharmacy) return null;
+  const medicine = normalizeMedicine(pharmacy);
+  const identity = medicineIdentity(medicine);
+  if (!identity) return null;
+  const products = await Product.find({ company: companyId }).select('_id name sku barcode customFields').limit(5000).lean();
+  return products.find((product) => {
+    if (String(product._id) === String(excludeProductId || '')) return false;
+    const existing = product.customFields?.pharmacy;
+    return existing && medicineIdentity(normalizeMedicine(existing)) === identity;
+  }) || null;
 }
 
 // @desc    Get all products
@@ -428,6 +456,10 @@ exports.getProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.createProduct = async (req, res, next) => {
   try {
+    const pharmacyErrors = applyPharmacyMedicineValidation(req.body);
+    if (pharmacyErrors) {
+      return res.status(422).json({ success: false, code: 'PHARMACY_MEDICINE_INVALID', errors: pharmacyErrors });
+    }
     const barcodeError = validateGs1Barcode(req.body.barcode, req.body.barcodeType);
     if (barcodeError) return res.status(422).json({ success: false, errors: { barcode: barcodeError } });
 
@@ -451,6 +483,14 @@ exports.createProduct = async (req, res, next) => {
     const barcodeConflict = await findBarcodeConflict(req.body.barcode, companyId);
     if (barcodeConflict) {
       return res.status(409).json({ success: false, code: 'PRODUCT_BARCODE_IN_USE', message: 'This barcode is already assigned to another product in this workspace.' });
+    }
+    const medicineConflict = await findMedicineIdentityConflict(req.body.customFields, companyId);
+    if (medicineConflict) {
+      return res.status(409).json({
+        success: false,
+        code: 'PHARMACY_MEDICINE_DUPLICATE',
+        message: `This medicine identity already exists as ${medicineConflict.name || medicineConflict.sku}.`,
+      });
     }
 
     // If category is provided, pre-fill account suggestions from category defaults (suggestion only)
@@ -540,6 +580,10 @@ exports.createProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.updateProduct = async (req, res, next) => {
   try {
+    const pharmacyErrors = applyPharmacyMedicineValidation(req.body);
+    if (pharmacyErrors) {
+      return res.status(422).json({ success: false, code: 'PHARMACY_MEDICINE_INVALID', errors: pharmacyErrors });
+    }
     if (req.body.customFields && Object.prototype.hasOwnProperty.call(req.body.customFields, 'purchaseUnits')) {
       try {
         normalizePurchaseUnitDefinitions({ ...req.body, customFields: req.body.customFields });
@@ -582,6 +626,16 @@ exports.updateProduct = async (req, res, next) => {
       const barcodeConflict = await findBarcodeConflict(req.body.barcode, companyId, product._id);
       if (barcodeConflict) {
         return res.status(409).json({ success: false, code: 'PRODUCT_BARCODE_IN_USE', message: 'This barcode is already assigned to another product in this workspace.' });
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body, 'customFields')) {
+      const medicineConflict = await findMedicineIdentityConflict(req.body.customFields, companyId, product._id);
+      if (medicineConflict) {
+        return res.status(409).json({
+          success: false,
+          code: 'PHARMACY_MEDICINE_DUPLICATE',
+          message: `This medicine identity already exists as ${medicineConflict.name || medicineConflict.sku}.`,
+        });
       }
     }
 

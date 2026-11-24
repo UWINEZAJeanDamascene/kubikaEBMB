@@ -185,6 +185,25 @@ describe('POS session authorization middleware', () => {
     expect(restaurantResponse.body).toBeNull();
   });
 
+  test('restricts Pharmacy POS routes to Pharmacy registers', () => {
+    const guard = requirePosSystemTillType('pharmacy');
+    const next = jest.fn();
+    const retailResponse = response();
+
+    guard({ posAuthContext: { register: { systemTillType: 'retail' } } }, retailResponse, next);
+    expect(retailResponse.statusCode).toBe(403);
+    expect(retailResponse.body).toMatchObject({
+      success: false,
+      code: 'POS_SYSTEM_TILL_TYPE_INVALID',
+    });
+    expect(next).not.toHaveBeenCalled();
+
+    const pharmacyResponse = response();
+    guard({ posAuthContext: { register: { systemTillType: 'pharmacy' } } }, pharmacyResponse, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(pharmacyResponse.body).toBeNull();
+  });
+
   test('cashier defaults stay least-privilege while supervisors and store managers get review rights', async () => {
     resolveUserRoles.mockResolvedValue([{ name: 'cashier' }]);
     const cashier = await permissionsForUser({ role: 'cashier' }, COMPANY_ID, {});
@@ -192,11 +211,13 @@ describe('POS session authorization middleware', () => {
       'pos.till.sell', 'pos.till.cash_move', 'pos.till.close_shift', 'pos.till.discount',
       'pos.till.receive_account_payment', 'pos.voucher.redeem', 'pos.till.open_shift',
       'pos.receipt.share', 'pos.giftcard.issue', 'pos.giftcard.redeem',
+      'pharmacy.till.sell',
     ]));
     expect(cashier).not.toEqual(expect.arrayContaining([
       'pos.till.refund', 'pos.till.void', 'pos.till.no_sale',
       'pos.till.credit_sell', 'pos.admin.view', 'pos.admin.registers', 'pos.admin.settings',
       'pos.payment.reconcile', 'pos.till.open_price',
+      'pharmacy.dispensing.review', 'pharmacy.prescription.capture', 'pharmacy.patient.view',
     ]));
     const configuredCashier = await permissionsForUser(
       { role: 'cashier' },
@@ -221,6 +242,23 @@ describe('POS session authorization middleware', () => {
       'pos.payment.reconcile',
     ]));
     expect(storeManager).not.toContain('pos.admin.roles');
+  });
+
+  test('pharmacists can review prescriptions without receiving POS administration permissions', async () => {
+    resolveUserRoles.mockResolvedValue([{ name: 'pharmacist' }]);
+    const pharmacist = await permissionsForUser({ role: 'pharmacist' }, COMPANY_ID, {});
+    expect(pharmacist).toEqual(expect.arrayContaining([
+      'pharmacy.till.sell',
+      'pharmacy.dispensing.review',
+      'pharmacy.prescription.capture',
+      'pharmacy.prescription.view',
+      'pharmacy.patient.view',
+    ]));
+    expect(pharmacist).not.toEqual(expect.arrayContaining([
+      'pos.admin.registers',
+      'pos.admin.settings',
+      'pharmacy.audit.read',
+    ]));
   });
 
   test('rejects an ERP session from a different company than the POS session', async () => {

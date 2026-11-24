@@ -62,6 +62,35 @@ describe('shared POS tracked-stock service', () => {
     expect(batch.save).not.toHaveBeenCalled();
   });
 
+  test('does not consume quantity reserved by another pending sale', async () => {
+    const held = { batchNo: 'HELD', qtyOnHand: 5, reservedQuantity: 5, unitCost: 2, save: jest.fn() };
+    const available = { batchNo: 'FREE', qtyOnHand: 3, reservedQuantity: 0, unitCost: 4, save: jest.fn() };
+    const legacy = { availableQuantity: 3, quantity: 3, unitCost: 4, save: jest.fn() };
+    StockBatch.find.mockReturnValue(query([held, available]));
+    InventoryBatch.find.mockImplementation((filter) => query(filter.batchNumber === 'FREE' ? [legacy] : []));
+
+    const result = await consumeTrackedBatches('co', 'product', 'warehouse', 2, {});
+
+    expect(result.allocations).toEqual([{ batchNo: 'FREE', quantity: 2, unitCost: 4 }]);
+    expect(held.qtyOnHand).toBe(5);
+    expect(held.save).not.toHaveBeenCalled();
+    expect(available.qtyOnHand).toBe(1);
+  });
+
+  test('excludes recalled batches from FEFO sale allocation', async () => {
+    const recalled = {
+      batchNo: 'RECALLED',
+      qtyOnHand: 5,
+      unitCost: 2,
+      expiryDate: new Date('2030-01-01'),
+      recallStatus: 'recalled',
+      save: jest.fn(),
+    };
+    StockBatch.find.mockReturnValue(query([recalled]));
+    await expect(consumeTrackedBatches('co', 'p', 'w', 1, {})).rejects.toMatchObject({ code: 'INSUFFICIENT_STOCK' });
+    expect(recalled.save).not.toHaveBeenCalled();
+  });
+
   test('honors snapshot batch IDs and records shortages using signed batch costs', async () => {
     const savedBatch = {
       _id: 'aaaaaaaaaaaaaaaaaaaaaaaa',

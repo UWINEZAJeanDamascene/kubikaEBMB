@@ -1,4 +1,5 @@
 const Supplier = require('../models/Supplier');
+const { normalizeSupplierPharmacyFields } = require('../services/pharmacyProcurementService');
 const StockMovement = require('../models/StockMovement');
 const PurchaseOrder = require('../models/PurchaseOrder');
 
@@ -128,6 +129,9 @@ exports.getSupplier = async (req, res, next) => {
 exports.createSupplier = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    if (Object.prototype.hasOwnProperty.call(req.body, 'customFields')) {
+      req.body.customFields = normalizeSupplierPharmacyFields(req.body.customFields);
+    }
     
     req.body.company = companyId;
     req.body.createdBy = req.user.id;
@@ -164,6 +168,9 @@ exports.createSupplier = async (req, res, next) => {
 exports.updateSupplier = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    if (Object.prototype.hasOwnProperty.call(req.body, 'customFields')) {
+      req.body.customFields = normalizeSupplierPharmacyFields(req.body.customFields);
+    }
     
     const supplier = await Supplier.findOneAndUpdate(
       { _id: req.params.id, company: companyId },

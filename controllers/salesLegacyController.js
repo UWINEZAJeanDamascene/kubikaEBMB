@@ -29,6 +29,13 @@ const { createHash, randomBytes } = require('crypto');
 const { dbClient } = require('../lib/prisma');
 const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
 const { writePosAuditLog, requestIp } = require('../services/posAuditService');
+const { validateAndRecordPharmacyCheckout } = require('../services/posPharmacyCheckoutService');
+const {
+  reservePharmacyPendingSale,
+  lockPharmacyPendingSaleReservation,
+  consumeReservedPharmacyBatches,
+  markPharmacyPendingSaleReservationConsumed,
+} = require('../services/posPharmacyPendingStockReservationService');
 const FiscalService = require('../services/fiscalService');
 const moduleEntitlementService = require('../services/moduleEntitlementService');
 const { verifyCapability: verifyPosOfflineCapability } = require('../services/posOfflineCapabilityService');
@@ -1048,6 +1055,7 @@ exports.createDirectSale = async (req, res, next) => {
               productId: String(product._id),
               warehouseId: String(warehouseId),
               isQuarantined: false,
+              recallStatus: 'active',
               qtyOnHand: { gt: 0 },
             },
             select: {
@@ -1057,6 +1065,7 @@ exports.createDirectSale = async (req, res, next) => {
               reservedQuantity: true,
               unitCost: true,
               expiryDate: true,
+              recallStatus: true,
               createdAt: true,
             },
             orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
@@ -1068,6 +1077,7 @@ exports.createDirectSale = async (req, res, next) => {
               batchNo: String(batch.batchNo || ''),
               availableQuantity: Math.max(0, Number(batch.qtyOnHand || 0) - Number(batch.reservedQuantity || 0)),
               expiryDate: batch.expiryDate ? new Date(batch.expiryDate).toISOString() : null,
+              recallStatus: String(batch.recallStatus || 'active'),
               unitCost: Number(batch.unitCost) || 0,
               createdAt: batch.createdAt ? new Date(batch.createdAt).getTime() : 0,
             }))
@@ -1652,6 +1662,7 @@ exports.createDirectSale = async (req, res, next) => {
     // Execute in transaction
     let invoice;
     let totalCOGS = 0;
+    let pharmacyStockReservation = null;
     let storedLinesForPosting = invoiceLines;
     let v2CreditLedgerData = null;
     let customerCreditLedgerData = null;
@@ -1982,6 +1993,18 @@ exports.createDirectSale = async (req, res, next) => {
             code: 'POS_PENDING_SALE_LINES_CHANGED',
           });
         }
+        if (String(claimedRegister.systemTillType || '').toLowerCase() === 'pharmacy') {
+          pharmacyStockReservation = await lockPharmacyPendingSaleReservation(
+            postingClient,
+            String(companyId),
+            String(invoice._id),
+          );
+          if (pharmacyStockReservation.status !== 'reserved') {
+            throw Object.assign(new Error('The Pharmacy stock reservation is no longer active.'), {
+              code: 'POS_PHARMACY_RESERVATION_STATE_INVALID',
+            });
+          }
+        }
         storedLinesForPosting = savedLines;
         invoice.status = paymentStatus;
         invoice.posPostingStatus = isV2Pending ? 'not_required' : 'pending';
@@ -2021,6 +2044,9 @@ exports.createDirectSale = async (req, res, next) => {
                 : {}),
             }
             : {
+              ...(req.body.pharmacyPatientId
+                ? { pharmacyPatientId: String(req.body.pharmacyPatientId).slice(0, 24) }
+                : {}),
               items: (Array.isArray(req.body.items) ? req.body.items : []).map((item) => ({
                 ...(item.unitPrice != null ? { unitPrice: Number(item.unitPrice) } : {}),
                 ...(item.catalogUnitPrice != null ? { catalogUnitPrice: Number(item.catalogUnitPrice) } : {}),
@@ -2067,6 +2093,15 @@ exports.createDirectSale = async (req, res, next) => {
 
         invoice = invoice[0];
       }
+      await validateAndRecordPharmacyCheckout({
+        client: dbClient(),
+        req,
+        companyId: String(companyId),
+        register: claimedRegister,
+        items: req.body.items,
+        invoiceId: String(invoice._id),
+        pending: isV2Pending,
+      });
       const voucherResult = voucherQuote || voucherTokens.length || req.posV2Completion?.voucherReservations
         ? await redeemPosVouchers(session, String(companyId), posCashierId, {
           tokens: voucherTokens,
@@ -2295,6 +2330,14 @@ exports.createDirectSale = async (req, res, next) => {
       }
 
       if (isV2Pending) {
+        if (String(claimedRegister.systemTillType || '').toLowerCase() === 'pharmacy') {
+          await reservePharmacyPendingSale(postingClient, {
+            companyId: String(companyId),
+            invoiceId: String(invoice._id),
+            registerId: String(claimedRegister.id),
+            stockUpdates,
+          });
+        }
         const finalized = await dbClient().$executeRawUnsafe(
           'UPDATE pos_sale_requests SET invoice_id = $3, status = \'completed\', updated_at = CURRENT_TIMESTAMP WHERE company_id = $1 AND request_key = $2 AND payload_hash = $4',
           String(companyId), requestKey, String(invoice._id), payloadHash,
@@ -2331,10 +2374,41 @@ exports.createDirectSale = async (req, res, next) => {
         const stockLevel = stockLevelByProduct.get(String(product._id));
         const reserved = Number(stockLevel?.qty_reserved || 0);
         const quarantined = quarantinedByProduct.get(String(product._id)) || 0;
+        const pharmacyReservationLine = pharmacyStockReservation?.lines.find((line) => (
+          Number(line.lineOrder) === Number(lineData.lineOrder)
+          && String(line.productId) === String(product._id)
+          && String(line.warehouseId) === String(selectedWarehouseId)
+        ));
+        if (pharmacyStockReservation && (!pharmacyReservationLine
+          || Math.abs(Number(pharmacyReservationLine.quantity) - Number(quantity)) > 0.0000001)) {
+          throw Object.assign(new Error(`The Pharmacy stock reservation no longer matches ${product.name}.`), {
+            code: 'POS_PHARMACY_RESERVATION_LINES_CHANGED',
+          });
+        }
         let actualAvailableStock = stockLevel
           ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - reserved - quarantined)
           : 0;
-        if (offlineContext || (allowNegativeStock && stockUpdate.trackingType === 'none')) {
+        if (pharmacyStockReservation) {
+          const stockLevelUpdate = await postingClient.$executeRawUnsafe(
+            `UPDATE stock_levels
+                SET qty_on_hand = qty_on_hand - $1::numeric,
+                    qty_reserved = qty_reserved - $1::numeric,
+                    last_movement_at = CURRENT_TIMESTAMP,
+                    last_movement_type = 'dispatch',
+                    updated_at = CURRENT_TIMESTAMP
+              WHERE company_id = $2 AND product_id = $3 AND warehouse_id = $4
+                AND qty_on_hand >= $1::numeric AND qty_reserved >= $1::numeric`,
+            quantity,
+            String(companyId),
+            String(product._id),
+            String(selectedWarehouseId),
+          );
+          if (stockLevelUpdate !== 1) {
+            throw Object.assign(new Error(`Reserved Pharmacy stock changed before payment completion for ${product.name}.`), {
+              code: 'POS_PHARMACY_RESERVATION_STOCK_CHANGED',
+            });
+          }
+        } else if (offlineContext || (allowNegativeStock && stockUpdate.trackingType === 'none')) {
           const stockRows = await dbClient().$queryRawUnsafe(
             `INSERT INTO stock_levels (id, company_id, product_id, warehouse_id, qty_on_hand, qty_reserved, qty_on_order, avg_cost, total_value, last_movement_at, last_movement_type, created_at, updated_at) VALUES ($1, $2, $3, $4, -$5::numeric, 0, 0, $6::numeric, 0, CURRENT_TIMESTAMP, 'dispatch', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, product_id, warehouse_id) DO UPDATE SET qty_on_hand = stock_levels.qty_on_hand - $5::numeric, last_movement_at = CURRENT_TIMESTAMP, last_movement_type = 'dispatch', updated_at = CURRENT_TIMESTAMP RETURNING (qty_on_hand + $5::numeric) AS "previousStock", qty_on_hand AS "newStock", qty_reserved AS "reservedStock"`,
             randomBytes(12).toString('hex'), String(companyId), String(product._id), String(selectedWarehouseId),
@@ -2411,7 +2485,15 @@ exports.createDirectSale = async (req, res, next) => {
             cogsAmount = unitCost * quantity;
           }
         } else if (trackingType === 'batch') {
-          const batchConsumption = offlineContext
+          const batchConsumption = pharmacyReservationLine
+            ? await consumeReservedPharmacyBatches(postingClient, {
+              companyId: String(companyId),
+              productId: String(product._id),
+              warehouseId: String(selectedWarehouseId),
+              reservationLine: pharmacyReservationLine,
+              session,
+            })
+            : offlineContext
             ? await consumeOfflineTrackedBatches(
               companyId,
               product._id,
@@ -2569,6 +2651,13 @@ exports.createDirectSale = async (req, res, next) => {
       }
       if (stockMovementCreates.length > 0) {
         await StockMovement.insertMany(stockMovementCreates, { session });
+      }
+      if (pharmacyStockReservation) {
+        await markPharmacyPendingSaleReservationConsumed(
+          postingClient,
+          String(companyId),
+          String(invoice._id),
+        );
       }
       const restaurantManagedLines = Array.isArray(req.posRestaurantCheckout?.lines)
         ? req.posRestaurantCheckout.lines.filter((line) => (
@@ -3094,6 +3183,13 @@ exports.createDirectSale = async (req, res, next) => {
         return next(replayError);
       }
     }
+    if (String(error?.code || '').startsWith('PHARMACY_')) {
+      return res.status(Number(error.statusCode) || 409).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+      });
+    }
     if (error?.accountingPostingFailure || error?.code === 'POS_ACCOUNTING_POST_FAILED') {
       if (req.posV2Completion) {
         try {
@@ -3345,6 +3441,11 @@ exports.getPosProducts = async (req, res, next) => {
       filters.push({ $or: searchTerms });
     }
     if (category) filters.push({ category });
+    if (String(req.query.pharmacyOnly || '').toLowerCase() === 'true') {
+      filters.push({
+        'customFields.pharmacy.prescriptionStatus': { $in: ['OTC', 'PRESCRIPTION', 'RESTRICTED'] },
+      });
+    }
     if (cursor) {
       filters.push({
         $or: [
@@ -3444,6 +3545,22 @@ exports.getPosProducts = async (req, res, next) => {
       const reservedStock = warehouseId ? toNumber(stockLevel?.qty_reserved) : toNumber(p.qtyReserved);
       const quarantinedStock = quarantinedByProduct.get(String(p._id)) || 0;
       const currentStock = Math.max(0, onHandStock - reservedStock - quarantinedStock);
+      const customFields = p.customFields && typeof p.customFields === 'object' && !Array.isArray(p.customFields)
+        ? p.customFields
+        : {};
+      const pharmacyFields = customFields.pharmacy && typeof customFields.pharmacy === 'object' && !Array.isArray(customFields.pharmacy)
+        ? customFields.pharmacy
+        : null;
+      const pharmacyStatus = String(pharmacyFields?.prescriptionStatus || 'OTC').trim().toUpperCase();
+      const pharmacy = pharmacyFields && ['OTC', 'PRESCRIPTION', 'RESTRICTED'].includes(pharmacyStatus)
+        ? {
+          genericName: String(pharmacyFields.genericName || '').trim().slice(0, 180),
+          strength: String(pharmacyFields.strength || '').trim().slice(0, 80),
+          dosageForm: String(pharmacyFields.dosageForm || '').trim().slice(0, 48),
+          prescriptionStatus: pharmacyStatus,
+          controlled: pharmacyFields.restrictedStatus === true || pharmacyStatus === 'RESTRICTED',
+        }
+        : null;
       return {
         _id: p._id,
         name: p.name,
@@ -3488,6 +3605,7 @@ exports.getPosProducts = async (req, res, next) => {
         trackingType: p.trackingType === 'serial' || p.trackSerialNumbers
           ? 'serial'
           : p.trackingType === 'batch' || p.trackBatch ? 'batch' : (p.trackingType || 'none'),
+        pharmacy,
       };
     });
 

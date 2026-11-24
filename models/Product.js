@@ -72,6 +72,25 @@ const FIELD_MAP = {
   ebm: { target: 'ebm' },
   history: { target: 'history' },
   customFields: { target: 'customFields' },
+  // Prisma JSON filters require an explicit path rather than a Mongo dotted key.
+  'customFields.pharmacy.prescriptionStatus': {
+    target: 'customFields',
+    transform: (value) => {
+      const statuses = Array.isArray(value?.in) ? value.in : [value];
+      if (!statuses.length
+        || statuses.some((status) => !['OTC', 'PRESCRIPTION', 'RESTRICTED'].includes(status))) {
+        return IMPOSSIBLE;
+      }
+      return {
+        OR: statuses.map((status) => ({
+          customFields: {
+            path: ['pharmacy', 'prescriptionStatus'],
+            equals: status,
+          },
+        })),
+      };
+    },
+  },
 };
 
 // productCustomFind() re-implements filter translation independently of

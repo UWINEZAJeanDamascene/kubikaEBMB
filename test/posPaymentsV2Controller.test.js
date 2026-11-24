@@ -11,6 +11,9 @@ jest.mock('../services/posAuditService', () => ({
   writePosAuditLog: jest.fn().mockResolvedValue(undefined),
   requestIp: jest.fn(() => '127.0.0.1'),
 }));
+jest.mock('../services/posPharmacyPendingStockReservationService', () => ({
+  releasePharmacyPendingSaleReservation: jest.fn().mockResolvedValue({ released: true, replayed: false }),
+}));
 jest.mock('../services/posManualMobileMoneyService', () => ({
   recordManualMobileMoneyPayment: jest.fn(),
   confirmManualMobileMoneyPayment: jest.fn(),
@@ -57,6 +60,7 @@ const { createDirectSale } = require('../controllers/salesLegacyController');
 const posManualMobileMoneyService = require('../services/posManualMobileMoneyService');
 const { hasPosPermission } = require('../middleware/posAuthMiddleware');
 const { writePosAuditLog } = require('../services/posAuditService');
+const { releasePharmacyPendingSaleReservation } = require('../services/posPharmacyPendingStockReservationService');
 const controller = require('../controllers/posPaymentsV2Controller');
 
 const COMPANY_ID = '507f1f77bcf86cd799439011';
@@ -1814,5 +1818,53 @@ describe('POS Payments V2 controller', () => {
       statuses: { SUCCESS: { count: 4, amount: 900 } },
     });
     expect(res.body.data.details).toEqual({ returned: 500, total: 501, limit: 500, hasMore: true });
+  });
+
+  test('cancels an unpaid Pharmacy sale and releases its stock reservation', async () => {
+    const invoice = pendingInvoice({ posPayments: [], referenceNo: 'PH-001' });
+    const { db } = setupDatabase(invoice);
+    db.invoice.update = jest.fn().mockImplementation(({ data }) => Promise.resolve({ ...invoice, ...data }));
+    const baseAuth = request().posAuthContext;
+    const req = request({
+      posAuthContext: {
+        ...baseAuth,
+        register: { ...baseAuth.register, systemTillType: 'pharmacy' },
+      },
+    });
+    const res = response();
+
+    await controller.cancelPharmacyPendingSale(req, res, jest.fn());
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data).toMatchObject({ saleId: SALE_ID, status: 'cancelled', replayed: false });
+    expect(releasePharmacyPendingSaleReservation).toHaveBeenCalledWith(db, COMPANY_ID, SALE_ID);
+    expect(db.invoice.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: SALE_ID },
+      data: expect.objectContaining({ status: 'cancelled', amountOutstanding: 0 }),
+    }));
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'PHARMACY_PENDING_SALE_CANCELLED',
+    }), db);
+  });
+
+  test('does not release reserved Pharmacy stock when payment has been received', async () => {
+    const invoice = pendingInvoice({
+      posPayments: [{ id: 'payment-1', status: 'SUCCESS', method: 'CASH', amount: 1000 }],
+    });
+    setupDatabase(invoice);
+    const baseAuth = request().posAuthContext;
+    const req = request({
+      posAuthContext: {
+        ...baseAuth,
+        register: { ...baseAuth.register, systemTillType: 'pharmacy' },
+      },
+    });
+    const res = response();
+
+    await controller.cancelPharmacyPendingSale(req, res, jest.fn());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('POS_PAYMENT_METHOD_UNRESOLVED');
+    expect(releasePharmacyPendingSaleReservation).not.toHaveBeenCalled();
   });
 });

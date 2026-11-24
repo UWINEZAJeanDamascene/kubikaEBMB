@@ -18,7 +18,7 @@ const DEFAULT_TILL_TYPE_FEATURES = Object.freeze({
   vouchers: true,
   customerCredit: true,
 });
-const DEFAULT_SYSTEM_TILL_TYPES = Object.freeze(['retail', 'restaurant']);
+const DEFAULT_SYSTEM_TILL_TYPES = Object.freeze(['retail', 'restaurant', 'pharmacy']);
 
 const DEFAULT_DISCOUNT_SETTINGS = Object.freeze({
   defaultLimits: Object.freeze({
@@ -32,6 +32,7 @@ const DEFAULT_DISCOUNT_SETTINGS = Object.freeze({
   tillTypeFeatures: Object.freeze({
     retail: DEFAULT_TILL_TYPE_FEATURES,
     restaurant: DEFAULT_TILL_TYPE_FEATURES,
+    pharmacy: DEFAULT_TILL_TYPE_FEATURES,
   }),
   registerLabels: Object.freeze([]),
 });
@@ -148,6 +149,9 @@ function normalizeDiscountSettings(value) {
     throw new TypeError('System till types must use letters, numbers, hyphens, or underscores and start with a letter.');
   }
   if (!systemTillTypes.includes('retail')) throw new TypeError('The retail system till type must remain available.');
+  for (const builtInType of DEFAULT_SYSTEM_TILL_TYPES) {
+    if (!systemTillTypes.includes(builtInType)) systemTillTypes.push(builtInType);
+  }
   const tillTypeFeatures = normalizeTillTypeFeatures(value.tillTypeFeatures, systemTillTypes);
   const registerLabels = normalizeStringList(value.registerLabels, 'Register discount labels', {
     maximumItems: 100, maximumLength: 80,
@@ -173,9 +177,10 @@ function normalizeStoredDiscountSettings(value) {
     return structuredClone(DEFAULT_DISCOUNT_SETTINGS);
   }
   const systemTillTypes = Array.isArray(value.systemTillTypes) ? value.systemTillTypes : [...DEFAULT_SYSTEM_TILL_TYPES];
-  const legacyTillTypes = !value.tillTypeFeatures
-    ? [...new Set([...systemTillTypes, 'restaurant'].map((type) => String(type).toLocaleLowerCase()))]
-    : systemTillTypes;
+  const legacyTillTypes = [...new Set([
+    ...systemTillTypes,
+    ...DEFAULT_SYSTEM_TILL_TYPES,
+  ].map((type) => String(type).toLocaleLowerCase()))];
   return normalizeDiscountSettings({
     defaultLimits: value.defaultLimits || DEFAULT_DISCOUNT_SETTINGS.defaultLimits,
     rules: Array.isArray(value.rules) ? value.rules : [],

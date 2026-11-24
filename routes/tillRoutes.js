@@ -7,7 +7,7 @@ router.use(posApiRateLimit);
 router.use(posAuditOutcome);
 const idem = (handler) => idempotentHandler(handler, { namespace: 'tills' });
 const { protect } = require('../middleware/auth');
-const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
+const { requireAnyPermission, requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const { requirePosSession, requirePermission } = require('../middleware/posAuthMiddleware');
 const { openTill, closeTill, recordNoSale, managerCloseTill, getActiveTill, getTillShifts, deleteEmptyTillShift } = require('../controllers/tillController');
 const posCheckoutSupportController = require('../controllers/posCheckoutSupportController');
@@ -24,6 +24,11 @@ const canResolveAssignedRegister = requirePermissionOrRoles(
 // Register/device administration uses the POS capability consistently with
 // the back-office UI; built-in administrator roles retain compatibility.
 const canManageRegisters = requirePermissionOrRoles('pos.admin', 'registers', ['admin', 'manager', 'store_manager', 'owner']);
+const canReadPharmacyMode = requireAnyPermission([
+  { resource: 'products', action: 'read' },
+  { resource: 'products', action: 'create' },
+  { resource: 'products', action: 'update' },
+]);
 const POS_DEVICE_ADMIN_ROLES = ['admin', 'manager', 'store_manager', 'owner', 'platform_admin', 'super_admin'];
 const canReadSecurityDevices = requirePermissionOrRoles(
   'pos.admin.security.sessions',
@@ -81,6 +86,7 @@ const posSessionRead = (permission, handler) => [
 
 // Device claims and register administration are ERP manager operations.
 router.get('/registers/device/:deviceId', protect, canResolveAssignedRegister, posRegisterController.getDeviceRegister);
+router.get('/pharmacy-mode', protect, canReadPharmacyMode, posRegisterController.getPharmacyMode);
 router.post('/registers/claim', protect, canManageRegisters, idem(posRegisterController.claimRegister));
 router.get('/registers', protect, canManageRegisters, posRegisterController.listRegisters);
 router.post('/registers/device-recovery/challenge', protect, canManageRegisters, idem(posRegisterController.createDeviceRecoveryChallenge));

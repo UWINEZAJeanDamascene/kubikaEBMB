@@ -2,10 +2,11 @@
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
 const StockSerialNumber = require('../models/StockSerialNumber');
+const StockMovement = require('../models/StockMovement');
 
 const STOCK_BATCH_LIST_SELECT = [
   '_id', 'company', 'batchNo', 'product', 'warehouse', 'qtyReceived', 'qtyOnHand',
-  'unitCost', 'manufactureDate', 'expiryDate', 'isQuarantined', 'notes',
+  'unitCost', 'manufactureDate', 'expiryDate', 'lotNumber', 'recallStatus', 'isQuarantined', 'notes',
   'createdAt', 'updatedAt'
 ].join(' ');
 
@@ -13,13 +14,16 @@ const STOCK_BATCH_LIST_SELECT = [
 exports.getStockBatches = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { product, warehouse, search, isQuarantined, page = 1, limit = 50 } = req.query;
+    const { product, warehouse, search, isQuarantined, recallStatus, page = 1, limit = 50 } = req.query;
 
     const query = { company: companyId };
 
     if (product) query.product = product;
     if (warehouse) query.warehouse = warehouse;
     if (isQuarantined === 'true' || isQuarantined === 'false') query.isQuarantined = isQuarantined === 'true';
+    if (['active', 'recalled', 'closed'].includes(String(recallStatus || '').toLowerCase())) {
+      query.recallStatus = String(recallStatus).toLowerCase();
+    }
 
     // Search by batch number
     if (search) {
@@ -79,7 +83,7 @@ exports.getStockBatch = async (req, res, next) => {
 exports.createStockBatch = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { batchNo, product, warehouse, grn, qtyReceived, qtyOnHand, unitCost, manufactureDate, expiryDate, isQuarantined, notes } = req.body;
+    const { batchNo, product, warehouse, grn, qtyReceived, qtyOnHand, unitCost, manufactureDate, expiryDate, lotNumber, recallStatus, isQuarantined, notes } = req.body;
 
     if (Number(qtyReceived || 0) !== 0 || Number(qtyOnHand || 0) !== 0) {
       return res.status(400).json({ success: false, code: 'BATCH_RECEIPT_REQUIRED', message: 'Batch quantities must be created through a stock receipt or opening stock transaction.' });
@@ -92,6 +96,12 @@ exports.createStockBatch = async (req, res, next) => {
     }
     if (productDoc.trackingType !== 'batch') {
       return res.status(400).json({ success: false, message: 'Product does not track batches' });
+    }
+    if (manufactureDate && expiryDate && new Date(expiryDate) <= new Date(manufactureDate)) {
+      return res.status(422).json({ success: false, code: 'BATCH_EXPIRY_INVALID', message: 'Expiry date must be after manufacture date.' });
+    }
+    if (recallStatus !== undefined && !['active', 'recalled', 'closed'].includes(String(recallStatus).toLowerCase())) {
+      return res.status(422).json({ success: false, code: 'BATCH_RECALL_STATUS_INVALID', message: 'Recall status must be active, recalled, or closed.' });
     }
 
     // Validate warehouse exists
@@ -123,6 +133,8 @@ exports.createStockBatch = async (req, res, next) => {
       unitCost: unitCost || 0,
       manufactureDate: manufactureDate || null,
       expiryDate: expiryDate || null,
+      lotNumber: lotNumber ? String(lotNumber).trim().slice(0, 80) : null,
+      recallStatus: String(recallStatus || 'active').toLowerCase(),
       isQuarantined: isQuarantined || false,
       notes: notes || null
     });
@@ -143,7 +155,7 @@ exports.createStockBatch = async (req, res, next) => {
 exports.updateStockBatch = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { batchNo, qtyOnHand, unitCost, manufactureDate, expiryDate, isQuarantined, notes } = req.body;
+    const { batchNo, qtyOnHand, unitCost, manufactureDate, expiryDate, lotNumber, recallStatus, isQuarantined, notes } = req.body;
 
     let batch = await StockBatch.findOne({ _id: req.params.id, company: companyId });
 
@@ -164,10 +176,20 @@ exports.updateStockBatch = async (req, res, next) => {
     if (unitCost !== undefined && Number(unitCost) !== Number(batch.unitCost)) {
       return res.status(400).json({ success: false, code: 'BATCH_COST_IMMUTABLE', message: 'Batch cost is fixed at receipt. Record a cost adjustment through the approved accounting workflow.' });
     }
+    const nextManufactureDate = manufactureDate !== undefined ? manufactureDate : batch.manufactureDate;
+    const nextExpiryDate = expiryDate !== undefined ? expiryDate : batch.expiryDate;
+    if (nextManufactureDate && nextExpiryDate && new Date(nextExpiryDate) <= new Date(nextManufactureDate)) {
+      return res.status(422).json({ success: false, code: 'BATCH_EXPIRY_INVALID', message: 'Expiry date must be after manufacture date.' });
+    }
+    if (recallStatus !== undefined && !['active', 'recalled', 'closed'].includes(String(recallStatus).toLowerCase())) {
+      return res.status(422).json({ success: false, code: 'BATCH_RECALL_STATUS_INVALID', message: 'Recall status must be active, recalled, or closed.' });
+    }
 
     // Update fields
     if (manufactureDate !== undefined) batch.manufactureDate = manufactureDate;
     if (expiryDate !== undefined) batch.expiryDate = expiryDate;
+    if (lotNumber !== undefined) batch.lotNumber = lotNumber ? String(lotNumber).trim().slice(0, 80) : null;
+    if (recallStatus !== undefined) batch.recallStatus = String(recallStatus).toLowerCase();
     if (isQuarantined !== undefined) batch.isQuarantined = isQuarantined;
     if (notes !== undefined) batch.notes = notes;
 
@@ -276,5 +298,58 @@ exports.quarantineStockBatch = async (req, res, next) => {
     res.status(200).json({ success: true, data: batch });
   } catch (error) {
     next(error);
+  }
+};
+
+exports.setBatchRecall = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const recallStatus = String(req.body?.recallStatus || '').trim().toLowerCase();
+    if (!['active', 'recalled', 'closed'].includes(recallStatus)) {
+      return res.status(422).json({
+        success: false,
+        code: 'BATCH_RECALL_STATUS_INVALID',
+        message: 'Recall status must be active, recalled, or closed.',
+      });
+    }
+    const batch = await StockBatch.findOneAndUpdate(
+      { _id: req.params.id, company: companyId },
+      { $set: { recallStatus, ...(recallStatus === 'recalled' ? { isQuarantined: true } : {}) } },
+      { new: true },
+    ).populate('product', 'name sku');
+    if (!batch) return res.status(404).json({ success: false, message: 'Batch not found' });
+    return res.status(200).json({ success: true, data: batch });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.getStockBatchGenealogy = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const batch = await StockBatch.findOne({ _id: req.params.id, company: companyId })
+      .populate('product', 'name sku trackingType')
+      .populate('warehouse', 'name code')
+      .populate('grn', 'referenceNo receivedDate')
+      .lean();
+    if (!batch) return res.status(404).json({ success: false, message: 'Batch not found' });
+    const movements = await StockMovement.find({
+      company: companyId,
+      product: batch.product?._id || batch.product,
+      warehouse: batch.warehouse?._id || batch.warehouse,
+    }).sort({ createdAt: 1 }).select('type quantity balanceAfter referenceNumber description batchNumber createdAt').lean();
+    return res.status(200).json({
+      success: true,
+      data: {
+        batch,
+        genealogy: {
+          receipt: batch.grn || null,
+          openingAndMovements: movements.filter((movement) =>
+            String(movement.batchNumber || '').toUpperCase().includes(String(batch.batchNo || '').toUpperCase())),
+        },
+      },
+    });
+  } catch (error) {
+    return next(error);
   }
 };

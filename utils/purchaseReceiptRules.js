@@ -63,6 +63,7 @@ function normalizeGRNLinesFromPurchaseOrder(po, requestedLines) {
       taxRate: Number(poLine.taxRate) || 0,
       purchaseUnitSnapshot,
       batchNo: line.batchNo ? String(line.batchNo).trim() : undefined,
+      lotNo: line.lotNo ? String(line.lotNo).trim() : undefined,
       serialNumbers: Array.isArray(line.serialNumbers)
         ? line.serialNumbers.map((serial) => String(serial).trim())
         : [],

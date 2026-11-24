@@ -73,7 +73,11 @@ const posCreditAccountController = require('../controllers/posCreditAccountContr
 const posChequeController = require('../controllers/posChequeController');
 const posRestaurantSetupController = require('../controllers/posRestaurantSetupController');
 const posRestaurantBillingSettingsController = require('../controllers/posRestaurantBillingSettingsController');
+const posPharmacyController = require('../controllers/posPharmacyController');
+const posPharmacyPrescriptionController = require('../controllers/posPharmacyPrescriptionController');
+const posPharmacyCheckoutController = require('../controllers/posPharmacyCheckoutController');
 const requireRestaurantRegister = requirePosSystemTillType('restaurant');
+const requirePharmacyRegister = requirePosSystemTillType('pharmacy');
 const requireProductionRestaurantRegister = requirePosTrainingModeDisabled();
 const canManagePosRegisters = requirePermissionOrRoles('pos.admin', 'registers', ['admin', 'manager', 'store_manager']);
 const canReadRestaurantReports = requirePosPermissions({ resource: 'pos.report', action: 'x' });
@@ -83,6 +87,27 @@ router.use('/print-agent', posPrintAgentRoutes);
 
 router.use('/payment-settings', posPaymentSettingsRoutes);
 const canManagePosSettings = requirePermissionOrRoles('pos.admin', 'settings', ['admin', 'manager', 'store_manager', 'owner']);
+router.get('/admin/pharmacy-settings', protect, canManagePosSettings, posPharmacyController.getSettings);
+router.put('/admin/pharmacy-settings', protect, canManagePosSettings, idem(posPharmacyController.updateSettings));
+router.get('/pharmacy/dashboard', requirePosSession(), requirePharmacyRegister, requirePermission('pos.till.sell'), posPharmacyController.getDashboard);
+router.get('/pharmacy/patients', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.patient.view'), posPharmacyPrescriptionController.listPatients);
+router.post('/pharmacy/patients', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.prescription.capture'), idem(posPharmacyPrescriptionController.createPatient));
+router.get('/pharmacy/products', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.till.sell'), posPharmacyPrescriptionController.searchPrescriptionProducts);
+router.get('/pharmacy/checkout/products', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.till.sell'), posPharmacyCheckoutController.searchProducts);
+router.get('/pharmacy/checkout/warehouses', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.till.sell'), posPharmacyCheckoutController.listWarehouses);
+router.get('/pharmacy/checkout/batches', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.till.sell'), posPharmacyCheckoutController.listBatches);
+router.get('/pharmacy/checkout/customers', requirePosSession(), requirePharmacyRegister, requirePermission('pos.till.credit_sell'), posPharmacyCheckoutController.searchCustomers);
+router.get('/pharmacy/checkout/customers/:customerId', requirePosSession(), requirePharmacyRegister, requirePermission('pos.till.credit_sell'), posPharmacyCheckoutController.getCustomer);
+router.get('/pharmacy/checkout/receipts/:invoiceId', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.till.sell'), posPharmacyCheckoutController.getFiscalReceipt);
+router.post('/pharmacy/checkout', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.till.sell'), idem(posPharmacyCheckoutController.createSale));
+router.get('/pharmacy/prescriptions', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.prescription.view'), posPharmacyPrescriptionController.listPrescriptions);
+router.post('/pharmacy/prescriptions', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.prescription.capture'), idem(posPharmacyPrescriptionController.createPrescription));
+router.post('/pharmacy/prescriptions/:prescriptionId/review', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.dispensing.review'), idem(posPharmacyPrescriptionController.reviewPrescription));
+router.post('/pharmacy/prescriptions/:prescriptionId/hold', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.dispensing.review'), idem(posPharmacyPrescriptionController.holdPrescription));
+router.post('/pharmacy/prescriptions/:prescriptionId/cancel', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.dispensing.review'), idem(posPharmacyPrescriptionController.cancelPrescription));
+router.post('/pharmacy/prescriptions/:prescriptionId/refills', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.prescription.capture'), idem(posPharmacyPrescriptionController.requestRefill));
+router.post('/pharmacy/prescriptions/:prescriptionId/dispenses', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.dispensing.review'), idem(posPharmacyPrescriptionController.recordDispense));
+router.get('/pharmacy/prescriptions/:prescriptionId/label', requirePosSession(), requirePharmacyRegister, requirePermission('pharmacy.prescription.view'), posPharmacyPrescriptionController.getPrescriptionLabel);
 router.get('/scanner-settings', requirePosSession(), requirePermission('pos.till.sell'), posScannerSettingsController.getCurrent);
 router.get('/admin/scanner-settings', protect, canManagePosSettings, posScannerSettingsController.getAdmin);
 router.put('/admin/scanner-settings', protect, canManagePosSettings, idem(posScannerSettingsController.updateAdmin));
@@ -164,6 +189,7 @@ router.post('/cheques/:chequeId/bounce', requirePosSession(), requirePermission(
 // approval before performing any refund unless the active role may refund.
 router.post('/payments-v2/sales/:saleId/payments/:paymentId/remove', requirePosSession(), requirePermission('pos.payment.take'), idem(posPaymentsV2Controller.removePayment));
 router.post('/payments-v2/sales/:saleId/complete', requirePosSession(), requirePermission('pos.payment.take'), idem(posPaymentsV2Controller.completeSale));
+router.post('/payments-v2/sales/:saleId/cancel-pending', requirePosSession(), requirePermission('pos.payment.take'), idem(posPaymentsV2Controller.cancelPharmacyPendingSale));
 router.get('/credit-accounts/:clientId', requirePosSession(), requirePermission('pos.till.receive_account_payment'), posCreditAccountController.getAccount);
 router.put('/credit-accounts/:clientId', requirePosSession(), requirePermission('pos.payment.settings'), idem(posCreditAccountController.updateAccount));
 router.post('/credit-accounts/:clientId/payments', requirePosSession(), requirePermission('pos.till.receive_account_payment'), idem(posCreditAccountController.takePayment));

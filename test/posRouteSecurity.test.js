@@ -38,6 +38,18 @@ describe('POS route security inventory', () => {
     ))).toEqual([]);
   });
 
+  test('Pharmacy POS-session routes require a Pharmacy register', () => {
+    const pharmacySessionRoutes = routes.filter((route) => (
+      route.path.includes('/pharmacy/')
+      && route.authentication === 'POS_SESSION'
+    ));
+
+    expect(pharmacySessionRoutes.length).toBeGreaterThan(0);
+    expect(pharmacySessionRoutes.filter((route) => (
+      !route.middleware.includes('requirePharmacyRegister')
+    ))).toEqual([]);
+  });
+
   test('print-agent routes use agent authentication or signed-document capabilities', () => {
     for (const key of [
       'POST /api/pos/print-agent/agent/status',

@@ -658,6 +658,8 @@ function stockBatchToApi(row) {
     unitCost: decimalToNumber(row.unitCost, 0),
     manufactureDate: row.manufactureDate ?? null,
     expiryDate: row.expiryDate ?? null,
+    lotNumber: row.lotNumber ?? null,
+    recallStatus: row.recallStatus || 'active',
     isQuarantined: row.isQuarantined,
     notes: row.notes ?? null,
     ...mapTimestamps(row),
@@ -675,6 +677,8 @@ const STOCK_BATCH_INPUT = {
   unitCost: 'unitCost',
   manufactureDate: 'manufactureDate',
   expiryDate: 'expiryDate',
+  lotNumber: 'lotNumber',
+  recallStatus: 'recallStatus',
   isQuarantined: 'isQuarantined',
   notes: 'notes',
 };

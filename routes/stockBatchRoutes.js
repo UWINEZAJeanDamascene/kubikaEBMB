@@ -40,6 +40,8 @@ router.put(
   cacheInvalidationMiddleware({ types: ['product', 'stock', 'pos'] }),
   stockBatchController.quarantineStockBatch,
 );
+router.put('/:id/recall', protect, requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), cacheInvalidationMiddleware({ types: ['product', 'stock', 'pos'] }), stockBatchController.setBatchRecall);
+router.get('/:id/genealogy', protect, requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), stockBatchController.getStockBatchGenealogy);
 
 // @route   DELETE /api/stock-batches/:id
 // @desc    Delete a stock batch

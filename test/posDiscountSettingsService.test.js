@@ -21,10 +21,11 @@ describe('POS discount settings', () => {
       },
       rules: [],
       discountReasons: [],
-      systemTillTypes: ['retail', 'restaurant'],
+      systemTillTypes: ['retail', 'restaurant', 'pharmacy'],
       tillTypeFeatures: {
         retail: { manualDiscounts: true, promotions: true, vouchers: true, customerCredit: true },
         restaurant: { manualDiscounts: true, promotions: true, vouchers: true, customerCredit: true },
+        pharmacy: { manualDiscounts: true, promotions: true, vouchers: true, customerCredit: true },
       },
       registerLabels: [],
     });
@@ -61,7 +62,7 @@ describe('POS discount settings', () => {
       registerLabels: [],
     });
 
-    expect(settings.systemTillTypes).toEqual(['retail', 'restaurant']);
+    expect(settings.systemTillTypes).toEqual(['retail', 'restaurant', 'pharmacy']);
     expect(getTillTypeFeatures(settings, 'restaurant')).toEqual({
       manualDiscounts: true,
       promotions: true,

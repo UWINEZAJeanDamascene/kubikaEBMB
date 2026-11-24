@@ -620,6 +620,16 @@ exports.confirmGRN = async (req, res, next) => {
             { status: 400 },
           );
         }
+        if (line.manufactureDate && line.expiryDate) {
+          const manufacture = new Date(line.manufactureDate);
+          const expiry = new Date(line.expiryDate);
+          if (Number.isFinite(manufacture.getTime()) && Number.isFinite(expiry.getTime()) && expiry <= manufacture) {
+            throw Object.assign(
+              new Error(`Expiry date must be after manufacture date for batch ${line.batchNo}`),
+              { status: 422, code: 'BATCH_EXPIRY_INVALID' },
+            );
+          }
+        }
       }
 
       // Serial tracking: require serialNumbers array with count matching qtyReceived
@@ -719,6 +729,7 @@ exports.confirmGRN = async (req, res, next) => {
           if (lineExpDate) {
             stockBatch.expiryDate = lineExpDate;
           }
+          if (line.lotNo) stockBatch.lotNumber = String(line.lotNo).trim().slice(0, 80);
           await stockBatch.save(useSession ? { session: sess } : {});
         } else {
           // Create new batch
@@ -736,6 +747,7 @@ exports.confirmGRN = async (req, res, next) => {
             unitCost: baseUnitCost,
             manufactureDate: mfgDate,
             expiryDate: expDate,
+            lotNumber: line.lotNo ? String(line.lotNo).trim().slice(0, 80) : null,
             isQuarantined: false,
           });
           await stockBatch.save(useSession ? { session: sess } : {});

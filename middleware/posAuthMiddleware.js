@@ -4,6 +4,7 @@ const { verifyPosSessionToken } = require('../services/posSessionTokenService');
 const { resolveUserRoles } = require('./authorize');
 const { requestIp, writePosAuditLog, withPosAuditCorrelation } = require('../services/posAuditService');
 const { getPosSessionPermissionCandidates } = require('../utils/posPermissionCompatibility');
+const { PHARMACY_ROLES } = require('../services/posPharmacyFeatureRegistry');
 
 const CASHIER_POS_PERMISSIONS = [
   'pos.till.sell',
@@ -139,11 +140,16 @@ function configuredPermissions(matrix, roles) {
       ? [...new Set([...configured, 'pos.receipt.share', 'pos.giftcard.redeem', 'pos.till.reprint'])]
         : configured;
     }
-    if (roleName === 'cashier' || roleName === 'sales') return CASHIER_POS_PERMISSIONS;
+    if (roleName === 'cashier' || roleName === 'sales') {
+      return [...CASHIER_POS_PERMISSIONS, ...PHARMACY_ROLES.cashier];
+    }
     if (roleName === 'supervisor') return SUPERVISOR_POS_PERMISSIONS;
-    if (roleName === 'manager') return STORE_MANAGER_POS_PERMISSIONS;
-    if (roleName === 'store_manager') return STORE_MANAGER_POS_PERMISSIONS;
-    if (['owner', 'admin', 'administrator', 'platform_admin'].includes(roleName)) return OWNER_POS_PERMISSIONS;
+    if (roleName === 'pharmacist') return PHARMACY_ROLES.pharmacist;
+    if (roleName === 'manager') return [...STORE_MANAGER_POS_PERMISSIONS, ...PHARMACY_ROLES.manager];
+    if (roleName === 'store_manager') return [...STORE_MANAGER_POS_PERMISSIONS, ...PHARMACY_ROLES.manager];
+    if (['owner', 'admin', 'administrator', 'platform_admin'].includes(roleName)) {
+      return [...OWNER_POS_PERMISSIONS, ...PHARMACY_ROLES.owner];
+    }
     return [];
   });
 }

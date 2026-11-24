@@ -52,6 +52,7 @@ const {
   recoverDeviceCredential,
   revokeDevice,
   listRegisters,
+  getPharmacyMode,
   setDeviceStatus,
 } = require('../controllers/posRegisterController');
 const enrollmentKeys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
@@ -286,6 +287,38 @@ describe('POS register listing', () => {
     );
 
     expect(res.body.data[0]).toMatchObject({ claimed: true, pairedDeviceCount: 2 });
+  });
+});
+
+describe('Pharmacy register mode', () => {
+  test('reports whether the company has an active Pharmacy register', async () => {
+    prisma.posRegister.findFirst.mockResolvedValue({ id: 'pharmacy-register' });
+    const res = createResponse();
+
+    await getPharmacyMode(
+      { user: { company: { _id: 'company-1' } } },
+      res,
+      (error) => { throw error; },
+    );
+
+    expect(prisma.posRegister.findFirst).toHaveBeenCalledWith({
+      where: { companyId: 'company-1', isActive: true, systemTillType: 'pharmacy' },
+      select: { id: true },
+    });
+    expect(res.body).toEqual({ success: true, data: { pharmacyConfigured: true } });
+  });
+
+  test('reports disabled when no active Pharmacy register exists', async () => {
+    prisma.posRegister.findFirst.mockResolvedValue(null);
+    const res = createResponse();
+
+    await getPharmacyMode(
+      { user: { company: { _id: 'company-1' } } },
+      res,
+      (error) => { throw error; },
+    );
+
+    expect(res.body).toEqual({ success: true, data: { pharmacyConfigured: false } });
   });
 });
 

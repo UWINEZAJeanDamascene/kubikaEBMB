@@ -4,6 +4,9 @@ const { randomBytes, createHash } = require('crypto');
 const { dbClient } = require('../lib/prisma');
 const { runInTransaction } = require('../services/transactionService');
 const { writePosAuditLog, requestIp } = require('../services/posAuditService');
+const {
+  releasePharmacyPendingSaleReservation,
+} = require('../services/posPharmacyPendingStockReservationService');
 const posPaymentService = require('../services/posPaymentService');
 const posProviderEventService = require('../services/posProviderEventService');
 const { hashStoredValueCode } = require('../services/posStoredValueCodeService');
@@ -1588,6 +1591,7 @@ exports.completeSale = async (req, res, next) => {
         }] : [];
       }),
     };
+
     req.posPaymentFlow = 'PAYMENTS_V2';
     req.posV2Completion = {
       invoiceId: saleId,
@@ -1616,6 +1620,84 @@ exports.completeSale = async (req, res, next) => {
     if (error?.code === 'POS_PAYMENT_FLOW_DISABLED') {
       return invalid(res, 409, error.code, error.message);
     }
+    return next(error);
+  }
+};
+
+exports.cancelPharmacyPendingSale = async (req, res, next) => {
+  const { companyId, register, user } = context(req);
+  const saleId = String(req.params.saleId || '');
+  const key = completionKey(req);
+  if (String(register.systemTillType || '').toLowerCase() !== 'pharmacy') {
+    return invalid(res, 403, 'POS_PHARMACY_CANCELLATION_REGISTER_REQUIRED', 'Unpaid Pharmacy sales can only be cancelled from a Pharmacy register.');
+  }
+  if (!IDEMPOTENCY_KEY_PATTERN.test(key)) {
+    return invalid(res, 400, 'POS_IDEMPOTENCY_KEY_INVALID', 'Provide an Idempotency-Key between 8 and 100 supported characters.');
+  }
+
+  try {
+    await assertPaymentsV2(companyId, String(register.id));
+    const result = await runInTransaction(async (tx) => {
+      await tx.$queryRawUnsafe(
+        'SELECT id FROM invoices WHERE id = $1 AND company_id = $2 FOR UPDATE',
+        saleId,
+        companyId,
+      );
+      const invoice = await tx.invoice.findFirst({
+        where: { id: saleId, companyId, posOrigin: true },
+        include: { posPayments: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] } },
+      });
+      if (!invoice) {
+        return { error: { status: 404, code: 'POS_PENDING_SALE_NOT_FOUND', message: 'Pending Pharmacy sale was not found.' } };
+      }
+      if (invoice.status === 'cancelled' && invoice.posCancellationKey === key) {
+        return { invoice, replayed: true };
+      }
+      if (invoice.status !== 'PENDING_PAYMENT') {
+        return { error: { status: 409, code: 'POS_SALE_NOT_PENDING', message: 'This Pharmacy sale is no longer waiting for payment.' } };
+      }
+      if (String(invoice.registerId || '') !== String(register.id)
+        || String(invoice.cashierId || '') !== String(user.id)) {
+        return { error: { status: 403, code: 'POS_PAYMENT_CONTEXT_MISMATCH', message: 'This sale belongs to a different cashier or register.' } };
+      }
+      const shift = await loadOpenShift(companyId, String(register.id));
+      if (!shift || String(shift.id) !== String(invoice.shiftId || '')) {
+        return { error: { status: 409, code: 'POS_PAYMENT_SHIFT_CHANGED', message: 'The sale shift is no longer open. Ask a manager to review this pending payment.' } };
+      }
+      const payments = Array.isArray(invoice.posPayments) ? invoice.posPayments : [];
+      if (payments.some((payment) => ['PENDING', 'PENDING_VERIFICATION', 'UNMATCHED_SUCCESS', 'SUCCESS'].includes(payment.status))) {
+        return { error: { status: 409, code: 'POS_PAYMENT_METHOD_UNRESOLVED', message: 'Resolve or refund received payments before cancelling this Pharmacy sale.' } };
+      }
+
+      await releasePharmacyPendingSaleReservation(tx, companyId, saleId);
+      const updatedInvoice = await tx.invoice.update({
+        where: { id: saleId },
+        data: {
+          status: 'cancelled',
+          amountOutstanding: 0,
+          posCancellationKey: key,
+          cancelledAt: new Date(),
+        },
+      });
+      await writePosAuditLog({
+        companyId,
+        registerId: String(register.id),
+        userId: String(user.id),
+        event: 'PHARMACY_PENDING_SALE_CANCELLED',
+        metadata: { saleId, invoiceNumber: invoice.referenceNo },
+        ip: requestIp(req),
+      }, tx);
+      return { invoice: updatedInvoice, replayed: false };
+    });
+
+    if (result.error) {
+      return invalid(res, result.error.status, result.error.code, result.error.message);
+    }
+    return res.json({
+      success: true,
+      data: { saleId, status: 'cancelled', replayed: Boolean(result.replayed) },
+    });
+  } catch (error) {
     return next(error);
   }
 };

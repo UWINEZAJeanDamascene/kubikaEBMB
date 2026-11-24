@@ -28,8 +28,12 @@ async function consumeLegacyBatchQuantity(companyId, productId, warehouseId, bat
 async function consumeTrackedBatches(companyId, productId, warehouseId, quantity, session) {
   const batches = await StockBatch.find({ company: companyId, product: productId, warehouse: warehouseId, qtyOnHand: { $gt: 0 }, isQuarantined: false })
     .sort({ expiryDate: 1, createdAt: 1 }).session(session);
-  const eligible = batches.filter((batch) => !batch.expiryDate || new Date(batch.expiryDate) >= new Date());
-  const available = eligible.reduce((sum, batch) => sum + Number(batch.qtyOnHand || 0), 0);
+  const eligible = batches.filter((batch) =>
+    String(batch.recallStatus || 'active').toLowerCase() === 'active'
+    && (!batch.expiryDate || new Date(batch.expiryDate) >= new Date()));
+  const available = eligible.reduce((sum, batch) => (
+    sum + Math.max(0, Number(batch.qtyOnHand || 0) - Number(batch.reservedQuantity || 0))
+  ), 0);
   if (available < quantity) {
     const error = new Error(`Insufficient non-quarantined, non-expired batch stock. Available: ${available}, required: ${quantity}`);
     error.code = 'INSUFFICIENT_STOCK';
@@ -41,7 +45,10 @@ async function consumeTrackedBatches(companyId, productId, warehouseId, quantity
   let totalCost = 0;
   for (const batch of eligible) {
     if (remaining <= 0) break;
-    const taken = Math.min(remaining, Number(batch.qtyOnHand || 0));
+    const taken = Math.min(
+      remaining,
+      Math.max(0, Number(batch.qtyOnHand || 0) - Number(batch.reservedQuantity || 0)),
+    );
     if (taken <= 0) continue;
     batch.qtyOnHand = Number(batch.qtyOnHand) - taken;
     await batch.save({ session });
@@ -93,6 +100,9 @@ async function consumeOfflineTrackedBatches(
       reason = 'batch_missing';
     } else if (batch.isQuarantined) {
       reason = 'batch_quarantined';
+    } else if (String(batch.recallStatus || 'active').toLowerCase() !== 'active'
+      || String(snapshotBatch.recallStatus || 'active').toLowerCase() !== 'active') {
+      reason = 'batch_recalled';
     } else if (batch.batchNo !== snapshotBatch.batchNo) {
       reason = 'batch_identity_changed';
     } else if (batch.expiryDate && new Date(batch.expiryDate).getTime() < saleCreatedAt.getTime()) {
@@ -173,5 +183,6 @@ async function findAvailableSerialsOutsideQuarantine({ companyId, productId, war
 module.exports = {
   consumeTrackedBatches,
   consumeOfflineTrackedBatches,
+  consumeLegacyBatchQuantity,
   findAvailableSerialsOutsideQuarantine,
 };

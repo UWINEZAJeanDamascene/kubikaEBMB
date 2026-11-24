@@ -782,6 +782,24 @@ function validateCleanRow(entityType, clean, rowNumber, definition = getEntityDe
     if (!isBlank(clean.isStockable) && !['true', 'false', 'yes', 'no', '1', '0'].includes(String(clean.isStockable).toLowerCase())) {
       errors.push(buildValidationError(rowNumber, 'isStockable', 'Stockable must be TRUE or FALSE.', clean.isStockable));
     }
+    if (!isBlank(clean.pharmacyPrescriptionStatus)
+      && !['OTC', 'PRESCRIPTION', 'RESTRICTED'].includes(String(clean.pharmacyPrescriptionStatus).trim().toUpperCase())) {
+      errors.push(buildValidationError(rowNumber, 'pharmacyPrescriptionStatus', 'Prescription Status must be OTC, PRESCRIPTION, or RESTRICTED.', clean.pharmacyPrescriptionStatus));
+    }
+    if (!isBlank(clean.pharmacyDosageForm)) {
+      const dosageForm = String(clean.pharmacyDosageForm).trim().toLowerCase();
+      if (!['tablet', 'capsule', 'syrup', 'suspension', 'injection', 'cream', 'ointment', 'drops', 'inhaler', 'powder', 'solution', 'other'].includes(dosageForm)) {
+        errors.push(buildValidationError(rowNumber, 'pharmacyDosageForm', 'Select a supported dosage form.', clean.pharmacyDosageForm));
+      }
+    }
+    if (!isBlank(clean.pharmacyRestrictedStatus)
+      && !['true', 'false', 'yes', 'no', '1', '0'].includes(String(clean.pharmacyRestrictedStatus).toLowerCase())) {
+      errors.push(buildValidationError(rowNumber, 'pharmacyRestrictedStatus', 'Restricted Medicine must be TRUE or FALSE.', clean.pharmacyRestrictedStatus));
+    }
+    if (!isBlank(clean.pharmacyFdaRegistrationExpiry)
+      && !/^\d{4}-\d{2}-\d{2}$/.test(String(clean.pharmacyFdaRegistrationExpiry).trim())) {
+      errors.push(buildValidationError(rowNumber, 'pharmacyFdaRegistrationExpiry', 'Rwanda FDA Registration Expiry must use YYYY-MM-DD.', clean.pharmacyFdaRegistrationExpiry));
+    }
     const trackingType = String(clean.trackingType || 'none').trim().toLowerCase();
     const serialNumbers = parseImportedSerialNumbers(clean.serialNumbers);
     const manufactureDate = parseDateValue(clean.manufactureDate);
@@ -1581,6 +1599,29 @@ function productPayload(companyId, userId, data, { ebmEnabled = true } = {}) {
       quantityUnitCode: data.quantityUnitCode
     } } : {}),
     createdBy: userId,
+    customFields: {
+      ...(data.pharmacyGenericName || data.pharmacyBrandName || data.pharmacyStrength
+        || data.pharmacyDosageForm || data.pharmacyPrescriptionStatus
+        ? {
+          pharmacy: {
+            genericName: data.pharmacyGenericName || '',
+            brandName: data.pharmacyBrandName || '',
+            strength: data.pharmacyStrength || '',
+            dosageForm: String(data.pharmacyDosageForm || '').toLowerCase(),
+            route: data.pharmacyRoute || '',
+            packSize: data.pharmacyPackSize || '',
+            prescriptionStatus: String(data.pharmacyPrescriptionStatus || 'OTC').toUpperCase(),
+            restrictedStatus: ['true', 'yes', '1'].includes(String(data.pharmacyRestrictedStatus || '').toLowerCase()),
+            requiresPharmacistReview: ['true', 'yes', '1'].includes(String(data.pharmacyRequiresPharmacistReview || '').toLowerCase()),
+            coldChain: ['true', 'yes', '1'].includes(String(data.pharmacyColdChain || '').toLowerCase()),
+            storageTemperature: data.pharmacyStorageTemperature || '',
+            rwandaFdaRegistrationNumber: data.pharmacyFdaRegistrationNumber || '',
+            rwandaFdaRegistrationExpiry: data.pharmacyFdaRegistrationExpiry || null,
+            dispensingLimit: parseNumber(data.pharmacyDispensingLimit) || 0,
+          },
+        }
+        : {}),
+    },
     ...(data.supplierId ? { supplier: data.supplierId, preferredSupplier: data.supplierId } : {})
   };
 }

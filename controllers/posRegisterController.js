@@ -150,6 +150,22 @@ exports.listRegisters = async (req, res, next) => {
   }
 };
 
+exports.getPharmacyMode = async (req, res, next) => {
+  try {
+    const register = await prisma.posRegister.findFirst({
+      where: {
+        companyId: companyIdFor(req),
+        isActive: true,
+        systemTillType: 'pharmacy',
+      },
+      select: { id: true },
+    });
+    return res.json({ success: true, data: { pharmacyConfigured: Boolean(register) } });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.createRegister = async (req, res, next) => {
   try {
     const companyId = companyIdFor(req);
