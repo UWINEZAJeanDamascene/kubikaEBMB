@@ -7,7 +7,7 @@ const { writePosAuditLog, requestIp } = require('../services/posAuditService');
 const { FEATURE_REGISTRY, PHARMACY_PERMISSIONS, PHARMACY_ROLES } =
   require('../services/posPharmacyFeatureRegistry');
 
-const companyIdFor = (req) => String(req.user?.company?._id || req.user?.companyId || '');
+const companyIdFor = (req) => String(req.company?._id || req.company?.id || req.user?.company?._id || req.user?.companyId || '');
 const userIdFor = (req) => String(req.user?.id || req.user?._id || '');
 
 function providerInput(value, { partial = false } = {}) {

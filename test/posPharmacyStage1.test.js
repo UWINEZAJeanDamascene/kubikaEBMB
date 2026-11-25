@@ -31,8 +31,7 @@ describe('Pharmacy Stage 1 foundation', () => {
     expect(PHARMACY_PERMISSIONS).toContain('pharmacy.credit.sell');
     expect(PHARMACY_ROLES.pharmacist).toContain('pharmacy.prescription.view');
     expect(PHARMACY_ROLES.manager).toContain('pharmacy.credit.sell');
-    expect(PHARMACY_ROLES.cashier).not.toContain('pharmacy.credit.sell');
-    expect(PHARMACY_ROLES.cashier).not.toContain('pharmacy.settings.manage');
+    expect(PHARMACY_ROLES.cashier).toEqual(PHARMACY_PERMISSIONS);
     expect(FEATURE_REGISTRY).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'pharmacy.base', status: 'implemented', requiredByStage: 1 }),
     ]));

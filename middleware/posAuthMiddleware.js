@@ -161,7 +161,13 @@ function configuredPermissions(matrix, roles) {
       ];
     }
     if (roleName === 'cashier' || roleName === 'sales') {
-      effectivePermissions = [...effectivePermissions, 'pos.receipt.share', 'pos.giftcard.redeem', 'pos.till.reprint'];
+      effectivePermissions = [
+        ...effectivePermissions,
+        ...PHARMACY_ROLES.cashier,
+        'pos.receipt.share',
+        'pos.giftcard.redeem',
+        'pos.till.reprint',
+      ];
     }
     return [...new Set(effectivePermissions)];
   });

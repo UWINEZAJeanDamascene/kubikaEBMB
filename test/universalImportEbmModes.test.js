@@ -146,6 +146,89 @@ describe('Smart Import product EBM mode behavior', () => {
     expect(EBMItemClass.find).not.toHaveBeenCalled();
   });
 
+  it('allows missing product categories and named warehouses to be created during import', async () => {
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 6 });
+    const validation = await ImportService.validateImport({
+      entityType: 'products',
+      companyId: 'company-1',
+      expectedFiscalEntitlementVersion: 6,
+      mapping: {
+        name: 'Product Name',
+        sku: 'SKU',
+        category: 'Category',
+        unit: 'Unit',
+        sellingPrice: 'Price',
+        warehouse: 'Warehouse',
+      },
+      rows: [{
+        'Product Name': 'Paracetamol 500mg',
+        SKU: 'MED-001',
+        Category: 'Medicines',
+        Unit: 'pcs',
+        Price: '1200',
+        Warehouse: 'Pharmacy Main',
+      }],
+    });
+
+    expect(validation.validRows).toBe(1);
+    expect(validation.errorRows).toBe(0);
+    expect(validation.rows[0].warnings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: 'category', message: expect.stringContaining('Medicines') }),
+      expect.objectContaining({ field: 'warehouse', message: expect.stringContaining('Pharmacy Main') }),
+    ]));
+    expect(validation.rows[0].data).toMatchObject({
+      category: 'Medicines',
+      warehouse: 'Pharmacy Main',
+      warehouseId: null,
+    });
+    expect(Category.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['name', 'Archived Store'],
+    ['code', 'OLD-01'],
+    ['RRA branch ID', '07'],
+  ])('blocks an inactive warehouse matched by %s', async (_identifier, warehouseValue) => {
+    moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 6 });
+    Warehouse.find.mockReturnValue(query([{
+      _id: 'warehouse-inactive',
+      name: 'Archived Store',
+      code: 'OLD-01',
+      rraBranchId: '07',
+      isActive: false,
+    }]));
+
+    const validation = await ImportService.validateImport({
+      entityType: 'products',
+      companyId: 'company-1',
+      expectedFiscalEntitlementVersion: 6,
+      mapping: {
+        name: 'Product Name',
+        sku: 'SKU',
+        category: 'Category',
+        unit: 'Unit',
+        sellingPrice: 'Price',
+        warehouse: 'Warehouse',
+      },
+      rows: [{
+        'Product Name': 'Product',
+        SKU: 'PRODUCT-01',
+        Category: 'General',
+        Unit: 'pcs',
+        Price: '1200',
+        Warehouse: warehouseValue,
+      }],
+    });
+
+    expect(validation.validRows).toBe(0);
+    expect(validation.errorRows).toBe(1);
+    expect(validation.rows[0].errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        message: expect.stringContaining('Reactivate it before importing'),
+      }),
+    ]));
+  });
+
   it('revalidates EBM-off source rows consistently before processing', async () => {
     moduleEntitlementService.getEntitlement.mockResolvedValue({ status: 'off', version: 6 });
     const mapping = {

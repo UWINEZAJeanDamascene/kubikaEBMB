@@ -16,7 +16,7 @@ const ENTITY_DEFINITIONS = {
     fields: [
       { key: 'name', label: 'Product Name', required: true, section: 'Basic information', example: 'Inyange Milk 1L', instructions: 'Product or item name.' },
       { key: 'sku', label: 'Code / SKU', required: true, section: 'Basic information', example: 'PRD-001', instructions: 'Unique product code.' },
-      { key: 'category', label: 'Category', required: true, section: 'Basic information', example: 'Dairy', instructions: 'Choose an existing category from the dropdown. Values are loaded from this workspace.' },
+      { key: 'category', label: 'Category', required: true, section: 'Basic information', example: 'Dairy', instructions: 'Use the category name from your file. Missing categories are created automatically when the product import starts.' },
       { key: 'barcode', label: 'Barcode', required: false, section: 'Basic information', example: '6001234567890', instructions: 'Optional scanned barcode; keep as text to preserve leading zeroes.' },
       { key: 'barcodeType', label: 'Barcode Type', required: false, section: 'Basic information', example: 'EAN13', instructions: 'CODE128, EAN13, EAN8, UPC, CODE39, ITF14, QR, or NONE.' },
       { key: 'pharmacyGenericName', label: 'Medicine Generic Name', required: false, section: 'Pharmacy', example: 'Paracetamol', instructions: 'Generic medicine name. Leave blank for non-medicine products.' },
@@ -58,7 +58,7 @@ const ENTITY_DEFINITIONS = {
       { key: 'serialNumbers', label: 'Serial Numbers', required: false, section: 'Inventory Tracking', example: 'SN001; SN002; SN003', instructions: 'For serial-tracked products, enter one unique serial per opening-stock unit, separated by commas, semicolons, pipes, or line breaks.' },
       { key: 'reorderLevel', label: 'Low Stock Threshold / Reorder Point', required: false, section: 'Inventory', example: '20', instructions: 'Minimum stock before reorder suggestion.' },
       { key: 'reorderQuantity', label: 'Reorder Quantity', required: false, section: 'Inventory', example: '50', instructions: 'Suggested purchase quantity at the threshold.' },
-      { key: 'warehouse', label: 'Default Warehouse', required: false, section: 'Inventory', example: 'Main Warehouse', instructions: 'Choose a workspace warehouse. Required when importing opening stock.' },
+      { key: 'warehouse', label: 'Default Warehouse', required: false, section: 'Inventory', example: 'Main Warehouse', instructions: 'Use a workspace warehouse name or enter a new name to create during product import. Required when importing opening stock.' },
       { key: 'openingStockQuantity', label: 'Opening Stock Quantity', required: false, section: 'Inventory', example: '100', instructions: 'Requires a warehouse and positive Cost Price to create sale-ready stock and FIFO cost.' },
       { key: 'weight', label: 'Weight', required: false, section: 'Inventory', example: '1.25', instructions: 'Optional numeric product weight.' },
       { key: 'inventoryAccount', label: 'Inventory Account Code', required: false, section: 'Accounting', example: '1400', instructions: 'Optional chart of accounts code; defaults from category/company if blank.' },

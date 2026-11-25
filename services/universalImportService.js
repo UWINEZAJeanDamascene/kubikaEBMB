@@ -443,14 +443,16 @@ async function buildProductEnrichmentContext(companyId, ebmEnabled) {
     }
   };
 
-  const [company, categories, warehouses, suppliers, products, accounts] = await Promise.all([
+  const [company, categories, allWarehouses, suppliers, products, accounts] = await Promise.all([
     Company.findById(companyId).lean(),
     readAllPages(() => Category.find({ company: companyId })),
-    readAllPages(() => Warehouse.find({ company: companyId, isActive: { $ne: false } })),
+    readAllPages(() => Warehouse.find({ company: companyId })),
     readAllPages(() => Supplier.find({ company: companyId, isActive: { $ne: false } })),
     readAllPages(() => Product.find({ company: companyId }).select('brand')),
     readAllPages(() => ChartOfAccount.find({ company: companyId, isActive: true })),
   ]);
+  const warehouses = allWarehouses.filter((warehouse) => warehouse.isActive !== false);
+  const inactiveWarehouses = allWarehouses.filter((warehouse) => warehouse.isActive === false);
 
   let itemClasses = [];
   let ebmCodes = [];
@@ -463,7 +465,7 @@ async function buildProductEnrichmentContext(companyId, ebmEnabled) {
     ]);
   }
 
-  return { company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts, ebmEnabled };
+  return { company, categories, warehouses, inactiveWarehouses, suppliers, products, itemClasses, ebmCodes, accounts, ebmEnabled };
 }
 
 async function enrichProductRow(companyId, clean, context, rowNumber) {
@@ -473,21 +475,31 @@ async function enrichProductRow(companyId, clean, context, rowNumber) {
   if (category) {
     clean.category = category.name;
     clean.categoryId = category._id;
-  } else {
-    warnings.push({ field: 'category', blocking: true, message: 'Select an existing category from this workspace.' });
+  } else if (!isBlank(clean.category)) {
+    warnings.push({ field: 'category', message: `Category "${clean.category}" will be created during import.` });
   }
 
   const requestedWarehouse = clean.warehouse;
   const warehouseMatch = requestedWarehouse && context.warehouses.find((warehouse) =>
     [warehouse.name, warehouse.code, warehouse.rraBranchId].some((value) => normalizeMatch(value) === normalizeMatch(requestedWarehouse)));
+  const inactiveWarehouseMatch = requestedWarehouse && context.inactiveWarehouses?.find((warehouse) =>
+    [warehouse.name, warehouse.code, warehouse.rraBranchId].some((value) => normalizeMatch(value) === normalizeMatch(requestedWarehouse)));
   const defaultWarehouse = context.warehouses.find((warehouse) => warehouse.isDefault)
     || context.warehouses.find((warehouse) => normalizeMatch(warehouse.name).includes('main'))
     || context.warehouses[0];
   const selectedWarehouse = warehouseMatch || (isBlank(clean.warehouse) ? defaultWarehouse : null);
-  clean.warehouse = selectedWarehouse?.name || null;
+  clean.warehouse = selectedWarehouse?.name || (isBlank(requestedWarehouse) ? null : String(requestedWarehouse).trim());
   clean.warehouseId = selectedWarehouse?._id || null;
   if (!isBlank(requestedWarehouse) && !selectedWarehouse) {
-    warnings.push({ field: 'warehouse', blocking: true, message: 'Select an active warehouse from this workspace.' });
+    if (inactiveWarehouseMatch) {
+      warnings.push({
+        field: 'warehouse',
+        blocking: true,
+        message: `Warehouse "${inactiveWarehouseMatch.name}" exists but is inactive. Reactivate it before importing.`,
+      });
+    } else {
+      warnings.push({ field: 'warehouse', message: `Warehouse "${requestedWarehouse}" will be created during import.` });
+    }
   } else if (!selectedWarehouse && parseNumber(clean.openingStockQuantity) > 0) {
     warnings.push({ field: 'warehouse', blocking: true, message: 'Create a warehouse before importing opening stock.' });
   }
@@ -1162,12 +1174,82 @@ async function validateImport({
   };
 }
 
-async function ensureCategory(companyId, name) {
+async function ensureCategory(companyId, name, userId) {
   const Category = require('../models/Category');
   const categoryName = name || 'General';
   let category = await Category.findOne({ company: companyId, name: categoryName });
-  if (!category) category = await Category.create({ company: companyId, name: categoryName, description: 'Created during import' });
+  if (!category) {
+    category = await Category.create({
+      company: companyId,
+      name: categoryName,
+      description: 'Created during product import',
+      createdBy: userId,
+    });
+  }
   return category._id;
+}
+
+async function ensureWarehouse(companyId, userId, name) {
+  const warehouseName = String(name || '').trim();
+  if (!warehouseName) return null;
+
+  const { prisma } = require('../lib/prisma');
+  const { warehouseTranslateCreate } = require('../utils/masterDataMappers');
+  const { nextWarehouseCode } = require('../utils/warehouseCode');
+  const { getDefaultWarehouseInventoryAccount } = require('./warehouseAccountService');
+  const companyKey = String(companyId);
+  const inventoryAccount = await getDefaultWarehouseInventoryAccount(companyId);
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const warehouse = await prisma.$transaction(async (tx) => {
+        const existing = await tx.warehouse.findFirst({
+          where: {
+            companyId: companyKey,
+            OR: [
+              { name: { equals: warehouseName, mode: 'insensitive' } },
+              { code: { equals: warehouseName, mode: 'insensitive' } },
+              { rraBranchId: warehouseName },
+            ],
+          },
+        });
+        if (existing) {
+          if (!existing.isActive) {
+            throw new Error(`Warehouse "${warehouseName}" exists but is inactive. Reactivate it before importing.`);
+          }
+          return existing;
+        }
+
+        const existingWarehouses = await tx.warehouse.findMany({
+          where: { companyId: companyKey },
+          select: { code: true },
+        });
+        const code = nextWarehouseCode(existingWarehouses.map((warehouseRow) => warehouseRow.code));
+        const existingDefault = await tx.warehouse.findFirst({
+          where: { companyId: companyKey, isDefault: true },
+          select: { id: true },
+        });
+        const data = await warehouseTranslateCreate({
+          company: companyId,
+          createdBy: userId,
+          name: warehouseName,
+          code,
+          description: 'Created during product import',
+          location: {},
+          inventoryAccount,
+          isActive: true,
+          isDefault: !existingDefault,
+        });
+        return tx.warehouse.create({ data });
+      });
+      return warehouse.id;
+    } catch (error) {
+      const isUniqueConflict = ['P2002', '23505', 11000].includes(error?.code);
+      if (!isUniqueConflict || attempt === 4) throw error;
+    }
+  }
+
+  throw new Error(`Could not create warehouse "${warehouseName}" during product import.`);
 }
 
 async function captureProductOpeningStock(companyId, userId, productId, data) {
@@ -1305,14 +1387,6 @@ async function calculateStockFromMovements(companyId, productId) {
     const quantity = Number(movement.quantity) || 0;
     return total + (String(movement.type).toLowerCase() === 'out' ? -quantity : quantity);
   }, 0);
-}
-
-async function resolveWarehouseId(companyId, name) {
-  if (!name) return null;
-  const Warehouse = require('../models/Warehouse');
-  const requestedName = String(name).trim().toLowerCase();
-  const warehouse = await Warehouse.findOne({ company: companyId, name: new RegExp(`^${requestedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }).lean();
-  return warehouse?._id || null;
 }
 
 async function writeFixedAsset(companyId, userId, data) {
@@ -1626,13 +1700,40 @@ function productPayload(companyId, userId, data, { ebmEnabled = true } = {}) {
   };
 }
 
+function isProductSkuUniqueConflict(error) {
+  if (error?.code !== 'P2002') return false;
+  const target = Array.isArray(error.meta?.target)
+    ? error.meta.target.join(' ')
+    : String(error.meta?.target || '');
+  if (target.toLowerCase().includes('sku')) return true;
+  const message = String(error.message || '').toLowerCase();
+  return message.includes('company_id') && message.includes('sku');
+}
+
+async function createProductWithGeneratedSku(Product, companyId, payload, originalSku) {
+  const normalizedSku = String(originalSku || '').trim().toUpperCase();
+  for (let copyNumber = 1; copyNumber <= 1000; copyNumber += 1) {
+    const generatedSku = `${normalizedSku}-COPY-${copyNumber}`;
+    const existing = await Product.findOne({ company: companyId, sku: generatedSku });
+    if (existing) continue;
+    try {
+      const product = await Product.create({ ...payload, sku: generatedSku });
+      return { product, generatedSku };
+    } catch (error) {
+      if (!isProductSkuUniqueConflict(error)) throw error;
+    }
+  }
+  throw new Error(`Could not generate an available SKU for "${normalizedSku}".`);
+}
+
 async function upsertRow(entityType, companyId, userId, data, duplicateAction, context = {}) {
   if (entityType === 'products') {
     const Product = require('../models/Product');
-    const warehouseId = data.warehouseId || await resolveWarehouseId(companyId, data.warehouse);
+    const warehouseId = data.warehouseId || await ensureWarehouse(companyId, userId, data.warehouse);
+    if (warehouseId) data.warehouseId = warehouseId;
     const payload = productPayload(companyId, userId, data, { ebmEnabled: context.ebmEnabled !== false });
     if (warehouseId) payload.defaultWarehouse = warehouseId;
-    payload.category = await ensureCategory(companyId, data.category);
+    payload.category = await ensureCategory(companyId, data.category, userId);
     const existing = await Product.findOne({ company: companyId, sku: payload.sku });
     if (existing && duplicateAction === 'skip') {
       // Imports commonly use "skip" to add opening stock to an existing SKU;
@@ -1681,10 +1782,37 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
       return { status: 'success', message: openingStockWasProcessed(stockStatus) ? 'Updated duplicate product; opening stock is present.' : 'Updated duplicate product.' };
     }
     if (existing && duplicateAction !== 'create') return { status: 'skipped', message: 'Skipped duplicate product.' };
-    const product = await Product.create(payload);
+    const originalSku = payload.sku;
+    let product;
+    let generatedSku = null;
+    if (existing && duplicateAction === 'create') {
+      ({ product, generatedSku } = await createProductWithGeneratedSku(
+        Product,
+        companyId,
+        payload,
+        originalSku,
+      ));
+    } else {
+      try {
+        product = await Product.create(payload);
+      } catch (error) {
+        if (duplicateAction !== 'create' || !isProductSkuUniqueConflict(error)) throw error;
+        ({ product, generatedSku } = await createProductWithGeneratedSku(
+          Product,
+          companyId,
+          payload,
+          originalSku,
+        ));
+      }
+    }
     await captureProductOpeningStock(companyId, userId, product._id, data);
     await linkImportedProductToSupplier(companyId, product._id, payload.supplier, data);
-    return { status: 'success', message: 'Created product.' };
+    return {
+      status: 'success',
+      message: generatedSku
+        ? `Created product with generated SKU ${generatedSku} because ${originalSku} already exists.`
+        : 'Created product.',
+    };
   }
 
   if (entityType === 'customers' || entityType === 'clients') {
@@ -2163,5 +2291,8 @@ module.exports = {
     isQuantityUnitCode,
     productPayload,
     validateRelatedRecords,
+    ensureCategory,
+    ensureWarehouse,
+    upsertRow,
   }
 };

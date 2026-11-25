@@ -79,6 +79,20 @@ describe('Pharmacy insurance provider setup', () => {
     });
   });
 
+  test('uses the tenant context established by the company guard', async () => {
+    prisma.pharmacyInsuranceProvider.findMany.mockResolvedValue([]);
+    const res = response();
+
+    await controller.getInsuranceProviders({
+      company: { _id: 'company-selected' },
+      user: { companyId: 'company-token' },
+    }, res, jest.fn());
+
+    expect(prisma.pharmacyInsuranceProvider.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { companyId: 'company-selected' },
+    }));
+  });
+
   test('creates a normalized insurer and records an audit event', async () => {
     prisma.pharmacyInsuranceProvider.create.mockImplementation(async ({ data }) => ({
       id: data.id,

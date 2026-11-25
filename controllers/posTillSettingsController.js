@@ -105,16 +105,25 @@ function defaultPharmacyPermissions(roleName) {
   return PHARMACY_ROLES[resolvedName] ? [...PHARMACY_ROLES[resolvedName]] : [];
 }
 
+function requiredPharmacyPermissions(roleName) {
+  return roleName === 'cashier' || roleName === 'sales' ? PHARMACY_ROLES.cashier : [];
+}
+
 function rolePharmacyPermissions(matrix, roleName) {
   const config = matrix?.[roleName];
+  let permissions;
   if (Array.isArray(config?.pharmacyPermissions)) {
-    return config.pharmacyPermissions.filter((permission) => PHARMACY_PERMISSIONS.includes(permission));
+    permissions = config.pharmacyPermissions.filter((permission) => PHARMACY_PERMISSIONS.includes(permission));
+  } else {
+    const configured = Array.isArray(config) ? config : config?.permissions;
+    permissions = Array.isArray(configured)
+      ? configured.filter((permission) => PHARMACY_PERMISSIONS.includes(permission))
+      : defaultPharmacyPermissions(roleName);
   }
-  const configured = Array.isArray(config) ? config : config?.permissions;
-  if (Array.isArray(configured)) {
-    return configured.filter((permission) => PHARMACY_PERMISSIONS.includes(permission));
+  if (roleName === 'cashier' || roleName === 'sales') {
+    return [...new Set([...permissions, ...requiredPharmacyPermissions(roleName)])];
   }
-  return defaultPharmacyPermissions(roleName);
+  return permissions;
 }
 
 function normalizedRolePermissionMatrix(value) {
@@ -169,7 +178,10 @@ exports.updatePharmacyRolePermissions = async (req, res, next) => {
     if (!Array.isArray(permissions) || permissions.some((permission) => !PHARMACY_PERMISSIONS.includes(permission))) {
       return sendInvalid(res, 'Select only supported Pharmacy permissions.');
     }
-    const pharmacyPermissions = [...new Set(permissions)];
+    const pharmacyPermissions = [...new Set([
+      ...permissions,
+      ...requiredPharmacyPermissions(roleName),
+    ])];
     const userId = String(req.user?.id || req.user?._id || '');
     const updated = await prisma.$transaction(async (tx) => {
       await tx.systemSettings.upsert({

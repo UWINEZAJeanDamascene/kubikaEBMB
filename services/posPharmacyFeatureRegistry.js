@@ -17,7 +17,7 @@ const PHARMACY_PERMISSIONS = Object.freeze([
 
 const PHARMACY_ROLES = Object.freeze({
   cashier: Object.freeze([
-    'pharmacy.till.sell',
+    ...PHARMACY_PERMISSIONS,
   ]),
   pharmacist: Object.freeze([
     'pharmacy.till.sell',

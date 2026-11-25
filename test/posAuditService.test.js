@@ -220,6 +220,7 @@ describe('POS audit logging', () => {
     expect(POS_AUDIT_EVENTS.has('GIFT_CARD_REDEEMED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('GIFT_CARD_REFUNDED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('PHARMACY_SETTINGS_UPDATED')).toBe(true);
+    expect(POS_AUDIT_EVENTS.has('POS_PHARMACY_ROLE_PERMISSIONS_UPDATED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('PHARMACY_INSURANCE_PROVIDER_CREATED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('PHARMACY_INSURANCE_PROVIDER_UPDATED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('PHARMACY_INSURANCE_CLAIM_ADJUSTED')).toBe(true);

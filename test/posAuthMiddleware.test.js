@@ -35,6 +35,7 @@ const {
   permissionsForUser,
   hasPosPermission,
 } = require('../middleware/posAuthMiddleware');
+const { PHARMACY_PERMISSIONS } = require('../services/posPharmacyFeatureRegistry');
 
 const COMPANY_ID = '507f1f77bcf86cd799439011';
 const REGISTER_ID = '507f1f77bcf86cd799439012';
@@ -204,20 +205,19 @@ describe('POS session authorization middleware', () => {
     expect(pharmacyResponse.body).toBeNull();
   });
 
-  test('cashier defaults stay least-privilege while supervisors and store managers get review rights', async () => {
+  test('cashier POS access stays limited while cashier roles receive all Pharmacy permissions', async () => {
     resolveUserRoles.mockResolvedValue([{ name: 'cashier' }]);
     const cashier = await permissionsForUser({ role: 'cashier' }, COMPANY_ID, {});
     expect(cashier).toEqual(expect.arrayContaining([
       'pos.till.sell', 'pos.till.cash_move', 'pos.till.close_shift', 'pos.till.discount',
       'pos.till.receive_account_payment', 'pos.voucher.redeem', 'pos.till.open_shift',
       'pos.receipt.share', 'pos.giftcard.issue', 'pos.giftcard.redeem',
-      'pharmacy.till.sell',
+      ...PHARMACY_PERMISSIONS,
     ]));
     expect(cashier).not.toEqual(expect.arrayContaining([
       'pos.till.refund', 'pos.till.void', 'pos.till.no_sale',
       'pos.till.credit_sell', 'pos.admin.view', 'pos.admin.registers', 'pos.admin.settings',
       'pos.payment.reconcile', 'pos.till.open_price',
-      'pharmacy.dispensing.review', 'pharmacy.prescription.capture', 'pharmacy.patient.view',
     ]));
     const configuredCashier = await permissionsForUser(
       { role: 'cashier' },
@@ -273,10 +273,8 @@ describe('POS session authorization middleware', () => {
     expect(cashier).toEqual(expect.arrayContaining([
       'pos.till.sell',
       'pos.receipt.share',
-      'pharmacy.till.sell',
-      'pharmacy.prescription.capture',
+      ...PHARMACY_PERMISSIONS,
     ]));
-    expect(cashier).not.toContain('pharmacy.patient.view');
   });
 
   test('rejects an ERP session from a different company than the POS session', async () => {
@@ -371,7 +369,13 @@ describe('POS session authorization middleware', () => {
     await requirePermission('pos.sell')(req, res, next);
 
     expect(next).toHaveBeenCalledWith();
-    expect(req.posPermissions).toEqual(['pos.sell', 'pos.receipt.share', 'pos.giftcard.redeem', 'pos.till.reprint']);
+    expect(req.posPermissions).toEqual(expect.arrayContaining([
+      'pos.sell',
+      ...PHARMACY_PERMISSIONS,
+      'pos.receipt.share',
+      'pos.giftcard.redeem',
+      'pos.till.reprint',
+    ]));
 
     const denied = response();
     await requirePermission('pos.refund')(req, denied, jest.fn());

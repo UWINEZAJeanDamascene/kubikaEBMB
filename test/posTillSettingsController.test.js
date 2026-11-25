@@ -17,6 +17,7 @@ jest.mock('../services/posAuditService', () => ({
 const { prisma } = require('../lib/prisma');
 const controller = require('../controllers/posTillSettingsController');
 const { writePosAuditLog } = require('../services/posAuditService');
+const { PHARMACY_PERMISSIONS } = require('../services/posPharmacyFeatureRegistry');
 
 function response() {
   return {
@@ -77,6 +78,7 @@ describe('POS till administration settings', () => {
     prisma.systemSettings.upsert.mockResolvedValue({
       posRolePermissions: {
         cashier: { permissions: ['pos.till.sell'] },
+        sales: { pharmacyPermissions: [] },
         'custom pharmacy role': { pharmacyPermissions: ['pharmacy.patient.view'] },
       },
     });
@@ -91,7 +93,8 @@ describe('POS till administration settings', () => {
 
     expect(res.body.data.permissions).toContain('pharmacy.prescription.capture');
     expect(res.body.data.roles).toEqual(expect.arrayContaining([
-      { name: 'cashier', pharmacyPermissions: [] },
+      { name: 'cashier', pharmacyPermissions: expect.arrayContaining(PHARMACY_PERMISSIONS) },
+      { name: 'sales', pharmacyPermissions: expect.arrayContaining(PHARMACY_PERMISSIONS) },
       { name: 'pharmacist', pharmacyPermissions: expect.arrayContaining(['pharmacy.prescription.capture']) },
       { name: 'custom pharmacy role', pharmacyPermissions: ['pharmacy.patient.view'] },
     ]));
@@ -149,6 +152,19 @@ describe('POS till administration settings', () => {
     expect(res.statusCode).toBe(400);
     expect(res.body.code).toBe('POS_TILL_SETTINGS_INVALID');
     expect(prisma.systemSettings.update).not.toHaveBeenCalled();
+  });
+
+  test('keeps all Pharmacy permissions enabled when saving cashier permissions', async () => {
+    prisma.systemSettings.upsert.mockResolvedValue({});
+    prisma.systemSettings.findUnique.mockResolvedValue({ posRolePermissions: {} });
+    const res = response();
+
+    await controller.updatePharmacyRolePermissions({
+      user: { id: 'manager-id', companyId: 'company-a' },
+      body: { roleName: 'cashier', permissions: ['pharmacy.till.sell'] },
+    }, res, (error) => { throw error; });
+
+    expect(res.body.data.pharmacyPermissions).toEqual(PHARMACY_PERMISSIONS);
   });
 
   test('loads settings only for the active company and applies defaults', async () => {
