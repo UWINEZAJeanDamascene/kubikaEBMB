@@ -265,7 +265,8 @@ exports.createPatient = async (req, res, next) => {
       const created = await tx.pharmacyPatient.create({
         data: {
           id,
-          ...context,
+          companyId: context.companyId,
+          registerId: context.registerId,
           patientCode: `PAT-${id.slice(-8).toUpperCase()}`,
           fullName,
           phone,

@@ -96,8 +96,8 @@ function request(overrides = {}) {
     },
     posAuthContext: {
       company: { id: COMPANY_ID },
-      register: { id: REGISTER_ID, code: 'REGISTER-1', claimedDeviceId: 'device-1' },
-      posDevice: { deviceId: 'device-1' },
+      register: { id: REGISTER_ID, code: 'REGISTER-1', claimedDeviceId: '00000000-0000-4000-8000-000000000001' },
+      posDevice: { deviceId: '00000000-0000-4000-8000-000000000001' },
       user: { id: CASHIER_ID, name: 'Cashier' },
       session: { id: 'session-id' },
     },
@@ -426,7 +426,7 @@ describe('POS Payments V2 controller', () => {
     expect(createDirectSale).toHaveBeenCalledWith(req, res, expect.any(Function));
     expect(req.posPaymentFlow).toBe('PAYMENTS_V2');
     expect(req.body.registerId).toBe('REGISTER-1');
-    expect(req.body.deviceId).toBe('device-1');
+    expect(req.body.deviceId).toBe('00000000-0000-4000-8000-000000000001');
     expect(req.user).toMatchObject({
       id: CASHIER_ID,
       company: { _id: COMPANY_ID },
@@ -783,6 +783,27 @@ describe('POS Payments V2 controller', () => {
     expect(res.statusCode).toBe(403);
     expect(res.body.code).toBe('POS_PERMISSION_DENIED');
     expect(db.posPayment.create).not.toHaveBeenCalled();
+  });
+
+  test('accepts the Pharmacy-specific credit permission on a Pharmacy register', async () => {
+    const { db } = setupDatabase();
+    db.posRegister.findFirst.mockResolvedValue({ systemTillType: 'pharmacy' });
+    db.$queryRawUnsafe.mockResolvedValue([]);
+    const baseAuth = request().posAuthContext;
+    const req = request({
+      body: { payments: [{ method: 'CREDIT', amount: 100 }] },
+      posAuthContext: {
+        ...baseAuth,
+        register: { ...baseAuth.register, systemTillType: 'pharmacy' },
+      },
+      posPermissions: ['pos.payment.take', 'pharmacy.credit.sell'],
+    });
+    const res = response();
+
+    await controller.recordCashPayment(req, res, jest.fn());
+
+    expect(res.statusCode).not.toBe(403);
+    expect(res.body.code).not.toBe('POS_PERMISSION_DENIED');
   });
 
   test('replays a split-payment request only when every allocation matches', async () => {
@@ -1339,7 +1360,7 @@ describe('POS Payments V2 controller', () => {
       warehouseId: '507f1f77bcf86cd799439018',
       clientId: CLIENT_ID,
       registerId: 'REGISTER-1',
-      deviceId: 'device-1',
+      deviceId: '00000000-0000-4000-8000-000000000001',
       payments: [{ paymentMethod: 'cash', amount: 600, reference: '' }],
     });
   });

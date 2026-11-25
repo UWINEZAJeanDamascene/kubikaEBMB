@@ -1436,7 +1436,15 @@ exports.createDirectSale = async (req, res, next) => {
     // Determine payment status
     const normalizedPaymentReference = String(paymentReference || '').trim();
     const storedValueMethods = ['gift_card', 'store_credit', 'loyalty'];
-    const supportedPaymentMethods = ['cash', 'card', 'bank_transfer', 'mobile_money', 'cheque', 'loyalty_points', ...storedValueMethods];
+    const pharmacyInsuranceTender = Boolean(
+      req.posV2Completion
+      && String(claimedRegister.systemTillType || '').toLowerCase() === 'pharmacy',
+    );
+    const supportedPaymentMethods = [
+      'cash', 'card', 'bank_transfer', 'mobile_money', 'cheque', 'loyalty_points',
+      ...storedValueMethods,
+      ...(pharmacyInsuranceTender ? ['insurance'] : []),
+    ];
     const rawPayments = isV2Pending
       ? []
       : req.posV2Completion
@@ -1527,6 +1535,7 @@ exports.createDirectSale = async (req, res, next) => {
           ? provider === 'momo' ? 'MTN_MOMO' : provider === 'airtel' ? 'AIRTEL_MONEY' : ''
           : method === 'credit' ? 'CREDIT'
             : method === 'loyalty' ? 'LOYALTY'
+              : method === 'insurance' ? 'INSURANCE'
               : method.toUpperCase();
         if (!methodCode) {
           return res.status(400).json({ success: false, code: 'POS_MOBILE_MONEY_PROVIDER_INVALID', message: `Select MoMo or Airtel as the provider for payment ${index + 1}.` });

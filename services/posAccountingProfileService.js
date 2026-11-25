@@ -310,6 +310,7 @@ function mappingForTender(tender) {
   if (method === 'loyalty_wallet') return { method, key: 'loyaltyWalletLiability' };
   if (method === 'loyalty_points') return { method, key: 'loyaltyPointsLiability' };
   if (method === 'customer_credit' || method === 'credit') return { method, key: 'accountsReceivable' };
+  if (method === 'insurance') return { method, key: 'accountsReceivable' };
   if (method === 'loyalty') return { method, key: 'customerAdvances' };
   return null;
 }

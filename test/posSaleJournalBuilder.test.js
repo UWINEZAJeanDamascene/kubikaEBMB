@@ -147,4 +147,32 @@ describe('POS sale journal builder till-type mappings', () => {
       expect.objectContaining({ accountCode: '1410', credit: 900 }),
     ]));
   });
+
+  test('posts a pharmacy insurance tender to the receivable account', async () => {
+    const result = await buildPosSaleJournalEntries({
+      companyId: 'company-a',
+      userId: 'pharmacist-a',
+      invoice: { id: 'invoice-insurance', referenceNo: 'INV-INS', invoiceDate: new Date('2026-11-06T10:00:00Z') },
+      register: { id: 'register-pharmacy', systemTillType: 'pharmacy' },
+      tenders: [
+        { paymentMethod: 'cash', amount: 900 },
+        { paymentMethod: 'insurance', amount: 100 },
+      ],
+      lines: [{ lineTax: 0, lineTotal: 1000, cogsAmount: 0 }],
+      totalAmount: 1000,
+      subtotal: 1000,
+      totalDiscount: 0,
+      taxAmount: 0,
+      amountPaid: 1000,
+      amountOutstanding: 0,
+      cogsAmount: 0,
+      paymentFlow: 'PAYMENTS_V2',
+    });
+
+    expect(result.journalEntries[0].lines).toContainEqual(
+      expect.objectContaining({ accountCode: '1300', debit: 100 }),
+    );
+    expect(result.journalEntries[0].lines.reduce((sum, line) => sum + line.debit, 0))
+      .toBe(result.journalEntries[0].lines.reduce((sum, line) => sum + line.credit, 0));
+  });
 });

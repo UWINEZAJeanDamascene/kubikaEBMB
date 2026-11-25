@@ -297,7 +297,7 @@ exports.recordCashPayment = async (req, res, next) => {
       return invalid(res, 400, 'POS_PAYMENT_SPLIT_INVALID', `Provide between 1 and ${MAX_SPLIT_PAYMENT_LINES} payment allocations.`);
     }
     const supportedSplitMethods = new Set([
-      'CASH', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT', 'GIFT_CARD', 'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS',
+      'CASH', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT', 'GIFT_CARD', 'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS', 'INSURANCE',
     ]);
     if (allocations.some((payment) => !supportedSplitMethods.has(payment.method))) {
       return invalid(res, 409, 'POS_PAYMENT_METHOD_UNAVAILABLE', 'This payment method is not yet available in this flow.');
@@ -324,7 +324,12 @@ exports.recordCashPayment = async (req, res, next) => {
       return invalid(res, 400, 'POS_GIFT_CARD_DUPLICATE', 'Use each gift card only once in a split payment.');
     }
     const allocationMethods = [...new Set(allocations.map((payment) => payment.method))];
-    if (allocationMethods.includes('CREDIT') && !req.posPermissions?.includes('pos.credit.sell')) {
+    if (allocationMethods.includes('INSURANCE') && !req.posPermissions?.includes('pharmacy.insurance.coverage')) {
+      return invalid(res, 403, 'PHARMACY_INSURANCE_PERMISSION_REQUIRED', 'Your Pharmacy role does not allow insurance coverage processing.');
+    }
+    const isPharmacyCreditSale = String(req.posAuthContext?.register?.systemTillType || '').toLowerCase() === 'pharmacy';
+    const creditPermission = isPharmacyCreditSale ? 'pharmacy.credit.sell' : 'pos.credit.sell';
+    if (allocationMethods.includes('CREDIT') && !req.posPermissions?.includes(creditPermission)) {
       return invalid(res, 403, 'POS_PERMISSION_DENIED', 'Your POS role does not allow customer credit sales.');
     }
     if (allocationMethods.includes('CREDIT')) {
@@ -769,7 +774,7 @@ exports.recordPayment = async (req, res, next) => {
   }
   if ([
     'CASH', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT', 'GIFT_CARD',
-    'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS',
+    'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS', 'INSURANCE',
   ].includes(method)) {
     return exports.recordCashPayment(req, res, next);
   }
@@ -1486,7 +1491,7 @@ exports.completeSale = async (req, res, next) => {
     });
     const supportedCompletionMethods = [
       'CASH', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT', 'GIFT_CARD',
-      'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS', 'MTN_MOMO', 'AIRTEL_MONEY',
+      'STORE_CREDIT', 'LOYALTY_WALLET', 'LOYALTY_POINTS', 'MTN_MOMO', 'AIRTEL_MONEY', 'INSURANCE',
     ];
     const unsupportedPayment = payments.find((payment) => !supportedCompletionMethods.includes(payment.method));
     if (unsupportedPayment) {
@@ -1580,6 +1585,7 @@ exports.completeSale = async (req, res, next) => {
           STORE_CREDIT: 'store_credit',
           LOYALTY_WALLET: 'loyalty',
           LOYALTY_POINTS: 'loyalty_points',
+          INSURANCE: 'insurance',
         }[payment.method];
         return method ? [{
           paymentMethod: method,

@@ -59,6 +59,7 @@ function tenderAccount(tender, accounts) {
   if (method === 'loyalty_wallet') return requiredAccount(accounts, 'loyaltyWalletLiability');
   if (method === 'loyalty_points') return requiredAccount(accounts, 'loyaltyPointsLiability');
   if (method === 'loyalty') return requiredAccount(accounts, 'customerAdvances');
+  if (method === 'insurance') return requiredAccount(accounts, 'accountsReceivable');
   if (method === 'customer_credit' || method === 'credit') return requiredAccount(accounts, 'accountsReceivable');
   throw new TypeError(`Unsupported POS payment method: ${method || '(empty)'}.`);
 }

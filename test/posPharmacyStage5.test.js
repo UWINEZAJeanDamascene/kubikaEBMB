@@ -125,6 +125,32 @@ describe('Pharmacy Stage 5 prescription and dispensing workflow', () => {
     ]));
   });
 
+  test('creates patient profiles without passing the POS context userId to Prisma', async () => {
+    const patient = {
+      id: 'patient-1',
+      patientCode: 'PAT-1',
+      fullName: 'Aline Uwase',
+      phone: null,
+      dateOfBirth: null,
+    };
+    const tx = {
+      pharmacyPatient: { create: jest.fn().mockResolvedValue(patient) },
+    };
+    prisma.$transaction = jest.fn((callback) => callback(tx));
+    const res = response();
+
+    await controller.createPatient(request({ fullName: 'Aline Uwase' }), res, jest.fn());
+
+    const createData = tx.pharmacyPatient.create.mock.calls[0][0].data;
+    expect(createData).toEqual(expect.objectContaining({
+      companyId: context.company.id,
+      registerId: context.register.id,
+      createdById: context.user.id,
+    }));
+    expect(createData).not.toHaveProperty('userId');
+    expect(res.statusCode).toBe(201);
+  });
+
   test('adds repeated partial dispense quantities when returning the prescription queue', async () => {
     const prescription = prescriptionWithFill('partially_dispensed', [
       { lines: [{ prescriptionLineId: 'line-1', quantity: '2.0000', suppliedProductName: 'Prescribed medicine' }] },

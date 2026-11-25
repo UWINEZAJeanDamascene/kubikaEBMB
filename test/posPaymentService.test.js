@@ -110,6 +110,7 @@ describe('POS payment settings and totals', () => {
       'LOYALTY',
       'LOYALTY_WALLET',
       'LOYALTY_POINTS',
+      'INSURANCE',
     ]);
   });
 
@@ -418,6 +419,29 @@ describe('POS payment settings and totals', () => {
       registerId: REGISTER_ID,
       method: 'CARD',
     })).resolves.toBeUndefined();
+  });
+
+  test('enables insurance payments only on pharmacy registers with an active insurer', async () => {
+    const pharmacyInsuranceProvider = { findFirst: jest.fn().mockResolvedValue({ id: 'insurer-a' }) };
+    dbClient.mockReturnValue({ pharmacyInsuranceProvider });
+
+    await expect(isPaymentMethodEnabled({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      method: 'INSURANCE',
+      tillType: 'retail',
+    })).resolves.toBe(false);
+    await expect(isPaymentMethodEnabled({
+      companyId: COMPANY_ID,
+      registerId: REGISTER_ID,
+      method: 'INSURANCE',
+      tillType: 'pharmacy',
+    })).resolves.toBe(true);
+
+    expect(pharmacyInsuranceProvider.findFirst).toHaveBeenCalledWith({
+      where: { companyId: COMPANY_ID, isActive: true },
+      select: { id: true },
+    });
   });
 
   test('blocks an enabled tender when its accounting mapping is missing', async () => {

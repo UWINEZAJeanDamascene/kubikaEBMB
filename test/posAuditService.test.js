@@ -219,6 +219,10 @@ describe('POS audit logging', () => {
     expect(POS_AUDIT_EVENTS.has('GIFT_CARD_LOADED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('GIFT_CARD_REDEEMED')).toBe(true);
     expect(POS_AUDIT_EVENTS.has('GIFT_CARD_REFUNDED')).toBe(true);
+    expect(POS_AUDIT_EVENTS.has('PHARMACY_SETTINGS_UPDATED')).toBe(true);
+    expect(POS_AUDIT_EVENTS.has('PHARMACY_INSURANCE_PROVIDER_CREATED')).toBe(true);
+    expect(POS_AUDIT_EVENTS.has('PHARMACY_INSURANCE_PROVIDER_UPDATED')).toBe(true);
+    expect(POS_AUDIT_EVENTS.has('PHARMACY_INSURANCE_CLAIM_ADJUSTED')).toBe(true);
     await expect(writePosAuditLog({ companyId: 'company', event: 'UNKNOWN' })).rejects.toThrow('Unsupported POS audit event');
     await expect(writePosAuditLog({ event: 'SESSION_ENDED' })).rejects.toThrow('A company is required');
     expect(prisma.posAuditLog.create).not.toHaveBeenCalled();

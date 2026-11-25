@@ -8,6 +8,11 @@ const PHARMACY_PERMISSIONS = Object.freeze([
   'pharmacy.patient.view',
   'pharmacy.settings.manage',
   'pharmacy.audit.read',
+  'pharmacy.insurance.view',
+  'pharmacy.insurance.coverage',
+  'pharmacy.insurance.claims',
+  'pharmacy.insurance.settlement',
+  'pharmacy.credit.sell',
 ]);
 
 const PHARMACY_ROLES = Object.freeze({
@@ -20,6 +25,9 @@ const PHARMACY_ROLES = Object.freeze({
     'pharmacy.prescription.capture',
     'pharmacy.prescription.view',
     'pharmacy.patient.view',
+    'pharmacy.insurance.view',
+    'pharmacy.insurance.coverage',
+    'pharmacy.insurance.claims',
   ]),
   manager: Object.freeze([
     'pharmacy.till.sell',
@@ -29,6 +37,11 @@ const PHARMACY_ROLES = Object.freeze({
     'pharmacy.patient.view',
     'pharmacy.settings.manage',
     'pharmacy.audit.read',
+    'pharmacy.insurance.view',
+    'pharmacy.insurance.coverage',
+    'pharmacy.insurance.claims',
+    'pharmacy.insurance.settlement',
+    'pharmacy.credit.sell',
   ]),
   owner: Object.freeze([
     ...PHARMACY_PERMISSIONS,
@@ -49,6 +62,13 @@ const FEATURE_REGISTRY = Object.freeze([
     category: 'clinical-workflow',
     status: 'implemented',
     requiredByStage: 5,
+  }),
+  Object.freeze({
+    code: 'pharmacy.insurance-credit',
+    name: 'Manual insurer claims and customer credit',
+    category: 'insurance-and-credit',
+    status: 'implemented',
+    requiredByStage: 7,
   }),
 ]);
 

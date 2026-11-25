@@ -853,225 +853,233 @@ model Liability {
 }
 
 model Company {
-  id                          String                      @id @db.Char(24)
-  name                        String
-  code                        String                      @unique
-  legalName                   String?                     @map("legal_name")
-  registrationNumber          String?                     @map("registration_number")
-  taxIdentificationNumber     String?                     @map("tax_identification_number")
-  email                       String?
-  phone                       String?
-  website                     String?
-  timezone                    String?                     @db.VarChar(64)
-  address                     Json                        @default("{}")
-  logoUrl                     String?                     @map("logo_url")
-  baseCurrency                String                      @default("RWF") @map("base_currency")
-  fiscalYearStartMonth        Int                         @default(1) @map("fiscal_year_start_month")
-  defaultPaymentTermsDays     Int                         @default(30) @map("default_payment_terms_days")
-  industry                    String?
-  isActive                    Boolean                     @default(true) @map("is_active")
-  approvalStatus              CompanyApprovalStatus       @default(approved) @map("approval_status")
-  registrationRejectionReason String?                     @map("registration_rejection_reason")
-  isVatRegistered             Boolean                     @default(false) @map("is_vat_registered")
-  vatRatePct                  Float                       @default(18) @map("vat_rate_pct")
-  setupCompleted              Boolean                     @default(false) @map("setup_completed")
-  setupStepsCompleted         Json                        @default("{}") @map("setup_steps_completed")
-  subscriptionPlan            SubscriptionPlan            @default(starter) @map("subscription_plan")
-  subscriptionStatus          SubscriptionStatus          @default(active) @map("subscription_status")
-  billingCycle                BillingCycle                @default(monthly) @map("billing_cycle")
-  billingAmount               Decimal                     @default(0) @map("billing_amount") @db.Decimal(19, 4)
-  nextBillingDate             DateTime?                   @map("next_billing_date") @db.Timestamptz(3)
-  featureAccess               Json                        @default("{}") @map("feature_access")
-  subscriptionModules         String[]                    @default([]) @map("subscription_modules")
-  platformNotes               String                      @default("") @map("platform_notes")
-  ebmEnabled                  Boolean                     @default(false) @map("ebm_enabled")
-  ebmToggleReason             String?                     @map("ebm_toggle_reason")
-  ebmToggleChangedAt          DateTime?                   @map("ebm_toggle_changed_at") @db.Timestamptz(3)
-  ebmToggleChangedBy          String?                     @map("ebm_toggle_changed_by") @db.Char(24)
-  rraVsdcApprovalStatus       String                      @default("not_confirmed") @map("rra_vsdc_approval_status")
-  rraVsdcApprovalReference    String?                     @map("rra_vsdc_approval_reference")
-  rraVsdcApprovalReason       String?                     @map("rra_vsdc_approval_reason")
-  rraVsdcApprovedAt           DateTime?                   @map("rra_vsdc_approved_at") @db.Timestamptz(3)
-  rraVsdcApprovedBy           String?                     @map("rra_vsdc_approved_by") @db.Char(24)
-  lastPaymentReminderAt       DateTime?                   @map("last_payment_reminder_at") @db.Timestamptz(3)
-  lastPlatformMessageAt       DateTime?                   @map("last_platform_message_at") @db.Timestamptz(3)
-  trialEndsAt                 DateTime?                   @map("trial_ends_at") @db.Timestamptz(3)
-  createdById                 String?                     @map("created_by") @db.Char(24)
-  createdAt                   DateTime                    @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt                   DateTime                    @updatedAt @map("updated_at") @db.Timestamptz(3)
-  accountBalances             AccountBalance[]
-  accountMappings             AccountMapping[]
-  accountingPeriods           AccountingPeriod[]
-  actionLogs                  ActionLog[]
-  apPaymentAllocations        APPaymentAllocation[]
-  apPayments                  APPayment[]
-  apTransactionLedger         ApTransactionLedger[]
-  arBadDebtWriteoffs          ArBadDebtWriteoff[]
-  arReceiptAllocations        ARReceiptAllocation[]
-  arReceipts                  ARReceipt[]
-  arTransactionLedger         ArTransactionLedger[]
-  assetCategories             AssetCategory[]
-  assetDisposalEvents         AssetDisposalEvent[]
-  assetStatusHistories        AssetStatusHistory[]
-  auditLogs                   AuditLog[]
-  bankAccounts                BankAccount[]
-  bankReconciliationMatches   BankReconciliationMatch[]
-  bankReconciliationSessions  BankReconciliationSession[]
-  bankReconciliations         BankReconciliation[]
-  bankStatementLines          BankStatementLine[]
-  bankStatementTransactions   BankStatementTransaction[]
-  bankTransactions            BankTransaction[]
-  budgetActualConsumptions    BudgetActualConsumption[]
-  budgetAlerts                BudgetAlert[]
-  budgetApprovals             BudgetApproval[]
-  budgetLines                 BudgetLine[]
-  budgetPeriodLocks           BudgetPeriodLock[]
-  budgetRevisions             BudgetRevision[]
-  budgetTransfers             BudgetTransfer[]
-  budgetWorkflowConfigs       BudgetWorkflowConfig[]
-  budgets                     Budget[]
-  budgetEntities              Budget[]                    @relation("BudgetEntity")
-  categories                  Category[]
-  chartOfAccounts             ChartOfAccount[]
-  clients                     Client[]
-  posCustomerLoyaltyLedger    PosCustomerLoyaltyLedger[]
-  posCustomerCreditLedger     PosCustomerCreditLedger[]
-  createdBy                   User?                       @relation("CompanyCreatedBy", fields: [createdById], references: [id])
-  companyUsers                CompanyUser[]
-  creditNotes                 CreditNote[]
-  deferredRevenues            DeferredRevenue[]
-  deliveryNotes               DeliveryNote[]
-  departments                 Department[]
-  depreciationEntries         DepreciationEntry[]
-  ebmAlerts                   EbmAlert[]
-  ebmCodes                    EbmCode[]
-  ebmCodeClasses              EbmCodeClass[]
-  ebmBranchLookups            EbmBranchLookup[]
-  ebmDevices                  EbmDevice[]
-  ebmRegisteredItems          EbmRegisteredItem[]
-  ebmImportedItems            EbmImportedItem[]
-  ebmItemClasses              EbmItemClass[]
-  ebmNotices                  EbmNotice[]
-  ebmSequences                EbmSequenceCounter[]
-  ebmSubmissionQueues         EbmSubmissionQueue[]
-  posEbmSettings              PosEbmSettings?
-  ebmReceiptReprints          PosEbmReceiptReprint[]
-  posPublicReceiptTokens      PosPublicReceiptToken[]
-  ebmSyncStates               EbmSyncState[]
-  ebmTins                     EbmTin[]
-  ebmUnmatchedPurchases       EbmUnmatchedPurchase[]
-  employeeAdvances            EmployeeAdvance[]
-  employees                   Employee[]
-  encumbrances                Encumbrance[]
-  exchangeRates               ExchangeRate[]
-  expenses                    Expense[]
-  fixedAssets                 FixedAsset[]
-  freightBills                FreightBill[]
-  goodsReceivedNotes          GoodsReceivedNote[]
-  inventoryBatches            InventoryBatch[]
-  inventoryLayers             InventoryLayer[]
-  invoiceReceiptMetadata      InvoiceReceiptMetadata[]
-  invoices                    Invoice[]
-  ipWhitelists                IpWhitelist[]
-  journalEntries              JournalEntry[]
-  journalEntryLines           JournalEntryLine[]
-  loans                       Loan[]
-  notificationSettings        NotificationSettings?
-  notifications               Notification[]
-  payrollRuns                 PayrollRun[]
-  payrolls                    Payroll[]
-  periods                     Period[]
-  pettyCashExpenses           PettyCashExpense[]
-  pettyCashFloats             PettyCashFloat[]
-  pettyCashReconciliations    PettyCashReconciliation[]
-  pettyCashReplenishments     PettyCashReplenishment[]
-  pettyCashTransactions       PettyCashTransaction[]
-  pickPackLines               PickPackLine[]
-  pickPacks                   PickPack[]
-  prepaidExpenses             PrepaidExpense[]
-  products                    Product[]
-  projects                    Project[]
-  projectMilestones           ProjectMilestone[]
-  projectMembers              ProjectMember[]
-  projectComments             ProjectComment[]
-  projectActivity             ProjectActivity[]
-  projectDocuments            ProjectDocument[]
-  projectLaborEntries         ProjectLaborEntry[]
-  laborCostingPolicies        LaborCostingPolicy[]
-  projectTypeSettings         ProjectTypeSetting[]
-  purchaseOrders              PurchaseOrder[]
-  purchaseReturns             PurchaseReturn[]
-  purchases                   Purchase[]
-  quotations                  Quotation[]
-  recurringInvoiceRuns        RecurringInvoiceRun[]
-  recurringInvoices           RecurringInvoice[]
-  reorderPoints               ReorderPoint[]
-  reportSnapshots             ReportSnapshot[]
-  roles                       Role[]
-  rolePermissionOverrides     RolePermissionOverride[]
-  salaryHistories             SalaryHistory[]
-  salesOrders                 SalesOrder[]
-  sequences                   SequenceCounter[]
-  stockAudits                 StockAudit[]
-  stockBatches                StockBatch[]
-  stockLevels                 StockLevel[]
-  stockMovements              StockMovement[]
-  stockSerialNumbers          StockSerialNumber[]
-  stockTransferLines          StockTransferLine[]
-  stockTransfers              StockTransfer[]
-  suppliers                   Supplier[]
-  taxRates                    TaxRate[]
-  taxTransactions             TaxTransaction[]
-  taxes                       Tax[]
-  tillSessions                TillSession[]
-  posRegisters                PosRegister[]
-  posDevices                  PosDevice[]
-  pharmacyPatients            PharmacyPatient[]
-  pharmacyPrescriptions       PharmacyPrescription[]
-  posNonPostingDocuments      PosNonPostingDocument[]
-  posPrintPairingCodes        PosPrintPairingCode[]
-  posPrintAgents              PosPrintAgent[]
-  posPrintPrinters            PosPrintPrinter[]
-  posPrintJobs                PosPrintJob[]
-  posPrintDocuments           PosPrintDocument[]
-  posHardwareDevices          PosHardwareDevice[]
-  posShifts                   PosShift[]
-  posShiftCorrectionReports   PosShiftCorrectionReport[]
-  posCashMovements            PosCashMovement[]
-  posZReports                 PosZReport[]
-  posUserCredentials          PosUserCredential[]
-  posRegisterAccess           PosRegisterAccess[]
-  posSessions                 PosSession[]
-  posApprovals                PosApproval[]
-  posApprovalPolicies         PosApprovalPolicy[]
-  posPromotions               PosPromotion[]
-  posVouchers                 PosVoucher[]
-  posVoucherRedemptions       PosVoucherRedemption[]
-  posVoucherCodeAttempts      PosVoucherCodeAttempt[]
-  posStoredValueAccounts      PosStoredValueAccount[]
-  posStoredValueLedger        PosStoredValueLedger[]
-  posPayments                 PosPayment[]
-  posPaymentAttempts          PosPaymentAttempt[]
-  posProviderEvents           PosProviderEvent[]
-  posPaymentRefunds           PosPaymentRefund[]
-  posAccountingPostings       PosAccountingPosting[]
-  posChequeDeposits           PosChequeDeposit[]
-  posCheques                  PosCheque[]
-  posPaymentSettings          PosPaymentSettings?
-  restaurantBillingSettings   RestaurantBillingSettings?
-  restaurantTips              RestaurantTip[]
-  restaurantTipPayouts        RestaurantTipPayout[]
-  restaurantTipReversals      RestaurantTipReversal[]
-  posManagerApprovals         PosManagerApproval[]
-  posApprovalRequests         PosApprovalRequest[]
-  posHeldSales                PosHeldSale[]
-  priceLists                  PriceList[]
-  priceListItems              PriceListItem[]
-  timesheets                  Timesheet[]
-  users                       User[]
-  warehouses                  Warehouse[]
-  moduleEntitlements          CompanyModuleEntitlement[]
-  platformModuleAuditLogs     PlatformModuleAuditLog[]
+  id                                String                             @id @db.Char(24)
+  name                              String
+  code                              String                             @unique
+  legalName                         String?                            @map("legal_name")
+  registrationNumber                String?                            @map("registration_number")
+  taxIdentificationNumber           String?                            @map("tax_identification_number")
+  email                             String?
+  phone                             String?
+  website                           String?
+  timezone                          String?                            @db.VarChar(64)
+  address                           Json                               @default("{}")
+  logoUrl                           String?                            @map("logo_url")
+  baseCurrency                      String                             @default("RWF") @map("base_currency")
+  fiscalYearStartMonth              Int                                @default(1) @map("fiscal_year_start_month")
+  defaultPaymentTermsDays           Int                                @default(30) @map("default_payment_terms_days")
+  industry                          String?
+  isActive                          Boolean                            @default(true) @map("is_active")
+  approvalStatus                    CompanyApprovalStatus              @default(approved) @map("approval_status")
+  registrationRejectionReason       String?                            @map("registration_rejection_reason")
+  isVatRegistered                   Boolean                            @default(false) @map("is_vat_registered")
+  vatRatePct                        Float                              @default(18) @map("vat_rate_pct")
+  setupCompleted                    Boolean                            @default(false) @map("setup_completed")
+  setupStepsCompleted               Json                               @default("{}") @map("setup_steps_completed")
+  subscriptionPlan                  SubscriptionPlan                   @default(starter) @map("subscription_plan")
+  subscriptionStatus                SubscriptionStatus                 @default(active) @map("subscription_status")
+  billingCycle                      BillingCycle                       @default(monthly) @map("billing_cycle")
+  billingAmount                     Decimal                            @default(0) @map("billing_amount") @db.Decimal(19, 4)
+  nextBillingDate                   DateTime?                          @map("next_billing_date") @db.Timestamptz(3)
+  featureAccess                     Json                               @default("{}") @map("feature_access")
+  subscriptionModules               String[]                           @default([]) @map("subscription_modules")
+  platformNotes                     String                             @default("") @map("platform_notes")
+  ebmEnabled                        Boolean                            @default(false) @map("ebm_enabled")
+  ebmToggleReason                   String?                            @map("ebm_toggle_reason")
+  ebmToggleChangedAt                DateTime?                          @map("ebm_toggle_changed_at") @db.Timestamptz(3)
+  ebmToggleChangedBy                String?                            @map("ebm_toggle_changed_by") @db.Char(24)
+  rraVsdcApprovalStatus             String                             @default("not_confirmed") @map("rra_vsdc_approval_status")
+  rraVsdcApprovalReference          String?                            @map("rra_vsdc_approval_reference")
+  rraVsdcApprovalReason             String?                            @map("rra_vsdc_approval_reason")
+  rraVsdcApprovedAt                 DateTime?                          @map("rra_vsdc_approved_at") @db.Timestamptz(3)
+  rraVsdcApprovedBy                 String?                            @map("rra_vsdc_approved_by") @db.Char(24)
+  lastPaymentReminderAt             DateTime?                          @map("last_payment_reminder_at") @db.Timestamptz(3)
+  lastPlatformMessageAt             DateTime?                          @map("last_platform_message_at") @db.Timestamptz(3)
+  trialEndsAt                       DateTime?                          @map("trial_ends_at") @db.Timestamptz(3)
+  createdById                       String?                            @map("created_by") @db.Char(24)
+  createdAt                         DateTime                           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                         DateTime                           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  accountBalances                   AccountBalance[]
+  accountMappings                   AccountMapping[]
+  accountingPeriods                 AccountingPeriod[]
+  actionLogs                        ActionLog[]
+  apPaymentAllocations              APPaymentAllocation[]
+  apPayments                        APPayment[]
+  apTransactionLedger               ApTransactionLedger[]
+  arBadDebtWriteoffs                ArBadDebtWriteoff[]
+  arReceiptAllocations              ARReceiptAllocation[]
+  arReceipts                        ARReceipt[]
+  arTransactionLedger               ArTransactionLedger[]
+  assetCategories                   AssetCategory[]
+  assetDisposalEvents               AssetDisposalEvent[]
+  assetStatusHistories              AssetStatusHistory[]
+  auditLogs                         AuditLog[]
+  bankAccounts                      BankAccount[]
+  bankReconciliationMatches         BankReconciliationMatch[]
+  bankReconciliationSessions        BankReconciliationSession[]
+  bankReconciliations               BankReconciliation[]
+  bankStatementLines                BankStatementLine[]
+  bankStatementTransactions         BankStatementTransaction[]
+  bankTransactions                  BankTransaction[]
+  budgetActualConsumptions          BudgetActualConsumption[]
+  budgetAlerts                      BudgetAlert[]
+  budgetApprovals                   BudgetApproval[]
+  budgetLines                       BudgetLine[]
+  budgetPeriodLocks                 BudgetPeriodLock[]
+  budgetRevisions                   BudgetRevision[]
+  budgetTransfers                   BudgetTransfer[]
+  budgetWorkflowConfigs             BudgetWorkflowConfig[]
+  budgets                           Budget[]
+  budgetEntities                    Budget[]                           @relation("BudgetEntity")
+  categories                        Category[]
+  chartOfAccounts                   ChartOfAccount[]
+  clients                           Client[]
+  posCustomerLoyaltyLedger          PosCustomerLoyaltyLedger[]
+  posCustomerCreditLedger           PosCustomerCreditLedger[]
+  createdBy                         User?                              @relation("CompanyCreatedBy", fields: [createdById], references: [id])
+  companyUsers                      CompanyUser[]
+  creditNotes                       CreditNote[]
+  deferredRevenues                  DeferredRevenue[]
+  deliveryNotes                     DeliveryNote[]
+  departments                       Department[]
+  depreciationEntries               DepreciationEntry[]
+  ebmAlerts                         EbmAlert[]
+  ebmCodes                          EbmCode[]
+  ebmCodeClasses                    EbmCodeClass[]
+  ebmBranchLookups                  EbmBranchLookup[]
+  ebmDevices                        EbmDevice[]
+  ebmRegisteredItems                EbmRegisteredItem[]
+  ebmImportedItems                  EbmImportedItem[]
+  ebmItemClasses                    EbmItemClass[]
+  ebmNotices                        EbmNotice[]
+  ebmSequences                      EbmSequenceCounter[]
+  ebmSubmissionQueues               EbmSubmissionQueue[]
+  posEbmSettings                    PosEbmSettings?
+  ebmReceiptReprints                PosEbmReceiptReprint[]
+  posPublicReceiptTokens            PosPublicReceiptToken[]
+  ebmSyncStates                     EbmSyncState[]
+  ebmTins                           EbmTin[]
+  ebmUnmatchedPurchases             EbmUnmatchedPurchase[]
+  employeeAdvances                  EmployeeAdvance[]
+  employees                         Employee[]
+  encumbrances                      Encumbrance[]
+  exchangeRates                     ExchangeRate[]
+  expenses                          Expense[]
+  fixedAssets                       FixedAsset[]
+  freightBills                      FreightBill[]
+  goodsReceivedNotes                GoodsReceivedNote[]
+  inventoryBatches                  InventoryBatch[]
+  inventoryLayers                   InventoryLayer[]
+  invoiceReceiptMetadata            InvoiceReceiptMetadata[]
+  invoices                          Invoice[]
+  ipWhitelists                      IpWhitelist[]
+  journalEntries                    JournalEntry[]
+  journalEntryLines                 JournalEntryLine[]
+  loans                             Loan[]
+  notificationSettings              NotificationSettings?
+  notifications                     Notification[]
+  payrollRuns                       PayrollRun[]
+  payrolls                          Payroll[]
+  periods                           Period[]
+  pettyCashExpenses                 PettyCashExpense[]
+  pettyCashFloats                   PettyCashFloat[]
+  pettyCashReconciliations          PettyCashReconciliation[]
+  pettyCashReplenishments           PettyCashReplenishment[]
+  pettyCashTransactions             PettyCashTransaction[]
+  pickPackLines                     PickPackLine[]
+  pickPacks                         PickPack[]
+  prepaidExpenses                   PrepaidExpense[]
+  products                          Product[]
+  projects                          Project[]
+  projectMilestones                 ProjectMilestone[]
+  projectMembers                    ProjectMember[]
+  projectComments                   ProjectComment[]
+  projectActivity                   ProjectActivity[]
+  projectDocuments                  ProjectDocument[]
+  projectLaborEntries               ProjectLaborEntry[]
+  laborCostingPolicies              LaborCostingPolicy[]
+  projectTypeSettings               ProjectTypeSetting[]
+  purchaseOrders                    PurchaseOrder[]
+  purchaseReturns                   PurchaseReturn[]
+  purchases                         Purchase[]
+  quotations                        Quotation[]
+  recurringInvoiceRuns              RecurringInvoiceRun[]
+  recurringInvoices                 RecurringInvoice[]
+  reorderPoints                     ReorderPoint[]
+  reportSnapshots                   ReportSnapshot[]
+  roles                             Role[]
+  rolePermissionOverrides           RolePermissionOverride[]
+  salaryHistories                   SalaryHistory[]
+  salesOrders                       SalesOrder[]
+  sequences                         SequenceCounter[]
+  stockAudits                       StockAudit[]
+  stockBatches                      StockBatch[]
+  stockLevels                       StockLevel[]
+  stockMovements                    StockMovement[]
+  stockSerialNumbers                StockSerialNumber[]
+  stockTransferLines                StockTransferLine[]
+  stockTransfers                    StockTransfer[]
+  suppliers                         Supplier[]
+  taxRates                          TaxRate[]
+  taxTransactions                   TaxTransaction[]
+  taxes                             Tax[]
+  tillSessions                      TillSession[]
+  posRegisters                      PosRegister[]
+  posDevices                        PosDevice[]
+  pharmacyPatients                  PharmacyPatient[]
+  pharmacyInsuranceProviders        PharmacyInsuranceProvider[]
+  pharmacyInsuranceMembers          PharmacyInsuranceMember[]
+  pharmacyInsuranceEligibilities    PharmacyInsuranceEligibility[]
+  pharmacyInsuranceAuthorizations   PharmacyInsuranceAuthorization[]
+  pharmacyInsuranceClaims           PharmacyInsuranceClaim[]
+  pharmacyInsuranceClaimAttempts    PharmacyInsuranceClaimAttempt[]
+  pharmacyInsuranceClaimAdjustments PharmacyInsuranceClaimAdjustment[]
+  pharmacyInsuranceSettlements      PharmacyInsuranceSettlement[]
+  pharmacyPrescriptions             PharmacyPrescription[]
+  posNonPostingDocuments            PosNonPostingDocument[]
+  posPrintPairingCodes              PosPrintPairingCode[]
+  posPrintAgents                    PosPrintAgent[]
+  posPrintPrinters                  PosPrintPrinter[]
+  posPrintJobs                      PosPrintJob[]
+  posPrintDocuments                 PosPrintDocument[]
+  posHardwareDevices                PosHardwareDevice[]
+  posShifts                         PosShift[]
+  posShiftCorrectionReports         PosShiftCorrectionReport[]
+  posCashMovements                  PosCashMovement[]
+  posZReports                       PosZReport[]
+  posUserCredentials                PosUserCredential[]
+  posRegisterAccess                 PosRegisterAccess[]
+  posSessions                       PosSession[]
+  posApprovals                      PosApproval[]
+  posApprovalPolicies               PosApprovalPolicy[]
+  posPromotions                     PosPromotion[]
+  posVouchers                       PosVoucher[]
+  posVoucherRedemptions             PosVoucherRedemption[]
+  posVoucherCodeAttempts            PosVoucherCodeAttempt[]
+  posStoredValueAccounts            PosStoredValueAccount[]
+  posStoredValueLedger              PosStoredValueLedger[]
+  posPayments                       PosPayment[]
+  posPaymentAttempts                PosPaymentAttempt[]
+  posProviderEvents                 PosProviderEvent[]
+  posPaymentRefunds                 PosPaymentRefund[]
+  posAccountingPostings             PosAccountingPosting[]
+  posChequeDeposits                 PosChequeDeposit[]
+  posCheques                        PosCheque[]
+  posPaymentSettings                PosPaymentSettings?
+  restaurantBillingSettings         RestaurantBillingSettings?
+  restaurantTips                    RestaurantTip[]
+  restaurantTipPayouts              RestaurantTipPayout[]
+  restaurantTipReversals            RestaurantTipReversal[]
+  posManagerApprovals               PosManagerApproval[]
+  posApprovalRequests               PosApprovalRequest[]
+  posHeldSales                      PosHeldSale[]
+  priceLists                        PriceList[]
+  priceListItems                    PriceListItem[]
+  timesheets                        Timesheet[]
+  users                             User[]
+  warehouses                        Warehouse[]
+  moduleEntitlements                CompanyModuleEntitlement[]
+  platformModuleAuditLogs           PlatformModuleAuditLog[]
 
   @@index([isActive])
   @@map("companies")
@@ -1939,18 +1947,22 @@ model PosAuditLog {
 }
 
 model PharmacyPatient {
-  id            String                 @id @db.Char(24)
-  companyId     String                 @map("company_id") @db.Char(24)
-  registerId    String                 @map("register_id") @db.Char(24)
-  patientCode   String                 @map("patient_code") @db.VarChar(40)
-  fullName      String                 @map("full_name") @db.VarChar(160)
-  phone         String?                @db.VarChar(40)
-  dateOfBirth   DateTime?              @map("date_of_birth") @db.Date
-  createdById   String                 @map("created_by_id") @db.Char(24)
-  createdAt     DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
-  company       Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  prescriptions PharmacyPrescription[]
+  id                      String                           @id @db.Char(24)
+  companyId               String                           @map("company_id") @db.Char(24)
+  registerId              String                           @map("register_id") @db.Char(24)
+  patientCode             String                           @map("patient_code") @db.VarChar(40)
+  fullName                String                           @map("full_name") @db.VarChar(160)
+  phone                   String?                          @db.VarChar(40)
+  dateOfBirth             DateTime?                        @map("date_of_birth") @db.Date
+  createdById             String                           @map("created_by_id") @db.Char(24)
+  createdAt               DateTime                         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime                         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company                 Company                          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  prescriptions           PharmacyPrescription[]
+  insuranceMembers        PharmacyInsuranceMember[]
+  insuranceEligibilities  PharmacyInsuranceEligibility[]
+  insuranceAuthorizations PharmacyInsuranceAuthorization[]
+  insuranceClaims         PharmacyInsuranceClaim[]
 
   @@unique([companyId, registerId, patientCode])
   @@index([companyId, registerId, fullName])
@@ -1958,24 +1970,263 @@ model PharmacyPatient {
   @@map("pharmacy_patients")
 }
 
+model PharmacyInsuranceProvider {
+  id                       String                           @id @db.Char(24)
+  companyId                String                           @map("company_id") @db.Char(24)
+  code                     String                           @db.VarChar(40)
+  name                     String                           @db.VarChar(160)
+  contactName              String?                          @map("contact_name") @db.VarChar(160)
+  phone                    String?                          @db.VarChar(40)
+  email                    String?                          @db.VarChar(160)
+  submissionInstructions   String?                          @map("submission_instructions") @db.VarChar(1000)
+  requiresPreauthorization Boolean                          @default(false) @map("requires_preauthorization")
+  isActive                 Boolean                          @default(true) @map("is_active")
+  createdById              String                           @map("created_by_id") @db.Char(24)
+  createdAt                DateTime                         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime                         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company                  Company                          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  members                  PharmacyInsuranceMember[]
+  eligibilities            PharmacyInsuranceEligibility[]
+  authorizations           PharmacyInsuranceAuthorization[]
+  claims                   PharmacyInsuranceClaim[]
+
+  @@unique([companyId, code])
+  @@index([companyId, isActive, name])
+  @@map("pharmacy_insurance_providers")
+}
+
+model PharmacyInsuranceMember {
+  id                    String                           @id @db.Char(24)
+  companyId             String                           @map("company_id") @db.Char(24)
+  providerId            String                           @map("provider_id") @db.Char(24)
+  patientId             String                           @map("patient_id") @db.Char(24)
+  memberNumber          String                           @map("member_number") @db.VarChar(100)
+  policyNumber          String?                          @map("policy_number") @db.VarChar(100)
+  groupNumber           String?                          @map("group_number") @db.VarChar(100)
+  relationshipToHolder  String?                          @map("relationship_to_holder") @db.VarChar(40)
+  effectiveFrom         DateTime?                        @map("effective_from") @db.Date
+  effectiveTo           DateTime?                        @map("effective_to") @db.Date
+  status                String                           @default("pending_verification") @db.VarChar(32)
+  verifiedAt            DateTime?                        @map("verified_at") @db.Timestamptz(3)
+  verifiedById          String?                          @map("verified_by_id") @db.Char(24)
+  verificationReference String?                          @map("verification_reference") @db.VarChar(160)
+  verificationNote      String?                          @map("verification_note") @db.VarChar(1000)
+  createdById           String                           @map("created_by_id") @db.Char(24)
+  createdAt             DateTime                         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime                         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company               Company                          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  provider              PharmacyInsuranceProvider        @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  patient               PharmacyPatient                  @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  eligibilities         PharmacyInsuranceEligibility[]
+  authorizations        PharmacyInsuranceAuthorization[]
+  claims                PharmacyInsuranceClaim[]
+
+  @@unique([companyId, providerId, patientId, memberNumber])
+  @@index([companyId, patientId, status])
+  @@index([companyId, providerId, memberNumber])
+  @@map("pharmacy_insurance_members")
+}
+
+model PharmacyInsuranceEligibility {
+  id                String                           @id @db.Char(24)
+  companyId         String                           @map("company_id") @db.Char(24)
+  providerId        String                           @map("provider_id") @db.Char(24)
+  memberId          String                           @map("member_id") @db.Char(24)
+  patientId         String                           @map("patient_id") @db.Char(24)
+  invoiceId         String                           @map("invoice_id") @db.Char(24)
+  status            String                           @default("pending") @db.VarChar(32)
+  coveredAmount     Decimal                          @default(0) @map("covered_amount") @db.Decimal(19, 2)
+  copayAmount       Decimal                          @default(0) @map("copay_amount") @db.Decimal(19, 2)
+  responseReference String?                          @map("response_reference") @db.VarChar(160)
+  responseNote      String?                          @map("response_note") @db.VarChar(1000)
+  checkedById       String                           @map("checked_by_id") @db.Char(24)
+  checkedAt         DateTime                         @default(now()) @map("checked_at") @db.Timestamptz(3)
+  validUntil        DateTime?                        @map("valid_until") @db.Timestamptz(3)
+  company           Company                          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  provider          PharmacyInsuranceProvider        @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  member            PharmacyInsuranceMember          @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  patient           PharmacyPatient                  @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  invoice           Invoice                          @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  authorizations    PharmacyInsuranceAuthorization[]
+  claims            PharmacyInsuranceClaim[]
+
+  @@unique([companyId, invoiceId])
+  @@index([companyId, patientId, checkedAt(sort: Desc)])
+  @@index([companyId, providerId, status, checkedAt(sort: Desc)])
+  @@map("pharmacy_insurance_eligibilities")
+}
+
+model PharmacyInsuranceAuthorization {
+  id                     String                       @id @db.Char(24)
+  companyId              String                       @map("company_id") @db.Char(24)
+  providerId             String                       @map("provider_id") @db.Char(24)
+  memberId               String                       @map("member_id") @db.Char(24)
+  patientId              String                       @map("patient_id") @db.Char(24)
+  eligibilityId          String                       @map("eligibility_id") @db.Char(24)
+  status                 String                       @default("requested") @db.VarChar(32)
+  requestedAmount        Decimal                      @map("requested_amount") @db.Decimal(19, 2)
+  authorizedAmount       Decimal                      @default(0) @map("authorized_amount") @db.Decimal(19, 2)
+  requestReference       String?                      @map("request_reference") @db.VarChar(160)
+  authorizationReference String?                      @map("authorization_reference") @db.VarChar(160)
+  requestNote            String?                      @map("request_note") @db.VarChar(1000)
+  responseNote           String?                      @map("response_note") @db.VarChar(1000)
+  requestedById          String                       @map("requested_by_id") @db.Char(24)
+  respondedById          String?                      @map("responded_by_id") @db.Char(24)
+  requestedAt            DateTime                     @default(now()) @map("requested_at") @db.Timestamptz(3)
+  respondedAt            DateTime?                    @map("responded_at") @db.Timestamptz(3)
+  expiresAt              DateTime?                    @map("expires_at") @db.Timestamptz(3)
+  company                Company                      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  provider               PharmacyInsuranceProvider    @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  member                 PharmacyInsuranceMember      @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  patient                PharmacyPatient              @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  eligibility            PharmacyInsuranceEligibility @relation(fields: [eligibilityId], references: [id], onDelete: Restrict)
+  claims                 PharmacyInsuranceClaim[]
+
+  @@index([companyId, patientId, requestedAt(sort: Desc)])
+  @@index([companyId, providerId, status, requestedAt(sort: Desc)])
+  @@map("pharmacy_insurance_authorizations")
+}
+
+model PharmacyInsuranceClaim {
+  id              String                             @id @db.Char(24)
+  companyId       String                             @map("company_id") @db.Char(24)
+  providerId      String                             @map("provider_id") @db.Char(24)
+  memberId        String                             @map("member_id") @db.Char(24)
+  patientId       String                             @map("patient_id") @db.Char(24)
+  invoiceId       String                             @map("invoice_id") @db.Char(24)
+  eligibilityId   String                             @map("eligibility_id") @db.Char(24)
+  authorizationId String?                            @map("authorization_id") @db.Char(24)
+  claimNumber     String                             @map("claim_number") @db.VarChar(80)
+  status          String                             @default("draft") @db.VarChar(32)
+  grossAmount     Decimal                            @map("gross_amount") @db.Decimal(19, 2)
+  copayAmount     Decimal                            @map("copay_amount") @db.Decimal(19, 2)
+  claimAmount     Decimal                            @map("claim_amount") @db.Decimal(19, 2)
+  settledAmount   Decimal                            @default(0) @map("settled_amount") @db.Decimal(19, 2)
+  adjustedAmount  Decimal                            @default(0) @map("adjusted_amount") @db.Decimal(19, 2)
+  approvedAmount  Decimal?                           @map("approved_amount") @db.Decimal(19, 2)
+  rejectionReason String?                            @map("rejection_reason") @db.VarChar(1000)
+  submittedAt     DateTime?                          @map("submitted_at") @db.Timestamptz(3)
+  resolvedAt      DateTime?                          @map("resolved_at") @db.Timestamptz(3)
+  createdById     String                             @map("created_by_id") @db.Char(24)
+  updatedById     String                             @map("updated_by_id") @db.Char(24)
+  createdAt       DateTime                           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime                           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company         Company                            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  provider        PharmacyInsuranceProvider          @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  member          PharmacyInsuranceMember            @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  patient         PharmacyPatient                    @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  invoice         Invoice                            @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  eligibility     PharmacyInsuranceEligibility       @relation(fields: [eligibilityId], references: [id], onDelete: Restrict)
+  authorization   PharmacyInsuranceAuthorization?    @relation(fields: [authorizationId], references: [id], onDelete: Restrict)
+  lines           PharmacyInsuranceClaimLine[]
+  attempts        PharmacyInsuranceClaimAttempt[]
+  adjustments     PharmacyInsuranceClaimAdjustment[]
+  settlements     PharmacyInsuranceSettlement[]
+
+  @@unique([companyId, invoiceId])
+  @@unique([companyId, providerId, claimNumber])
+  @@index([companyId, status, createdAt(sort: Desc)])
+  @@index([companyId, providerId, status, createdAt(sort: Desc)])
+  @@map("pharmacy_insurance_claims")
+}
+
+model PharmacyInsuranceClaimLine {
+  id              String                 @id @db.Char(24)
+  claimId         String                 @map("claim_id") @db.Char(24)
+  invoiceLineId   String                 @map("invoice_line_id") @db.Char(24)
+  quantity        Decimal                @db.Decimal(19, 4)
+  grossAmount     Decimal                @map("gross_amount") @db.Decimal(19, 2)
+  copayAmount     Decimal                @map("copay_amount") @db.Decimal(19, 2)
+  claimAmount     Decimal                @map("claim_amount") @db.Decimal(19, 2)
+  rejectionReason String?                @map("rejection_reason") @db.VarChar(1000)
+  claim           PharmacyInsuranceClaim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  invoiceLine     InvoiceLine            @relation(fields: [invoiceLineId], references: [id], onDelete: Restrict)
+
+  @@unique([claimId, invoiceLineId])
+  @@index([invoiceLineId])
+  @@map("pharmacy_insurance_claim_lines")
+}
+
+model PharmacyInsuranceClaimAttempt {
+  id             String                 @id @db.Char(24)
+  companyId      String                 @map("company_id") @db.Char(24)
+  claimId        String                 @map("claim_id") @db.Char(24)
+  attemptNumber  Int                    @map("attempt_number")
+  status         String                 @db.VarChar(32)
+  reference      String?                @db.VarChar(160)
+  responseNote   String?                @map("response_note") @db.VarChar(1000)
+  responseAmount Decimal?               @map("response_amount") @db.Decimal(19, 2)
+  submittedById  String                 @map("submitted_by_id") @db.Char(24)
+  submittedAt    DateTime               @default(now()) @map("submitted_at") @db.Timestamptz(3)
+  respondedById  String?                @map("responded_by_id") @db.Char(24)
+  respondedAt    DateTime?              @map("responded_at") @db.Timestamptz(3)
+  company        Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  claim          PharmacyInsuranceClaim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+
+  @@unique([claimId, attemptNumber])
+  @@index([companyId, claimId, submittedAt(sort: Desc)])
+  @@map("pharmacy_insurance_claim_attempts")
+}
+
+model PharmacyInsuranceClaimAdjustment {
+  id             String                 @id @db.Char(24)
+  companyId      String                 @map("company_id") @db.Char(24)
+  claimId        String                 @map("claim_id") @db.Char(24)
+  amount         Decimal                @db.Decimal(19, 2)
+  reason         String                 @db.VarChar(1000)
+  reference      String?                @db.VarChar(160)
+  idempotencyKey String                 @map("idempotency_key") @db.VarChar(100)
+  journalEntryId String?                @map("journal_entry_id") @db.Char(24)
+  postingStatus  String                 @default("pending") @map("posting_status") @db.VarChar(16)
+  recordedById   String                 @map("recorded_by_id") @db.Char(24)
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  claim          PharmacyInsuranceClaim @relation(fields: [claimId], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId, claimId, createdAt(sort: Desc)])
+  @@map("pharmacy_insurance_claim_adjustments")
+}
+
+model PharmacyInsuranceSettlement {
+  id             String                 @id @db.Char(24)
+  companyId      String                 @map("company_id") @db.Char(24)
+  claimId        String                 @map("claim_id") @db.Char(24)
+  amount         Decimal                @db.Decimal(19, 2)
+  settlementDate DateTime               @map("settlement_date") @db.Timestamptz(3)
+  reference      String?                @db.VarChar(160)
+  note           String?                @db.VarChar(1000)
+  idempotencyKey String                 @map("idempotency_key") @db.VarChar(100)
+  journalEntryId String?                @map("journal_entry_id") @db.Char(24)
+  postingStatus  String                 @default("pending") @map("posting_status") @db.VarChar(16)
+  recordedById   String                 @map("recorded_by_id") @db.Char(24)
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  claim          PharmacyInsuranceClaim @relation(fields: [claimId], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId, claimId, settlementDate(sort: Desc)])
+  @@map("pharmacy_insurance_settlements")
+}
+
 model PharmacyPrescription {
-  id                 String                      @id @db.Char(24)
-  companyId          String                      @map("company_id") @db.Char(24)
-  registerId         String                      @map("register_id") @db.Char(24)
-  patientId          String                      @map("patient_id") @db.Char(24)
-  prescriptionNumber String                      @map("prescription_number") @db.VarChar(80)
-  prescriberName     String                      @map("prescriber_name") @db.VarChar(160)
-  prescriberLicense  String                      @map("prescriber_license") @db.VarChar(80)
-  issueDate          DateTime                    @map("issue_date") @db.Date
-  expiryDate         DateTime                    @map("expiry_date") @db.Date
-  status             String                      @default("pending_review") @db.VarChar(24)
-  refillsAuthorized  Int                         @default(0) @map("refills_authorized")
-  refillsUsed        Int                         @default(0) @map("refills_used")
-  createdById        String                      @map("created_by_id") @db.Char(24)
-  createdAt          DateTime                    @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt          DateTime                    @updatedAt @map("updated_at") @db.Timestamptz(3)
-  company            Company                     @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  patient            PharmacyPatient             @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  id                 String                     @id @db.Char(24)
+  companyId          String                     @map("company_id") @db.Char(24)
+  registerId         String                     @map("register_id") @db.Char(24)
+  patientId          String                     @map("patient_id") @db.Char(24)
+  prescriptionNumber String                     @map("prescription_number") @db.VarChar(80)
+  prescriberName     String                     @map("prescriber_name") @db.VarChar(160)
+  prescriberLicense  String                     @map("prescriber_license") @db.VarChar(80)
+  issueDate          DateTime                   @map("issue_date") @db.Date
+  expiryDate         DateTime                   @map("expiry_date") @db.Date
+  status             String                     @default("pending_review") @db.VarChar(24)
+  refillsAuthorized  Int                        @default(0) @map("refills_authorized")
+  refillsUsed        Int                        @default(0) @map("refills_used")
+  createdById        String                     @map("created_by_id") @db.Char(24)
+  createdAt          DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company            Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  patient            PharmacyPatient            @relation(fields: [patientId], references: [id], onDelete: Restrict)
   lines              PharmacyPrescriptionLine[]
   fills              PharmacyPrescriptionFill[]
   dispenses          PharmacyDispense[]
@@ -1987,44 +2238,44 @@ model PharmacyPrescription {
 }
 
 model PharmacyPrescriptionLine {
-  id                   String                 @id @db.Char(24)
-  prescriptionId       String                 @map("prescription_id") @db.Char(24)
-  productId            String                 @map("product_id") @db.Char(24)
-  productName          String                 @map("product_name") @db.VarChar(180)
-  genericName          String                 @map("generic_name") @db.VarChar(180)
-  strength             String                 @db.VarChar(80)
-  dosageForm           String                 @map("dosage_form") @db.VarChar(48)
-  prescriptionStatus   String                 @map("prescription_status") @db.VarChar(24)
-  controlled           Boolean                @default(false)
-  prescribedQuantity   Decimal                @map("prescribed_quantity") @db.Decimal(19, 4)
-  dosageInstructions   String                 @map("dosage_instructions") @db.VarChar(500)
-  substitutionAllowed  Boolean                @default(false) @map("substitution_allowed")
-  prescription         PharmacyPrescription   @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
-  dispenseLines        PharmacyDispenseLine[]
+  id                  String                 @id @db.Char(24)
+  prescriptionId      String                 @map("prescription_id") @db.Char(24)
+  productId           String                 @map("product_id") @db.Char(24)
+  productName         String                 @map("product_name") @db.VarChar(180)
+  genericName         String                 @map("generic_name") @db.VarChar(180)
+  strength            String                 @db.VarChar(80)
+  dosageForm          String                 @map("dosage_form") @db.VarChar(48)
+  prescriptionStatus  String                 @map("prescription_status") @db.VarChar(24)
+  controlled          Boolean                @default(false)
+  prescribedQuantity  Decimal                @map("prescribed_quantity") @db.Decimal(19, 4)
+  dosageInstructions  String                 @map("dosage_instructions") @db.VarChar(500)
+  substitutionAllowed Boolean                @default(false) @map("substitution_allowed")
+  prescription        PharmacyPrescription   @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  dispenseLines       PharmacyDispenseLine[]
 
   @@index([prescriptionId])
   @@map("pharmacy_prescription_lines")
 }
 
 model PharmacyPrescriptionFill {
-  id             String                @id @db.Char(24)
-  companyId      String                @map("company_id") @db.Char(24)
-  registerId     String                @map("register_id") @db.Char(24)
-  prescriptionId String                @map("prescription_id") @db.Char(24)
-  fillNumber     Int                   @map("fill_number")
-  status         String                @default("pending_review") @db.VarChar(24)
-  reviewedById   String?               @map("reviewed_by_id") @db.Char(24)
-  reviewedAt     DateTime?             @map("reviewed_at") @db.Timestamptz(3)
-  reviewNote     String?               @map("review_note") @db.VarChar(500)
-  heldById       String?               @map("held_by_id") @db.Char(24)
-  heldAt         DateTime?             @map("held_at") @db.Timestamptz(3)
-  holdReason     String?               @map("hold_reason") @db.VarChar(500)
-  cancelledById  String?               @map("cancelled_by_id") @db.Char(24)
-  cancelledAt    DateTime?             @map("cancelled_at") @db.Timestamptz(3)
-  cancelReason   String?               @map("cancel_reason") @db.VarChar(500)
-  createdAt      DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt      DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
-  prescription   PharmacyPrescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  id             String                 @id @db.Char(24)
+  companyId      String                 @map("company_id") @db.Char(24)
+  registerId     String                 @map("register_id") @db.Char(24)
+  prescriptionId String                 @map("prescription_id") @db.Char(24)
+  fillNumber     Int                    @map("fill_number")
+  status         String                 @default("pending_review") @db.VarChar(24)
+  reviewedById   String?                @map("reviewed_by_id") @db.Char(24)
+  reviewedAt     DateTime?              @map("reviewed_at") @db.Timestamptz(3)
+  reviewNote     String?                @map("review_note") @db.VarChar(500)
+  heldById       String?                @map("held_by_id") @db.Char(24)
+  heldAt         DateTime?              @map("held_at") @db.Timestamptz(3)
+  holdReason     String?                @map("hold_reason") @db.VarChar(500)
+  cancelledById  String?                @map("cancelled_by_id") @db.Char(24)
+  cancelledAt    DateTime?              @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason   String?                @map("cancel_reason") @db.VarChar(500)
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+  prescription   PharmacyPrescription   @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
   dispenses      PharmacyDispense[]
   dispenseLines  PharmacyDispenseLine[]
 
@@ -2034,38 +2285,38 @@ model PharmacyPrescriptionFill {
 }
 
 model PharmacyDispense {
-  id                   String                    @id @db.Char(24)
-  companyId            String                    @map("company_id") @db.Char(24)
-  registerId           String                    @map("register_id") @db.Char(24)
-  prescriptionId       String                    @map("prescription_id") @db.Char(24)
-  fillId               String                    @map("fill_id") @db.Char(24)
-  invoiceId            String?                   @map("invoice_id") @db.Char(24)
-  dispensingUserId     String                    @map("dispensing_user_id") @db.Char(24)
-  controlledReference  String?                   @map("controlled_reference") @db.VarChar(120)
-  createdAt            DateTime                  @default(now()) @map("created_at") @db.Timestamptz(3)
-  prescription         PharmacyPrescription     @relation(fields: [prescriptionId], references: [id], onDelete: Restrict)
-  fill                 PharmacyPrescriptionFill @relation(fields: [fillId], references: [id], onDelete: Restrict)
-  lines                PharmacyDispenseLine[]
+  id                  String                   @id @db.Char(24)
+  companyId           String                   @map("company_id") @db.Char(24)
+  registerId          String                   @map("register_id") @db.Char(24)
+  prescriptionId      String                   @map("prescription_id") @db.Char(24)
+  fillId              String                   @map("fill_id") @db.Char(24)
+  invoiceId           String?                  @map("invoice_id") @db.Char(24)
+  dispensingUserId    String                   @map("dispensing_user_id") @db.Char(24)
+  controlledReference String?                  @map("controlled_reference") @db.VarChar(120)
+  createdAt           DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  prescription        PharmacyPrescription     @relation(fields: [prescriptionId], references: [id], onDelete: Restrict)
+  fill                PharmacyPrescriptionFill @relation(fields: [fillId], references: [id], onDelete: Restrict)
+  lines               PharmacyDispenseLine[]
 
+  @@unique([invoiceId, fillId])
   @@index([companyId, registerId, createdAt(sort: Desc)])
   @@index([prescriptionId, fillId])
   @@index([companyId, invoiceId])
-  @@unique([invoiceId, fillId])
   @@map("pharmacy_dispenses")
 }
 
 model PharmacyDispenseLine {
-  id                    String                   @id @db.Char(24)
-  dispenseId            String                   @map("dispense_id") @db.Char(24)
-  fillId                String                   @map("fill_id") @db.Char(24)
-  prescriptionLineId    String                   @map("prescription_line_id") @db.Char(24)
-  quantity              Decimal                  @db.Decimal(19, 4)
-  suppliedProductId     String                   @map("supplied_product_id") @db.Char(24)
-  suppliedProductName   String                   @map("supplied_product_name") @db.VarChar(180)
-  substitutionReason   String?                  @map("substitution_reason") @db.VarChar(300)
-  dispense              PharmacyDispense         @relation(fields: [dispenseId], references: [id], onDelete: Cascade)
-  fill                  PharmacyPrescriptionFill @relation(fields: [fillId], references: [id], onDelete: Restrict)
-  prescriptionLine      PharmacyPrescriptionLine @relation(fields: [prescriptionLineId], references: [id], onDelete: Restrict)
+  id                  String                   @id @db.Char(24)
+  dispenseId          String                   @map("dispense_id") @db.Char(24)
+  fillId              String                   @map("fill_id") @db.Char(24)
+  prescriptionLineId  String                   @map("prescription_line_id") @db.Char(24)
+  quantity            Decimal                  @db.Decimal(19, 4)
+  suppliedProductId   String                   @map("supplied_product_id") @db.Char(24)
+  suppliedProductName String                   @map("supplied_product_name") @db.VarChar(180)
+  substitutionReason  String?                  @map("substitution_reason") @db.VarChar(300)
+  dispense            PharmacyDispense         @relation(fields: [dispenseId], references: [id], onDelete: Cascade)
+  fill                PharmacyPrescriptionFill @relation(fields: [fillId], references: [id], onDelete: Restrict)
+  prescriptionLine    PharmacyPrescriptionLine @relation(fields: [prescriptionLineId], references: [id], onDelete: Restrict)
 
   @@index([dispenseId])
   @@index([fillId])
@@ -4234,78 +4485,80 @@ model SalesOrderLine {
 }
 
 model Invoice {
-  id                       String                   @id @db.Char(24)
-  companyId                String                   @map("company_id") @db.Char(24)
-  referenceNo              String                   @map("reference_no")
-  clientId                 String                   @map("client_id") @db.Char(24)
-  customerTin              String?                  @map("customer_tin")
-  customerName             String?                  @map("customer_name")
-  customerAddress          String?                  @map("customer_address")
-  quotationId              String?                  @map("quotation_id") @db.Char(24)
-  salesOrderId             String?                  @map("sales_order_id") @db.Char(24)
-  deliveryNoteId           String?                  @map("delivery_note_id") @db.Char(24)
-  status                   String                   @default("draft")
-  posOrigin                Boolean                  @default(false) @map("pos_origin")
-  tillSessionId            String?                  @map("till_session_id") @db.Char(24)
-  shiftId                  String?                  @map("shift_id") @db.Char(24)
-  cashierId                String?                  @map("cashier_id") @db.Char(24)
-  registerId               String?                  @map("register_id")
-  posCheckoutPayload       Json?                    @map("pos_checkout_payload")
-  posCompletionKey         String?                  @map("pos_completion_key") @db.VarChar(100)
-  posCancellationKey       String?                  @map("pos_cancellation_key") @db.VarChar(100)
-  currencyCode             String                   @default("RWF") @map("currency_code")
-  exchangeRate             Decimal                  @default(1) @map("exchange_rate") @db.Decimal(19, 6)
-  subtotal                 Decimal                  @default(0) @db.Decimal(19, 2)
-  taxAmount                Decimal                  @default(0) @map("tax_amount") @db.Decimal(19, 2)
-  totalAmount              Decimal                  @default(0) @map("total_amount") @db.Decimal(19, 2)
-  amountPaid               Decimal                  @default(0) @map("amount_paid") @db.Decimal(19, 2)
-  amountOutstanding        Decimal                  @default(0) @map("amount_outstanding") @db.Decimal(19, 2)
-  totalAEx                 Decimal                  @default(0) @map("total_a_ex") @db.Decimal(19, 2)
-  totalB18                 Decimal                  @default(0) @map("total_b18") @db.Decimal(19, 2)
-  totalDiscount            Decimal                  @default(0) @map("total_discount") @db.Decimal(19, 2)
-  invoiceDate              DateTime                 @default(now()) @map("invoice_date") @db.Timestamptz(3)
-  dueDate                  DateTime                 @map("due_date") @db.Timestamptz(3)
-  paidDate                 DateTime?                @map("paid_date") @db.Timestamptz(3)
-  confirmedAt              DateTime?                @map("confirmed_at") @db.Timestamptz(3)
-  confirmedById            String?                  @map("confirmed_by") @db.Char(24)
-  cancelledAt              DateTime?                @map("cancelled_at") @db.Timestamptz(3)
-  cancelledById            String?                  @map("cancelled_by") @db.Char(24)
-  cancellationReason       String?                  @map("cancellation_reason")
-  revenueJournalEntryId    String?                  @map("revenue_journal_entry_id") @db.Char(24)
-  cogsJournalEntryId       String?                  @map("cogs_journal_entry_id") @db.Char(24)
-  posPostingStatus         String?                  @map("pos_posting_status") @db.VarChar(16)
-  stockDeducted            Boolean                  @default(false) @map("stock_deducted")
-  autoConfirm              Boolean                  @default(false) @map("auto_confirm")
-  generatedFromRecurringId String?                  @map("generated_from_recurring_id") @db.Char(24)
-  payments                 Json                     @default("[]")
-  posPromotion             Json?                    @map("pos_promotion")
-  posPricingSnapshot       Json?                    @map("pos_pricing_snapshot")
-  ebm                      Json                     @default("{}")
-  fiscalMode               String?                  @map("fiscal_mode") @db.VarChar(8)
-  fiscalStatus             String?                  @map("fiscal_status") @db.VarChar(32)
-  terms                    String?
-  notes                    String?
-  createdById              String?                  @map("created_by") @db.Char(24)
-  createdAt                DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt                DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(3)
-  badDebtWrittenOff        Boolean                  @default(false) @map("bad_debt_written_off")
-  writtenOffAt             DateTime?                @map("written_off_at") @db.Timestamptz(3)
-  writtenOffById           String?                  @map("written_off_by") @db.Char(24)
-  badDebtReason            String?                  @map("bad_debt_reason")
-  arBadDebtWriteoffs       ArBadDebtWriteoff[]
-  arAllocations            ARReceiptAllocation[]
-  creditNotes              CreditNote[]
-  lines                    InvoiceLine[]
-  receiptMetadata          InvoiceReceiptMetadata[]
-  ebmReceiptReprints       PosEbmReceiptReprint[]
-  posPublicReceiptTokens   PosPublicReceiptToken[]
-  client                   Client                   @relation(fields: [clientId], references: [id])
-  company                  Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  shift                    PosShift?                @relation(fields: [shiftId], references: [id], onDelete: SetNull)
-  cashier                  User?                    @relation("PosInvoiceCashier", fields: [cashierId], references: [id], onDelete: SetNull)
-  posPayments              PosPayment[]
-  posCheques               PosCheque[]
-  posPaymentRefunds        PosPaymentRefund[]
+  id                             String                         @id @db.Char(24)
+  companyId                      String                         @map("company_id") @db.Char(24)
+  referenceNo                    String                         @map("reference_no")
+  clientId                       String                         @map("client_id") @db.Char(24)
+  customerTin                    String?                        @map("customer_tin")
+  customerName                   String?                        @map("customer_name")
+  customerAddress                String?                        @map("customer_address")
+  quotationId                    String?                        @map("quotation_id") @db.Char(24)
+  salesOrderId                   String?                        @map("sales_order_id") @db.Char(24)
+  deliveryNoteId                 String?                        @map("delivery_note_id") @db.Char(24)
+  status                         String                         @default("draft")
+  posOrigin                      Boolean                        @default(false) @map("pos_origin")
+  tillSessionId                  String?                        @map("till_session_id") @db.Char(24)
+  shiftId                        String?                        @map("shift_id") @db.Char(24)
+  cashierId                      String?                        @map("cashier_id") @db.Char(24)
+  registerId                     String?                        @map("register_id")
+  posCheckoutPayload             Json?                          @map("pos_checkout_payload")
+  posCompletionKey               String?                        @map("pos_completion_key") @db.VarChar(100)
+  posCancellationKey             String?                        @map("pos_cancellation_key") @db.VarChar(100)
+  currencyCode                   String                         @default("RWF") @map("currency_code")
+  exchangeRate                   Decimal                        @default(1) @map("exchange_rate") @db.Decimal(19, 6)
+  subtotal                       Decimal                        @default(0) @db.Decimal(19, 2)
+  taxAmount                      Decimal                        @default(0) @map("tax_amount") @db.Decimal(19, 2)
+  totalAmount                    Decimal                        @default(0) @map("total_amount") @db.Decimal(19, 2)
+  amountPaid                     Decimal                        @default(0) @map("amount_paid") @db.Decimal(19, 2)
+  amountOutstanding              Decimal                        @default(0) @map("amount_outstanding") @db.Decimal(19, 2)
+  totalAEx                       Decimal                        @default(0) @map("total_a_ex") @db.Decimal(19, 2)
+  totalB18                       Decimal                        @default(0) @map("total_b18") @db.Decimal(19, 2)
+  totalDiscount                  Decimal                        @default(0) @map("total_discount") @db.Decimal(19, 2)
+  invoiceDate                    DateTime                       @default(now()) @map("invoice_date") @db.Timestamptz(3)
+  dueDate                        DateTime                       @map("due_date") @db.Timestamptz(3)
+  paidDate                       DateTime?                      @map("paid_date") @db.Timestamptz(3)
+  confirmedAt                    DateTime?                      @map("confirmed_at") @db.Timestamptz(3)
+  confirmedById                  String?                        @map("confirmed_by") @db.Char(24)
+  cancelledAt                    DateTime?                      @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById                  String?                        @map("cancelled_by") @db.Char(24)
+  cancellationReason             String?                        @map("cancellation_reason")
+  revenueJournalEntryId          String?                        @map("revenue_journal_entry_id") @db.Char(24)
+  cogsJournalEntryId             String?                        @map("cogs_journal_entry_id") @db.Char(24)
+  posPostingStatus               String?                        @map("pos_posting_status") @db.VarChar(16)
+  stockDeducted                  Boolean                        @default(false) @map("stock_deducted")
+  autoConfirm                    Boolean                        @default(false) @map("auto_confirm")
+  generatedFromRecurringId       String?                        @map("generated_from_recurring_id") @db.Char(24)
+  payments                       Json                           @default("[]")
+  posPromotion                   Json?                          @map("pos_promotion")
+  posPricingSnapshot             Json?                          @map("pos_pricing_snapshot")
+  ebm                            Json                           @default("{}")
+  fiscalMode                     String?                        @map("fiscal_mode") @db.VarChar(8)
+  fiscalStatus                   String?                        @map("fiscal_status") @db.VarChar(32)
+  terms                          String?
+  notes                          String?
+  createdById                    String?                        @map("created_by") @db.Char(24)
+  createdAt                      DateTime                       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                      DateTime                       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  badDebtWrittenOff              Boolean                        @default(false) @map("bad_debt_written_off")
+  writtenOffAt                   DateTime?                      @map("written_off_at") @db.Timestamptz(3)
+  writtenOffById                 String?                        @map("written_off_by") @db.Char(24)
+  badDebtReason                  String?                        @map("bad_debt_reason")
+  arBadDebtWriteoffs             ArBadDebtWriteoff[]
+  arAllocations                  ARReceiptAllocation[]
+  creditNotes                    CreditNote[]
+  lines                          InvoiceLine[]
+  receiptMetadata                InvoiceReceiptMetadata[]
+  ebmReceiptReprints             PosEbmReceiptReprint[]
+  posPublicReceiptTokens         PosPublicReceiptToken[]
+  client                         Client                         @relation(fields: [clientId], references: [id])
+  company                        Company                        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  shift                          PosShift?                      @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  cashier                        User?                          @relation("PosInvoiceCashier", fields: [cashierId], references: [id], onDelete: SetNull)
+  posPayments                    PosPayment[]
+  pharmacyInsuranceEligibilities PharmacyInsuranceEligibility[]
+  pharmacyInsuranceClaims        PharmacyInsuranceClaim[]
+  posCheques                     PosCheque[]
+  posPaymentRefunds              PosPaymentRefund[]
 
   @@unique([companyId, id])
   @@unique([companyId, referenceNo])
@@ -4347,38 +4600,39 @@ model InvoiceReceiptMetadata {
 }
 
 model InvoiceLine {
-  id                  String     @id @db.Char(24)
-  companyId           String     @map("company_id") @db.Char(24)
-  invoiceId           String     @map("invoice_id") @db.Char(24)
-  lineOrder           Int        @default(0) @map("line_order")
-  lineId              String?    @map("line_id") @db.Char(24)
-  isServiceLine       Boolean    @default(false) @map("is_service_line")
-  serviceChargeExempt Boolean    @default(false) @map("service_charge_exempt")
-  productId           String     @map("product_id") @db.Char(24)
-  productName         String?    @map("product_name")
-  productCode         String?    @map("product_code")
-  description         String?
-  qty                 Decimal    @db.Decimal(19, 4)
-  qtyDelivered        Decimal    @default(0) @map("qty_delivered") @db.Decimal(19, 4)
-  unit                String?
-  unitPrice           Decimal    @map("unit_price") @db.Decimal(19, 6)
-  discountPct         Decimal    @default(0) @map("discount_pct") @db.Decimal(19, 4)
-  discountReason      String?    @map("discount_reason")
-  taxRate             Decimal    @default(0) @map("tax_rate") @db.Decimal(19, 4)
-  taxCode             String     @default("A") @map("tax_code")
-  lineSubtotal        Decimal    @default(0) @map("line_subtotal") @db.Decimal(19, 2)
-  lineTax             Decimal    @default(0) @map("line_tax") @db.Decimal(19, 2)
-  lineTotal           Decimal    @default(0) @map("line_total") @db.Decimal(19, 2)
-  unitCost            Decimal    @default(0) @map("unit_cost") @db.Decimal(19, 6)
-  cogsAmount          Decimal    @default(0) @map("cogs_amount") @db.Decimal(19, 2)
-  warehouseId         String?    @map("warehouse_id") @db.Char(24)
-  projectId           String?    @map("project_id") @db.Char(24)
-  qtyCredited         Decimal    @default(0) @map("qty_credited") @db.Decimal(19, 4)
-  serialNumbers       Json       @default("[]") @map("serial_numbers")
-  invoice             Invoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
-  product             Product    @relation(fields: [productId], references: [id])
-  warehouse           Warehouse? @relation(fields: [warehouseId], references: [id])
-  project             Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  id                          String                       @id @db.Char(24)
+  companyId                   String                       @map("company_id") @db.Char(24)
+  invoiceId                   String                       @map("invoice_id") @db.Char(24)
+  lineOrder                   Int                          @default(0) @map("line_order")
+  lineId                      String?                      @map("line_id") @db.Char(24)
+  isServiceLine               Boolean                      @default(false) @map("is_service_line")
+  serviceChargeExempt         Boolean                      @default(false) @map("service_charge_exempt")
+  productId                   String                       @map("product_id") @db.Char(24)
+  productName                 String?                      @map("product_name")
+  productCode                 String?                      @map("product_code")
+  description                 String?
+  qty                         Decimal                      @db.Decimal(19, 4)
+  qtyDelivered                Decimal                      @default(0) @map("qty_delivered") @db.Decimal(19, 4)
+  unit                        String?
+  unitPrice                   Decimal                      @map("unit_price") @db.Decimal(19, 6)
+  discountPct                 Decimal                      @default(0) @map("discount_pct") @db.Decimal(19, 4)
+  discountReason              String?                      @map("discount_reason")
+  taxRate                     Decimal                      @default(0) @map("tax_rate") @db.Decimal(19, 4)
+  taxCode                     String                       @default("A") @map("tax_code")
+  lineSubtotal                Decimal                      @default(0) @map("line_subtotal") @db.Decimal(19, 2)
+  lineTax                     Decimal                      @default(0) @map("line_tax") @db.Decimal(19, 2)
+  lineTotal                   Decimal                      @default(0) @map("line_total") @db.Decimal(19, 2)
+  unitCost                    Decimal                      @default(0) @map("unit_cost") @db.Decimal(19, 6)
+  cogsAmount                  Decimal                      @default(0) @map("cogs_amount") @db.Decimal(19, 2)
+  warehouseId                 String?                      @map("warehouse_id") @db.Char(24)
+  projectId                   String?                      @map("project_id") @db.Char(24)
+  qtyCredited                 Decimal                      @default(0) @map("qty_credited") @db.Decimal(19, 4)
+  serialNumbers               Json                         @default("[]") @map("serial_numbers")
+  invoice                     Invoice                      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  pharmacyInsuranceClaimLines PharmacyInsuranceClaimLine[]
+  product                     Product                      @relation(fields: [productId], references: [id])
+  warehouse                   Warehouse?                   @relation(fields: [warehouseId], references: [id])
+  project                     Project?                     @relation(fields: [projectId], references: [id], onDelete: SetNull)
 
   @@index([invoiceId])
   @@index([companyId, productId])
@@ -7588,6 +7842,7 @@ enum PosPaymentMethod {
   STORE_CREDIT
   LOYALTY_WALLET
   LOYALTY_POINTS
+  INSURANCE
 }
 
 enum PosPaymentStatus {

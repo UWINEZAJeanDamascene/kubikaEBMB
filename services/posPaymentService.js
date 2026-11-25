@@ -32,6 +32,7 @@ const PAYMENT_METHODS = Object.freeze([
   'LOYALTY',
   'LOYALTY_WALLET',
   'LOYALTY_POINTS',
+  'INSURANCE',
 ]);
 const PAYMENT_METHOD_SET = new Set(PAYMENT_METHODS);
 const PAYMENT_ENVIRONMENTS = Object.freeze(['sandbox', 'production']);
@@ -118,6 +119,26 @@ function validateTenderConfiguration(settings, {
   allowOptionalReference = false,
 } = {}) {
   validateMethod(method);
+  if (method === 'INSURANCE') {
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw paymentError('POS_PAYMENT_AMOUNT_INVALID', 'Insurance claim amounts must be positive.');
+    }
+    const normalizedReference = typeof reference === 'string' ? reference.normalize('NFKC').trim() : '';
+    if (normalizedReference.length > 160 || /[\u0000-\u001f\u007f]/.test(normalizedReference)) {
+      throw paymentError('POS_PAYMENT_REFERENCE_INVALID', 'Insurance references must be valid and no more than 160 characters.');
+    }
+    return {
+      id: 'INSURANCE',
+      type: 'insurance',
+      displayName: 'Insurance claim',
+      minAmount: 0.01,
+      maxAmount: null,
+      requiresCustomer: false,
+      requiresReference: false,
+      changeAllowed: false,
+      confirmationMode: 'instant',
+    };
+  }
   const normalized = normalizeSettings(settings);
   const config = resolveMethodRegistry(normalized.methodRegistry, { registerId, tillType })[
     paymentMethodRegistryId(method)
@@ -233,6 +254,7 @@ function accountingTendersForMethod(method) {
   if (method === 'MTN_MOMO') return [{ paymentMethod: 'mobile_money', provider: 'mtn' }];
   if (method === 'AIRTEL_MONEY') return [{ paymentMethod: 'mobile_money', provider: 'airtel' }];
   if (method === 'CREDIT') return [{ paymentMethod: 'customer_credit' }];
+  if (method === 'INSURANCE') return [{ paymentMethod: 'insurance' }];
   if (method === 'LOYALTY') {
     return [{ paymentMethod: 'loyalty' }, { paymentMethod: 'loyalty_wallet' }];
   }
@@ -716,6 +738,21 @@ function resolvePaymentFlow(settings, registerId) {
 
 async function isPaymentMethodEnabled({ companyId, registerId, method, tillType }) {
   validateMethod(method);
+  if (method === 'INSURANCE') {
+    let effectiveTillType = tillType;
+    if (!effectiveTillType && registerId) {
+      const register = await dbClient().posRegister.findFirst({
+        where: { id: String(registerId), companyId: requireCompanyId(companyId) },
+        select: { systemTillType: true },
+      });
+      effectiveTillType = register?.systemTillType || '';
+    }
+    if (String(effectiveTillType || '').toLowerCase() !== 'pharmacy') return false;
+    return Boolean(await dbClient().pharmacyInsuranceProvider.findFirst({
+      where: { companyId: requireCompanyId(companyId), isActive: true },
+      select: { id: true },
+    }));
+  }
   const settings = await getPaymentSettings(companyId);
   return resolveEnabledMethods(settings, registerId, tillType).includes(method);
 }
@@ -733,6 +770,25 @@ async function assertPaymentMethodEnabled({ companyId, registerId, method, tillT
       throw paymentError('POS_PAYMENT_REGISTER_OVERRIDE_INVALID', 'The selected POS register does not belong to this company.');
     }
     effectiveTillType = register.systemTillType || 'retail';
+  }
+  if (method === 'INSURANCE') {
+    if (String(effectiveTillType).toLowerCase() !== 'pharmacy') {
+      throw paymentError('POS_PAYMENT_METHOD_DISABLED', 'Insurance claims are available only on a Pharmacy register.');
+    }
+    const provider = await dbClient().pharmacyInsuranceProvider.findFirst({
+      where: { companyId: scopedCompanyId, isActive: true },
+      select: { id: true },
+    });
+    if (!provider) {
+      throw paymentError('POS_PAYMENT_METHOD_DISABLED', 'Configure an active insurer before accepting an insurance claim.');
+    }
+    await assertPaymentAccountingReady({
+      companyId: scopedCompanyId,
+      registerId,
+      tillType: effectiveTillType,
+      method,
+    });
+    return;
   }
   const settings = await getPaymentSettings(scopedCompanyId);
   if (PROVIDER_ADAPTERS[method] && settings.providers[method]?.configured !== true) {
