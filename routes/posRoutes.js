@@ -114,6 +114,8 @@ router.put('/admin/scanner-settings', protect, canManagePosSettings, idem(posSca
 router.put('/admin/scanner-settings/open-price-product', protect, canManagePosSettings, idem(posScannerSettingsController.updateOpenPriceProduct));
 router.get('/register-settings/payment-methods', protect, canManagePosSettings, posPaymentSettingsController.getAdminSettings);
 router.put('/register-settings/payment-methods', protect, canManagePosSettings, idem(posPaymentSettingsController.updateAdminSettings));
+router.get('/register-settings/pharmacy-role-permissions', protect, canManagePosSettings, posTillSettingsController.getPharmacyRolePermissions);
+router.put('/register-settings/pharmacy-role-permissions', protect, canManagePosSettings, idem(posTillSettingsController.updatePharmacyRolePermissions));
 router.get('/register-settings', protect, canManagePosSettings, posTillSettingsController.getSettings);
 router.put('/register-settings', protect, canManagePosSettings, idem(posTillSettingsController.updateSettings));
 router.get('/restaurant/setup', protect, canManagePosSettings, posRestaurantSetupController.getSetup);

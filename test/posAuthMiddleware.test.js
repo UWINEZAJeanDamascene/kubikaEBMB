@@ -261,6 +261,24 @@ describe('POS session authorization middleware', () => {
     ]));
   });
 
+  test('applies Pharmacy role overrides without changing other POS permissions', async () => {
+    resolveUserRoles.mockResolvedValue([{ name: 'cashier' }]);
+    const cashier = await permissionsForUser({ role: 'cashier' }, COMPANY_ID, {
+      cashier: {
+        permissions: ['pos.till.sell', 'pharmacy.till.sell', 'pharmacy.patient.view'],
+        pharmacyPermissions: ['pharmacy.till.sell', 'pharmacy.prescription.capture'],
+      },
+    });
+
+    expect(cashier).toEqual(expect.arrayContaining([
+      'pos.till.sell',
+      'pos.receipt.share',
+      'pharmacy.till.sell',
+      'pharmacy.prescription.capture',
+    ]));
+    expect(cashier).not.toContain('pharmacy.patient.view');
+  });
+
   test('rejects an ERP session from a different company than the POS session', async () => {
     const req = request({ company: { id: '507f1f77bcf86cd799439099' } });
     expect(req.company.id).toBe('507f1f77bcf86cd799439099');

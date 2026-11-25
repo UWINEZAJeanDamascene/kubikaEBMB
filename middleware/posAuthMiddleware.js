@@ -4,7 +4,7 @@ const { verifyPosSessionToken } = require('../services/posSessionTokenService');
 const { resolveUserRoles } = require('./authorize');
 const { requestIp, writePosAuditLog, withPosAuditCorrelation } = require('../services/posAuditService');
 const { getPosSessionPermissionCandidates } = require('../utils/posPermissionCompatibility');
-const { PHARMACY_ROLES } = require('../services/posPharmacyFeatureRegistry');
+const { PHARMACY_PERMISSIONS, PHARMACY_ROLES } = require('../services/posPharmacyFeatureRegistry');
 
 const CASHIER_POS_PERMISSIONS = [
   'pos.till.sell',
@@ -134,23 +134,36 @@ function configuredPermissions(matrix, roles) {
     const roleName = String(role.name || '').trim().toLowerCase();
     const config = savedMatrix[roleName];
     const permissions = Array.isArray(config) ? config : config?.permissions;
+    const pharmacyPermissions = Array.isArray(config?.pharmacyPermissions)
+      ? config.pharmacyPermissions.filter((permission) => PHARMACY_PERMISSIONS.includes(permission))
+      : null;
+    let effectivePermissions;
     if (Array.isArray(permissions)) {
-      const configured = permissions.filter((permission) => typeof permission === 'string');
-      return roleName === 'cashier' || roleName === 'sales'
-      ? [...new Set([...configured, 'pos.receipt.share', 'pos.giftcard.redeem', 'pos.till.reprint'])]
-        : configured;
+      effectivePermissions = permissions.filter((permission) => typeof permission === 'string');
+    } else if (roleName === 'cashier' || roleName === 'sales') {
+      effectivePermissions = [...CASHIER_POS_PERMISSIONS, ...PHARMACY_ROLES.cashier];
+    } else if (roleName === 'supervisor') {
+      effectivePermissions = SUPERVISOR_POS_PERMISSIONS;
+    } else if (roleName === 'pharmacist') {
+      effectivePermissions = PHARMACY_ROLES.pharmacist;
+    } else if (roleName === 'manager' || roleName === 'store_manager') {
+      effectivePermissions = [...STORE_MANAGER_POS_PERMISSIONS, ...PHARMACY_ROLES.manager];
+    } else if (['owner', 'admin', 'administrator', 'platform_admin'].includes(roleName)) {
+      effectivePermissions = [...OWNER_POS_PERMISSIONS, ...PHARMACY_ROLES.owner];
+    } else {
+      effectivePermissions = [];
+    }
+
+    if (pharmacyPermissions) {
+      effectivePermissions = [
+        ...effectivePermissions.filter((permission) => !PHARMACY_PERMISSIONS.includes(permission)),
+        ...pharmacyPermissions,
+      ];
     }
     if (roleName === 'cashier' || roleName === 'sales') {
-      return [...CASHIER_POS_PERMISSIONS, ...PHARMACY_ROLES.cashier];
+      effectivePermissions = [...effectivePermissions, 'pos.receipt.share', 'pos.giftcard.redeem', 'pos.till.reprint'];
     }
-    if (roleName === 'supervisor') return SUPERVISOR_POS_PERMISSIONS;
-    if (roleName === 'pharmacist') return PHARMACY_ROLES.pharmacist;
-    if (roleName === 'manager') return [...STORE_MANAGER_POS_PERMISSIONS, ...PHARMACY_ROLES.manager];
-    if (roleName === 'store_manager') return [...STORE_MANAGER_POS_PERMISSIONS, ...PHARMACY_ROLES.manager];
-    if (['owner', 'admin', 'administrator', 'platform_admin'].includes(roleName)) {
-      return [...OWNER_POS_PERMISSIONS, ...PHARMACY_ROLES.owner];
-    }
-    return [];
+    return [...new Set(effectivePermissions)];
   });
 }
 

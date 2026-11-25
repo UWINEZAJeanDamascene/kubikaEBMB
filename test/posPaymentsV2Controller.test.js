@@ -1344,6 +1344,7 @@ describe('POS Payments V2 controller', () => {
     });
   });
 
+
   test('surfaces an offline flow-change exception instead of rerouting a V2 sale', async () => {
     setupDatabase(pendingInvoice({
       posCheckoutPayload: {

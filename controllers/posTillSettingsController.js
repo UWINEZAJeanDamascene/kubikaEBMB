@@ -10,6 +10,7 @@ const {
 } = require('../services/posOfflineActionCapsService');
 const { normalizeOfflinePolicy } = require('../services/posOfflinePolicyService');
 const { requestIp, writePosAuditLog } = require('../services/posAuditService');
+const { PHARMACY_PERMISSIONS, PHARMACY_ROLES } = require('../services/posPharmacyFeatureRegistry');
 const {
   DEFAULT_RECEIPT_SETTINGS, normalizeReceiptSettings, resolveReceiptSettings,
   hasBranchReceiptOverride, saveReceiptSettings, clearBranchReceiptSettings,
@@ -90,6 +91,128 @@ async function validateBranch(companyId, branchId) {
 function sendInvalid(res, message) {
   return res.status(400).json({ success: false, code: 'POS_TILL_SETTINGS_INVALID', message });
 }
+
+const PHARMACY_ROLE_ALIASES = Object.freeze({
+  sales: 'cashier',
+  store_manager: 'manager',
+  admin: 'owner',
+  administrator: 'owner',
+  platform_admin: 'owner',
+});
+
+function defaultPharmacyPermissions(roleName) {
+  const resolvedName = PHARMACY_ROLE_ALIASES[roleName] || roleName;
+  return PHARMACY_ROLES[resolvedName] ? [...PHARMACY_ROLES[resolvedName]] : [];
+}
+
+function rolePharmacyPermissions(matrix, roleName) {
+  const config = matrix?.[roleName];
+  if (Array.isArray(config?.pharmacyPermissions)) {
+    return config.pharmacyPermissions.filter((permission) => PHARMACY_PERMISSIONS.includes(permission));
+  }
+  const configured = Array.isArray(config) ? config : config?.permissions;
+  if (Array.isArray(configured)) {
+    return configured.filter((permission) => PHARMACY_PERMISSIONS.includes(permission));
+  }
+  return defaultPharmacyPermissions(roleName);
+}
+
+function normalizedRolePermissionMatrix(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+exports.getPharmacyRolePermissions = async (req, res, next) => {
+  try {
+    const companyId = companyIdFor(req);
+    if (!companyId) return res.status(400).json({ success: false, code: 'COMPANY_REQUIRED', message: 'Select a company before loading POS role permissions.' });
+    const [row, companyRoles] = await Promise.all([
+      prisma.systemSettings.upsert({
+        where: { companyId },
+        create: { id: generateObjectId(), companyId },
+        update: {},
+        select: { posRolePermissions: true },
+      }),
+      prisma.role.findMany({
+        where: { OR: [{ companyId }, { isSystemRole: true }] },
+        select: { name: true },
+      }),
+    ]);
+    const matrix = normalizedRolePermissionMatrix(row?.posRolePermissions);
+    const roleNames = new Set([
+      'cashier', 'sales', 'supervisor', 'pharmacist', 'manager', 'store_manager',
+      'owner', 'admin', 'administrator', 'platform_admin',
+      ...companyRoles.map((role) => String(role.name || '').trim().toLowerCase()).filter(Boolean),
+      ...Object.keys(matrix).map((roleName) => roleName.toLowerCase()),
+    ]);
+    const roles = [...roleNames].sort().map((name) => ({
+      name,
+      pharmacyPermissions: rolePharmacyPermissions(matrix, name),
+    }));
+    return res.json({
+      success: true,
+      data: { permissions: PHARMACY_PERMISSIONS, roles },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.updatePharmacyRolePermissions = async (req, res, next) => {
+  try {
+    const companyId = companyIdFor(req);
+    const roleName = String(req.body?.roleName || '').trim().toLowerCase();
+    const permissions = req.body?.permissions;
+    if (!companyId) return res.status(400).json({ success: false, code: 'COMPANY_REQUIRED', message: 'Select a company before saving POS role permissions.' });
+    if (!/^[a-z0-9][a-z0-9 _.-]{0,79}$/.test(roleName)) {
+      return sendInvalid(res, 'Choose a valid POS role before saving Pharmacy permissions.');
+    }
+    if (!Array.isArray(permissions) || permissions.some((permission) => !PHARMACY_PERMISSIONS.includes(permission))) {
+      return sendInvalid(res, 'Select only supported Pharmacy permissions.');
+    }
+    const pharmacyPermissions = [...new Set(permissions)];
+    const userId = String(req.user?.id || req.user?._id || '');
+    const updated = await prisma.$transaction(async (tx) => {
+      await tx.systemSettings.upsert({
+        where: { companyId },
+        create: { id: generateObjectId(), companyId },
+        update: {},
+      });
+      const current = await tx.systemSettings.findUnique({
+        where: { companyId },
+        select: { posRolePermissions: true },
+      });
+      const matrix = normalizedRolePermissionMatrix(current?.posRolePermissions);
+      const existing = matrix[roleName];
+      const roleConfig = Array.isArray(existing)
+        ? { permissions: existing }
+        : existing && typeof existing === 'object'
+          ? { ...existing }
+          : {};
+      const before = rolePharmacyPermissions(matrix, roleName);
+      const nextMatrix = {
+        ...matrix,
+        [roleName]: { ...roleConfig, pharmacyPermissions },
+      };
+      await tx.systemSettings.update({
+        where: { companyId },
+        data: { posRolePermissions: nextMatrix, lastUpdatedBy: userId || null },
+      });
+      if (JSON.stringify(before) !== JSON.stringify(pharmacyPermissions)) {
+        await writePosAuditLog({
+          companyId,
+          userId: userId || null,
+          event: 'POS_PHARMACY_ROLE_PERMISSIONS_UPDATED',
+          metadata: { roleName, before, after: pharmacyPermissions },
+          ip: requestIp(req),
+        }, tx);
+      }
+      return { roleName, pharmacyPermissions };
+    });
+    return res.json({ success: true, data: updated });
+  } catch (error) {
+    return next(error);
+  }
+};
 
 exports.getSettings = async (req, res, next) => {
   try {

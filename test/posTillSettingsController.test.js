@@ -1,6 +1,7 @@
 jest.mock('../lib/prisma', () => ({
   prisma: {
     systemSettings: { upsert: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
+    role: { findMany: jest.fn() },
     $transaction: jest.fn((callback) => callback(require('../lib/prisma').prisma)),
     $queryRaw: jest.fn(),
     $executeRaw: jest.fn(),
@@ -71,6 +72,84 @@ const completeSettings = {
 
 describe('POS till administration settings', () => {
   beforeEach(() => jest.clearAllMocks());
+
+  test('loads Pharmacy role permissions with defaults and company roles', async () => {
+    prisma.systemSettings.upsert.mockResolvedValue({
+      posRolePermissions: {
+        cashier: { permissions: ['pos.till.sell'] },
+        'custom pharmacy role': { pharmacyPermissions: ['pharmacy.patient.view'] },
+      },
+    });
+    prisma.role.findMany.mockResolvedValue([{ name: 'Cashier' }, { name: 'custom pharmacy role' }]);
+    const res = response();
+
+    await controller.getPharmacyRolePermissions(
+      { user: { companyId: 'company-a' } },
+      res,
+      (error) => { throw error; },
+    );
+
+    expect(res.body.data.permissions).toContain('pharmacy.prescription.capture');
+    expect(res.body.data.roles).toEqual(expect.arrayContaining([
+      { name: 'cashier', pharmacyPermissions: [] },
+      { name: 'pharmacist', pharmacyPermissions: expect.arrayContaining(['pharmacy.prescription.capture']) },
+      { name: 'custom pharmacy role', pharmacyPermissions: ['pharmacy.patient.view'] },
+    ]));
+    expect(prisma.role.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { OR: [{ companyId: 'company-a' }, { isSystemRole: true }] },
+    }));
+  });
+
+  test('saves Pharmacy role permissions without replacing existing POS grants', async () => {
+    prisma.systemSettings.upsert.mockResolvedValue({});
+    prisma.systemSettings.findUnique.mockResolvedValue({
+      posRolePermissions: {
+        pharmacist: { permissions: ['pos.till.sell', 'pharmacy.till.sell'], customFlag: true },
+      },
+    });
+    const res = response();
+
+    await controller.updatePharmacyRolePermissions({
+      user: { id: 'manager-id', companyId: 'company-a' },
+      body: {
+        roleName: 'pharmacist',
+        permissions: ['pharmacy.till.sell', 'pharmacy.dispensing.review'],
+      },
+    }, res, (error) => { throw error; });
+
+    expect(prisma.systemSettings.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { companyId: 'company-a' },
+      data: expect.objectContaining({
+        posRolePermissions: {
+          pharmacist: {
+            permissions: ['pos.till.sell', 'pharmacy.till.sell'],
+            customFlag: true,
+            pharmacyPermissions: ['pharmacy.till.sell', 'pharmacy.dispensing.review'],
+          },
+        },
+      }),
+    }));
+    expect(res.body.data).toEqual({
+      roleName: 'pharmacist',
+      pharmacyPermissions: ['pharmacy.till.sell', 'pharmacy.dispensing.review'],
+    });
+    expect(writePosAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: 'company-a',
+      event: 'POS_PHARMACY_ROLE_PERMISSIONS_UPDATED',
+    }), expect.anything());
+  });
+
+  test('rejects unsupported Pharmacy role permissions', async () => {
+    const res = response();
+    await controller.updatePharmacyRolePermissions({
+      user: { companyId: 'company-a' },
+      body: { roleName: 'pharmacist', permissions: ['pos.admin.roles'] },
+    }, res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.code).toBe('POS_TILL_SETTINGS_INVALID');
+    expect(prisma.systemSettings.update).not.toHaveBeenCalled();
+  });
 
   test('loads settings only for the active company and applies defaults', async () => {
     prisma.systemSettings.upsert.mockResolvedValue({
